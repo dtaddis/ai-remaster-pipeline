@@ -1,0 +1,5 @@
+﻿# source_video=outpainted/example_00.00.00to00.10.00_outpaint.mp4
+enabled,end,reference
+true,0:00:20,references/example/cut_0000.png
+true,0:00:40,references/example/cut_0001.png
+false,0:10:00,references/example/placeholder.png

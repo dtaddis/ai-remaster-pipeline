@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI remaster pipeline local/runtime data
+/tools/ComfyUI/
+/tools/ComfyUI_windows_portable/
+/tools/TransNetV2/
+/models/
+/input/**/*.mp4
+/input/**/*.mov
+/input/**/*.mkv
+/input/**/*.avi
+/input/**/*.wav
+/input/**/*.flac
+/input/**/*.png
+/input/**/*.jpg
+/input/**/*.jpeg
+!/input/**/.gitkeep
+!/examples/**
+/output/**
+!/output/**/.gitkeep
+*.jsonl
+*.partial.mp4
+*.tmp
+.env

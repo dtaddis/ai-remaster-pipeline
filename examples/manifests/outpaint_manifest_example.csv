@@ -1,0 +1,5 @@
+﻿# source_video=source_4x3/example_00.00.00to00.10.00.mp4
+enabled,end,prompt
+true,0:00:20,"Expand to 16:9. Preserve the original center frame exactly; generate plausible missing left and right image area with matching grain, lens softness, lighting, and period production design."
+true,0:00:40,"Continue the same restrained widescreen restoration. Keep faces, text, props, and original camera motion unchanged."
+false,0:10:00,"Disabled placeholder for the rest of this reel."
