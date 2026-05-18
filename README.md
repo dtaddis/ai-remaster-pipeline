@@ -1,4 +1,8 @@
-﻿# AI Movie Remaster Pipeline
+﻿<p align="center">
+  <img src="assets/branding/arp-logo.png" alt="ARP - AI Remaster Pipeline" width="520">
+</p>
+
+# ARP - AI Remaster Pipeline
 
 A staged toolkit for remastering public-domain or licensed film material with ComfyUI-assisted outpainting, shot-reference extraction, optional Qwen Image Edit still colorization, optional reference-based video colorization, and final Resolve-friendly compositing.
 
@@ -143,6 +147,44 @@ The FFmpeg blend is an approximation of a Resolve-style color layer. For final g
 
 Scripts write `.sig.json` sidecars beside outputs. If inputs and settings match, a rerun reuses the existing output. If a source video, source frame, prompt, workflow, or relevant parameter changes, the dependent output is regenerated.
 
+## GUI
+
+The repo also includes a cross-platform local web GUI for running and inspecting the pipeline:
+
+```bat
+launch_gui.bat
+```
+
+On macOS or Linux, use:
+
+```sh
+./launch_gui.sh
+```
+
+Or, from an activated Python environment on any platform:
+
+```bat
+python -m ai_remaster_gui
+```
+
+The GUI keeps the command-line scripts as the backend, so anything you configure in the tabs is shown as an equivalent command before it runs. It includes:
+
+- A Global tab with whole-pipeline progress and a one-shot run button.
+- Stage tabs for outpainting, shot detection, Qwen reference generation, video colourisation, and recomposition.
+- Image/video preview panes for intermediate files in each stage folder.
+- A manifest editor for enabling/disabling references and adjusting reference paths.
+- A ComfyUI tab for queue inspection and optional log-file tailing.
+
+The GUI stores local field history in `.ai_remaster_gui.json`, which is ignored by Git.
+
+## Branding
+
+Logo and thumbnail assets live in `assets/branding`:
+
+- `arp-logo.png` for the README and general project branding.
+- `arp-app-icon-512.png`, `arp-app-icon-192.png`, `favicon.png`, and `favicon.ico` for the GUI/browser icon.
+- `arp-github-social.png` for the GitHub repository social preview image.
+
 ## Installation
 
 For a full Windows setup, run:
@@ -175,6 +217,8 @@ You also need FFmpeg available on PATH, or pass `--ffmpeg` to `final_composite.p
 ## Licensing Notes
 
 Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, ColorMNet, or any other model weights.
+
+
 
 
 

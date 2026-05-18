@@ -6,6 +6,7 @@ venv/
 .env
 .ruff_cache/
 .pytest_cache/
+.ai_remaster_gui.json
 
 # Local tools and models
 /tools/ComfyUI/
