@@ -162,9 +162,35 @@ function Download-HfFile {
     Ensure-Directory $DownloadCache
     $HfExe = Join-Path $ComfyDir 'venv\Scripts\hf.exe'
     if (-not (Test-Path -LiteralPath $HfExe)) { $HfExe = 'hf' }
-    $downloaded = & $HfExe download $Repo $File --local-dir $DownloadCache 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "hf download failed for $Repo/$File`n$downloaded"
+    $stdout = [System.IO.Path]::GetTempFileName()
+    $stderr = [System.IO.Path]::GetTempFileName()
+    $oldPythonUtf8 = $env:PYTHONUTF8
+    $oldPythonIoEncoding = $env:PYTHONIOENCODING
+    $oldDisableProgress = $env:HF_HUB_DISABLE_PROGRESS_BARS
+    try {
+        $env:PYTHONUTF8 = '1'
+        $env:PYTHONIOENCODING = 'utf-8'
+        $env:HF_HUB_DISABLE_PROGRESS_BARS = '1'
+        $process = Start-Process `
+            -FilePath $HfExe `
+            -ArgumentList @('download', $Repo, $File, '--local-dir', $DownloadCache) `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+        $downloaded = ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue)).Trim()
+        if ($process.ExitCode -ne 0) {
+            throw "hf download failed for $Repo/$File`n$downloaded"
+        }
+        if ($downloaded) {
+            Write-Host $downloaded
+        }
+    } finally {
+        $env:PYTHONUTF8 = $oldPythonUtf8
+        $env:PYTHONIOENCODING = $oldPythonIoEncoding
+        $env:HF_HUB_DISABLE_PROGRESS_BARS = $oldDisableProgress
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
     }
     $source = Join-Path $DownloadCache $File
     if (-not (Test-Path -LiteralPath $source)) {
