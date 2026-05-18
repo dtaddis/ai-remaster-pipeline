@@ -193,7 +193,16 @@ For a full Windows setup, run:
 install_windows.bat
 ```
 
-That script creates `tools\comfyui`, sets up a CUDA PyTorch ComfyUI venv, installs ComfyUI Manager, LTXVideo nodes, Deep Exemplar / ColorMNet reference colorization nodes, creates this repo's `.venv`, and downloads the default model set:
+The installer will ask whether to clone ComfyUI into this project or use an existing ComfyUI directory. Existing installs are expected to contain `main.py`; the installer will then add the required custom nodes, model folders, models, and a `venv` under that ComfyUI folder if needed.
+
+For unattended installs, pass the ComfyUI directory explicitly or use the default clone location:
+
+```bat
+install_windows.bat -ComfyDir D:\somewhere\ComfyUI
+install_windows.bat -NonInteractive
+```
+
+Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It sets up a CUDA PyTorch ComfyUI venv, installs ComfyUI Manager, LTXVideo nodes, Deep Exemplar / ColorMNet reference colorization nodes, creates this repo's `.venv`, and downloads the default model set:
 
 - LTX 2.3 FP8 checkpoint.
 - LTX 2.3 text encoder and audio VAE.

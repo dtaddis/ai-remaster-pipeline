@@ -1,19 +1,19 @@
 ﻿param(
-    [string]$ComfyDir = (Join-Path $PSScriptRoot 'tools\comfyui'),
+    [string]$ComfyDir,
     [string]$PythonLauncher = 'py -3.13',
     [string]$TorchIndexUrl = 'https://download.pytorch.org/whl/cu128',
     [switch]$SkipModelDownloads,
     [switch]$SkipDeepExemplar,
     [switch]$SkipComfyManager,
-    [switch]$InstallCorrelationExtension
+    [switch]$InstallCorrelationExtension,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
-$ComfyDir = [System.IO.Path]::GetFullPath($ComfyDir)
-$VenvPython = Join-Path $ComfyDir 'venv\Scripts\python.exe'
-$CustomNodes = Join-Path $ComfyDir 'custom_nodes'
 $DownloadCache = Join-Path $Root '.cache\huggingface'
+$DefaultComfyDir = Join-Path $Root 'tools\comfyui'
+$UseExistingComfy = $false
 
 function Invoke-Step {
     param([string]$Label, [scriptblock]$Block)
@@ -40,6 +40,89 @@ function Ensure-Directory {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
+
+function Test-ComfyDir {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    return (Test-Path -LiteralPath (Join-Path $Path 'main.py'))
+}
+
+function Read-Choice {
+    param(
+        [string]$Prompt,
+        [string[]]$Valid,
+        [string]$Default
+    )
+    while ($true) {
+        $suffix = if ($Default) { " [$Default]" } else { '' }
+        $answer = Read-Host "$Prompt$suffix"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            $answer = $Default
+        }
+        foreach ($value in $Valid) {
+            if ($answer -ieq $value) {
+                return $value
+            }
+        }
+        Write-Host "Please enter one of: $($Valid -join ', ')." -ForegroundColor Yellow
+    }
+}
+
+function Resolve-ComfyInstallMode {
+    if ($ComfyDir) {
+        $full = [System.IO.Path]::GetFullPath($ComfyDir)
+        return @{
+            Dir = $full
+            Existing = (Test-ComfyDir $full)
+        }
+    }
+
+    if ($NonInteractive) {
+        return @{
+            Dir = [System.IO.Path]::GetFullPath($DefaultComfyDir)
+            Existing = $false
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'ComfyUI setup' -ForegroundColor Cyan
+    Write-Host '1. Clone ComfyUI into this project under tools\comfyui'
+    Write-Host '2. Use an existing ComfyUI directory'
+    $choice = Read-Choice 'Choose ComfyUI setup mode (1 or 2)' @('1', '2') '1'
+
+    if ($choice -eq '1') {
+        $target = Read-Host "Clone destination [$DefaultComfyDir]"
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            $target = $DefaultComfyDir
+        }
+        return @{
+            Dir = [System.IO.Path]::GetFullPath($target)
+            Existing = $false
+        }
+    }
+
+    while ($true) {
+        $target = Read-Host 'Existing ComfyUI directory'
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            Write-Host 'Please enter a ComfyUI directory.' -ForegroundColor Yellow
+            continue
+        }
+        $full = [System.IO.Path]::GetFullPath($target)
+        if (Test-ComfyDir $full) {
+            return @{
+                Dir = $full
+                Existing = $true
+            }
+        }
+        Write-Host "That does not look like a ComfyUI checkout because main.py was not found: $full" -ForegroundColor Yellow
+        $retry = Read-Choice 'Try another path? (Y/N)' @('Y', 'N') 'Y'
+        if ($retry -eq 'N') {
+            throw 'Install cancelled.'
+        }
     }
 }
 
@@ -91,8 +174,21 @@ function Download-HfFile {
     Write-Host "Downloaded: $Destination"
 }
 
-Invoke-Step 'Clone ComfyUI' {
-    Git-Clone-IfMissing 'https://github.com/comfyanonymous/ComfyUI.git' $ComfyDir
+$mode = Resolve-ComfyInstallMode
+$ComfyDir = $mode.Dir
+$UseExistingComfy = [bool]$mode.Existing
+$VenvPython = Join-Path $ComfyDir 'venv\Scripts\python.exe'
+$CustomNodes = Join-Path $ComfyDir 'custom_nodes'
+
+Invoke-Step 'Configure ComfyUI directory' {
+    if ($UseExistingComfy) {
+        Write-Host "Using existing ComfyUI: $ComfyDir"
+    } else {
+        Git-Clone-IfMissing 'https://github.com/comfyanonymous/ComfyUI.git' $ComfyDir
+    }
+    if (-not (Test-ComfyDir $ComfyDir)) {
+        throw "ComfyUI main.py was not found in: $ComfyDir"
+    }
 }
 
 Invoke-Step 'Create ComfyUI venv' {
