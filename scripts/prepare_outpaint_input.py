@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 
-from common import file_fingerprint, format_time, resolve_path, root_relative, signature_matches, write_signature
+from common import file_fingerprint, format_time, resolve_path, root_relative, resumable_output, write_signature
 
 
 def parse_aspect(value: str) -> float:
@@ -39,7 +39,7 @@ def find_ffmpeg(explicit: str | None) -> str:
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
-    candidates.extend([Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'), Path('ffmpeg')])
+    candidates.extend([Path(__file__).resolve().parents[1] / '.cache' / 'tools' / 'ffmpeg' / 'ffmpeg.exe', Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'), Path('ffmpeg')])
     for candidate in candidates:
         try:
             subprocess.run([str(candidate), '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -117,7 +117,7 @@ def main():
     target_width = even(target_height * parse_aspect(args.target_aspect))
     output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height)
     sig = signature(args, source, info, target_width, target_height)
-    if not args.force and signature_matches(output, sig):
+    if not args.force and resumable_output(output, sig, video_like=source, width=target_width, height=target_height):
         print(f'Reuse prepared outpaint input: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)

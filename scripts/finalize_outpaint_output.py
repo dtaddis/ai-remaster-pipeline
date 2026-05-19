@@ -4,14 +4,14 @@ import argparse
 import subprocess
 from pathlib import Path
 
-from common import file_fingerprint, resolve_path, root_relative, signature_matches, write_signature
+from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 
 
 def find_ffmpeg(explicit: str | None) -> str:
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
-    candidates.extend([Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'), Path('ffmpeg')])
+    candidates.extend([Path(__file__).resolve().parents[1] / '.cache' / 'tools' / 'ffmpeg' / 'ffmpeg.exe', Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'), Path('ffmpeg')])
     for candidate in candidates:
         try:
             subprocess.run([str(candidate), '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -78,7 +78,7 @@ def main():
         raise FileNotFoundError(f'Outpainted source not found: {source}')
     output = resolve_path(args.output) if args.output else default_output(source)
     sig = signature(args, source)
-    if not args.force and signature_matches(output, sig):
+    if not args.force and resumable_output(output, sig, video_like=source):
         print(f'Reuse restored outpaint: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)

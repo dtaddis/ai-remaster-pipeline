@@ -3,6 +3,7 @@
     [string]$PythonLauncher = 'py -3.13',
     [string]$TorchIndexUrl = 'https://download.pytorch.org/whl/cu128',
     [switch]$SkipModelDownloads,
+    [switch]$DownloadModels,
     [switch]$SkipDeepExemplar,
     [switch]$SkipComfyManager,
     [switch]$InstallCorrelationExtension,
@@ -217,6 +218,42 @@ Invoke-Step 'Configure ComfyUI directory' {
     }
 }
 
+function Install-FfmpegIfMissing {
+    $ToolDir = Join-Path $Root '.cache\tools\ffmpeg'
+    $FfmpegExe = Join-Path $ToolDir 'ffmpeg.exe'
+    $FfprobeExe = Join-Path $ToolDir 'ffprobe.exe'
+    if ((Test-Path -LiteralPath $FfmpegExe) -and (Test-Path -LiteralPath $FfprobeExe)) {
+        Write-Host "FFmpeg already exists: $ToolDir"
+        return
+    }
+    $ArchiveDir = Join-Path $Root '.cache\downloads'
+    $Archive = Join-Path $ArchiveDir 'ffmpeg-release-essentials.zip'
+    Ensure-Directory $ArchiveDir
+    Ensure-Directory $ToolDir
+    if (-not (Test-Path -LiteralPath $Archive)) {
+        Write-Host 'Downloading FFmpeg essentials from https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+        Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $Archive -UseBasicParsing
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $name = [System.IO.Path]::GetFileName($entry.FullName)
+            $normalized = $entry.FullName.Replace('\', '/').ToLowerInvariant()
+            if (($name -eq 'ffmpeg.exe' -or $name -eq 'ffprobe.exe') -and $normalized.Contains('/bin/')) {
+                $target = Join-Path $ToolDir $name
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    if (-not ((Test-Path -LiteralPath $FfmpegExe) -and (Test-Path -LiteralPath $FfprobeExe))) {
+        throw "Could not extract ffmpeg.exe and ffprobe.exe from $Archive"
+    }
+    Write-Host "Installed FFmpeg tools: $ToolDir"
+}
+
 Invoke-Step 'Create ai-remaster-pipeline venv' {
     if (-not (Test-Path -LiteralPath $PipelinePython)) {
         Invoke-PythonLauncher -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
@@ -261,11 +298,16 @@ Invoke-Step 'Create model directories' {
     }
 }
 
-if (-not $SkipModelDownloads) {
+Invoke-Step 'Install local FFmpeg tools' {
+    Install-FfmpegIfMissing
+}
+
+if ($DownloadModels -and -not $SkipModelDownloads) {
     Invoke-Step 'Download LTX 2.3 models and outpainting LoRA' {
         Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' (Join-Path $ComfyDir 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors')
         Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors')
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_audio_vae_bf16.safetensors')
+        Download-HfFile 'Lightricks/LTX-2.3' 'ltx-2.3-22b-distilled-lora-384.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-distilled-lora-384.safetensors')
         Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors')
     }
 
@@ -276,7 +318,7 @@ if (-not $SkipModelDownloads) {
         Download-HfFile 'lightx2v/Qwen-Image-Lightning' 'Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors' (Join-Path $ComfyDir 'models\loras\Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors')
     }
 } else {
-    Write-Host 'Skipping model downloads because -SkipModelDownloads was passed.'
+    Write-Host 'Skipping model downloads. Models and LoRAs will download on demand when their pipeline stages run.'
 }
 
 Invoke-Step 'Write local ARP configuration' {

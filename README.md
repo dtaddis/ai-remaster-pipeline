@@ -6,7 +6,11 @@
 
 A staged toolkit for remastering public-domain or licensed film material with ComfyUI-assisted outpainting, shot-reference extraction, optional Qwen Image Edit still colorization, optional reference-based video colorization, and final Resolve-friendly compositing.
 
-The pipeline is deliberately modular. Each stage writes obvious intermediate files, and the scripts use sidecar signatures so reruns skip unchanged work and regenerate outputs when their source material, prompt, workflow, or settings change.
+The pipeline is deliberately modular. Each stage writes obvious intermediate files, and the scripts use sidecar signatures plus media validation so reruns can resume completed work only when the existing files still match the expected duration, dimensions, and image/video format.
+
+<p align="center">
+  <img src="assets/screenshots/arp-gui-global.png" alt="ARP GUI showing source video previews, metadata, and remaster stages">
+</p>
 
 ## Folder Layout
 
@@ -34,25 +38,21 @@ Place your source movie or working segment in `input`. Keep filenames descriptiv
 input\Metropolis_00.00.00to00.10.00_source.mp4
 ```
 
-## 2. Widescreen Conversion
+## 2. Outpainting
 
 The LTX 2.3 outpainting LoRA fills pure black pixels. To stop it from treating genuine black pixels in the original movie as mask, prepare the input first:
 
 ```bat
-prepare_outpaint_input.bat ^
+outpaint_video.bat ^
   --source input\Metropolis_00.00.00to00.10.00_source.mp4 ^
-  --output intermediate\outpaint_prepared\Metropolis_00.00.00to00.10.00_16x9_lifted.mp4
+  --target-aspect 16:9
 ```
 
-This lifts the source image away from pure black, centres it in a 16:9 canvas, and leaves only the new left/right regions as exact black. Use that prepared clip in ComfyUI with the LTX 2.3 IC outpainting workflow.
+This wraps the full outpainting stage. It lifts the source image away from pure black, centres it in the target canvas, queues the LTX 2.3 IC-LoRA outpainting workflow in ComfyUI, copies the raw ComfyUI render, and restores the lift into `intermediate/outpainted`.
 
-After ComfyUI renders the outpainted clip, restore the lift:
+Common target aspects include `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, `2.35:1`, `1.85:1`, `3:2`, `2:3`, `5:4`, and `4:5`.
 
-```bat
-finalize_outpaint_output.bat ^
-  --source path\to\comfy_outpaint_render.mp4 ^
-  --output intermediate\outpainted\Metropolis_00.00.00to00.10.00_outpaint.mp4
-```
+The lower-level helpers still exist if you want to prepare and restore manually: `prepare_outpaint_input.bat` and `finalize_outpaint_output.bat`.
 
 See `docs/ltx-outpainting-prep.md` for the black-lift/gamma details.
 
@@ -184,6 +184,7 @@ When launched, the GUI checks whether ComfyUI is available at `http://127.0.0.1:
 Logo and thumbnail assets live in `assets/branding`:
 
 - `arp-logo.png` for the README and general project branding.
+- `arp-logo-wide.png` for the GUI Global page.
 - `arp-app-icon-512.png`, `arp-app-icon-192.png`, `favicon.png`, and `favicon.ico` for the GUI/browser icon.
 - `arp-github-social.png` for the GitHub repository social preview image.
 
@@ -204,10 +205,13 @@ install_windows.bat -ComfyDir D:\somewhere\ComfyUI
 install_windows.bat -NonInteractive
 ```
 
-Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, Deep Exemplar / ColorMNet reference colorization nodes, and downloads the default model set:
+Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, and Deep Exemplar / ColorMNet reference colorization nodes.
+
+Models and LoRAs are downloaded on demand when their pipeline stages first need them:
 
 - LTX 2.3 FP8 checkpoint.
 - LTX 2.3 text encoder and audio VAE.
+- LTX 2.3 distilled LoRA used by the bundled outpainting workflow.
 - LTX 2.3 outpainting IC-LoRA.
 - Qwen Image Edit 2509 FP8 diffusion model.
 - Qwen image text encoder and VAE.
@@ -216,15 +220,15 @@ Depending on your choice, that script either creates `tools\comfyui` or uses you
 Useful installer options:
 
 ```bat
-install_windows.bat -SkipModelDownloads
 install_windows.bat -SkipDeepExemplar
 install_windows.bat -ComfyDir D:\somewhere\comfyui
 install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu128
+install_windows.bat -DownloadModels
 ```
 
-The model downloads are huge and resumable. If a file already exists at the expected destination, the installer skips it. See `docs/installer-model-sources.md` for the exact Hugging Face repo/file mapping.
+Model downloads are huge and resumable. By default they happen on demand; pass `-DownloadModels` if you want the installer to prefetch the main model set. If a file already exists at the expected destination, the downloader skips it. See `docs/installer-model-sources.md` for the exact Hugging Face repo/file mapping.
 
-You also need FFmpeg available on PATH, or pass `--ffmpeg` to `final_composite.py`.
+The installer places FFmpeg and ffprobe under `.cache/tools/ffmpeg`; command-line scripts can still use a system FFmpeg from PATH or an explicit `--ffmpeg` where supported.
 ## Licensing Notes
 
 Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, ColorMNet, or any other model weights.

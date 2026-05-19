@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import cv2
 import numpy as np
-from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, signature_matches, write_signature
+from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, resumable_output, write_signature
 
 DEFAULT_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references'
 DEFAULT_COLOR_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
@@ -162,8 +162,8 @@ def extract_frames(args,source_path,rows):
                     if png not in expected: png.unlink(missing_ok=True); png.with_suffix(png.suffix+'.sig.json').unlink(missing_ok=True); print(f'Removed orphan source frame: {png}')
     for row in rows:
         sig=source_signature(source_path,row)
-        if not args.force and not args.regenerate_source_frames and signature_matches(row.source_reference,sig): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
-        if not args.force and row.source_reference.exists() and signature_matches(row.source_reference,sig): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
+        if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=info.width,height=info.height): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
+        if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=info.width,height=info.height): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
         write_png(row.source_reference,read_frame(source_path,row.selected_frame)); write_signature(row.source_reference,sig); print(f'Wrote source frame {row.index:04d}: {row.source_reference}')
 def default_manifest_path(source_path): return DEFAULT_MANIFEST_ROOT/f'colorize_manifest_{safe_stem(source_path.name)}_shots_auto.csv'
 

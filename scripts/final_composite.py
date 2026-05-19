@@ -4,7 +4,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
-from common import file_fingerprint, resolve_path, root_relative, signature_matches, write_signature
+from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 
 
 def find_ffmpeg(explicit: str | None):
@@ -12,6 +12,7 @@ def find_ffmpeg(explicit: str | None):
     if explicit:
         candidates.append(Path(explicit))
     candidates.extend([
+        Path(__file__).resolve().parents[1] / '.cache' / 'tools' / 'ffmpeg' / 'ffmpeg.exe',
         Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'),
         Path('ffmpeg'),
     ])
@@ -72,7 +73,7 @@ def run(args):
     colorized = resolve_path(args.colorized) if args.colorized else None
     output = resolve_path(args.output)
     sig = signature(args)
-    if not args.force and signature_matches(output, sig):
+    if not args.force and resumable_output(output, sig, video_like=outpainted):
         print(f'Reuse composite: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)

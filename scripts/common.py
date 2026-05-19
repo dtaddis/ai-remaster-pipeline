@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import hashlib
+import math
 import json
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,82 @@ def signature_matches(path: Path, signature: dict[str, Any]) -> bool:
         return json.loads(sig.read_text(encoding="utf-8-sig")) == signature
     except Exception:
         return False
+
+
+def video_info(path: Path) -> dict[str, Any]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    ok, _frame = cap.read()
+    cap.release()
+    if width <= 0 or height <= 0 or frames <= 0 or not ok:
+        raise RuntimeError(f"Video is not readable or has no frames: {path}")
+    return {"width": width, "height": height, "fps": fps or 24.0, "frames": frames, "duration": frames / (fps or 24.0)}
+
+
+def image_info(path: Path) -> dict[str, int]:
+    import cv2
+
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None or image.size == 0:
+        raise RuntimeError(f"Image is not readable: {path}")
+    height, width = image.shape[:2]
+    return {"width": int(width), "height": int(height)}
+
+
+def video_matches(
+    path: Path,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    like: Path | None = None,
+    duration_tolerance: float = 1.5,
+    frame_tolerance: int = 3,
+) -> bool:
+    try:
+        info = video_info(path)
+        expected = video_info(like) if like else None
+    except Exception:
+        return False
+    expected_width = width if width is not None else (expected["width"] if expected else None)
+    expected_height = height if height is not None else (expected["height"] if expected else None)
+    if expected_width is not None and info["width"] != expected_width:
+        return False
+    if expected_height is not None and info["height"] != expected_height:
+        return False
+    if expected:
+        if abs(info["duration"] - expected["duration"]) > duration_tolerance:
+            return False
+        if abs(info["frames"] - expected["frames"]) > max(frame_tolerance, math.ceil(expected["fps"] * duration_tolerance)):
+            return False
+    return True
+
+
+def image_matches(path: Path, *, like: Path | None = None, width: int | None = None, height: int | None = None) -> bool:
+    try:
+        info = image_info(path)
+        expected = image_info(like) if like else None
+    except Exception:
+        return False
+    expected_width = width if width is not None else (expected["width"] if expected else None)
+    expected_height = height if height is not None else (expected["height"] if expected else None)
+    return (expected_width is None or info["width"] == expected_width) and (expected_height is None or info["height"] == expected_height)
+
+
+def resumable_output(path: Path, signature: dict[str, Any], *, video_like: Path | None = None, width: int | None = None, height: int | None = None, image_like: Path | None = None) -> bool:
+    if not signature_matches(path, signature):
+        return False
+    if video_like or ((width is not None or height is not None) and path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}):
+        return video_matches(path, like=video_like, width=width, height=height)
+    if image_like or width is not None or height is not None:
+        return image_matches(path, like=image_like, width=width, height=height)
+    return True
 
 
 def write_signature(path: Path, signature: dict[str, Any]) -> None:

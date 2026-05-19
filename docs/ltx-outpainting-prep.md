@@ -12,7 +12,19 @@ The pipeline handles this with a reversible-ish lift:
 
 It is technically a black-floor lift plus optional gamma lift. Pure gamma alone does not protect exact black because `0` stays `0`.
 
-## Prepare The Comfy Input
+## Run The Full Outpainting Stage
+
+The normal ARP entry point is:
+
+```bat
+outpaint_video.bat ^
+  --source input\movie_4x3.mp4 ^
+  --target-aspect 16:9
+```
+
+This prepares the input, queues the bundled ComfyUI workflow from `workflows/outpaint_ltx/outpaint_LTX-IC.json`, copies the raw ComfyUI render, and restores the black/gamma lift into `intermediate/outpainted`.
+
+## Prepare The Comfy Input Manually
 
 ```bat
 prepare_outpaint_input.bat ^

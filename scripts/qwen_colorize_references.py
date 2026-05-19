@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_prompt, workflow_to_prompt, http_json
-from common import ROOT, file_fingerprint, resolve_path, root_relative, signature_matches, write_signature
+from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
+from dependency_manager import ensure_qwen_image_edit_models
 
 DEFAULT_PROMPT = 'Colorize this image.'
 DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
@@ -21,6 +22,17 @@ REFERENCE_DESCRIPTION_PROMPT = (
     'Do not identify the film, do not invent story context, and do not describe composition unless it affects colour continuity. '
     'Keep it concise, factual, and useful as colour guidance for another black-and-white frame.'
 )
+
+
+def load_local_config() -> dict[str, str]:
+    path = ROOT / '.ai_remaster_config.json'
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except json.JSONDecodeError:
+        return {}
+    return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
 def read_manifest(path: Path):
@@ -194,10 +206,12 @@ def newest_output(files: list[Path]) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    config = load_local_config()
     parser = argparse.ArgumentParser(description='Colorize extracted reference stills with a single-image Qwen Image Edit ComfyUI workflow.')
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--workflow', required=True, type=Path, help='ComfyUI Qwen Image Edit workflow JSON/API file.')
     parser.add_argument('--comfy-url', default='http://127.0.0.1:8188')
+    parser.add_argument('--comfy-dir', type=Path, default=Path(config.get('comfy_dir', ROOT / 'tools' / 'comfyui')), help='ComfyUI directory used for on-demand model downloads.')
     parser.add_argument('--comfy-output-root', type=Path, default=ROOT / 'tools' / 'comfyui' / 'output', help='ComfyUI output directory used to locate saved images.')
     parser.add_argument('--prompt', default=DEFAULT_PROMPT)
     parser.add_argument('--prompt-suffix', default='')
@@ -232,12 +246,15 @@ def main() -> int:
         raise RuntimeError('--continuity-reference-count must be zero or greater')
     manifest = resolve_path(args.manifest)
     workflow_path = resolve_path(args.workflow)
+    comfy_dir = resolve_path(args.comfy_dir)
     _, rows = read_manifest(manifest)
     if args.limit is not None:
         rows = rows[:args.limit]
     print(f'Manifest: {manifest}')
     print(f'Rows: {len(rows)}')
     print('Qwen mode: one source image only; extra references are converted to text guidance when enabled.')
+    if not args.dry_run and rows:
+        ensure_qwen_image_edit_models(comfy_dir)
     for index, row in enumerate(rows):
         src = resolve_path(row_source(row))
         dst = output_for_row(args, row)
@@ -247,7 +264,7 @@ def main() -> int:
         sig = signature(args, workflow_path, src, prompt)
         if args.print_final_prompt:
             print(f'Final prompt {index:04d}: {prompt}')
-        if not args.force and signature_matches(dst, sig):
+        if not args.force and resumable_output(dst, sig, image_like=src):
             print(f'Reuse {index:04d}: {dst}')
             continue
         ref_note = f', described refs={len(refs)}' if refs else ''
