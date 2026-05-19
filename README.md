@@ -177,6 +177,8 @@ The GUI keeps the command-line scripts as the backend, so anything you configure
 
 The GUI stores local field history in `.ai_remaster_gui.json`, which is ignored by Git.
 
+When launched, the GUI checks whether ComfyUI is available at `http://127.0.0.1:8188`. If it is not running and `.ai_remaster_config.json` points at a valid ComfyUI directory, the GUI starts ComfyUI in a separate process/window with this repo's `.venv`. Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` to disable that behavior.
+
 ## Branding
 
 Logo and thumbnail assets live in `assets/branding`:
@@ -193,7 +195,7 @@ For a full Windows setup, run:
 install_windows.bat
 ```
 
-The installer will ask whether to clone ComfyUI into this project or use an existing ComfyUI directory. Existing installs are expected to contain `main.py`; the installer will then add the required custom nodes, model folders, models, and a `venv` under that ComfyUI folder if needed.
+The installer will ask whether to clone ComfyUI into this project or use an existing ComfyUI directory. Existing installs are expected to contain `main.py`; the installer will then add the required custom nodes, model folders, and models. Python packages are installed into this repo's `.venv`, not into the ComfyUI directory.
 
 For unattended installs, pass the ComfyUI directory explicitly or use the default clone location:
 
@@ -202,7 +204,7 @@ install_windows.bat -ComfyDir D:\somewhere\ComfyUI
 install_windows.bat -NonInteractive
 ```
 
-Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It sets up a CUDA PyTorch ComfyUI venv, installs ComfyUI Manager, LTXVideo nodes, Deep Exemplar / ColorMNet reference colorization nodes, creates this repo's `.venv`, and downloads the default model set:
+Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, Deep Exemplar / ColorMNet reference colorization nodes, and downloads the default model set:
 
 - LTX 2.3 FP8 checkpoint.
 - LTX 2.3 text encoder and audio VAE.
@@ -226,12 +228,19 @@ You also need FFmpeg available on PATH, or pass `--ffmpeg` to `final_composite.p
 ## Licensing Notes
 
 Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, ColorMNet, or any other model weights.
+## Qwen Continuity Lessons
 
+The Qwen still-colourisation stage now follows the lessons from the HotB restoration work: use Qwen as a single-image edit, do not pass multiple reference images directly, and use text descriptions for continuity instead. `--add-prompt` is appended last, and `--print-final-prompt` shows exactly what the workflow receives.
 
+Optional local continuity guidance:
 
+```bat
+qwen_colorize_references.bat --manifest manifests\references\clip.csv --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --reference-description-provider ollama --ollama-vision-model qwen2.5vl:7b --continuity-reference-count 3
+```
 
+Single still repair:
 
-
-
-
+```bat
+generate_single_reference.bat --source-image intermediate\outpainted_references\clip\cut_0014.png --output intermediate\outpainted_references_color\clip\cut_0014.png --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --add-prompt "brown hair, no added text"
+```
 

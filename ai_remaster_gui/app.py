@@ -20,9 +20,30 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 SETTINGS_FILE = ROOT / ".ai_remaster_gui.json"
+CONFIG_FILE = ROOT / ".ai_remaster_config.json"
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 TEXT_EXTS = {".csv", ".json", ".txt", ".log", ".md"}
+
+
+def load_config() -> dict[str, str]:
+    config = {
+        "comfy_dir": str(ROOT / "tools" / "comfyui"),
+        "comfy_url": "http://127.0.0.1:8188",
+        "comfy_host": "127.0.0.1",
+        "comfy_port": "8188",
+    }
+    if CONFIG_FILE.exists():
+        try:
+            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                config.update({key: str(value) for key, value in stored.items() if value is not None})
+        except json.JSONDecodeError:
+            pass
+    return config
+
+
+CONFIG = load_config()
 
 
 @dataclass(frozen=True)
@@ -164,6 +185,11 @@ def load_settings() -> dict[str, dict[str, str]]:
             values["colorized_video"] = rel(colorized)
     if outpainted and not defaults["recomp"].get("output"):
         defaults["recomp"]["output"] = rel(ROOT / "output" / "reassembled" / f"{outpainted.stem}_final.mp4")
+    bundled_output = rel(ROOT / "tools" / "comfyui" / "output")
+    if not defaults["references"].get("comfy_output_root") or (CONFIG_FILE.exists() and defaults["references"].get("comfy_output_root") == bundled_output):
+        defaults["references"]["comfy_output_root"] = rel(Path(CONFIG["comfy_dir"]) / "output")
+    if not defaults["references"].get("comfy_url"):
+        defaults["references"]["comfy_url"] = CONFIG["comfy_url"]
     return defaults
 
 
@@ -517,11 +543,60 @@ setInterval(refresh,4000);refresh();
 </html>"""
 
 
+def comfy_is_running(url: str) -> bool:
+    try:
+        with urlopen(url.rstrip("/") + "/queue", timeout=2) as response:
+            return 200 <= response.status < 300
+    except (URLError, OSError, TimeoutError):
+        return False
+
+
+def start_comfy_if_needed() -> None:
+    url = CONFIG.get("comfy_url", "http://127.0.0.1:8188")
+    if comfy_is_running(url):
+        print(f"ComfyUI already running at {url}")
+        return
+    comfy_dir = Path(CONFIG.get("comfy_dir", ROOT / "tools" / "comfyui"))
+    main_py = comfy_dir / "main.py"
+    if not main_py.exists():
+        if CONFIG_FILE.exists():
+            print(f"ComfyUI is configured but main.py was not found: {main_py}")
+            print("Run install_windows.bat again and choose your ComfyUI directory.")
+        else:
+            print("ComfyUI is not configured yet.")
+            print("Run install_windows.bat again and choose whether to clone ComfyUI or use an existing ComfyUI directory.")
+        return
+    host = CONFIG.get("comfy_host", "127.0.0.1")
+    port = str(CONFIG.get("comfy_port", "8188"))
+    command = [sys.executable, "main.py", "--listen", host, "--port", port]
+    kwargs: dict = {"cwd": str(comfy_dir)}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    subprocess.Popen(command, **kwargs)
+    print(f"Started ComfyUI in a new process at {url}")
+
+
+def create_server(host: str, requested_port: int) -> ThreadingHTTPServer:
+    ports = [requested_port, 0] if requested_port != 0 else [0]
+    last_error: OSError | None = None
+    for port in ports:
+        try:
+            return ThreadingHTTPServer((host, port), Handler)
+        except OSError as exc:
+            last_error = exc
+            if port != 0:
+                print(f"GUI port {port} was unavailable ({exc}); trying a free port.")
+    assert last_error is not None
+    raise last_error
+
+
 def main() -> int:
     os.chdir(ROOT)
+    if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") != "1":
+        start_comfy_if_needed()
     host = "127.0.0.1"
     requested_port = int(os.environ.get("AI_REMASTER_GUI_PORT", "8765"))
-    server = ThreadingHTTPServer((host, requested_port), Handler)
+    server = create_server(host, requested_port)
     url = f"http://{host}:{server.server_port}/"
     print(f"AI Remaster GUI running at {url}")
     if os.environ.get("AI_REMASTER_NO_BROWSER") != "1":

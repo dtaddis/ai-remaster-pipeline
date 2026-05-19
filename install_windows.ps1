@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $DownloadCache = Join-Path $Root '.cache\huggingface'
 $DefaultComfyDir = Join-Path $Root 'tools\comfyui'
+$PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
 $UseExistingComfy = $false
 
 function Invoke-Step {
@@ -138,7 +139,7 @@ function Git-Clone-IfMissing {
 
 function Install-Pip {
     param([string[]]$Packages)
-    Invoke-External -Command (@($VenvPython, '-m', 'pip', 'install') + $Packages)
+    Invoke-External -Command (@($PipelinePython, '-m', 'pip', 'install') + $Packages)
 }
 
 function Install-RequirementsIfPresent {
@@ -160,7 +161,7 @@ function Download-HfFile {
     }
     Ensure-Directory (Split-Path -Parent $Destination)
     Ensure-Directory $DownloadCache
-    $HfExe = Join-Path $ComfyDir 'venv\Scripts\hf.exe'
+    $HfExe = Join-Path $Root '.venv\Scripts\hf.exe'
     if (-not (Test-Path -LiteralPath $HfExe)) { $HfExe = 'hf' }
     $stdout = [System.IO.Path]::GetTempFileName()
     $stderr = [System.IO.Path]::GetTempFileName()
@@ -203,7 +204,6 @@ function Download-HfFile {
 $mode = Resolve-ComfyInstallMode
 $ComfyDir = $mode.Dir
 $UseExistingComfy = [bool]$mode.Existing
-$VenvPython = Join-Path $ComfyDir 'venv\Scripts\python.exe'
 $CustomNodes = Join-Path $ComfyDir 'custom_nodes'
 
 Invoke-Step 'Configure ComfyUI directory' {
@@ -217,11 +217,12 @@ Invoke-Step 'Configure ComfyUI directory' {
     }
 }
 
-Invoke-Step 'Create ComfyUI venv' {
-    if (-not (Test-Path -LiteralPath $VenvPython)) {
-        Invoke-PythonLauncher -Arguments @('-m', 'venv', (Join-Path $ComfyDir 'venv'))
+Invoke-Step 'Create ai-remaster-pipeline venv' {
+    if (-not (Test-Path -LiteralPath $PipelinePython)) {
+        Invoke-PythonLauncher -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
     }
-    Invoke-External -Command @($VenvPython, '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel')
+    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel')
+    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))
 }
 
 Invoke-Step 'Install PyTorch CUDA and ComfyUI requirements' {
@@ -278,16 +279,22 @@ if (-not $SkipModelDownloads) {
     Write-Host 'Skipping model downloads because -SkipModelDownloads was passed.'
 }
 
-Invoke-Step 'Install ai-remaster-pipeline venv' {
-    $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $PipelinePython)) {
-        Invoke-PythonLauncher -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
+Invoke-Step 'Write local ARP configuration' {
+    $config = [ordered]@{
+        comfy_dir = $ComfyDir
+        comfy_url = 'http://127.0.0.1:8188'
+        comfy_host = '127.0.0.1'
+        comfy_port = '8188'
     }
-    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel')
-    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))
+    $configPath = Join-Path $Root '.ai_remaster_config.json'
+    ($config | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $configPath -Encoding UTF8
+    Write-Host "Wrote: $configPath"
 }
 
 Write-Host "`nInstall complete." -ForegroundColor Green
 Write-Host "ComfyUI: $ComfyDir"
-Write-Host "Start ComfyUI with: $VenvPython main.py --listen 127.0.0.1 --port 8188"
+Write-Host "Python environment: $PipelinePython"
+Write-Host "Start ComfyUI with:"
+Write-Host "  cd `"$ComfyDir`""
+Write-Host "  `"$PipelinePython`" main.py --listen 127.0.0.1 --port 8188"
 
