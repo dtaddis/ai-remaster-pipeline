@@ -199,6 +199,8 @@ class PipelineApp:
         self.log: list[str] = []
         self.process: subprocess.Popen[str] | None = None
         self.running_stage = ""
+        self.running_stage_key = ""
+        self.run_started_at = 0.0
         self.lock = threading.Lock()
 
     def save(self) -> None:
@@ -227,6 +229,72 @@ class PipelineApp:
         }
         return [{"stage": key, "status": "Ready" if value else "Waiting", "latest": rel(value) if value else ""} for key, value in checks.items()]
 
+    def phase_progress(self) -> dict:
+        current = self.estimate_running_progress()
+        stages = []
+        completed = 0.0
+        for stage in STAGES:
+            title = stage.title
+            latest = next((item["latest"] for item in self.progress() if item["stage"] == title), "")
+            if self.running_stage_key == stage.key and current:
+                percent = current["percent"]
+                label = current["label"]
+            elif latest:
+                percent = 100
+                label = "Ready"
+            else:
+                percent = 0
+                label = "Waiting"
+            completed += percent / 100
+            stages.append({"key": stage.key, "stage": title, "percent": percent, "label": label})
+        global_percent = int(round((completed / max(1, len(STAGES))) * 100))
+        return {"global": {"percent": global_percent, "label": f"{global_percent}% complete"}, "stages": stages}
+
+    def estimate_running_progress(self) -> dict:
+        if not self.running_stage_key:
+            return {}
+        elapsed = max(0.0, time.time() - self.run_started_at)
+        log_text = "\n".join(self.log[-300:])
+        lower = log_text.lower()
+        percent = min(90, 5 + int(elapsed / 60 * 20))
+        label = "Running"
+        if self.running_stage_key == "outpaint":
+            milestones = [
+                ("reuse prepared outpaint input", 20, "Prepared input reused"),
+                ("wrote prepared outpaint input", 20, "Prepared input written"),
+                ("prepared comfy input", 25, "Prepared for ComfyUI"),
+                ("waiting for comfyui", 30, "Waiting for ComfyUI"),
+                ("queued comfyui prompt", 40, "Queued in ComfyUI"),
+                ("wrote raw comfy render", 82, "Raw outpaint render written"),
+                ("reuse raw comfy render", 82, "Raw outpaint render reused"),
+                ("wrote outpainted video", 100, "Outpainted video written"),
+            ]
+            for token, value, text in milestones:
+                if token in lower and value >= percent:
+                    percent, label = value, text
+        elif self.running_stage_key == "shots":
+            if "detected " in lower:
+                percent, label = max(percent, 75), "Shots detected"
+            if "wrote manifest" in lower:
+                percent, label = 100, "Manifest written"
+        elif self.running_stage_key == "references":
+            rows = first_int_after(log_text, "Rows:")
+            done = count_lines_matching(log_text, ("Reuse ", "Wrote "))
+            if rows:
+                percent = min(99, int((done / rows) * 100))
+                label = f"{done}/{rows} references"
+        elif self.running_stage_key == "colour":
+            if "reuse" in lower:
+                percent, label = max(percent, 75), "Existing colorized video reused"
+            if "wrote" in lower or "finished with exit code 0" in lower:
+                percent, label = 100, "Colourisation complete"
+        elif self.running_stage_key == "recomp":
+            if "wrote composite" in lower:
+                percent, label = 100, "Composite written"
+            else:
+                label = "Compositing"
+        return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
+
     def state(self) -> dict:
         with self.lock:
             running = self.process is not None and self.process.poll() is None
@@ -238,6 +306,7 @@ class PipelineApp:
                 "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in STAGES],
                 "settings": self.settings,
                 "progress": self.progress(),
+                "phase_progress": self.phase_progress(),
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in STAGES},
                 "source_previews": previews,
                 "source_info": info,
@@ -359,13 +428,24 @@ class PipelineApp:
             missing = ["source material on the Global tab"]
         if missing:
             return False, "Missing settings: " + ", ".join(missing)
+        if stage_key in {"outpaint", "references", "colour"}:
+            ok, message = ensure_comfy_available_for_stage(stage.title)
+            if not ok:
+                return False, message
         with self.lock:
             if self.process and self.process.poll() is None:
                 return False, "A command is already running."
             self.running_stage = stage.title
+            self.running_stage_key = stage.key
+            self.run_started_at = time.time()
             cmd = self.command_for(stage_key)
             self.log.append("> " + " ".join(cmd))
-            self.process = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            self.process = subprocess.Popen(cmd, **kwargs)
             threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
         return True, "Started " + stage.title
 
@@ -394,17 +474,47 @@ class PipelineApp:
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
             self.running_stage = ""
+            self.running_stage_key = ""
+            self.run_started_at = 0.0
             if code == 0:
                 self.hydrate_stage_inputs(stage_key)
 
     def stop(self) -> None:
         with self.lock:
             if self.process and self.process.poll() is None:
-                self.process.terminate()
+                terminate_process_tree(self.process)
                 self.log.append("Stop requested.")
 
 
 APP = PipelineApp()
+
+
+def first_int_after(text: str, marker: str) -> int:
+    for line in text.splitlines():
+        if marker in line:
+            tail = line.split(marker, 1)[1].strip().split()
+            if tail:
+                try:
+                    return int(tail[0].strip(":,"))
+                except ValueError:
+                    return 0
+    return 0
+
+
+def count_lines_matching(text: str, prefixes: tuple[str, ...]) -> int:
+    return sum(1 for line in text.splitlines() if line.startswith(prefixes))
+
+
+def terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except Exception:
+        process.terminate()
 
 
 def read_manifest(path: Path) -> list[dict[str, str]]:
@@ -551,12 +661,27 @@ def aspect_preview_cached(source_path: str, _size: int, mtime_ns: int, aspect: s
     else:
         target_w = width
         target_h = int(round(width / ratio))
-    canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+    canvas = patterned_canvas(target_w, target_h)
     canvas.paste(image, ((target_w - width) // 2, (target_h - height) // 2))
     preview = ImageOps.contain(canvas, (960, 540), Image.Resampling.LANCZOS)
     target.parent.mkdir(parents=True, exist_ok=True)
     preview.save(target, quality=90)
     return rel(target)
+
+
+def patterned_canvas(width: int, height: int):
+    from PIL import Image, ImageDraw
+
+    canvas = Image.new("RGB", (width, height), (21, 39, 43))
+    draw = ImageDraw.Draw(canvas)
+    spacing = max(14, min(width, height) // 28)
+    line_color = (58, 139, 128)
+    accent = (211, 164, 58)
+    for offset in range(-height, width, spacing):
+        draw.line((offset, 0, offset + height, height), fill=line_color, width=max(1, spacing // 9))
+    for offset in range(0, width + height, spacing * 4):
+        draw.line((offset, 0, offset - height, height), fill=accent, width=max(1, spacing // 12))
+    return canvas
 
 
 def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int) -> str:
@@ -578,7 +703,12 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
     scaled_w = max(2, even_int(source_w * scale))
     scaled_h = max(2, even_int(source_h * scale))
     target.parent.mkdir(parents=True, exist_ok=True)
-    filter_text = f"scale={scaled_w}:{scaled_h},pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black"
+    filter_text = (
+        f"scale={scaled_w}:{scaled_h}[src];"
+        f"color=c=0x15272b:s={out_w}x{out_h}[bg];"
+        f"[bg]geq=r='34+34*mod(floor((X+Y)/18)\\,2)':g='62+48*mod(floor((X+Y)/18)\\,2)':b='67+40*mod(floor((X+Y)/18)\\,2)'[pat];"
+        f"[pat][src]overlay=(W-w)/2:(H-h)/2"
+    )
     command = [ffmpeg, "-y", "-ss", "10", "-i", str(source), "-frames:v", "1", "-vf", filter_text, "-q:v", "3", str(target)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1078,7 +1208,7 @@ label{display:block;color:var(--muted);font-size:12px;margin:10px 0 5px}input,se
 button{background:#26333b;color:var(--text);border:1px solid #43545f;border-radius:6px;padding:8px 12px;cursor:pointer}button:hover{background:#30404a}.primary{background:var(--accent);border-color:#44a995;font-weight:700}.warn{background:#5b4322;border-color:#8a6830}
 .row{display:flex;gap:8px;align-items:center}.row>*{flex:1}.field-row{display:flex;gap:8px;align-items:center}.field-row input,.field-row select{flex:1}.field-row button{flex:0 0 auto}.checks label{display:inline-flex;gap:6px;align-items:center;margin-right:12px}.checks input{width:auto}
 .files{max-height:62vh;overflow:auto}.file{display:grid;grid-template-columns:74px 1fr;gap:10px;align-items:center;padding:8px;border-bottom:1px solid #27333a;cursor:pointer;color:#cfe0e5}.file:hover{background:#202a31}.file.no-thumb{display:block}.file-thumb{width:74px;aspect-ratio:16/9;object-fit:cover;background:#050607;border:1px solid var(--line);border-radius:5px}.file-path{word-break:break-word}.output-list{margin:10px 0 0;padding-left:18px;color:#c5d5da;font-size:12px;word-break:break-word}
-.preview img,.preview video{width:100%;max-height:62vh;object-fit:contain;background:#050607;border-radius:8px}.preview pre,pre.log{white-space:pre-wrap;background:#0b0e10;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:230px;overflow:auto}
+.preview img,.preview video{width:100%;max-height:62vh;object-fit:contain;background:#050607;border-radius:8px}.preview pre,pre.log{white-space:pre-wrap;background:#0b0e10;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:230px;overflow:auto}.log-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.log-heading h3{margin:0}.log-error{color:#ff8f8f}.log-warn{color:#ffd27d}.log-ok{color:#75d6b9}.actions{display:flex;gap:8px;align-items:center;margin:14px 0}.actions button{flex:0 0 auto}.phase-progress{margin:12px 0}.phase-progress progress{width:100%;height:18px}.phase-progress div{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:4px}
 .filmstrip{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}.filmstrip img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:#050607;border:1px solid var(--line)}
 .source-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:12px 0}.source-info div{background:#11181d;border:1px solid var(--line);border-radius:6px;padding:8px}.source-info span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.source-info strong{display:block;margin-top:2px;font-size:13px;word-break:break-word}
 table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left}th{color:#b8cbd1;background:#202a31}.status-ready{color:#75d6b9}.status-waiting{color:var(--warn)}
@@ -1099,14 +1229,21 @@ function stage(k){return state.stages.find(s=>s.key===k)}
 function settings(k){return state.settings[k]||{}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function draw(followLogs=false){if(active==='global')return drawGlobal(followLogs); if(active==='manifest')return drawManifest(); if(active==='comfy')return drawComfy(); return drawStage(stage(active),followLogs);}
-function drawGlobal(followLogs=false){const done=state.progress.filter(p=>p.status==='Ready').length;const src=(state.settings.global&&state.settings.global.source)||'';const thumbs=(state.source_previews||[]).map(p=>`<img src="${media(p)}" alt="">`).join('');const info=sourceInfoHtml(state.source_info||{});document.getElementById('app').innerHTML=`<section class="card"><img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline"><p class="hero">AI Remaster Pipeline</p><p>Choose the source material, then run or inspect each stage.</p><label>Source material</label><div class="field-row"><input id="globalSource" value="${esc(src)}"><button type="button" onclick="browseGlobalSource()">Browse</button></div>${thumbs?`<div class="filmstrip">${thumbs}</div>`:''}${info}<progress value="${done}" max="${state.progress.length}" style="width:100%;height:24px;margin-top:16px"></progress><p><button class="primary" onclick="runAll()">Run Whole Remaster</button></p><table><tr><th>Stage</th><th>Status</th><th>Latest output</th></tr>${state.progress.map(p=>`<tr><td>${p.stage}</td><td class="status-${p.status.toLowerCase()}">${p.status}</td><td>${esc(p.latest)}</td></tr>`).join('')}</table><h3>Run Log</h3><pre class="log">${esc(state.log)}</pre></section>`;document.getElementById('globalSource').addEventListener('change',saveGlobal);if(followLogs)scrollLogsToBottom()}
+function drawGlobal(followLogs=false){const src=(state.settings.global&&state.settings.global.source)||'';const thumbs=(state.source_previews||[]).map(p=>`<img src="${media(p)}" alt="">`).join('');const info=sourceInfoHtml(state.source_info||{});const gp=(state.phase_progress&&state.phase_progress.global)||{percent:0,label:'Waiting'};document.getElementById('app').innerHTML=`<section class="card"><img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline"><p class="hero">AI Remaster Pipeline</p><p>Choose the source material, then run or inspect each stage.</p><label>Source material</label><div class="field-row"><input id="globalSource" value="${esc(src)}"><button type="button" onclick="browseGlobalSource()">Browse</button></div>${thumbs?`<div class="filmstrip">${thumbs}</div>`:''}${info}${progressHtml(gp.percent,gp.label)}<div class="actions"><button class="primary" onclick="runAll()">Run Whole Remaster</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><table><tr><th>Stage</th><th>Status</th><th>Progress</th><th>Latest output</th></tr>${state.progress.map(p=>{const sp=stageProgressByTitle(p.stage);return `<tr><td>${p.stage}</td><td class="status-${p.status.toLowerCase()}">${p.status}</td><td>${progressHtml(sp.percent,sp.label)}</td><td>${esc(p.latest)}</td></tr>`}).join('')}</table>${runLogHtml()}</section>`;document.getElementById('globalSource').addEventListener('change',saveGlobal);if(followLogs)scrollLogsToBottom()}
 function sourceInfoHtml(info){const labels={resolution:'Resolution',aspect:'Aspect',duration:'Duration',frame_rate:'Frame rate',frames:'Frames',video_codec:'Video codec',pixel_format:'Pixel format',colour:'Colour',audio:'Audio',container:'Container',overall_bitrate:'Overall bitrate',video_bitrate:'Video bitrate',size:'File size',codec_note:'Note'};const keys=['resolution','aspect','duration','frame_rate','frames','video_codec','pixel_format','colour','audio','container','overall_bitrate','video_bitrate','size','codec_note'];const items=keys.filter(k=>info[k]).map(k=>`<div><span>${labels[k]||k}</span><strong>${esc(info[k])}</strong></div>`).join('');return items?`<div class="source-info">${items}</div>`:''}
 function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
 function aspectPreviewHtml(st){if(st.key!=='outpaint')return '';const img=state.aspect_preview;const outputs=(state.expected_outputs&&state.expected_outputs.outpaint)||[];return `<h3>Target Preview</h3>${img?`<img src="${media(img)}" alt="Target aspect preview">`:'<p>Choose source material on the Global tab to preview the target frame.</p>'}${outputs.length?`<h3>Output Path</h3><ul class="output-list">${outputs.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}`}
 function fileRow(st,f){const thumb=f.preview?`<img class="file-thumb" src="${media(f.preview)}" alt="">`:'';return `<div class="file ${thumb?'':'no-thumb'}" onclick="selected['${st.key}']='${esc(f.path)}';draw()">${thumb}<div class="file-path">${esc(f.path)}</div></div>`}
-function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><p><button class="primary" onclick="runStage('${st.key}')">Run ${st.title}</button></p><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px"><h3>Run Log</h3><pre class="log">${esc(state.log)}</pre></section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key);if(followLogs)scrollLogsToBottom()}
+function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];const sp=stageProgress(st.key);document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('${st.key}')" ${state.running?'disabled':''}>Run ${st.title}</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key);if(followLogs)scrollLogsToBottom()}
+function stageProgress(key){return ((state.phase_progress&&state.phase_progress.stages)||[]).find(p=>p.key===key)||{percent:0,label:'Waiting'}}
+function stageProgressByTitle(title){return ((state.phase_progress&&state.phase_progress.stages)||[]).find(p=>p.stage===title)||{percent:0,label:'Waiting'}}
+function progressHtml(percent,label){const p=Math.max(0,Math.min(100,Number(percent)||0));return `<div class="phase-progress"><div><span>${esc(label||'Waiting')}</span><span>${p}%</span></div><progress value="${p}" max="100"></progress></div>`}
 function logsNearBottom(){const logs=[...document.querySelectorAll('pre.log')];return !logs.length||logs.some(el=>el.scrollHeight-el.scrollTop-el.clientHeight<32)}
 function scrollLogsToBottom(){document.querySelectorAll('pre.log').forEach(el=>{el.scrollTop=el.scrollHeight})}
+function runLogHtml(){return `<div class="log-heading"><h3>Run Log</h3><button type="button" onclick="copyRunLog()">Copy Log</button></div><pre class="log">${logHtml(state.log)}</pre>`}
+function logHtml(text){return String(text||'').split('\n').map(line=>`<span class="${logClass(line)}">${esc(line)}</span>`).join('\n')}
+function logClass(line){const lower=String(line).toLowerCase();if(/traceback|runtimeerror|exception|error|failed|refused|exit code [1-9]|filenotfound/.test(lower))return 'log-error';if(/warning|skipping|timed out/.test(lower))return 'log-warn';if(/ready|reuse|wrote|finished with exit code 0|started/.test(lower))return 'log-ok';return ''}
+async function copyRunLog(){const text=state.log||'';try{await navigator.clipboard.writeText(text)}catch{const area=document.createElement('textarea');area.value=text;document.body.appendChild(area);area.select();document.execCommand('copy');area.remove()}}
 function preview(p){if(!p)return '<p>Select an image, video, manifest, workflow, or log file.</p>';const ext=p.split('.').pop().toLowerCase();if(['png','jpg','jpeg','webp','tif','tiff'].includes(ext))return `<img src="${media(p)}">`;if(['mp4','mov','mkv','avi','webm','m4v'].includes(ext))return `<video src="${media(p)}" controls></video>`;return `<pre id="textPreview">Text preview opens via the browser media endpoint.</pre><p><a href="${media(p)}" target="_blank">Open file</a></p>`}
 async function saveStage(k,redraw=false){const values={};document.querySelectorAll('[data-field]').forEach(el=>{values[el.dataset.field]=el.type==='checkbox'?String(el.checked):el.value});await api('/api/settings',{method:'POST',body:JSON.stringify({stage:k,values})});state=await api('/api/state');if(redraw)draw();showCommand(k)}
 async function saveGlobal(){await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{source:document.getElementById('globalSource').value}})});state=await api('/api/state')}
@@ -1137,21 +1274,119 @@ def comfy_is_running(url: str) -> bool:
         return False
 
 
+def comfy_queue(url: str, timeout: float = 2.0) -> dict | None:
+    try:
+        with urlopen(url.rstrip("/") + "/queue", timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (URLError, OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def queue_count(queue: dict | None, key: str) -> int:
+    value = queue.get(key) if isinstance(queue, dict) else None
+    return len(value) if isinstance(value, list) else 0
+
+
+def comfy_busy_message(url: str, queue: dict | None) -> str:
+    running = queue_count(queue, "queue_running")
+    pending = queue_count(queue, "queue_pending")
+    if running or pending:
+        return f"ComfyUI at {url} is busy ({running} running, {pending} pending). Wait for it to finish or clear the ComfyUI queue."
+    return ""
+
+
+def discover_comfy_instances(configured_url: str) -> list[str]:
+    parsed = urlparse(configured_url)
+    host = parsed.hostname or "127.0.0.1"
+    configured_port = parsed.port or 8188
+    urls = [configured_url.rstrip("/")]
+    if host in {"127.0.0.1", "localhost"}:
+        for port in range(8188, 8199):
+            candidate = f"{parsed.scheme or 'http'}://{host}:{port}"
+            if port != configured_port:
+                urls.append(candidate)
+    found: list[str] = []
+    for url in dict.fromkeys(urls):
+        if comfy_queue(url, timeout=0.35) is not None:
+            found.append(url)
+    return found
+
+
+def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
+    if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") == "1":
+        return True, ""
+    url = CONFIG.get("comfy_url", "http://127.0.0.1:8188")
+    instances = discover_comfy_instances(url)
+    if len(instances) > 1:
+        message = "Multiple ComfyUI instances appear to be running: " + ", ".join(instances) + ". Close extras or update .ai_remaster_config.json to the one ARP should use."
+        startup_log(message)
+        return False, message
+    if instances:
+        queue = comfy_queue(url)
+        message = comfy_busy_message(url, queue)
+        if message:
+            startup_log(message)
+            return False, message
+        startup_log(f"Found ComfyUI already running at {url}; queue is idle.")
+        return True, ""
+    if STARTED_COMFY_PROCESS and STARTED_COMFY_PROCESS.poll() is None:
+        startup_log(f"ComfyUI launch is already in progress at {url}.")
+        return True, ""
+    startup_log(f"ComfyUI is not running at {url}; launching it now.")
+    start_comfy_if_needed()
+    return True, ""
+
+
+def startup_log(message: str) -> None:
+    print(message)
+    app = globals().get("APP")
+    if app is not None:
+        app.log.append(message)
+
+
+def wait_for_comfy_ready(url: str, process: subprocess.Popen | None, timeout_seconds: float = 180.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if comfy_is_running(url):
+            startup_log(f"ComfyUI is ready at {url}")
+            return True
+        if process and process.poll() is not None:
+            startup_log(f"ComfyUI exited before it became ready. Exit code: {process.returncode}")
+            return False
+        time.sleep(2)
+    startup_log(f"Timed out waiting for ComfyUI to become ready at {url}")
+    return False
+
+
+def monitor_comfy_startup(url: str, process: subprocess.Popen | None) -> None:
+    wait_for_comfy_ready(url, process, float(os.environ.get("AI_REMASTER_COMFY_START_TIMEOUT", "180")))
+
+
 def start_comfy_if_needed() -> None:
     global STARTED_COMFY_PROCESS
     url = CONFIG.get("comfy_url", "http://127.0.0.1:8188")
-    if comfy_is_running(url):
-        print(f"ComfyUI already running at {url}")
+    if STARTED_COMFY_PROCESS and STARTED_COMFY_PROCESS.poll() is None:
+        startup_log(f"ComfyUI launch is already in progress at {url}.")
+        return
+    instances = discover_comfy_instances(url)
+    if len(instances) > 1:
+        startup_log("Multiple ComfyUI instances appear to be running: " + ", ".join(instances) + ". Close extras or update .ai_remaster_config.json to the one ARP should use.")
+        return
+    if instances:
+        if instances[0].rstrip("/") == url.rstrip("/"):
+            startup_log(f"ComfyUI already running at {url}")
+        else:
+            startup_log(f"ComfyUI appears to be running at {instances[0]}, but ARP is configured for {url}. Close it or update .ai_remaster_config.json.")
         return
     comfy_dir = Path(CONFIG.get("comfy_dir", ROOT / "tools" / "comfyui"))
     main_py = comfy_dir / "main.py"
     if not main_py.exists():
         if CONFIG_FILE.exists():
-            print(f"ComfyUI is configured but main.py was not found: {main_py}")
-            print("Run install_windows.bat again and choose your ComfyUI directory.")
+            startup_log(f"ComfyUI is configured but main.py was not found: {main_py}")
+            startup_log("Run install_windows.bat again and choose your ComfyUI directory.")
         else:
-            print("ComfyUI is not configured yet.")
-            print("Run install_windows.bat again and choose whether to clone ComfyUI or use an existing ComfyUI directory.")
+            startup_log("ComfyUI is not configured yet.")
+            startup_log("Run install_windows.bat again and choose whether to clone ComfyUI or use an existing ComfyUI directory.")
         return
     host = CONFIG.get("comfy_host", "127.0.0.1")
     port = str(CONFIG.get("comfy_port", "8188"))
@@ -1162,7 +1397,9 @@ def start_comfy_if_needed() -> None:
     else:
         kwargs["start_new_session"] = True
     STARTED_COMFY_PROCESS = subprocess.Popen(command, **kwargs)
-    print(f"Started ComfyUI in a new process at {url}")
+    startup_log(f"Started ComfyUI in a new process at {url}")
+    startup_log("ComfyUI is still starting; the pipeline will wait before queueing prompts.")
+    threading.Thread(target=monitor_comfy_startup, args=(url, STARTED_COMFY_PROCESS), daemon=True).start()
 
 
 def stop_started_comfy() -> None:

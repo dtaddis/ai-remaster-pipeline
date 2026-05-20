@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_prompt, workflow_to_prompt
+from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature, safe_stem
 from dependency_manager import ensure_outpaint_models
 from prepare_outpaint_input import default_output as default_prepared_output
@@ -210,6 +210,8 @@ def main() -> int:
         else:
             workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
             prompt = patch_workflow(args, workflow, prepared, comfy_dir, output_prefix)
+            print(f"Waiting for ComfyUI at {args.comfy_url}...")
+            wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
             prompt_id = queue_prompt(args.comfy_url, prompt)
             print(f"Queued ComfyUI prompt: {prompt_id}")
             history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_prompt, workflow_to_prompt, http_json
+from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt, http_json
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
 
@@ -255,6 +255,8 @@ def main() -> int:
     print('Qwen mode: one source image only; extra references are converted to text guidance when enabled.')
     if not args.dry_run and rows:
         ensure_qwen_image_edit_models(comfy_dir)
+        print(f'Waiting for ComfyUI at {args.comfy_url}...')
+        wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
     for index, row in enumerate(rows):
         src = resolve_path(row_source(row))
         dst = output_for_row(args, row)

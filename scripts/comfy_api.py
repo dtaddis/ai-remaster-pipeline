@@ -30,6 +30,19 @@ def queue_prompt(comfy_url: str, prompt: dict[str, Any], client_id: str | None =
     return str(prompt_id)
 
 
+def wait_for_comfy(comfy_url: str, timeout_seconds: float = 180.0, poll_seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            http_json('GET', f"{comfy_url.rstrip('/')}/queue", timeout=5)
+            return
+        except RuntimeError as exc:
+            last_error = str(exc)
+            time.sleep(poll_seconds)
+    raise RuntimeError(f"ComfyUI did not become ready at {comfy_url} within {timeout_seconds:.0f}s. Last error: {last_error}")
+
+
 def wait_for_prompt(comfy_url: str, prompt_id: str, poll_seconds: float) -> dict[str, Any]:
     while True:
         history = http_json('GET', f"{comfy_url.rstrip('/')}/history/{prompt_id}", timeout=30)
