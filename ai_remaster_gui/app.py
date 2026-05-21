@@ -31,6 +31,18 @@ ASPECT_PREVIEW_DIR = ROOT / ".cache" / "aspect_previews"
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 TEXT_EXTS = {".csv", ".json", ".txt", ".log", ".md"}
+REFERENCE_PROMPT = (
+    "Transform this black-and-white frame into a clean modern full-colour animation production still. "
+    "Keep the exact drawing, characters, camera angle, line art, shapes, and composition. "
+    "Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. "
+    "Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading. "
+    "Do not add text, captions, logos, labels, signs, subtitles, or new objects."
+)
+REFERENCE_PROMPT_SUFFIX = (
+    "White gloves and faces should stay clean and bright, black ink areas should stay deep black, "
+    "wood, metal, sky, water, fabric, and background props should receive distinct natural colours. "
+    "Preserve original lighting, shadows, outlines, and film grain while making the colour read as genuine full colour, not a tint."
+)
 
 
 def load_config() -> dict[str, str]:
@@ -77,7 +89,7 @@ STAGES = (
         (
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
             ("target_height", "Output height", "select:544|576|720|768|1080", "720"),
-            ("chunk_seconds", "Chunk seconds", "number", "20"),
+            ("chunk_seconds", "Chunk seconds", "number", "4"),
             ("overlap_frames", "Overlap frames", "range:0|48|1", "8"),
         ),
         (),
@@ -106,8 +118,8 @@ STAGES = (
             ("workflow", "Qwen workflow", "file", ""),
             ("comfy_output_root", "Comfy output folder", "folder", "tools/comfyui/output"),
             ("comfy_url", "Comfy URL", "text", "http://127.0.0.1:8188"),
-            ("prompt", "Prompt", "text", "Colorize this image."),
-            ("prompt_suffix", "Prompt suffix", "text", "Natural period color, preserve lighting and composition."),
+            ("prompt", "Prompt", "text", REFERENCE_PROMPT),
+            ("prompt_suffix", "Prompt suffix", "text", REFERENCE_PROMPT_SUFFIX),
             ("load_image_node_id", "Load image node", "text", "1"),
             ("prompt_node_id", "Prompt node", "text", ""),
             ("save_node_id", "Save node", "text", ""),
@@ -118,12 +130,13 @@ STAGES = (
     Stage(
         "colour",
         "Colourisation",
-        "Run your ComfyUI reference-video colorizer over the manifest.",
+        "Run ColorMNet in ComfyUI over the outpainted video, using the generated colour references.",
         ("intermediate/outpainted_references_color", "intermediate/outpainted_colorized", "manifests/references"),
         (
             ("manifest", "Manifest", "file", ""),
-            ("comfy_runner", "Colorizer runner", "file", ""),
-            ("method", "Method", "text", "DeepExemplar"),
+            ("memory_mode", "Memory mode", "select:low_memory|balanced|high_quality", "low_memory"),
+            ("feature_encoder", "Feature encoder", "select:resnet50|vgg19|dinov2_vits|dinov2_vitb|dinov2_vitl|clip_vitb", "resnet50"),
+            ("crf", "CRF", "number", "18"),
         ),
         ("manifest",),
     ),
@@ -198,6 +211,20 @@ def load_settings() -> dict[str, dict[str, str]]:
         defaults["references"]["comfy_output_root"] = rel(Path(config["comfy_dir"]) / "output")
     if not defaults["references"].get("comfy_url"):
         defaults["references"]["comfy_url"] = config["comfy_url"]
+    old_reference_prompts = {
+        "",
+        "Colorize this image.",
+        "Colorize this image. Preserve the original image. Do not add text, captions, logos, labels, signs, subtitles, or new objects.",
+    }
+    old_reference_suffixes = {
+        "",
+        "Natural period color, preserve lighting and composition.",
+        "Modern clean restoration, natural period color, preserve composition and text.",
+    }
+    if defaults["references"].get("prompt", "") in old_reference_prompts:
+        defaults["references"]["prompt"] = REFERENCE_PROMPT
+    if defaults["references"].get("prompt_suffix", "") in old_reference_suffixes:
+        defaults["references"]["prompt_suffix"] = REFERENCE_PROMPT_SUFFIX
     return defaults
 
 
@@ -396,7 +423,9 @@ class PipelineApp:
             self.settings.setdefault("references", {})["manifest"] = manifest_text
             self.settings.setdefault("colour", {})["manifest"] = manifest_text
             self.log.append(f"Updated manifest inputs: {manifest_text}")
-        colorized = newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS)
+        expected_colorized_text = self.expected_outputs("colour")[0] if self.expected_outputs("colour") else ""
+        expected_colorized = resolve(expected_colorized_text) if expected_colorized_text else None
+        colorized = expected_colorized if expected_colorized and expected_colorized.exists() else newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS)
         if colorized:
             self.settings.setdefault("recomp", {})["colorized_video"] = rel(colorized)
         source = self.settings.get("global", {}).get("source")
@@ -416,6 +445,9 @@ class PipelineApp:
             return [manifest_for_outpainted(values.get("outpainted_video", ""))]
         if stage_key == "references":
             return color_reference_outputs(values.get("manifest", ""))
+        if stage_key == "colour":
+            output = colorized_output_for_manifest(values.get("manifest", ""))
+            return [output] if output else []
         if stage_key == "recomp":
             return [values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))]
         return []
@@ -461,10 +493,15 @@ class PipelineApp:
         elif stage_key == "colour":
             cmd.append(str(SCRIPTS / "colorize_video.py"))
             add(["--manifest", values.get("manifest", "")])
-            if values.get("comfy_runner"):
-                add(["--comfy-runner", values["comfy_runner"]])
-            if values.get("method"):
-                add(["--method", values["method"]])
+            output = colorized_output_for_manifest(values.get("manifest", ""))
+            if output:
+                add(["--output", output])
+            add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
+            add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
+            add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
+            add(["--memory-mode", values.get("memory_mode", "low_memory")])
+            add(["--feature-encoder", values.get("feature_encoder", "resnet50")])
+            add(["--crf", values.get("crf", "18")])
         elif stage_key == "recomp":
             cmd.append(str(SCRIPTS / "final_composite.py"))
             output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
@@ -617,6 +654,18 @@ def read_manifest(path: Path) -> list[dict[str, str]]:
     return []
 
 
+def manifest_source_video(path: Path) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for line in handle:
+            if line.startswith("# source_video="):
+                return line.split("=", 1)[1].strip()
+            if line and not line.startswith("#"):
+                return ""
+    return ""
+
+
 def write_manifest(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -671,6 +720,20 @@ def recomposition_output_for(outpainted_text: str) -> str:
         return ""
     outpainted = resolve(outpainted_text)
     return rel(ROOT / "output" / "reassembled" / f"{safe_stem(outpainted.name)}_final.mp4")
+
+
+def colorized_output_for_manifest(manifest_text: str) -> str:
+    if not manifest_text:
+        return ""
+    manifest = resolve(manifest_text)
+    source_video = manifest_source_video(manifest)
+    if source_video:
+        source = resolve(source_video)
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source.name)}_colormnet_colorized.mp4")
+    if manifest_text:
+        stem = safe_stem(Path(manifest_text).stem.replace("colorize_manifest_", "").replace("_shots_auto", ""))
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{stem}_colormnet_colorized.mp4")
+    return ""
 
 
 def color_reference_outputs(manifest_text: str) -> list[str]:

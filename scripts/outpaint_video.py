@@ -139,6 +139,14 @@ def set_input_link(workflow: dict[str, Any], node_id: str, input_name: str, link
     node.setdefault("inputs", []).append({"name": input_name, "link": link_id})
 
 
+def clear_input_link(workflow: dict[str, Any], node_id: str, input_name: str) -> None:
+    node = node_by_id(workflow, node_id)
+    for item in node.get("inputs", []):
+        if item.get("name") == input_name:
+            item["link"] = None
+            return
+
+
 def ensure_widget_input(node: dict[str, Any], name: str, input_type: str = "COMBO") -> None:
     for item in node.setdefault("inputs", []):
         if item.get("name") == name:
@@ -191,6 +199,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
 def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
     image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
+    prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
     try:
         image_node = node_by_id(workflow, "2004")
@@ -204,6 +213,36 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
 
     for node_id in args.extra_save_node_id:
         set_widget_if_node(workflow, node_id, args.save_prefix_widget, output_prefix)
+
+    # Avoid depending on the optional ComfyMath CM_FloatToInt node; the audio latent node accepts
+    # a normal integer widget value when its frame_rate link is cleared.
+    try:
+        clear_input_link(workflow, "3980", "frame_rate")
+        audio_latent_node = node_by_id(workflow, "3980")
+        set_widget(audio_latent_node, "1", int(round(float(prepared_info.get("fps") or 24))))
+    except KeyError:
+        pass
+
+    try:
+        latent_video_node = node_by_id(workflow, "3059")
+        for input_name in ("width", "height", "length"):
+            clear_input_link(workflow, "3059", input_name)
+        set_widget(latent_video_node, "0", int(prepared_info["width"]))
+        set_widget(latent_video_node, "1", int(prepared_info["height"]))
+        set_widget(latent_video_node, "2", int(prepared_info["frames"]))
+        set_widget(latent_video_node, "3", 1)
+    except KeyError:
+        pass
+
+    # ARP already prepares an exact target-size canvas, so bypass the demo workflow's
+    # pad/resize/reference-image branch. This avoids optional/dynamic helper nodes and
+    # feeds the prepared video frames directly into LTX conditioning.
+    try:
+        set_input_link(workflow, "3336", "image", 13586)
+        set_input_link(workflow, "5012", "image", 13586)
+        set_input_link(workflow, args.save_node_id, "images", 13594)
+    except KeyError:
+        pass
 
     if args.model_backend == "gguf":
         patch_lightweight_gguf(workflow, args)
@@ -305,7 +344,9 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], output: Path, overlap_frames:
         trimmed_paths: list[Path] = []
         for index, chunk in enumerate(chunks):
             trimmed = tmp / f"trimmed_{index:04d}.mp4"
-            start_frame = overlap_frames if index and overlap_frames > 0 else 0
+            # LTX 2.3 can return fewer frames than were supplied for each chunk. In
+            # that case trimming the nominal overlap again shortens the final clip.
+            start_frame = 0
             vf = f"trim=start_frame={start_frame},setpts=PTS-STARTPTS"
             subprocess.run([ffmpeg, "-y", "-i", str(chunk), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(trimmed)], check=True)
             trimmed_paths.append(trimmed)

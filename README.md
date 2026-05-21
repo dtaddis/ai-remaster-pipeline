@@ -100,8 +100,8 @@ qwen_colorize_references.bat ^
   --load-image-node-id 1 ^
   --prompt-node-id 2 ^
   --save-node-id 9 ^
-  --prompt "Colorize this image." ^
-  --prompt-suffix "Modern clean restoration, natural period color, preserve composition and text."
+  --prompt "Transform this black-and-white frame into a clean modern full-colour animation production still. Keep the exact drawing, line art, shapes, and composition. Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading." ^
+  --prompt-suffix "White gloves and faces should stay clean and bright, black ink areas should stay deep black, and props/backgrounds should receive distinct natural colours. Preserve lighting and film grain while making the colour read as genuine full colour, not a tint."
 ```
 
 The exact node IDs depend on your workflow. For normal exported ComfyUI workflows, widget selectors are usually numeric indexes like `0`; for API-format workflows, they can be input names. If ComfyUI is not under `tools\comfyui`, add `--comfy-output-root D:\dtaddis\ComfyUI\output` or wherever your Comfy output folder lives. The script patches the input image, prompt, and save prefix, then copies ComfyUI's result to the `color_reference` path in the manifest.
@@ -247,5 +247,5 @@ Single still repair:
 ```bat
 generate_single_reference.bat --source-image intermediate\outpainted_references\clip\cut_0014.png --output intermediate\outpainted_references_color\clip\cut_0014.png --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --add-prompt "brown hair, no added text"
 ```
-Keep Qwen prompts short. Verbose restoration prompts can leak into the generated image as fake captions or logo-like text. The Qwen runner prints the exact prompt for each queued edit and clamps local continuity descriptions with `--reference-description-max-chars`.
+Keep Qwen prompts direct and visual. ARP's default is intentionally not a "period restoration" prompt: it asks for modern full-colour animation and explicitly rejects sepia, monochrome tinting, and antique hand-colour grading. The Qwen runner prints the exact prompt for each queued edit and clamps local continuity descriptions with `--reference-description-max-chars`.
 

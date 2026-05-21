@@ -104,7 +104,7 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel]) -> None:
             size = remote_file_size(model.repo, model.file)
             size_text = f" ({format_bytes(size)})" if size else ""
             print(f"Downloading model: {model.repo}/{model.file}{size_text}", flush=True)
-            downloaded = Path(hf_hub_download(repo_id=model.repo, filename=model.file, local_dir=cache_root))
+            downloaded = download_hf_file(model.repo, model.file, cache_root)
             shutil.copy2(downloaded, destination)
             print(f"Downloaded: {destination}", flush=True)
     finally:
@@ -137,6 +137,16 @@ def format_bytes(size: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{size} B"
+
+
+def download_hf_file(repo: str, filename: str, cache_root: Path) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    kwargs = {"repo_id": repo, "filename": filename, "cache_dir": cache_root}
+    try:
+        return Path(hf_hub_download(**kwargs, resume_download=True))
+    except TypeError:
+        return Path(hf_hub_download(**kwargs))
 
 
 def ensure_outpaint_models(comfy_dir: Path) -> None:

@@ -51,6 +51,9 @@ def wait_for_prompt(comfy_url: str, prompt_id: str, poll_seconds: float) -> dict
             status = entry.get('status', {})
             if status.get('completed'):
                 return entry
+            if status.get('status_str') == 'error':
+                messages = status.get('messages') or []
+                raise RuntimeError(json.dumps(messages[-1] if messages else status, ensure_ascii=False))
             for message in status.get('messages') or []:
                 if isinstance(message, list) and message and message[0] == 'execution_error':
                     raise RuntimeError(json.dumps(message[1], ensure_ascii=False))
@@ -161,8 +164,53 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
             for name, value in zip(fallback_names, values):
                 if name not in inputs:
                     inputs[name] = value
+        if not isinstance(widget_values, dict):
+            for name, value in widget_fallback_inputs(node.get('type'), widget_values).items():
+                if name not in inputs:
+                    inputs[name] = value
         prompt[node_id] = {'class_type': node['type'], 'inputs': inputs}
         if node.get('title'):
             prompt[node_id]['_meta'] = {'title': node['title']}
     return prompt
+
+
+def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[str, Any]:
+    values = widget_values if isinstance(widget_values, list) else [widget_values]
+    if not class_type or not values:
+        return {}
+    if class_type == 'ImagePadKJ':
+        return dict(zip(('left', 'right', 'top', 'bottom', 'extra_padding', 'pad_mode', 'color'), values))
+    if class_type == 'ResizeImageMaskNode':
+        resize_type = str(values[0]) if values else 'scale by multiplier'
+        resize: dict[str, Any] = {'resize_type': resize_type}
+        if resize_type == 'scale by multiplier' and len(values) > 1:
+            resize['multiplier'] = values[1]
+        elif resize_type == 'scale to multiple' and len(values) > 1:
+            resize['multiple'] = values[1]
+        elif resize_type == 'match size' and len(values) > 1:
+            resize['crop'] = values[1]
+        elif resize_type == 'scale dimensions':
+            if len(values) > 1:
+                resize['width'] = values[1]
+            if len(values) > 2:
+                resize['height'] = values[2]
+            if len(values) > 3:
+                resize['crop'] = values[3]
+        out = {'resize_type': resize}
+        if values:
+            out['scale_method'] = values[-1]
+        return out
+    simple_maps = {
+        'LTXVPreprocess': ('img_compression',),
+        'EmptyLTXVLatentVideo': ('width', 'height', 'length', 'batch_size'),
+        'LTXVImgToVideoConditionOnly': ('strength', 'bypass'),
+        'CLIPTextEncode': ('text',),
+        'LTXAddVideoICLoRAGuide': ('frame_idx', 'strength', 'latent_downscale_factor', 'crop', 'use_tiled_encode', 'tile_size', 'tile_overlap'),
+        'LTXVEmptyLatentAudio': ('frames_number', 'frame_rate', 'batch_size'),
+        'RandomNoise': ('noise_seed', 'control_after_generate'),
+        'CFGGuider': ('cfg',),
+        'VAEDecodeTiled': ('tile_size', 'overlap', 'temporal_size', 'temporal_overlap'),
+    }
+    names = simple_maps.get(class_type)
+    return dict(zip(names, values)) if names else {}
 

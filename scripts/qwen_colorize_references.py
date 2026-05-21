@@ -13,7 +13,18 @@ from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
 
-DEFAULT_PROMPT = 'Colorize this image. Preserve the original image. Do not add text, captions, logos, labels, signs, subtitles, or new objects.'
+DEFAULT_PROMPT = (
+    'Transform this black-and-white frame into a clean modern full-colour animation production still. '
+    'Keep the exact drawing, characters, camera angle, line art, shapes, and composition. '
+    'Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. '
+    'Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading. '
+    'Do not add text, captions, logos, labels, signs, subtitles, or new objects.'
+)
+DEFAULT_PROMPT_SUFFIX = (
+    'White gloves and faces should stay clean and bright, black ink areas should stay deep black, '
+    'wood, metal, sky, water, fabric, and background props should receive distinct natural colours. '
+    'Preserve original lighting, shadows, outlines, and film grain while making the colour read as genuine full colour, not a tint.'
+)
 DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
 DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434'
 DEFAULT_OLLAMA_VISION_MODEL = 'qwen2.5vl:7b'
@@ -234,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--comfy-dir', type=Path, default=Path(config.get('comfy_dir', ROOT / 'tools' / 'comfyui')), help='ComfyUI directory used for on-demand model downloads.')
     parser.add_argument('--comfy-output-root', type=Path, default=ROOT / 'tools' / 'comfyui' / 'output', help='ComfyUI output directory used to locate saved images.')
     parser.add_argument('--prompt', default=DEFAULT_PROMPT)
-    parser.add_argument('--prompt-suffix', default='')
+    parser.add_argument('--prompt-suffix', default=DEFAULT_PROMPT_SUFFIX)
     parser.add_argument('--add-prompt', default='', help='Extra one-off guidance appended last, after generated reference descriptions.')
     parser.add_argument('--reference-description', default='', help='Static palette/continuity guidance appended to the image edit prompt.')
     parser.add_argument('--reference-description-file', type=Path, help='UTF-8 text file with static palette/continuity guidance.')

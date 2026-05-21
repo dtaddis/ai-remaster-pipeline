@@ -153,7 +153,7 @@ def write_manifest(path,source_path,rows,info):
         for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference)])
     tmp.replace(path)
 def source_signature(source_path,row): return {'version':1,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'generator':'generate_references.py'}
-def extract_frames(args,source_path,rows):
+def extract_frames(args,source_path,info,rows):
     expected={row.source_reference for row in rows}
     if args.prune_source_frames:
         for folder in {p.parent for p in expected}:
@@ -212,17 +212,17 @@ def main():
     samples=sample_video(source_path,info,args)
     shots=detect_shots(samples,info,args)
     rows=build_rows(args,source_path,info,shots)
-    reused=sum(1 for row in rows if row.reused_from)
+    reused=sum(1 for row in rows if row.reused_color_from)
     print(f'Source: {source_path}')
     print(f'Video: {info.width}x{info.height}, {info.fps:.6g} fps, {info.frame_count} frames, {format_time(info.duration)}')
     print(f'Detected {len(shots)} cut spans; writing {len(rows)} manifest rows, {len(rows)-reused} unique/new reference targets, {reused} reused.')
     for row in rows:
-        note=f' reuse={root_relative(row.reused_from)}' if row.reused_from else ''
+        note=f' reuse={root_relative(row.reused_color_from)}' if row.reused_color_from else ''
         print(f'cut {row.index:04d} selected={format_time(row.selected_time)} end={format_time(row.end_frame/info.fps)} ref={root_relative(row.color_reference)}{note}')
     if args.dry_run:
         print(f'Dry run; would write {manifest}')
         return 0
-    extract_frames(args,source_path,rows)
+    extract_frames(args,source_path,info,rows)
     write_manifest(manifest,source_path,rows,info)
     print(f'Wrote manifest: {manifest}')
     return 0

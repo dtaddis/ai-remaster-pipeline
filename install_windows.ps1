@@ -265,7 +265,7 @@ Invoke-Step 'Create ai-remaster-pipeline venv' {
 Invoke-Step 'Install PyTorch CUDA and ComfyUI requirements' {
     Install-Pip @('torch', 'torchvision', 'torchaudio', '--index-url', $TorchIndexUrl)
     Install-RequirementsIfPresent (Join-Path $ComfyDir 'requirements.txt')
-    Install-Pip @('huggingface_hub[cli]', 'opencv-python', 'pillow', 'numpy', 'numba')
+    Install-Pip @('huggingface_hub[cli]', 'opencv-contrib-python', 'imageio-ffmpeg', 'pillow', 'numpy', 'numba')
 }
 
 Invoke-Step 'Install ComfyUI custom nodes' {
