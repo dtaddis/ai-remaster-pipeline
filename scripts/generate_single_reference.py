@@ -15,8 +15,8 @@ def write_temp_manifest(source: Path, output: Path) -> Path:
     handle = tempfile.NamedTemporaryFile('w', encoding='utf-8', newline='', suffix='.csv', prefix='single_reference_', dir=temp_dir, delete=False)
     with handle:
         writer = csv.writer(handle, lineterminator='\n')
-        writer.writerow(['enabled', 'end', 'source_reference', 'color_reference'])
-        writer.writerow(['true', '0:00:01', root_relative(source), root_relative(output)])
+        writer.writerow(['enabled', 'end', 'source_reference', 'color_reference', 'prompt'])
+        writer.writerow(['true', '0:00:01', root_relative(source), root_relative(output), ''])
     return Path(handle.name)
 
 

@@ -14,16 +14,11 @@ from common import ROOT, file_fingerprint, resolve_path, root_relative, resumabl
 from dependency_manager import ensure_qwen_image_edit_models
 
 DEFAULT_PROMPT = (
-    'Transform this black-and-white frame into a clean modern full-colour animation production still. '
-    'Keep the exact drawing, characters, camera angle, line art, shapes, and composition. '
-    'Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. '
-    'Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading. '
-    'Do not add text, captions, logos, labels, signs, subtitles, or new objects.'
+    'Colorize this image. Preserve the drawing and composition. '
+    'Use clean modern cartoon colours, not sepia. Do not add text or new objects.'
 )
 DEFAULT_PROMPT_SUFFIX = (
-    'White gloves and faces should stay clean and bright, black ink areas should stay deep black, '
-    'wood, metal, sky, water, fabric, and background props should receive distinct natural colours. '
-    'Preserve original lighting, shadows, outlines, and film grain while making the colour read as genuine full colour, not a tint.'
+    'Keep black ink deep, whites clean, and props/backgrounds naturally coloured.'
 )
 DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
 DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434'
@@ -179,7 +174,7 @@ def continuity_description(args: argparse.Namespace, refs: list[Path]) -> str:
     return '\n'.join(lines) if len(lines) > 1 else ''
 
 
-def build_prompt(args: argparse.Namespace, extra_description: str = '') -> str:
+def build_prompt(args: argparse.Namespace, extra_description: str = '', row_prompt: str = '') -> str:
     parts = [args.prompt.strip()]
     suffix = (args.prompt_suffix or '').strip()
     static_description = read_text_file(args.reference_description_file)
@@ -191,6 +186,8 @@ def build_prompt(args: argparse.Namespace, extra_description: str = '') -> str:
         parts.append(static_description)
     if extra_description:
         parts.append(extra_description.strip())
+    if row_prompt:
+        parts.append(row_prompt.strip())
     # The user's one-off direction belongs last so it is not buried under generated palette text.
     if args.add_prompt:
         parts.append(args.add_prompt.strip())
@@ -236,6 +233,65 @@ def newest_output(files: list[Path]) -> Path:
     return max(paths, key=lambda p: p.stat().st_mtime_ns)
 
 
+def iter_workflow_nodes(workflow: dict[str, Any]):
+    seen: set[int] = set()
+
+    def visit(value: Any):
+        if isinstance(value, dict):
+            ident = id(value)
+            if ident in seen:
+                return
+            seen.add(ident)
+            if 'class_type' in value or 'type' in value:
+                yield value
+            for child in value.values():
+                yield from visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from visit(child)
+
+    yield from visit(workflow)
+
+
+def node_widget_values(node: dict[str, Any]) -> list[Any]:
+    inputs = node.get('inputs', {})
+    if isinstance(inputs, dict):
+        input_values = list(inputs.values())
+    else:
+        input_values = []
+    values = node.get('widgets_values', [])
+    if isinstance(values, list):
+        return input_values + values
+    if isinstance(values, dict):
+        return input_values + list(values.values())
+    return input_values + [values]
+
+
+def patch_qwen_model_backend(args, workflow: dict[str, Any]) -> None:
+    if args.model_backend != 'gguf':
+        return
+    patched = 0
+    for node in iter_workflow_nodes(workflow):
+        class_type = node.get('class_type') or node.get('type')
+        if class_type not in {'UNETLoader', 'UnetLoader'}:
+            continue
+        values = ' '.join(str(value).lower() for value in node_widget_values(node))
+        title = str(node.get('title') or '').lower()
+        if 'qwen' not in values and 'qwen' not in title:
+            continue
+        if 'class_type' in node:
+            node['class_type'] = 'UnetLoaderGGUF'
+            node.setdefault('inputs', {})['unet_name'] = args.gguf_model
+        else:
+            node['type'] = 'UnetLoaderGGUF'
+            node['title'] = 'Unet Loader (GGUF)'
+            node['inputs'] = [{'name': 'unet_name', 'type': 'COMBO', 'widget': {'name': 'unet_name'}}]
+            node['widgets_values'] = [args.gguf_model]
+        patched += 1
+    if not patched:
+        raise RuntimeError('Could not find a Qwen UNETLoader node to patch to UnetLoaderGGUF. Use a Qwen Image Edit workflow with a visible UNETLoader node, or run with --model-backend safetensors.')
+
+
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
     parser = argparse.ArgumentParser(description='Colorize extracted reference stills with a single-image Qwen Image Edit ComfyUI workflow.')
@@ -244,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--comfy-url', default='http://127.0.0.1:8188')
     parser.add_argument('--comfy-dir', type=Path, default=Path(config.get('comfy_dir', ROOT / 'tools' / 'comfyui')), help='ComfyUI directory used for on-demand model downloads.')
     parser.add_argument('--comfy-output-root', type=Path, default=ROOT / 'tools' / 'comfyui' / 'output', help='ComfyUI output directory used to locate saved images.')
+    parser.add_argument('--model-backend', choices=['gguf', 'safetensors'], default='gguf')
+    parser.add_argument('--gguf-model', default='qwen-image-edit-2511-Q4_K_M.gguf')
     parser.add_argument('--prompt', default=DEFAULT_PROMPT)
     parser.add_argument('--prompt-suffix', default=DEFAULT_PROMPT_SUFFIX)
     parser.add_argument('--add-prompt', default='', help='Extra one-off guidance appended last, after generated reference descriptions.')
@@ -284,8 +342,10 @@ def main() -> int:
         rows = rows[:args.limit]
     print(f'Manifest: {manifest}')
     print(f'Rows: {len(rows)}')
-    print('Qwen mode: one source image only; extra references are converted to text guidance when enabled.')
+    print(f'Qwen mode: {args.model_backend}; one source image only; extra references are converted to text guidance when enabled.')
     if not args.dry_run and rows:
+        if args.model_backend == 'gguf' and not (comfy_dir / 'custom_nodes' / 'ComfyUI-GGUF').exists():
+            raise FileNotFoundError(f'ComfyUI-GGUF is required for Qwen GGUF. Re-run install_windows.bat, then restart ComfyUI: {comfy_dir / "custom_nodes" / "ComfyUI-GGUF"}')
         ensure_qwen_image_edit_models(comfy_dir)
         print(f'Waiting for ComfyUI at {args.comfy_url}...')
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
@@ -294,7 +354,7 @@ def main() -> int:
         dst = output_for_row(args, row)
         refs = continuity_reference_paths(args, rows, index)
         extra_description = continuity_description(args, refs)
-        prompt = build_prompt(args, extra_description)
+        prompt = build_prompt(args, extra_description, row.get('prompt') or row.get('custom_prompt') or '')
         sig = signature(args, workflow_path, src, prompt)
         if args.print_final_prompt:
             print(f'Final prompt {index:04d}: {prompt}')
@@ -304,11 +364,12 @@ def main() -> int:
         ref_note = f', described refs={len(refs)}' if refs else ''
         print(f'Colorize {index:04d}: {src} -> {dst}{ref_note}')
         print(f'Qwen prompt {index:04d}: {prompt}')
+        workflow = load_workflow(workflow_path)
+        patch_qwen_model_backend(args, workflow)
         if args.dry_run:
             continue
         if not src.exists():
             raise FileNotFoundError(f'Reference source not found: {src}')
-        workflow = load_workflow(workflow_path)
         prompt_payload = patch_workflow(args, workflow, src, dst, prompt)
         prompt_id = queue_prompt(args.comfy_url, prompt_payload)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

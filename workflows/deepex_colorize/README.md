@@ -1,3 +1,3 @@
-﻿Place Deep Exemplar / ColorMNet ComfyUI workflow JSON files here.
+Place Deep Exemplar ComfyUI workflow JSON files here.
 
-The generic wrapper expects a compatible manifest runner, usually copied from a working ComfyUI setup into `tools/ComfyUI/scripts/colorize_manifest_runner.py` or passed with `--comfy-runner`.
+ARP builds the Deep Exemplar video colourisation prompt directly for ComfyUI, so this folder is mainly for saved experiments and reference workflows.

@@ -314,11 +314,11 @@ if ($DownloadModels -and -not $SkipModelDownloads) {
         Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors')
     }
 
-    Invoke-Step 'Download Qwen Image Edit models and Lightning LoRA' {
-        Download-HfFile 'Comfy-Org/Qwen-Image-Edit_ComfyUI' 'split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors' (Join-Path $ComfyDir 'models\diffusion_models\qwen_image_edit_2509_fp8_e4m3fn.safetensors')
+    Invoke-Step 'Download Qwen Image Edit 2511 GGUF Q4_K_M models and Lightning LoRA' {
+        Download-HfFile 'unsloth/Qwen-Image-Edit-2511-GGUF' 'qwen-image-edit-2511-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\diffusion_models\qwen-image-edit-2511-Q4_K_M.gguf')
         Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\qwen_2.5_vl_7b_fp8_scaled.safetensors')
         Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/vae/qwen_image_vae.safetensors' (Join-Path $ComfyDir 'models\vae\qwen_image_vae.safetensors')
-        Download-HfFile 'lightx2v/Qwen-Image-Lightning' 'Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors' (Join-Path $ComfyDir 'models\loras\Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors')
+        Download-HfFile 'lightx2v/Qwen-Image-Edit-2511-Lightning' 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors' (Join-Path $ComfyDir 'models\loras\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
     }
 } else {
     Write-Host 'Skipping model downloads. Models and LoRAs will download on demand when their pipeline stages run.'

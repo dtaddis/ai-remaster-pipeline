@@ -31,17 +31,13 @@ ASPECT_PREVIEW_DIR = ROOT / ".cache" / "aspect_previews"
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 TEXT_EXTS = {".csv", ".json", ".txt", ".log", ".md"}
+COLORIZE_STAGE_KEYS = {"shots", "references", "colour"}
 REFERENCE_PROMPT = (
-    "Transform this black-and-white frame into a clean modern full-colour animation production still. "
-    "Keep the exact drawing, characters, camera angle, line art, shapes, and composition. "
-    "Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. "
-    "Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading. "
-    "Do not add text, captions, logos, labels, signs, subtitles, or new objects."
+    "Colorize this image. Preserve the drawing and composition. "
+    "Use clean modern cartoon colours, not sepia. Do not add text or new objects."
 )
 REFERENCE_PROMPT_SUFFIX = (
-    "White gloves and faces should stay clean and bright, black ink areas should stay deep black, "
-    "wood, metal, sky, water, fabric, and background props should receive distinct natural colours. "
-    "Preserve original lighting, shadows, outlines, and film grain while making the colour read as genuine full colour, not a tint."
+    "Keep black ink deep, whites clean, and props/backgrounds naturally coloured."
 )
 
 
@@ -68,6 +64,19 @@ STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 
 def current_config() -> dict[str, str]:
     return load_config()
+
+
+def default_qwen_workflow(config: dict[str, str] | None = None) -> str:
+    config = config or current_config()
+    candidates = [
+        ROOT / "workflows" / "qwen_image_edit" / "Qwen Image Edit Reference Colorize.json",
+        Path(config.get("comfy_dir", "")) / "blueprints" / "Image Edit (Qwen 2511).json",
+        Path(config.get("comfy_dir", "")) / "blueprints" / "Image Edit (Qwen 2509).json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return rel(candidate)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -115,27 +124,23 @@ STAGES = (
         ("intermediate/outpainted_references", "intermediate/outpainted_references_color", "manifests/references"),
         (
             ("manifest", "Manifest", "file", ""),
-            ("workflow", "Qwen workflow", "file", ""),
-            ("comfy_output_root", "Comfy output folder", "folder", "tools/comfyui/output"),
-            ("comfy_url", "Comfy URL", "text", "http://127.0.0.1:8188"),
             ("prompt", "Prompt", "text", REFERENCE_PROMPT),
             ("prompt_suffix", "Prompt suffix", "text", REFERENCE_PROMPT_SUFFIX),
-            ("load_image_node_id", "Load image node", "text", "1"),
-            ("prompt_node_id", "Prompt node", "text", ""),
-            ("save_node_id", "Save node", "text", ""),
             ("limit", "Limit rows", "number", ""),
         ),
-        ("manifest", "workflow", "save_node_id"),
+        ("manifest",),
     ),
     Stage(
         "colour",
         "Colourisation",
-        "Run ColorMNet in ComfyUI over the outpainted video, using the generated colour references.",
+        "Run Deep Exemplar in ComfyUI over the outpainted video, using the generated colour references.",
         ("intermediate/outpainted_references_color", "intermediate/outpainted_colorized", "manifests/references"),
         (
             ("manifest", "Manifest", "file", ""),
-            ("memory_mode", "Memory mode", "select:low_memory|balanced|high_quality", "low_memory"),
-            ("feature_encoder", "Feature encoder", "select:resnet50|vgg19|dinov2_vits|dinov2_vitb|dinov2_vitl|clip_vitb", "resnet50"),
+            ("frame_propagate", "Frame propagation", "select:true|false", "true"),
+            ("use_half_resolution", "Half-resolution processing", "select:true|false", "true"),
+            ("use_torch_compile", "Torch compile", "select:false|true", "false"),
+            ("use_sage_attention", "SageAttention", "select:false|true", "false"),
             ("crf", "CRF", "number", "18"),
         ),
         ("manifest",),
@@ -181,7 +186,7 @@ def newest(folder: Path, exts: set[str]) -> Path | None:
 
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": ""}
+    defaults["global"] = {"source": "", "colorize": "true"}
     if SETTINGS_FILE.exists():
         try:
             stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -196,7 +201,9 @@ def load_settings() -> dict[str, dict[str, str]]:
     colorized = newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS)
     if source and not defaults["global"].get("source"):
         defaults["global"]["source"] = rel(source)
-    for values in defaults.values():
+    for stage_key, values in defaults.items():
+        if stage_key == "global":
+            continue
         if outpainted and not values.get("outpainted_video"):
             values["outpainted_video"] = rel(outpainted)
         if manifest and not values.get("manifest"):
@@ -205,21 +212,36 @@ def load_settings() -> dict[str, dict[str, str]]:
             values["colorized_video"] = rel(colorized)
     if outpainted and not defaults["recomp"].get("output"):
         defaults["recomp"]["output"] = rel(ROOT / "output" / "reassembled" / f"{outpainted.stem}_final.mp4")
+    if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
+        defaults["recomp"]["colorized_video"] = ""
     bundled_output = rel(ROOT / "tools" / "comfyui" / "output")
     config = current_config()
     if not defaults["references"].get("comfy_output_root") or (CONFIG_FILE.exists() and defaults["references"].get("comfy_output_root") == bundled_output):
         defaults["references"]["comfy_output_root"] = rel(Path(config["comfy_dir"]) / "output")
     if not defaults["references"].get("comfy_url"):
         defaults["references"]["comfy_url"] = config["comfy_url"]
+    if not defaults["references"].get("workflow"):
+        defaults["references"]["workflow"] = default_qwen_workflow(config)
+    if not defaults["references"].get("load_image_node_id"):
+        defaults["references"]["load_image_node_id"] = "1"
+    defaults["references"].setdefault("prompt_node_id", "")
+    if not defaults["references"].get("save_node_id"):
+        defaults["references"]["save_node_id"] = "9"
+    defaults["references"].setdefault("model_backend", "gguf")
+    defaults["references"].setdefault("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf")
     old_reference_prompts = {
         "",
         "Colorize this image.",
         "Colorize this image. Preserve the original image. Do not add text, captions, logos, labels, signs, subtitles, or new objects.",
+        "Colorize this image as a clean modern full-colour cartoon production still. Preserve the exact drawing, characters, line art, camera angle, and composition. Use natural vivid colours, not sepia or a single tint. Do not add text or new objects.",
+        "Transform this black-and-white frame into a clean modern full-colour animation production still. Keep the exact drawing, characters, camera angle, line art, shapes, and composition. Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading. Do not add text, captions, logos, labels, signs, subtitles, or new objects.",
     }
     old_reference_suffixes = {
         "",
         "Natural period color, preserve lighting and composition.",
         "Modern clean restoration, natural period color, preserve composition and text.",
+        "Keep black ink deep and whites clean. Give sky, water, wood, metal, fabric, and props distinct believable colours.",
+        "White gloves and faces should stay clean and bright, black ink areas should stay deep black, wood, metal, sky, water, fabric, and background props should receive distinct natural colours. Preserve original lighting, shadows, outlines, and film grain while making the colour read as genuine full colour, not a tint.",
     }
     if defaults["references"].get("prompt", "") in old_reference_prompts:
         defaults["references"]["prompt"] = REFERENCE_PROMPT
@@ -235,8 +257,18 @@ class PipelineApp:
         self.process: subprocess.Popen[str] | None = None
         self.running_stage = ""
         self.running_stage_key = ""
+        self.running_reference_manifest = ""
+        self.running_reference_index: int | None = None
         self.run_started_at = 0.0
         self.lock = threading.Lock()
+
+    def colorize_enabled(self) -> bool:
+        return self.settings.get("global", {}).get("colorize", "true") == "true"
+
+    def active_stages(self) -> tuple[Stage, ...]:
+        if self.colorize_enabled():
+            return STAGES
+        return tuple(stage for stage in STAGES if stage.key not in COLORIZE_STAGE_KEYS)
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
@@ -283,13 +315,15 @@ class PipelineApp:
             "Colourisation": newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS),
             "Recomposition": newest(ROOT / "output" / "reassembled", VIDEO_EXTS),
         }
-        return [{"stage": key, "status": "Ready" if value else "Waiting", "latest": rel(value) if value else ""} for key, value in checks.items()]
+        active_titles = {stage.title for stage in self.active_stages()}
+        return [{"stage": key, "status": "Ready" if value else "Waiting", "latest": rel(value) if value else ""} for key, value in checks.items() if key in active_titles]
 
     def phase_progress(self) -> dict:
         current = self.estimate_running_progress()
         stages = []
         completed = 0.0
-        for stage in STAGES:
+        active = self.active_stages()
+        for stage in active:
             title = stage.title
             latest = next((item["latest"] for item in self.progress() if item["stage"] == title), "")
             if self.running_stage_key == stage.key and current:
@@ -303,7 +337,7 @@ class PipelineApp:
                 label = "Waiting"
             completed += percent / 100
             stages.append({"key": stage.key, "stage": title, "percent": percent, "label": label})
-        global_percent = int(round((completed / max(1, len(STAGES))) * 100))
+        global_percent = int(round((completed / max(1, len(active))) * 100))
         return {"global": {"percent": global_percent, "label": f"{global_percent}% complete"}, "stages": stages}
 
     def estimate_running_progress(self) -> dict:
@@ -348,11 +382,23 @@ class PipelineApp:
             if "wrote manifest" in lower:
                 percent, label = 100, "Manifest written"
         elif self.running_stage_key == "references":
-            rows = first_int_after(log_text, "Rows:")
-            done = count_lines_matching(log_text, ("Reuse ", "Wrote "))
-            if rows:
-                percent = min(99, int((done / rows) * 100))
-                label = f"{done}/{rows} references"
+            if self.running_reference_index is not None:
+                label = f"Regenerating shot {self.running_reference_index + 1}"
+                if "queued comfyui prompt" in lower or "waiting for comfyui" in lower:
+                    percent = max(percent, 35)
+                    label = f"Shot {self.running_reference_index + 1}: waiting for ComfyUI"
+                if "copied comfyui output" in lower or "wrote " in lower:
+                    percent = max(percent, 85)
+                    label = f"Shot {self.running_reference_index + 1}: saving reference"
+                if "regenerated colour reference" in lower or "finished with exit code 0" in lower:
+                    percent = 100
+                    label = f"Shot {self.running_reference_index + 1}: complete"
+            else:
+                rows = first_int_after(log_text, "Rows:")
+                done = count_lines_matching(log_text, ("Reuse ", "Wrote "))
+                if rows:
+                    percent = min(99, int((done / rows) * 100))
+                    label = f"{done}/{rows} references"
         elif self.running_stage_key == "colour":
             if "reuse" in lower:
                 percent, label = max(percent, 75), "Existing colorized video reused"
@@ -373,16 +419,22 @@ class PipelineApp:
             info = source_info(source_text)
             return {
                 "root": str(ROOT),
-                "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in STAGES],
+                "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in self.active_stages()],
                 "settings": self.settings,
                 "progress": self.progress(),
                 "phase_progress": self.phase_progress(),
-                "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in STAGES},
+                "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in self.active_stages()},
                 "source_previews": previews,
                 "source_info": info,
+                "source_monochrome": source_monochrome(source_text),
                 "aspect_preview": aspect_preview(source_text, self.settings.get("outpaint", {}).get("target_aspect", "16:9")),
+                "shot_views": shot_views(self.settings),
                 "running": running,
                 "running_stage": self.running_stage,
+                "running_reference": {
+                    "manifest": self.running_reference_manifest,
+                    "index": self.running_reference_index,
+                } if self.running_reference_index is not None else None,
                 "log": "\n".join(self.log[-800:]),
             }
 
@@ -390,6 +442,9 @@ class PipelineApp:
         self.settings.setdefault(stage, {}).update({key: str(value) for key, value in values.items()})
         if stage == "global" and "source" in values:
             self.log.append(f"Loading source material: {values.get('source')}")
+            self.settings.setdefault("global", {})["colorize"] = "true" if source_monochrome(str(values.get("source", ""))) else "false"
+            self.hydrate_stage_inputs("global")
+        elif stage == "global" and "colorize" in values:
             self.hydrate_stage_inputs("global")
         if stage == "shots" and "outpainted_video" in values:
             manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
@@ -417,7 +472,7 @@ class PipelineApp:
             for stage_key in ("references", "colour"):
                 self.settings.setdefault(stage_key, {})["manifest"] = ""
         expected_manifest = resolve(self.expected_outputs("shots")[0]) if self.expected_outputs("shots") else None
-        manifest = expected_manifest if expected_manifest and expected_manifest.exists() else newest(ROOT / "manifests" / "references", {".csv"})
+        manifest = expected_manifest if expected_manifest and expected_manifest.exists() else None
         if manifest:
             manifest_text = rel(manifest)
             self.settings.setdefault("references", {})["manifest"] = manifest_text
@@ -425,9 +480,11 @@ class PipelineApp:
             self.log.append(f"Updated manifest inputs: {manifest_text}")
         expected_colorized_text = self.expected_outputs("colour")[0] if self.expected_outputs("colour") else ""
         expected_colorized = resolve(expected_colorized_text) if expected_colorized_text else None
-        colorized = expected_colorized if expected_colorized and expected_colorized.exists() else newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS)
-        if colorized:
+        colorized = expected_colorized if expected_colorized and expected_colorized.exists() else None
+        if self.colorize_enabled() and colorized:
             self.settings.setdefault("recomp", {})["colorized_video"] = rel(colorized)
+        elif not self.colorize_enabled():
+            self.settings.setdefault("recomp", {})["colorized_video"] = ""
         source = self.settings.get("global", {}).get("source")
         if source:
             self.settings.setdefault("recomp", {})["source"] = source
@@ -482,10 +539,14 @@ class PipelineApp:
                 add(["--limit", values["limit"]])
         elif stage_key == "references":
             cmd.append(str(SCRIPTS / "qwen_colorize_references.py"))
-            add(["--manifest", values.get("manifest", ""), "--workflow", values.get("workflow", ""), "--comfy-url", values.get("comfy_url", "http://127.0.0.1:8188")])
-            if values.get("comfy_output_root"):
-                add(["--comfy-output-root", values["comfy_output_root"]])
-            add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "1"), "--save-node-id", values.get("save_node_id", "")])
+            workflow = values.get("workflow") or default_qwen_workflow(config)
+            comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
+            comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
+            comfy_output = values.get("comfy_output_root") or str(Path(comfy_dir) / "output")
+            add(["--manifest", values.get("manifest", ""), "--workflow", workflow, "--comfy-url", comfy_url])
+            add(["--comfy-dir", comfy_dir, "--comfy-output-root", comfy_output])
+            add(["--model-backend", values.get("model_backend", "gguf"), "--gguf-model", values.get("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf")])
+            add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "1"), "--save-node-id", values.get("save_node_id", "9")])
             if values.get("prompt_node_id"):
                 add(["--prompt-node-id", values["prompt_node_id"]])
             if values.get("limit"):
@@ -499,14 +560,15 @@ class PipelineApp:
             add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
             add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
             add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
-            add(["--memory-mode", values.get("memory_mode", "low_memory")])
-            add(["--feature-encoder", values.get("feature_encoder", "resnet50")])
             add(["--crf", values.get("crf", "18")])
+            for key in ("frame_propagate", "use_half_resolution", "use_torch_compile", "use_sage_attention"):
+                flag = "--" + key.replace("_", "-")
+                add([flag if values.get(key, "false") == "true" else "--no-" + flag[2:]])
         elif stage_key == "recomp":
             cmd.append(str(SCRIPTS / "final_composite.py"))
             output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
             add(["--outpainted", values.get("outpainted_video", ""), "--source", values.get("source", ""), "--output", output])
-            if values.get("colorized_video"):
+            if self.colorize_enabled() and values.get("colorized_video"):
                 add(["--colorized", values["colorized_video"]])
             add(["--feather-pixels", values.get("feather_pixels", "80"), "--saturation", values.get("saturation", "0.82"), "--temperature", values.get("temperature", "-0.015"), "--color-opacity", values.get("color_opacity", "1.0"), "--encoder", values.get("encoder", "h264")])
         if values.get("force") == "true":
@@ -516,6 +578,8 @@ class PipelineApp:
         return [part for part in cmd if part != ""]
 
     def run_stage(self, stage_key: str) -> tuple[bool, str]:
+        if stage_key in COLORIZE_STAGE_KEYS and not self.colorize_enabled():
+            return False, "Colorize is disabled on the Global tab."
         stage = next(item for item in STAGES if item.key == stage_key)
         values = self.settings[stage_key]
         missing = [key for key in stage.required if not values.get(key)]
@@ -544,12 +608,48 @@ class PipelineApp:
             threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
         return True, "Started " + stage.title
 
+    def run_reference_regeneration(self, manifest_text: str, index: int) -> tuple[bool, str]:
+        ok, message = ensure_comfy_available_for_stage("Reference Generation")
+        if not ok:
+            return False, message
+        try:
+            cmd, output = reference_regeneration_command(manifest_text, index)
+        except Exception as exc:
+            return False, str(exc)
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = "Reference Generation"
+            self.running_stage_key = "references"
+            self.running_reference_manifest = manifest_text
+            self.running_reference_index = index
+            self.run_started_at = time.time()
+            self.log.append(f"Regenerating colour reference for shot {index + 1}: {output}")
+            self.log.append("> " + " ".join(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            try:
+                self.process = subprocess.Popen(cmd, **kwargs)
+            except Exception as exc:
+                self.running_stage = ""
+                self.running_stage_key = ""
+                self.running_reference_manifest = ""
+                self.running_reference_index = None
+                self.run_started_at = 0.0
+                self.log.append(f"Could not start reference regeneration: {exc}")
+                return False, f"Could not start reference regeneration: {exc}"
+            threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
+        return True, f"Started reference regeneration for shot {index + 1}."
+
     def run_all(self) -> tuple[bool, str]:
         threading.Thread(target=self._run_all_worker, daemon=True).start()
         return True, "Started whole remaster queue."
 
     def _run_all_worker(self) -> None:
-        for stage in STAGES:
+        for stage in self.active_stages():
             ok, message = self.run_stage(stage.key)
             if not ok:
                 with self.lock:
@@ -570,6 +670,8 @@ class PipelineApp:
             self.log.append(f"Process finished with exit code {code}.")
             self.running_stage = ""
             self.running_stage_key = ""
+            self.running_reference_manifest = ""
+            self.running_reference_index = None
             self.run_started_at = 0.0
             if code == 0:
                 self.hydrate_stage_inputs(stage_key)
@@ -645,17 +747,27 @@ def terminate_process_tree(process: subprocess.Popen) -> None:
 
 
 def read_manifest(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
+    _source, _fields, rows = read_manifest_details(path)
+    return rows
+
+
+def read_manifest_details(path: Path) -> tuple[str, list[str], list[dict[str, str]]]:
+    if not path.exists() or not path.is_file():
+        return "", [], []
+    source_video = ""
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for line in handle:
-            if not line.startswith("#"):
-                return list(csv.DictReader([line, *handle.readlines()]))
-    return []
+            if line.startswith("#"):
+                if line.startswith("# source_video="):
+                    source_video = line.split("=", 1)[1].strip()
+                continue
+            reader = csv.DictReader([line, *handle.readlines()])
+            return source_video, list(reader.fieldnames or []), list(reader)
+    return source_video, [], []
 
 
 def manifest_source_video(path: Path) -> str:
-    if not path.exists():
+    if not path.exists() or not path.is_file():
         return ""
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for line in handle:
@@ -666,13 +778,22 @@ def manifest_source_video(path: Path) -> str:
     return ""
 
 
-def write_manifest(path: Path, rows: list[dict[str, str]]) -> None:
+def update_manifest_row(path: Path, index: int, values: dict[str, str]) -> None:
+    source_video, fieldnames, rows = read_manifest_details(path)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    for key in values:
+        if key not in fieldnames:
+            fieldnames.append(key)
+    rows[index].update(values)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["enabled", "end", "source_reference", "color_reference"], lineterminator="\n")
+        if source_video:
+            handle.write(f"# source_video={source_video}\n")
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: row.get(key, "") for key in writer.fieldnames})
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
@@ -729,18 +850,246 @@ def colorized_output_for_manifest(manifest_text: str) -> str:
     source_video = manifest_source_video(manifest)
     if source_video:
         source = resolve(source_video)
-        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source.name)}_colormnet_colorized.mp4")
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source.name)}_deepexemplar_colorized.mp4")
     if manifest_text:
         stem = safe_stem(Path(manifest_text).stem.replace("colorize_manifest_", "").replace("_shots_auto", ""))
-        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{stem}_colormnet_colorized.mp4")
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{stem}_deepexemplar_colorized.mp4")
     return ""
 
 
 def color_reference_outputs(manifest_text: str) -> list[str]:
     if not manifest_text:
         return []
-    rows = read_manifest(resolve(manifest_text))
+    manifest = resolve(manifest_text)
+    if not manifest.is_file():
+        return []
+    rows = read_manifest(manifest)
     return [row.get("color_reference", "") for row in rows if row.get("color_reference")]
+
+
+def shot_views(settings: dict[str, dict[str, str]]) -> dict[str, object]:
+    shots_manifest = manifest_for_outpainted(settings.get("shots", {}).get("outpainted_video", ""))
+    references_manifest = settings.get("references", {}).get("manifest", "")
+    colour_manifest = settings.get("colour", {}).get("manifest", "") or references_manifest
+    return {
+        "shots_manifest": shots_manifest,
+        "shots": shot_rows(shots_manifest),
+        "references_manifest": references_manifest,
+        "references": shot_rows(references_manifest),
+        "colour_manifest": colour_manifest,
+        "colour": shot_rows(colour_manifest),
+    }
+
+
+def shot_rows(manifest_text: str) -> list[dict[str, object]]:
+    if not manifest_text:
+        return []
+    path = resolve(manifest_text)
+    rows = read_manifest(path)
+    out: list[dict[str, object]] = []
+    start = 0.0
+    for index, row in enumerate(rows):
+        end = parse_time_seconds(row.get("end", "")) or start
+        selected = selected_seconds_from_reference(row.get("source_reference", "")) or ((start + end) / 2 if end > start else start)
+        selected = max(start, min(end, selected))
+        out.append(
+            {
+                "index": index,
+                "enabled": row.get("enabled", "true"),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration": round(max(0.0, end - start), 3),
+                "selected_time": round(selected, 3),
+                "start_label": format_timecode(start),
+                "end_label": format_timecode(end),
+                "selected_label": format_timecode(selected),
+                "source_reference": row.get("source_reference", ""),
+                "color_reference": row.get("color_reference", ""),
+                "source_reference_mtime": file_mtime(row.get("source_reference", "")),
+                "color_reference_mtime": file_mtime(row.get("color_reference", "")),
+                "prompt": row.get("prompt", ""),
+            }
+        )
+        start = end
+    return out
+
+
+def file_mtime(path_text: str) -> int:
+    if not path_text:
+        return 0
+    path = resolve(path_text)
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
+
+
+def parse_time_seconds(value: str) -> float:
+    value = str(value or "").strip()
+    if not value:
+        return 0.0
+    parts = value.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def selected_seconds_from_reference(path_text: str) -> float:
+    stem = Path(path_text).stem
+    parts = stem.split("_")
+    if len(parts) < 3 or parts[0] != "cut":
+        return 0.0
+    time_parts = parts[-1].split(".")
+    try:
+        if len(time_parts) >= 3:
+            seconds = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
+            if len(time_parts) > 3:
+                seconds += float("0." + "".join(time_parts[3:]))
+            return seconds
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
+def format_timecode(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+
+def reference_name_for_time(index: int, seconds: float) -> str:
+    return f"cut_{index:04d}_{format_timecode(seconds).replace(':', '.')}.png"
+
+
+def color_reference_for_source(source_reference: str) -> str:
+    source = resolve(source_reference)
+    try:
+        relative = source.relative_to(ROOT / "intermediate" / "outpainted_references")
+        return rel(ROOT / "intermediate" / "outpainted_references_color" / relative)
+    except ValueError:
+        return rel(source.with_name(source.stem + "_color" + source.suffix))
+
+
+def extract_reference_frame(manifest_text: str, index: int, seconds: float) -> dict[str, str]:
+    manifest = resolve(manifest_text)
+    source_video, _fields, rows = read_manifest_details(manifest)
+    if not source_video:
+        raise RuntimeError("Manifest does not record a source_video, so ARP cannot rescrub this shot.")
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    old_reference = rows[index].get("source_reference", "")
+    if old_reference:
+        folder = resolve(old_reference).parent
+    else:
+        source = resolve(source_video)
+        folder = ROOT / "intermediate" / "outpainted_references" / safe_stem(source.name)
+    new_source = folder / reference_name_for_time(index, seconds)
+    ffmpeg = local_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("Run install_windows.bat to install local FFmpeg for shot scrubbing.")
+    new_source.parent.mkdir(parents=True, exist_ok=True)
+    command = [ffmpeg, "-y", "-ss", f"{seconds:.3f}", "-i", str(resolve(source_video)), "-frames:v", "1", "-q:v", "2", str(new_source)]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
+    new_color = color_reference_for_source(rel(new_source))
+    update_manifest_row(manifest, index, {"source_reference": rel(new_source), "color_reference": new_color})
+    APP.log.append(f"Updated shot {index + 1} reference frame to {format_timecode(seconds)}: {rel(new_source)}")
+    return {"source_reference": rel(new_source), "color_reference": new_color}
+
+
+def preview_reference_frame(manifest_text: str, index: int, seconds: float) -> str:
+    manifest = resolve(manifest_text)
+    source_video, _fields, rows = read_manifest_details(manifest)
+    if not source_video:
+        raise RuntimeError("Manifest does not record a source_video, so ARP cannot preview this shot.")
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    source = resolve(source_video)
+    target_dir = PREVIEW_DIR / "shot_scrub" / safe_preview_name(manifest)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"shot_{index:04d}_{int(seconds * 1000):010d}.jpg"
+    if target.exists():
+        return rel(target)
+    ffmpeg = local_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("Run install_windows.bat to install local FFmpeg for shot previews.")
+    command = [ffmpeg, "-y", "-ss", f"{seconds:.3f}", "-i", str(source), "-frames:v", "1", "-q:v", "4", str(target)]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
+    return rel(target)
+
+
+def reference_regeneration_command(manifest_text: str, index: int) -> tuple[list[str], str]:
+    manifest = resolve(manifest_text)
+    _source_video, _fields, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    row = rows[index]
+    source = row.get("source_reference", "")
+    output = row.get("color_reference", "")
+    if not source or not output:
+        raise RuntimeError("Manifest row must have source_reference and color_reference.")
+    values = APP.settings.get("references", {})
+    config = current_config()
+    workflow = values.get("workflow") or default_qwen_workflow(config)
+    if not workflow:
+        raise RuntimeError("No Qwen Image Edit workflow found. Install/configure ComfyUI first.")
+    cmd = [
+        sys.executable,
+        "-u",
+        str(SCRIPTS / "generate_single_reference.py"),
+        "--source-image",
+        source,
+        "--output",
+        output,
+        "--workflow",
+        workflow,
+        "--comfy-url",
+        values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188"),
+        "--comfy-dir",
+        config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
+        "--comfy-output-root",
+        values.get("comfy_output_root") or str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output"),
+        "--model-backend",
+        values.get("model_backend", "gguf"),
+        "--gguf-model",
+        values.get("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf"),
+        "--prompt",
+        values.get("prompt", REFERENCE_PROMPT),
+        "--prompt-suffix",
+        values.get("prompt_suffix", REFERENCE_PROMPT_SUFFIX),
+        "--load-image-node-id",
+        values.get("load_image_node_id", "1"),
+        "--save-node-id",
+        values.get("save_node_id", "9"),
+        "--force",
+    ]
+    if values.get("prompt_node_id"):
+        cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
+    if row.get("prompt"):
+        cmd.extend(["--add-prompt", row["prompt"]])
+    return cmd, output
+
+
+def regenerate_reference_image(manifest_text: str, index: int) -> dict[str, str]:
+    cmd, output = reference_regeneration_command(manifest_text, index)
+    APP.log.append("> " + " ".join(cmd))
+    result = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in result.stdout.splitlines():
+        APP.log.append(line)
+    if result.returncode != 0:
+        raise RuntimeError(f"Reference regeneration failed with exit code {result.returncode}.")
+    APP.log.append(f"Regenerated colour reference for shot {index + 1}: {output}")
+    return {"color_reference": output}
 
 
 def source_previews(source_text: str) -> list[str]:
@@ -779,6 +1128,36 @@ def source_info(source_text: str) -> dict[str, str]:
             APP.log.append(f"Source info skipped; file was not found or is not a supported video: {source}")
         return {}
     return dict(source_info_cached(*signature))
+
+
+def source_monochrome(source_text: str) -> bool:
+    signature = source_signature(source_text)
+    if signature is None:
+        return True
+    return source_monochrome_cached(*signature)
+
+
+@lru_cache(maxsize=16)
+def source_monochrome_cached(source_path: str, size: int, mtime_ns: int) -> bool:
+    try:
+        from PIL import Image, ImageChops, ImageStat
+    except ModuleNotFoundError:
+        return True
+    previews = source_previews_cached(source_path, size, mtime_ns)
+    if not previews:
+        return True
+    scores = []
+    for preview_path in previews:
+        try:
+            image = Image.open(resolve(preview_path)).convert("RGB").resize((160, 90))
+            r, g, b = image.split()
+            rg = ImageStat.Stat(ImageChops.difference(r, g)).mean[0]
+            rb = ImageStat.Stat(ImageChops.difference(r, b)).mean[0]
+            gb = ImageStat.Stat(ImageChops.difference(g, b)).mean[0]
+            scores.append((rg + rb + gb) / 3)
+        except Exception:
+            continue
+    return (sum(scores) / max(1, len(scores))) < 2.5
 
 
 @lru_cache(maxsize=16)
@@ -1252,9 +1631,6 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/existing-outputs":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"paths": APP.existing_outputs(stage) if stage else []})
-        elif parsed.path == "/api/manifest":
-            path = resolve(parse_qs(parsed.query).get("path", [""])[0])
-            self.send_json({"rows": read_manifest(path)})
         elif parsed.path == "/api/comfy":
             url = parse_qs(parsed.query).get("url", ["http://127.0.0.1:8188"])[0].rstrip("/")
             try:
@@ -1266,6 +1642,13 @@ class Handler(BaseHTTPRequestHandler):
             path = resolve(parse_qs(parsed.query).get("path", [""])[0])
             text = path.read_text(encoding="utf-8", errors="replace")[-12000:] if path.exists() else ""
             self.send_json({"text": text})
+        elif parsed.path == "/api/shot-preview":
+            query = parse_qs(parsed.query)
+            try:
+                path = preview_reference_frame(query.get("manifest", [""])[0], int(query.get("index", ["0"])[0]), float(query.get("time", ["0"])[0]))
+                self.send_json({"ok": True, "path": path})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/media":
             self.send_media(resolve(unquote(parse_qs(parsed.query).get("path", [""])[0])))
         else:
@@ -1286,9 +1669,35 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/stop":
             APP.stop()
             self.send_json({"ok": True})
-        elif parsed.path == "/api/manifest":
-            write_manifest(resolve(str(data.get("path", ""))), data.get("rows", []))
-            self.send_json({"ok": True})
+        elif parsed.path == "/api/shot-scrub":
+            try:
+                result = extract_reference_frame(str(data.get("manifest", "")), int(data.get("index", 0)), float(data.get("time", 0)))
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                APP.log.append(f"Shot scrub failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/shot-prompt":
+            try:
+                update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"prompt": str(data.get("prompt", ""))})
+                self.send_json({"ok": True})
+            except Exception as exc:
+                APP.log.append(f"Shot prompt save failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/shot-enabled":
+            try:
+                enabled = "true" if data.get("enabled") else "false"
+                update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"enabled": enabled})
+                self.send_json({"ok": True})
+            except Exception as exc:
+                APP.log.append(f"Shot enabled save failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/reference-regenerate":
+            try:
+                ok, message = APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)))
+                self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
+            except Exception as exc:
+                APP.log.append(f"Reference regeneration failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:
                 selected = browse_path(str(data.get("kind", "file")), str(data.get("current", "")))
@@ -1369,9 +1778,11 @@ button{background:#26333b;color:var(--text);border:1px solid #43545f;border-radi
 .files{max-height:62vh;overflow:auto}.file{display:grid;grid-template-columns:74px 1fr;gap:10px;align-items:center;padding:8px;border-bottom:1px solid #27333a;cursor:pointer;color:#cfe0e5}.file:hover{background:#202a31}.file.no-thumb{display:block}.file-thumb{width:74px;aspect-ratio:16/9;object-fit:cover;background:#050607;border:1px solid var(--line);border-radius:5px}.file-path{word-break:break-word}.output-list{margin:10px 0 0;padding-left:18px;color:#c5d5da;font-size:12px;word-break:break-word}
 .preview img,.preview video{width:100%;max-height:62vh;object-fit:contain;background:#050607;border-radius:8px}.preview pre,pre.log{white-space:pre-wrap;background:#0b0e10;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:230px;overflow:auto}.log-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.log-heading h3{margin:0}.log-error{color:#ff8f8f}.log-warn{color:#ffd27d}.log-ok{color:#75d6b9}.actions{display:flex;gap:8px;align-items:center;margin:14px 0}.actions button{flex:0 0 auto}.phase-progress{margin:12px 0}.phase-progress progress{width:100%;height:18px}.phase-progress div{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:4px}
 .filmstrip{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}.filmstrip img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:#050607;border:1px solid var(--line)}
-.source-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:12px 0}.source-info div{background:#11181d;border:1px solid var(--line);border-radius:6px;padding:8px}.source-info span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.source-info strong{display:block;margin-top:2px;font-size:13px;word-break:break-word}
+.global-top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.support-link{color:#9db0b8;text-decoration:none;font-size:12px;border:1px solid var(--line);border-radius:6px;padding:6px 8px}.support-link:hover{color:var(--text);background:#202930}.source-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:12px 0}.source-info div{background:#11181d;border:1px solid var(--line);border-radius:6px;padding:8px}.source-info span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.source-info strong{display:block;margin-top:2px;font-size:13px;word-break:break-word}
 table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left}th{color:#b8cbd1;background:#202a31}.status-ready{color:#75d6b9}.status-waiting{color:var(--warn)}
-.hidden{display:none}.command{font-size:12px;color:#c5d5da;word-break:break-all}.manifest td input{border:0;border-radius:0;background:#11181d}
+.shot-page{display:grid;grid-template-columns:minmax(280px,360px) 1fr;gap:16px;align-items:start}.shot-list{display:grid;gap:12px}.shot-card{display:grid;grid-template-columns:120px minmax(220px,.8fr) minmax(220px,.8fr) 1fr;gap:12px;align-items:start;background:#11181d;border:1px solid var(--line);border-radius:8px;padding:10px}.shot-number{font-size:18px;font-weight:800}.shot-time{color:var(--muted);font-size:12px}.shot-card img{width:100%;aspect-ratio:16/9;object-fit:cover;background:#050607;border:1px solid var(--line);border-radius:6px}.shot-card textarea{min-height:88px;resize:vertical}.shot-card input[type=range]{padding:0}.shot-card label input[type=checkbox]{width:auto;margin-right:6px}.shot-tools{display:flex;gap:8px;margin-top:8px;align-items:center}.shot-tools button{flex:0 0 auto}.shot-empty{color:var(--muted)}.mini-progress{margin-top:8px;color:var(--muted);font-size:12px}.mini-progress progress{width:100%;height:12px}.spinner{width:14px;height:14px;border:2px solid #43545f;border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.editor-page{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:16px;align-items:start}.editor-viewer video{width:100%;max-height:64vh;background:#050607;border:1px solid var(--line);border-radius:8px}.timeline{margin-top:12px;background:#0b0e10;border:1px solid var(--line);border-radius:8px;padding:10px}.timeline input[type=range]{padding:0}.track{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center;margin:8px 0}.track-name{color:#b8cbd1;font-size:12px}.track-bar{height:18px;border:1px solid #3b4b55;border-radius:4px;background:#223038;position:relative;overflow:hidden}.track-bar::after{content:"";display:block;height:100%;width:100%;opacity:.85}.track-outpaint::after{background:#52636d}.track-original::after{background:#d6d6d6}.track-colour::after{background:#2d8f7d}.layer-grid{display:grid;gap:8px}.layer-item{background:#11181d;border:1px solid var(--line);border-radius:6px;padding:8px}.layer-item span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.layer-item strong{display:block;word-break:break-word}.editor-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.editor-controls label{margin-top:0}
+.hidden{display:none}.command{font-size:12px;color:#c5d5da;word-break:break-all}
 </style>
 </head>
 <body>
@@ -1382,31 +1793,53 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 let state=null, active='global', selected={};
 const media=p=>'/media?path='+encodeURIComponent(p);
 async function api(path, opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});return await r.json();}
-async function refresh(){const follow=logsNearBottom();state=await api('/api/state');pruneSelected();document.getElementById('root').textContent=state.root+(state.running?'  |  Running: '+state.running_stage:'');drawTabs();draw(follow);}
-function drawTabs(){const tabs=['global',...state.stages.map(s=>s.key),'manifest','comfy'];const names={global:'Global',manifest:'Manifests',comfy:'ComfyUI'};document.getElementById('tabs').innerHTML=tabs.map(t=>`<button class="tab ${active===t?'active':''}" onclick="active='${t}';draw()">${names[t]||stage(t).title}</button>`).join('');}
+async function refresh(){const snap=captureScrollState(),oldLog=state?state.log:'';state=await api('/api/state');pruneSelected();if(!availableTabs().includes(active))active='global';document.getElementById('root').textContent=state.root+(state.running?'  |  Running: '+state.running_stage:'');drawTabs();draw(false);restoreScrollState(snap,{followLogs:snap.logsAtBottom,logChanged:state.log!==oldLog});}
+function availableTabs(){return ['global',...state.stages.map(s=>s.key),'comfy']}
+function drawTabs(){const tabs=availableTabs();const names={global:'Global',comfy:'ComfyUI'};document.getElementById('tabs').innerHTML=tabs.map(t=>`<button class="tab ${active===t?'active':''}" onclick="active='${t}';draw()">${names[t]||stage(t).title}</button>`).join('');}
 function stage(k){return state.stages.find(s=>s.key===k)}
 function settings(k){return state.settings[k]||{}}
 function pruneSelected(){if(!state||!state.stages)return;for(const st of state.stages){if(selected[st.key]&&!st.files.some(f=>f.path===selected[st.key]))delete selected[st.key]}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function draw(followLogs=false){if(active==='global')return drawGlobal(followLogs); if(active==='manifest')return drawManifest(); if(active==='comfy')return drawComfy(); return drawStage(stage(active),followLogs);}
-function drawGlobal(followLogs=false){const src=(state.settings.global&&state.settings.global.source)||'';const thumbs=(state.source_previews||[]).map(p=>`<img src="${media(p)}" alt="">`).join('');const info=sourceInfoHtml(state.source_info||{});const gp=(state.phase_progress&&state.phase_progress.global)||{percent:0,label:'Waiting'};document.getElementById('app').innerHTML=`<section class="card"><img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline"><p class="hero">AI Remaster Pipeline</p><p>Choose the source material, then run or inspect each stage.</p><label>Source material</label><div class="field-row"><input id="globalSource" value="${esc(src)}"><button type="button" onclick="browseGlobalSource()">Browse</button></div>${thumbs?`<div class="filmstrip">${thumbs}</div>`:''}${info}${progressHtml(gp.percent,gp.label)}<div class="actions"><button class="primary" onclick="runAll()">Run Whole Remaster</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><table><tr><th>Stage</th><th>Status</th><th>Progress</th><th>Latest output</th></tr>${state.progress.map(p=>{const sp=stageProgressByTitle(p.stage);return `<tr><td>${p.stage}</td><td class="status-${p.status.toLowerCase()}">${p.status}</td><td>${progressHtml(sp.percent,sp.label)}</td><td>${esc(p.latest)}</td></tr>`}).join('')}</table>${runLogHtml()}</section>`;document.getElementById('globalSource').addEventListener('change',saveGlobal);if(followLogs)scrollLogsToBottom()}
+function draw(followLogs=false){if(active==='global')return drawGlobal(followLogs); if(active==='comfy')return drawComfy(); if(active==='shots')return drawShots(followLogs); if(active==='references')return drawReferences(followLogs); if(active==='colour')return drawColour(followLogs); if(active==='recomp')return drawRecomp(followLogs); return drawStage(stage(active),followLogs);}
+function drawGlobal(followLogs=false){const src=(state.settings.global&&state.settings.global.source)||'',colorize=(state.settings.global&&state.settings.global.colorize)!=='false';const thumbs=(state.source_previews||[]).map(p=>`<img src="${media(p)}" alt="">`).join('');const info=sourceInfoHtml(state.source_info||{});const gp=(state.phase_progress&&state.phase_progress.global)||{percent:0,label:'Waiting'};const mono=state.source_monochrome?'Source looks black and white':'Source appears to contain colour';document.getElementById('app').innerHTML=`<section class="card"><div class="global-top"><div><p class="hero">AI Remaster Pipeline</p><p>Choose the source material, then run or inspect each stage.</p></div><a class="support-link" href="https://buymeacoffee.com/davidaddis" target="_blank" rel="noreferrer">Buy me a coffee</a></div><img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline"><label>Source material</label><div class="field-row"><input id="globalSource" value="${esc(src)}"><button type="button" onclick="browseGlobalSource()">Browse</button></div><div class="checks"><label><input id="globalColorize" type="checkbox" ${colorize?'checked':''}>Colorize</label><span class="shot-time">${esc(mono)}</span></div>${thumbs?`<div class="filmstrip">${thumbs}</div>`:''}${info}${progressHtml(gp.percent,gp.label)}<div class="actions"><button class="primary" onclick="runAll()">Run Whole Remaster</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><table><tr><th>Stage</th><th>Status</th><th>Progress</th><th>Latest output</th></tr>${state.progress.map(p=>{const sp=stageProgressByTitle(p.stage);return `<tr><td>${p.stage}</td><td class="status-${p.status.toLowerCase()}">${p.status}</td><td>${progressHtml(sp.percent,sp.label)}</td><td>${esc(p.latest)}</td></tr>`}).join('')}</table>${runLogHtml()}</section>`;document.getElementById('globalSource').addEventListener('change',saveGlobal);document.getElementById('globalColorize').addEventListener('change',saveGlobalColorize);if(followLogs)scrollLogsToBottom()}
 function sourceInfoHtml(info){const labels={resolution:'Resolution',aspect:'Aspect',duration:'Duration',frame_rate:'Frame rate',frames:'Frames',video_codec:'Video codec',pixel_format:'Pixel format',colour:'Colour',audio:'Audio',container:'Container',overall_bitrate:'Overall bitrate',video_bitrate:'Video bitrate',size:'File size',codec_note:'Note'};const keys=['resolution','aspect','duration','frame_rate','frames','video_codec','pixel_format','colour','audio','container','overall_bitrate','video_bitrate','size','codec_note'];const items=keys.filter(k=>info[k]).map(k=>`<div><span>${labels[k]||k}</span><strong>${esc(info[k])}</strong></div>`).join('');return items?`<div class="source-info">${items}</div>`:''}
 function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}if(kind.startsWith('range:')){const [min,max,step]=kind.slice(6).split('|');return `<label>${label}: <span id="${key}Value">${esc(v)}</span></label><input data-field="${key}" data-kind="${kind}" type="range" min="${esc(min)}" max="${esc(max)}" step="${esc(step||'1')}" value="${esc(v)}" oninput="document.getElementById('${key}Value').textContent=this.value">`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
 function aspectPreviewHtml(st){if(st.key!=='outpaint')return '';const img=state.aspect_preview;const outputs=(state.expected_outputs&&state.expected_outputs.outpaint)||[];return `<h3>Target Preview</h3>${img?`<img src="${media(img)}" alt="Target aspect preview">`:'<p>Choose source material on the Global tab to preview the target frame.</p>'}${outputs.length?`<h3>Output Path</h3><ul class="output-list">${outputs.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}`}
 function fileRow(st,f){const thumb=f.preview?`<img class="file-thumb" src="${media(f.preview)}" alt="">`:'';return `<div class="file ${thumb?'':'no-thumb'}" onclick="selected['${st.key}']='${esc(f.path)}';draw()">${thumb}<div class="file-path">${esc(f.path)}</div></div>`}
 function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];const sp=stageProgress(st.key);document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('${st.key}')" ${state.running?'disabled':''}>Run ${st.title}</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key);if(followLogs)scrollLogsToBottom()}
+function drawShots(followLogs=false){const st=stage('shots'),s=settings('shots'),expected=(state.expected_outputs&&state.expected_outputs.shots)||[],sp=stageProgress('shots');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('shots')" ${state.running?'disabled':''}>Run Shot Detection</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>Shots</h2>${shotCards('shots')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('shots',true)));showCommand('shots');if(followLogs)scrollLogsToBottom()}
+function drawReferences(followLogs=false){const st=stage('references'),s=settings('references'),expected=(state.expected_outputs&&state.expected_outputs.references)||[],sp=stageProgress('references');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.slice(0,8).map(p=>`<li>${esc(p)}</li>`).join('')}${expected.length>8?`<li>${expected.length-8} more...</li>`:''}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('references')" ${state.running?'disabled':''}>Run Reference Generation</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>References</h2>${shotCards('references')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('references',true)));showCommand('references');if(followLogs)scrollLogsToBottom()}
+function drawColour(followLogs=false){const st=stage('colour'),s=settings('colour'),expected=(state.expected_outputs&&state.expected_outputs.colour)||[],sp=stageProgress('colour');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('colour')" ${state.running?'disabled':''}>Run Colourisation</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>Shot Segments</h2>${shotCards('colour')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('colour',true)));showCommand('colour');if(followLogs)scrollLogsToBottom()}
+function drawRecomp(followLogs=false){const st=stage('recomp'),s=settings('recomp'),expected=(state.expected_outputs&&state.expected_outputs.recomp)||[],sp=stageProgress('recomp'),output=expected[0]||s.output||'',previewPath=output||s.colorized_video||s.outpainted_video||s.source||'';const pathFields=['outpainted_video','source','colorized_video'];const controlFields=['feather_pixels','saturation','temperature','color_opacity','encoder'];document.getElementById('app').innerHTML=`<div class="editor-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}<div class="layer-grid"><div class="layer-item"><span>Bottom layer</span><strong>${esc(s.outpainted_video||'Outpainted video not set')}</strong></div><div class="layer-item"><span>Middle layer</span><strong>${esc(s.source||'Original source not set')}</strong></div><div class="layer-item"><span>Top layer - Color blend</span><strong>${esc(s.colorized_video||'Colourised video not set')}</strong></div></div>${pathFields.map(k=>fieldHtml(st,st.fields.find(f=>f[0]===k))).join('')}<h3>Blend Parameters</h3><div class="editor-controls">${controlFields.map(k=>`<div>${fieldHtml(st,st.fields.find(f=>f[0]===k))}</div>`).join('')}</div>${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('recomp')" ${state.running?'disabled':''}>Run Recomposition</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card editor-viewer"><h2>Output Preview</h2>${videoEditorHtml(previewPath)}<div class="timeline"><input id="recompScrub" type="range" min="0" max="1000" value="0" oninput="scrubEditorVideo(this.value)"><div class="track"><div class="track-name">Outpainted</div><div class="track-bar track-outpaint"></div></div><div class="track"><div class="track-name">Original</div><div class="track-bar track-original"></div></div><div class="track"><div class="track-name">Colour</div><div class="track-bar track-colour"></div></div></div></section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('recomp',true)));wireEditorVideo();showCommand('recomp');if(followLogs)scrollLogsToBottom()}
+function videoEditorHtml(path){return path?`<video id="recompVideo" src="${media(path)}" controls></video>`:'<p class="shot-empty">Run recomposition to preview the final movie, or set one of the layer videos.</p>'}
+function wireEditorVideo(){const v=document.getElementById('recompVideo'),s=document.getElementById('recompScrub');if(!v||!s)return;v.addEventListener('loadedmetadata',()=>{s.value=0});v.addEventListener('timeupdate',()=>{if(v.duration&&!s.matches(':active'))s.value=Math.round((v.currentTime/v.duration)*1000)})}
+function scrubEditorVideo(value){const v=document.getElementById('recompVideo');if(v&&v.duration)v.currentTime=(Number(value)||0)/1000*v.duration}
+function shotCards(mode){const view=state.shot_views||{},rows=view[mode]||[],manifest=view[mode+'_manifest']||'';if(!rows.length)return `<p class="shot-empty">No shot manifest yet. Run Shot Detection first.</p>`;return `<div class="shot-list">${rows.map(row=>shotCard(mode,manifest,row)).join('')}</div>`}
+function shotCard(mode,manifest,row){const src=row.source_reference||'',col=row.color_reference||'',idx=row.index,slider=`shotSlider_${mode}_${idx}`,label=`shotLabel_${mode}_${idx}`,img=`shotImg_${mode}_${idx}`;const canScrub=mode==='shots';const enabled=String(row.enabled||'true').toLowerCase()!=='false';const regen=mode==='references'&&state.running_reference&&state.running_reference.index===idx&&state.running_reference.manifest===manifest;const rp=stageProgress('references');const srcUrl=src?media(src)+'&t='+(row.source_reference_mtime||0):'';const colUrl=col?media(col)+'&t='+(row.color_reference_mtime||0):'';const regenProgress=regen?`<div class="mini-progress"><div>${esc(rp.label||'Regenerating reference')}</div><progress value="${Math.max(5,Math.min(100,Number(rp.percent)||5))}" max="100"></progress></div>`:'';const prompt=mode==='references'?`<label>Shot prompt</label><textarea data-shot-prompt="${idx}" onblur="saveShotPrompt('${esc(manifest)}',${idx},this.value)" placeholder="Optional extra direction for this shot">${esc(row.prompt||'')}</textarea><div class="shot-tools"><button type="button" onclick="regenerateReference('${esc(manifest)}',${idx})" ${state.running?'disabled':''}>${regen?'Regenerating...':'Regenerate Reference'}</button>${regen?'<span class="spinner" aria-label="In progress"></span>':''}</div>${regenProgress}`:'';const color=(mode==='references'||mode==='colour')?`<div><label>${mode==='colour'?'Colour reference':'Qwen colour reference'}</label>${col?`<img src="${colUrl}" alt="">`:'<p class="shot-empty">Not generated yet.</p>'}</div>`:'';const status=mode==='colour'?`<div><label>Segment status</label><p class="shot-empty">${enabled?(col?'Ready for Deep Exemplar video colourisation':'Missing colour reference'):'Disabled in manifest'}</p><p class="shot-time">Deep Exemplar uses this reference from ${esc(row.start_label)} to ${esc(row.end_label)}.</p></div>`:'';return `<article class="shot-card"><div><div class="shot-number">Shot ${idx+1}</div><div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div><label><input type="checkbox" ${enabled?'checked':''} onchange="saveShotEnabled('${esc(manifest)}',${idx},this.checked)"> Use shot</label><label>${canScrub?'Screenshot time':'Reference time'}</label><input id="${slider}" type="range" min="${row.start}" max="${row.end}" step="0.041" value="${row.selected_time}" ${canScrub?'':"disabled"} oninput="updateShotPreview('${esc(manifest)}',${idx},this.value,'${img}','${label}')"><div class="shot-time" id="${label}">${esc(row.selected_label)}</div>${canScrub?`<div class="shot-tools"><button type="button" onclick="scrubShot('${esc(manifest)}',${idx},document.getElementById('${slider}').value)">Use Frame</button></div>`:''}</div><div><label>B&W screenshot</label>${src?`<img id="${img}" src="${srcUrl}" alt="">`:'<p class="shot-empty">No screenshot yet.</p>'}</div>${color}<div>${prompt}${status}</div></article>`}
+function formatSeconds(value){const total=Math.max(0,Number(value)||0),h=Math.floor(total/3600),m=Math.floor((total%3600)/60),s=(total%60).toFixed(3).padStart(6,'0');return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${s}`}
+async function scrubShot(manifest,index,time){const snap=captureScrollState();const r=await api('/api/shot-scrub',{method:'POST',body:JSON.stringify({manifest,index,time})});if(!r.ok){alert(r.error||'Could not update shot frame');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
+async function saveShotPrompt(manifest,index,prompt){const r=await api('/api/shot-prompt',{method:'POST',body:JSON.stringify({manifest,index,prompt})});if(!r.ok){alert(r.error||'Could not save prompt');return}state=await api('/api/state')}
+async function saveShotEnabled(manifest,index,enabled){const snap=captureScrollState();const r=await api('/api/shot-enabled',{method:'POST',body:JSON.stringify({manifest,index,enabled})});if(!r.ok){alert(r.error||'Could not save shot setting');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
+const previewTimers={};
+function updateShotPreview(manifest,index,time,imgId,labelId){document.getElementById(labelId).textContent=formatSeconds(time);clearTimeout(previewTimers[imgId]);previewTimers[imgId]=setTimeout(async()=>{const r=await api('/api/shot-preview?manifest='+encodeURIComponent(manifest)+'&index='+index+'&time='+encodeURIComponent(time));if(r.ok&&r.path){const img=document.getElementById(imgId);if(img)img.src=media(r.path)+'&t='+Date.now()}},180)}
+async function regenerateReference(manifest,index){const snap=captureScrollState(),oldLog=state?state.log:'';const r=await api('/api/reference-regenerate',{method:'POST',body:JSON.stringify({manifest,index})});if(!r.ok){alert(r.error||'Could not regenerate reference');return}state=r.state||await api('/api/state');draw(false);restoreScrollState(snap,{followLogs:snap.logsAtBottom,logChanged:state.log!==oldLog});setTimeout(refresh,1000)}
 function stageProgress(key){return ((state.phase_progress&&state.phase_progress.stages)||[]).find(p=>p.key===key)||{percent:0,label:'Waiting'}}
 function stageProgressByTitle(title){return ((state.phase_progress&&state.phase_progress.stages)||[]).find(p=>p.stage===title)||{percent:0,label:'Waiting'}}
 function progressHtml(percent,label){const p=Math.max(0,Math.min(100,Number(percent)||0));return `<div class="phase-progress"><div><span>${esc(label||'Waiting')}</span><span>${p}%</span></div><progress value="${p}" max="100"></progress></div>`}
 function logsNearBottom(){const logs=[...document.querySelectorAll('pre.log')];return !logs.length||logs.some(el=>el.scrollHeight-el.scrollTop-el.clientHeight<32)}
 function scrollLogsToBottom(){document.querySelectorAll('pre.log').forEach(el=>{el.scrollTop=el.scrollHeight})}
+function scrollableElements(){return [...document.querySelectorAll('.files, pre.log')]}
+function scrollElementKey(el,index){if(el.id)return '#'+el.id;if(el.classList.contains('files'))return 'files:'+index;if(el.classList.contains('log'))return 'log:'+index;return 'scroll:'+index}
+function captureScrollState(){const entries=scrollableElements().map((el,index)=>({key:scrollElementKey(el,index),top:el.scrollTop,left:el.scrollLeft}));return {windowX:window.scrollX,windowY:window.scrollY,logsAtBottom:logsNearBottom(),entries}}
+function restoreScrollState(snap,{followLogs=false,logChanged=false}={}){if(!snap)return;const byKey=new Map(snap.entries.map(item=>[item.key,item]));scrollableElements().forEach((el,index)=>{const saved=byKey.get(scrollElementKey(el,index));if(saved){el.scrollTop=saved.top;el.scrollLeft=saved.left}});window.scrollTo(snap.windowX||0,snap.windowY||0);if(followLogs&&logChanged)scrollLogsToBottom()}
 function runLogHtml(){return `<div class="log-heading"><h3>Run Log</h3><button type="button" onclick="copyRunLog()">Copy Log</button></div><pre class="log">${logHtml(state.log)}</pre>`}
 function logHtml(text){return String(text||'').split('\n').map(line=>`<span class="${logClass(line)}">${esc(line)}</span>`).join('\n')}
 function logClass(line){const lower=String(line).toLowerCase();if(/traceback|runtimeerror|exception|error|failed|refused|exit code [1-9]|filenotfound/.test(lower))return 'log-error';if(/warning|skipping|timed out/.test(lower))return 'log-warn';if(/ready|reuse|wrote|finished with exit code 0|started/.test(lower))return 'log-ok';return ''}
 async function copyRunLog(){const text=state.log||'';try{await navigator.clipboard.writeText(text)}catch{const area=document.createElement('textarea');area.value=text;document.body.appendChild(area);area.select();document.execCommand('copy');area.remove()}}
 function preview(p){if(!p)return '<p>Select an image, video, manifest, workflow, or log file.</p>';const ext=p.split('.').pop().toLowerCase();if(['png','jpg','jpeg','webp','tif','tiff'].includes(ext))return `<img src="${media(p)}">`;if(['mp4','mov','mkv','avi','webm','m4v'].includes(ext))return `<video src="${media(p)}" controls></video>`;return `<pre id="textPreview">Text preview opens via the browser media endpoint.</pre><p><a href="${media(p)}" target="_blank">Open file</a></p>`}
-async function saveStage(k,redraw=false){const values={};document.querySelectorAll('[data-field]').forEach(el=>{values[el.dataset.field]=el.type==='checkbox'?String(el.checked):el.value});await api('/api/settings',{method:'POST',body:JSON.stringify({stage:k,values})});state=await api('/api/state');pruneSelected();if(redraw)draw();showCommand(k)}
-async function saveGlobal(){await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{source:document.getElementById('globalSource').value}})});selected={};state=await api('/api/state');pruneSelected();draw()}
+async function saveStage(k,redraw=false){const snap=captureScrollState();const values={};document.querySelectorAll('[data-field]').forEach(el=>{values[el.dataset.field]=el.type==='checkbox'?String(el.checked):el.value});await api('/api/settings',{method:'POST',body:JSON.stringify({stage:k,values})});state=await api('/api/state');pruneSelected();if(redraw){draw(false);restoreScrollState(snap)}showCommand(k)}
+async function saveGlobal(){await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{source:document.getElementById('globalSource').value}})});selected={};state=await api('/api/state');pruneSelected();if(!availableTabs().includes(active))active='global';drawTabs();draw()}
+async function saveGlobalColorize(){const snap=captureScrollState();await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{colorize:String(document.getElementById('globalColorize').checked)}})});state=await api('/api/state');pruneSelected();if(!availableTabs().includes(active))active='global';drawTabs();draw(false);restoreScrollState(snap)}
 async function browseGlobalSource(){const el=document.getElementById('globalSource');const r=await api('/api/browse-global-source',{method:'POST',body:JSON.stringify({current:el.value})});if(!r.ok){alert(r.error||'Browse failed');return}if(r.path){selected={};state=r.state;pruneSelected();draw()}else{await refresh()}}
 async function browseField(stageKey,fieldKey,kind){const el=document.querySelector(`[data-field="${fieldKey}"]`);const r=await api('/api/browse',{method:'POST',body:JSON.stringify({kind,current:el.value})});if(!r.ok){alert(r.error||'Browse failed');return}if(r.path){el.value=r.path;await saveStage(stageKey)}}
 async function showCommand(k){const r=await api('/api/command?stage='+encodeURIComponent(k));const el=document.getElementById('cmd');if(el)el.textContent=r.command.join(' ')}
@@ -1414,9 +1847,6 @@ async function confirmOverwrite(k){const force=(settings(k).force==='true');if(!
 async function runStage(k){await saveStage(k);if(!(await confirmOverwrite(k)))return;const r=await api('/api/run',{method:'POST',body:JSON.stringify({stage:k})});if(!r.ok)alert(r.message);setTimeout(refresh,500)}
 async function runAll(){for(const st of state.stages){if(!(await confirmOverwrite(st.key)))return}const r=await api('/api/run',{method:'POST',body:JSON.stringify({all:true})});if(!r.ok)alert(r.message);setTimeout(refresh,500)}
 async function stopRun(){await api('/api/stop',{method:'POST',body:'{}'});refresh()}
-function drawManifest(){document.getElementById('app').innerHTML=`<section class="card"><h2>Manifest Editor</h2><div class="row"><input id="manifestPath" placeholder="manifests/references/colorize_manifest_clip_shots_auto.csv"><button onclick="loadManifest()">Load</button><button onclick="saveManifest()">Save</button></div><div id="manifestRows"></div></section>`}
-async function loadManifest(){const path=document.getElementById('manifestPath').value;const r=await api('/api/manifest?path='+encodeURIComponent(path));document.getElementById('manifestRows').innerHTML=`<table class="manifest"><tr><th>enabled</th><th>end</th><th>source_reference</th><th>color_reference</th></tr>${r.rows.map(row=>`<tr>${['enabled','end','source_reference','color_reference'].map(k=>`<td><input value="${esc(row[k]||'')}" data-col="${k}"></td>`).join('')}</tr>`).join('')}</table>`}
-async function saveManifest(){const path=document.getElementById('manifestPath').value;const rows=[...document.querySelectorAll('.manifest tr')].slice(1).map(tr=>{const row={};tr.querySelectorAll('input').forEach(i=>row[i.dataset.col]=i.value);return row});await api('/api/manifest',{method:'POST',body:JSON.stringify({path,rows})});alert('Manifest saved.')}
 function drawComfy(){document.getElementById('app').innerHTML=`<section class="card"><h2>ComfyUI</h2><div class="row"><input id="comfyUrl" value="http://127.0.0.1:8188"><button onclick="loadComfy()">Refresh Queue</button></div><pre class="log" id="queue"></pre><h3>Log file</h3><div class="row"><input id="comfyLog" placeholder="path/to/comfy.log"><button onclick="loadLogFile()">Load</button></div><pre class="log" id="comfyLogText"></pre></section>`}
 async function loadComfy(){const r=await api('/api/comfy?url='+encodeURIComponent(document.getElementById('comfyUrl').value));document.getElementById('queue').textContent=r.ok?JSON.stringify(r.queue,null,2):r.error}
 async function loadLogFile(){const r=await api('/api/logfile?path='+encodeURIComponent(document.getElementById('comfyLog').value));document.getElementById('comfyLogText').textContent=r.text}

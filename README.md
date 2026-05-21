@@ -20,7 +20,7 @@ intermediate/outpaint_prepared/        Gamma/black-lifted 16:9 clips prepared fo
 intermediate/outpainted/                 Restored widescreen/outpainted clips from ComfyUI LTX
 intermediate/outpainted_references/      B&W source reference stills selected from cuts
 intermediate/outpainted_references_color/ Qwen/Comfy colorized reference stills
-intermediate/outpainted_colorized/       Deep Exemplar or ColorMNet colorized video chunks
+intermediate/outpainted_colorized/       Deep Exemplar colorized video chunks
 manifests/references/                    Shot/reference manifests
 manifests/colorize/                      Video colorization manifests if you keep them separate
 output/reassembled/                      Final reassembled/composited masters
@@ -100,8 +100,8 @@ qwen_colorize_references.bat ^
   --load-image-node-id 1 ^
   --prompt-node-id 2 ^
   --save-node-id 9 ^
-  --prompt "Transform this black-and-white frame into a clean modern full-colour animation production still. Keep the exact drawing, line art, shapes, and composition. Use vivid but tasteful contemporary cartoon colours as if the same scene had been made today with modern colour cameras and animation paint. Do not use sepia, monochrome tinting, hand-tinted antique colours, washed-out beige, or archival restoration grading." ^
-  --prompt-suffix "White gloves and faces should stay clean and bright, black ink areas should stay deep black, and props/backgrounds should receive distinct natural colours. Preserve lighting and film grain while making the colour read as genuine full colour, not a tint."
+  --prompt "Colorize this image. Preserve the drawing and composition. Use clean modern cartoon colours, not sepia. Do not add text or new objects." ^
+  --prompt-suffix "Keep black ink deep, whites clean, and props/backgrounds naturally coloured."
 ```
 
 The exact node IDs depend on your workflow. For normal exported ComfyUI workflows, widget selectors are usually numeric indexes like `0`; for API-format workflows, they can be input names. If ComfyUI is not under `tools\comfyui`, add `--comfy-output-root D:\dtaddis\ComfyUI\output` or wherever your Comfy output folder lives. The script patches the input image, prompt, and save prefix, then copies ComfyUI's result to the `color_reference` path in the manifest.
@@ -111,7 +111,7 @@ The exact node IDs depend on your workflow. For normal exported ComfyUI workflow
 The repository provides a lightweight wrapper for the reference-video colorization runner rather than hard-coding one person's ComfyUI graph:
 
 ```bat
-colorize_video.bat --manifest manifests\references\colorize_manifest_clip_shots_auto.csv --method DeepExemplar
+colorize_video.bat --manifest manifests\references\colorize_manifest_clip_shots_auto.csv
 ```
 
 By default it looks for:
@@ -205,7 +205,7 @@ install_windows.bat -ComfyDir D:\somewhere\ComfyUI
 install_windows.bat -NonInteractive
 ```
 
-Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, ComfyUI-GGUF, and Deep Exemplar / ColorMNet reference colorization nodes.
+Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, ComfyUI-GGUF, and Deep Exemplar reference colorization nodes.
 
 Models and LoRAs are downloaded on demand when their pipeline stages first need them:
 
@@ -213,9 +213,9 @@ Models and LoRAs are downloaded on demand when their pipeline stages first need 
 - LTX 2.3 FP8 checkpoint for ComfyUI's LTX text/audio loader support.
 - LTX 2.3 text encoder, video VAE, and audio VAE.
 - LTX 2.3 outpainting IC-LoRA.
-- Qwen Image Edit 2509 FP8 diffusion model.
+- Qwen Image Edit 2511 GGUF Q4_K_M diffusion model.
 - Qwen image text encoder and VAE.
-- Qwen Image Edit Lightning 4-step LoRA.
+- Qwen Image Edit 2511 Lightning 4-step LoRA.
 
 Useful installer options:
 
@@ -231,7 +231,7 @@ Model downloads are huge and resumable. By default they happen on demand; pass `
 The installer places FFmpeg and ffprobe under `.cache/tools/ffmpeg`; command-line scripts can still use a system FFmpeg from PATH or an explicit `--ffmpeg` where supported.
 ## Licensing Notes
 
-Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, ColorMNet, or any other model weights.
+Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, or any other model weights.
 ## Qwen Continuity Lessons
 
 The Qwen still-colourisation stage now follows the lessons from the HotB restoration work: use Qwen as a single-image edit, do not pass multiple reference images directly, and use text descriptions for continuity instead. `--add-prompt` is appended last, and `--print-final-prompt` shows exactly what the workflow receives.
@@ -247,5 +247,5 @@ Single still repair:
 ```bat
 generate_single_reference.bat --source-image intermediate\outpainted_references\clip\cut_0014.png --output intermediate\outpainted_references_color\clip\cut_0014.png --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --add-prompt "brown hair, no added text"
 ```
-Keep Qwen prompts direct and visual. ARP's default is intentionally not a "period restoration" prompt: it asks for modern full-colour animation and explicitly rejects sepia, monochrome tinting, and antique hand-colour grading. The Qwen runner prints the exact prompt for each queued edit and clamps local continuity descriptions with `--reference-description-max-chars`.
+Keep Qwen prompts direct and visual. ARP's default starts with "Colorize this image" and stays short, because Qwen Image Edit tends to follow concise image-edit instructions better than long restoration briefs. The GUI also lets you add per-shot prompt notes from the Reference Generation tab.
 

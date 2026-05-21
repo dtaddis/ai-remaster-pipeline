@@ -90,7 +90,7 @@ def copy_to_comfy_input(path: Path, comfy_dir: Path, subfolder: str) -> str:
 
 
 def default_output(source_video: Path) -> Path:
-    return ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source_video.name)}_colormnet_colorized.mp4"
+    return ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source_video.name)}_deepexemplar_colorized.mp4"
 
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path) -> dict[str, Any]:
@@ -101,9 +101,11 @@ def signature(args: argparse.Namespace, manifest: Path, source_video: Path) -> d
         "manifest_fingerprint": file_fingerprint(manifest),
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
-        "memory_mode": args.memory_mode,
-        "feature_encoder": args.feature_encoder,
-        "use_fp16": args.use_fp16,
+        "method": "DeepExemplar",
+        "frame_propagate": args.frame_propagate,
+        "use_half_resolution": args.use_half_resolution,
+        "use_torch_compile": args.use_torch_compile,
+        "use_sage_attention": args.use_sage_attention,
     }
 
 
@@ -146,16 +148,16 @@ def build_prompt(
         },
         "2": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
         "3": {
-            "class_type": "ColorMNetVideo",
+            "class_type": "DeepExColorVideoNode",
             "inputs": {
                 "video_frames": ["1", 0],
                 "reference_image": ["2", 0],
+                "frame_propagate": args.frame_propagate,
+                "use_half_resolution": args.use_half_resolution,
                 "target_width": width,
                 "target_height": height,
-                "memory_mode": args.memory_mode,
-                "feature_encoder": args.feature_encoder,
-                "use_fp16": args.use_fp16,
-                "use_torch_compile": False,
+                "use_torch_compile": args.use_torch_compile,
+                "use_sage_attention": args.use_sage_attention,
             },
         },
         "4": {
@@ -197,16 +199,17 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
-    parser = argparse.ArgumentParser(description="Colorize outpainted video shots with ColorMNet in ComfyUI.")
+    parser = argparse.ArgumentParser(description="Colorize outpainted video shots with Deep Exemplar in ComfyUI.")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--source-video", help="Override the # source_video from the manifest.")
     parser.add_argument("--output")
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     parser.add_argument("--comfy-output-root", default="")
-    parser.add_argument("--memory-mode", choices=["balanced", "low_memory", "high_quality"], default="low_memory")
-    parser.add_argument("--feature-encoder", choices=["resnet50", "vgg19", "dinov2_vits", "dinov2_vitb", "dinov2_vitl", "clip_vitb"], default="resnet50")
-    parser.add_argument("--no-fp16", dest="use_fp16", action="store_false", default=True)
+    parser.add_argument("--frame-propagate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-half-resolution", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use-sage-attention", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--video-format", default="video/h264-mp4")
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--poll-seconds", type=float, default=2.0)

@@ -149,8 +149,8 @@ def build_rows(args,source_path,info,shots):
 def write_manifest(path,source_path,rows,info):
     path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
     with tmp.open('w',encoding='utf-8',newline='') as h:
-        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','end','source_reference','color_reference'])
-        for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference)])
+        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','end','source_reference','color_reference','prompt'])
+        for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),''])
     tmp.replace(path)
 def source_signature(source_path,row): return {'version':1,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'generator':'generate_references.py'}
 def extract_frames(args,source_path,info,rows):
