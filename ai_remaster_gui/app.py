@@ -42,7 +42,7 @@ def load_config() -> dict[str, str]:
     }
     if CONFIG_FILE.exists():
         try:
-            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
             if isinstance(stored, dict):
                 config.update({key: str(value) for key, value in stored.items() if value is not None})
         except json.JSONDecodeError:
@@ -52,6 +52,10 @@ def load_config() -> dict[str, str]:
 
 CONFIG = load_config()
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
+
+
+def current_config() -> dict[str, str]:
+    return load_config()
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,9 @@ STAGES = (
         ("input", "intermediate/outpaint_prepared", "intermediate/outpainted"),
         (
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
+            ("target_height", "Output height", "select:544|576|720|768|1080", "720"),
+            ("chunk_seconds", "Chunk seconds", "number", "20"),
+            ("overlap_frames", "Overlap frames", "range:0|48|1", "8"),
         ),
         (),
     ),
@@ -186,10 +193,11 @@ def load_settings() -> dict[str, dict[str, str]]:
     if outpainted and not defaults["recomp"].get("output"):
         defaults["recomp"]["output"] = rel(ROOT / "output" / "reassembled" / f"{outpainted.stem}_final.mp4")
     bundled_output = rel(ROOT / "tools" / "comfyui" / "output")
+    config = current_config()
     if not defaults["references"].get("comfy_output_root") or (CONFIG_FILE.exists() and defaults["references"].get("comfy_output_root") == bundled_output):
-        defaults["references"]["comfy_output_root"] = rel(Path(CONFIG["comfy_dir"]) / "output")
+        defaults["references"]["comfy_output_root"] = rel(Path(config["comfy_dir"]) / "output")
     if not defaults["references"].get("comfy_url"):
-        defaults["references"]["comfy_url"] = CONFIG["comfy_url"]
+        defaults["references"]["comfy_url"] = config["comfy_url"]
     return defaults
 
 
@@ -208,16 +216,37 @@ class PipelineApp:
 
     def files_for(self, stage: Stage) -> list[dict[str, str | int]]:
         exts = VIDEO_EXTS | IMAGE_EXTS | TEXT_EXTS
+        scoped_prefixes = self.stage_file_prefixes(stage.key)
         out = []
         for folder_text in stage.folders:
             folder = ROOT / folder_text
             if not folder.exists():
                 continue
             for path in folder.rglob("*"):
-                if path.is_file() and path.suffix.lower() in exts:
+                if path.is_file() and path.suffix.lower() in exts and self.stage_file_matches(stage.key, path, scoped_prefixes):
                     stat = path.stat()
                     out.append({"path": rel(path), "size": stat.st_size, "mtime": int(stat.st_mtime), "preview": file_preview(path)})
         return sorted(out, key=lambda item: str(item["path"]).lower())
+
+    def stage_file_prefixes(self, stage_key: str) -> tuple[str, ...]:
+        source = self.settings.get("global", {}).get("source", "")
+        if stage_key == "outpaint" and source:
+            stem = safe_stem(resolve(source).name)
+            values = self.settings.get("outpaint", {})
+            aspect = aspect_slug(values.get("target_aspect", "16:9"))
+            try:
+                height = int(float(values.get("target_height", "720") or "720"))
+            except ValueError:
+                height = 720
+            size = f"{even_int(height * parse_aspect(values.get('target_aspect', '16:9')))}x{even_int(height)}"
+            return (stem,)
+        return ()
+
+    def stage_file_matches(self, stage_key: str, path: Path, prefixes: tuple[str, ...]) -> bool:
+        if stage_key != "outpaint" or not prefixes:
+            return True
+        name = path.stem
+        return any(name == prefix or name.startswith(prefix + "_") for prefix in prefixes)
 
     def progress(self) -> list[dict[str, str]]:
         checks = {
@@ -259,12 +288,19 @@ class PipelineApp:
         percent = min(90, 5 + int(elapsed / 60 * 20))
         label = "Running"
         if self.running_stage_key == "outpaint":
+            chunk = outpaint_chunk_progress(log_text)
             milestones = [
+                ("checking model", 8, "Checking models"),
+                ("downloading model", 10, "Downloading models"),
+                ("downloaded:", 11, "Model download complete"),
+                ("preparing expanded outpaint canvas", 12, "Preparing expanded canvas"),
                 ("reuse prepared outpaint input", 20, "Prepared input reused"),
                 ("wrote prepared outpaint input", 20, "Prepared input written"),
-                ("prepared comfy input", 25, "Prepared for ComfyUI"),
+                ("prepared expanded canvas for comfyui", 25, "Prepared for ComfyUI"),
+                ("splitting prepared canvas", 28, "Splitting into chunks"),
                 ("waiting for comfyui", 30, "Waiting for ComfyUI"),
                 ("queued comfyui prompt", 40, "Queued in ComfyUI"),
+                ("outpaint chunk", 42, "Outpainting chunks"),
                 ("wrote raw comfy render", 82, "Raw outpaint render written"),
                 ("reuse raw comfy render", 82, "Raw outpaint render reused"),
                 ("wrote outpainted video", 100, "Outpainted video written"),
@@ -272,6 +308,13 @@ class PipelineApp:
             for token, value, text in milestones:
                 if token in lower and value >= percent:
                     percent, label = value, text
+            if chunk["total"] and percent < 100:
+                percent = max(percent, min(95, 35 + int((chunk["done"] / chunk["total"]) * 55)))
+                eta = outpaint_eta_label(elapsed, chunk["done"], chunk["current"], chunk["total"])
+                if chunk["done"] >= chunk["total"]:
+                    label = f"Chunks complete, finalizing{eta}"
+                else:
+                    label = f"Chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done){eta}"
         elif self.running_stage_key == "shots":
             if "detected " in lower:
                 percent, label = max(percent, 75), "Shots detected"
@@ -320,6 +363,7 @@ class PipelineApp:
         self.settings.setdefault(stage, {}).update({key: str(value) for key, value in values.items()})
         if stage == "global" and "source" in values:
             self.log.append(f"Loading source material: {values.get('source')}")
+            self.hydrate_stage_inputs("global")
         if stage == "shots" and "outpainted_video" in values:
             manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
             self.settings.setdefault("references", {}).setdefault("manifest", manifest)
@@ -328,7 +372,10 @@ class PipelineApp:
 
     def hydrate_stage_inputs(self, completed_stage: str = "") -> None:
         expected_outpainted = resolve(self.expected_outputs("outpaint")[0]) if self.expected_outputs("outpaint") else None
-        outpainted = expected_outpainted if expected_outpainted and expected_outpainted.exists() else newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS)
+        if completed_stage == "global" and not (expected_outpainted and expected_outpainted.exists()):
+            outpainted = None
+        else:
+            outpainted = expected_outpainted if expected_outpainted and expected_outpainted.exists() else newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS)
         if outpainted:
             outpainted_text = rel(outpainted)
             self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
@@ -337,6 +384,11 @@ class PipelineApp:
             self.settings.setdefault("references", {})["manifest"] = manifest
             self.settings.setdefault("colour", {})["manifest"] = manifest
             self.log.append(f"Updated Shot Detection input: {outpainted_text}")
+        elif completed_stage == "global":
+            for stage_key in ("shots", "recomp"):
+                self.settings.setdefault(stage_key, {})["outpainted_video"] = ""
+            for stage_key in ("references", "colour"):
+                self.settings.setdefault(stage_key, {})["manifest"] = ""
         expected_manifest = resolve(self.expected_outputs("shots")[0]) if self.expected_outputs("shots") else None
         manifest = expected_manifest if expected_manifest and expected_manifest.exists() else newest(ROOT / "manifests" / "references", {".csv"})
         if manifest:
@@ -359,7 +411,7 @@ class PipelineApp:
         values = self.settings.get(stage_key, {})
         if stage_key == "outpaint":
             source = self.settings.get("global", {}).get("source", "")
-            return [outpaint_output_for(source, values.get("target_aspect", "16:9"))] if source else []
+            return [outpaint_output_for(source, values.get("target_aspect", "16:9"), values.get("target_height", "720"))] if source else []
         if stage_key == "shots":
             return [manifest_for_outpainted(values.get("outpainted_video", ""))]
         if stage_key == "references":
@@ -373,13 +425,19 @@ class PipelineApp:
 
     def command_for(self, stage_key: str) -> list[str]:
         values = self.settings[stage_key]
+        config = current_config()
         py = sys.executable
-        cmd = [py]
+        cmd = [py, "-u"]
         add = cmd.extend
         if stage_key == "outpaint":
             cmd.append(str(SCRIPTS / "outpaint_video.py"))
             add(["--source", self.settings.get("global", {}).get("source", "")])
             add(["--target-aspect", values.get("target_aspect", "16:9")])
+            add(["--target-height", values.get("target_height", "720")])
+            add(["--chunk-seconds", values.get("chunk_seconds", "20")])
+            add(["--overlap-frames", values.get("overlap_frames", "8")])
+            add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
+            add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
         elif stage_key == "shots":
             cmd.append(str(SCRIPTS / "generate_references.py"))
             add(["--source-video", values.get("outpainted_video", "")])
@@ -501,6 +559,38 @@ def first_int_after(text: str, marker: str) -> int:
     return 0
 
 
+def outpaint_chunk_progress(text: str) -> dict[str, int]:
+    done = count_lines_matching(text, ("Wrote raw Comfy chunk", "Reuse raw Comfy chunk"))
+    total = 0
+    current = 0
+    for line in text.splitlines():
+        marker = "Outpaint chunk "
+        if marker not in line:
+            continue
+        tail = line.split(marker, 1)[1].split(":", 1)[0]
+        if "/" not in tail:
+            continue
+        try:
+            left, right = tail.split("/", 1)
+            current = max(current, int(left.strip()))
+            total = max(total, int(right.strip()))
+        except ValueError:
+            pass
+    if total:
+        current = max(1, min(total, current or min(done + 1, total)))
+    return {"done": done, "current": current, "total": total}
+
+
+def outpaint_eta_label(elapsed: float, done: int, current: int, total: int) -> str:
+    if total <= 0 or done >= total:
+        return ""
+    if done <= 0:
+        return ", ETA calculating"
+    average_seconds = elapsed / done
+    remaining_seconds = max(0.0, average_seconds * (total - done))
+    return f", ETA {format_duration(remaining_seconds)}"
+
+
 def count_lines_matching(text: str, prefixes: tuple[str, ...]) -> int:
     return sum(1 for line in text.splitlines() if line.startswith(prefixes))
 
@@ -563,11 +653,17 @@ def safe_stem(path_text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in stem)
 
 
-def outpaint_output_for(source_text: str, aspect: str) -> str:
+def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
     if not source_text:
         return ""
     source = resolve(source_text)
-    return rel(ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_outpainted.mp4")
+    try:
+        target_height = int(float(target_height_text or "720"))
+    except ValueError:
+        target_height = 720
+    width = even_int(target_height * parse_aspect(aspect))
+    height = even_int(target_height)
+    return rel(ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}_outpainted.mp4")
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -1223,15 +1319,16 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 let state=null, active='global', selected={};
 const media=p=>'/media?path='+encodeURIComponent(p);
 async function api(path, opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});return await r.json();}
-async function refresh(){const follow=logsNearBottom();state=await api('/api/state');document.getElementById('root').textContent=state.root+(state.running?'  |  Running: '+state.running_stage:'');drawTabs();draw(follow);}
+async function refresh(){const follow=logsNearBottom();state=await api('/api/state');pruneSelected();document.getElementById('root').textContent=state.root+(state.running?'  |  Running: '+state.running_stage:'');drawTabs();draw(follow);}
 function drawTabs(){const tabs=['global',...state.stages.map(s=>s.key),'manifest','comfy'];const names={global:'Global',manifest:'Manifests',comfy:'ComfyUI'};document.getElementById('tabs').innerHTML=tabs.map(t=>`<button class="tab ${active===t?'active':''}" onclick="active='${t}';draw()">${names[t]||stage(t).title}</button>`).join('');}
 function stage(k){return state.stages.find(s=>s.key===k)}
 function settings(k){return state.settings[k]||{}}
+function pruneSelected(){if(!state||!state.stages)return;for(const st of state.stages){if(selected[st.key]&&!st.files.some(f=>f.path===selected[st.key]))delete selected[st.key]}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function draw(followLogs=false){if(active==='global')return drawGlobal(followLogs); if(active==='manifest')return drawManifest(); if(active==='comfy')return drawComfy(); return drawStage(stage(active),followLogs);}
 function drawGlobal(followLogs=false){const src=(state.settings.global&&state.settings.global.source)||'';const thumbs=(state.source_previews||[]).map(p=>`<img src="${media(p)}" alt="">`).join('');const info=sourceInfoHtml(state.source_info||{});const gp=(state.phase_progress&&state.phase_progress.global)||{percent:0,label:'Waiting'};document.getElementById('app').innerHTML=`<section class="card"><img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline"><p class="hero">AI Remaster Pipeline</p><p>Choose the source material, then run or inspect each stage.</p><label>Source material</label><div class="field-row"><input id="globalSource" value="${esc(src)}"><button type="button" onclick="browseGlobalSource()">Browse</button></div>${thumbs?`<div class="filmstrip">${thumbs}</div>`:''}${info}${progressHtml(gp.percent,gp.label)}<div class="actions"><button class="primary" onclick="runAll()">Run Whole Remaster</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><table><tr><th>Stage</th><th>Status</th><th>Progress</th><th>Latest output</th></tr>${state.progress.map(p=>{const sp=stageProgressByTitle(p.stage);return `<tr><td>${p.stage}</td><td class="status-${p.status.toLowerCase()}">${p.status}</td><td>${progressHtml(sp.percent,sp.label)}</td><td>${esc(p.latest)}</td></tr>`}).join('')}</table>${runLogHtml()}</section>`;document.getElementById('globalSource').addEventListener('change',saveGlobal);if(followLogs)scrollLogsToBottom()}
 function sourceInfoHtml(info){const labels={resolution:'Resolution',aspect:'Aspect',duration:'Duration',frame_rate:'Frame rate',frames:'Frames',video_codec:'Video codec',pixel_format:'Pixel format',colour:'Colour',audio:'Audio',container:'Container',overall_bitrate:'Overall bitrate',video_bitrate:'Video bitrate',size:'File size',codec_note:'Note'};const keys=['resolution','aspect','duration','frame_rate','frames','video_codec','pixel_format','colour','audio','container','overall_bitrate','video_bitrate','size','codec_note'];const items=keys.filter(k=>info[k]).map(k=>`<div><span>${labels[k]||k}</span><strong>${esc(info[k])}</strong></div>`).join('');return items?`<div class="source-info">${items}</div>`:''}
-function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
+function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}if(kind.startsWith('range:')){const [min,max,step]=kind.slice(6).split('|');return `<label>${label}: <span id="${key}Value">${esc(v)}</span></label><input data-field="${key}" data-kind="${kind}" type="range" min="${esc(min)}" max="${esc(max)}" step="${esc(step||'1')}" value="${esc(v)}" oninput="document.getElementById('${key}Value').textContent=this.value">`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
 function aspectPreviewHtml(st){if(st.key!=='outpaint')return '';const img=state.aspect_preview;const outputs=(state.expected_outputs&&state.expected_outputs.outpaint)||[];return `<h3>Target Preview</h3>${img?`<img src="${media(img)}" alt="Target aspect preview">`:'<p>Choose source material on the Global tab to preview the target frame.</p>'}${outputs.length?`<h3>Output Path</h3><ul class="output-list">${outputs.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}`}
 function fileRow(st,f){const thumb=f.preview?`<img class="file-thumb" src="${media(f.preview)}" alt="">`:'';return `<div class="file ${thumb?'':'no-thumb'}" onclick="selected['${st.key}']='${esc(f.path)}';draw()">${thumb}<div class="file-path">${esc(f.path)}</div></div>`}
 function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];const sp=stageProgress(st.key);document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('${st.key}')" ${state.running?'disabled':''}>Run ${st.title}</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key);if(followLogs)scrollLogsToBottom()}
@@ -1245,9 +1342,9 @@ function logHtml(text){return String(text||'').split('\n').map(line=>`<span clas
 function logClass(line){const lower=String(line).toLowerCase();if(/traceback|runtimeerror|exception|error|failed|refused|exit code [1-9]|filenotfound/.test(lower))return 'log-error';if(/warning|skipping|timed out/.test(lower))return 'log-warn';if(/ready|reuse|wrote|finished with exit code 0|started/.test(lower))return 'log-ok';return ''}
 async function copyRunLog(){const text=state.log||'';try{await navigator.clipboard.writeText(text)}catch{const area=document.createElement('textarea');area.value=text;document.body.appendChild(area);area.select();document.execCommand('copy');area.remove()}}
 function preview(p){if(!p)return '<p>Select an image, video, manifest, workflow, or log file.</p>';const ext=p.split('.').pop().toLowerCase();if(['png','jpg','jpeg','webp','tif','tiff'].includes(ext))return `<img src="${media(p)}">`;if(['mp4','mov','mkv','avi','webm','m4v'].includes(ext))return `<video src="${media(p)}" controls></video>`;return `<pre id="textPreview">Text preview opens via the browser media endpoint.</pre><p><a href="${media(p)}" target="_blank">Open file</a></p>`}
-async function saveStage(k,redraw=false){const values={};document.querySelectorAll('[data-field]').forEach(el=>{values[el.dataset.field]=el.type==='checkbox'?String(el.checked):el.value});await api('/api/settings',{method:'POST',body:JSON.stringify({stage:k,values})});state=await api('/api/state');if(redraw)draw();showCommand(k)}
-async function saveGlobal(){await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{source:document.getElementById('globalSource').value}})});state=await api('/api/state')}
-async function browseGlobalSource(){const el=document.getElementById('globalSource');const r=await api('/api/browse-global-source',{method:'POST',body:JSON.stringify({current:el.value})});if(!r.ok){alert(r.error||'Browse failed');return}if(r.path){state=r.state;draw()}else{await refresh()}}
+async function saveStage(k,redraw=false){const values={};document.querySelectorAll('[data-field]').forEach(el=>{values[el.dataset.field]=el.type==='checkbox'?String(el.checked):el.value});await api('/api/settings',{method:'POST',body:JSON.stringify({stage:k,values})});state=await api('/api/state');pruneSelected();if(redraw)draw();showCommand(k)}
+async function saveGlobal(){await api('/api/settings',{method:'POST',body:JSON.stringify({stage:'global',values:{source:document.getElementById('globalSource').value}})});selected={};state=await api('/api/state');pruneSelected();draw()}
+async function browseGlobalSource(){const el=document.getElementById('globalSource');const r=await api('/api/browse-global-source',{method:'POST',body:JSON.stringify({current:el.value})});if(!r.ok){alert(r.error||'Browse failed');return}if(r.path){selected={};state=r.state;pruneSelected();draw()}else{await refresh()}}
 async function browseField(stageKey,fieldKey,kind){const el=document.querySelector(`[data-field="${fieldKey}"]`);const r=await api('/api/browse',{method:'POST',body:JSON.stringify({kind,current:el.value})});if(!r.ok){alert(r.error||'Browse failed');return}if(r.path){el.value=r.path;await saveStage(stageKey)}}
 async function showCommand(k){const r=await api('/api/command?stage='+encodeURIComponent(k));const el=document.getElementById('cmd');if(el)el.textContent=r.command.join(' ')}
 async function confirmOverwrite(k){const force=(settings(k).force==='true');if(!force&&k!=='shots')return true;const r=await api('/api/existing-outputs?stage='+encodeURIComponent(k));if(!r.paths||!r.paths.length)return true;const reason=force?'Regenerate is enabled':'Shot Detection rewrites its manifest';return confirm(reason+' and these output paths already exist:\n\n'+r.paths.join('\n')+'\n\nOverwrite them?')}
@@ -1315,7 +1412,8 @@ def discover_comfy_instances(configured_url: str) -> list[str]:
 def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
     if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") == "1":
         return True, ""
-    url = CONFIG.get("comfy_url", "http://127.0.0.1:8188")
+    config = current_config()
+    url = config.get("comfy_url", "http://127.0.0.1:8188")
     instances = discover_comfy_instances(url)
     if len(instances) > 1:
         message = "Multiple ComfyUI instances appear to be running: " + ", ".join(instances) + ". Close extras or update .ai_remaster_config.json to the one ARP should use."
@@ -1364,7 +1462,8 @@ def monitor_comfy_startup(url: str, process: subprocess.Popen | None) -> None:
 
 def start_comfy_if_needed() -> None:
     global STARTED_COMFY_PROCESS
-    url = CONFIG.get("comfy_url", "http://127.0.0.1:8188")
+    config = current_config()
+    url = config.get("comfy_url", "http://127.0.0.1:8188")
     if STARTED_COMFY_PROCESS and STARTED_COMFY_PROCESS.poll() is None:
         startup_log(f"ComfyUI launch is already in progress at {url}.")
         return
@@ -1378,7 +1477,7 @@ def start_comfy_if_needed() -> None:
         else:
             startup_log(f"ComfyUI appears to be running at {instances[0]}, but ARP is configured for {url}. Close it or update .ai_remaster_config.json.")
         return
-    comfy_dir = Path(CONFIG.get("comfy_dir", ROOT / "tools" / "comfyui"))
+    comfy_dir = Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     main_py = comfy_dir / "main.py"
     if not main_py.exists():
         if CONFIG_FILE.exists():
@@ -1388,8 +1487,8 @@ def start_comfy_if_needed() -> None:
             startup_log("ComfyUI is not configured yet.")
             startup_log("Run install_windows.bat again and choose whether to clone ComfyUI or use an existing ComfyUI directory.")
         return
-    host = CONFIG.get("comfy_host", "127.0.0.1")
-    port = str(CONFIG.get("comfy_port", "8188"))
+    host = config.get("comfy_host", "127.0.0.1")
+    port = str(config.get("comfy_port", "8188"))
     command = [sys.executable, "main.py", "--listen", host, "--port", port]
     kwargs: dict = {"cwd": str(comfy_dir)}
     if os.name == "nt":

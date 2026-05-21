@@ -205,13 +205,13 @@ install_windows.bat -ComfyDir D:\somewhere\ComfyUI
 install_windows.bat -NonInteractive
 ```
 
-Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, and Deep Exemplar / ColorMNet reference colorization nodes.
+Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, ComfyUI-GGUF, and Deep Exemplar / ColorMNet reference colorization nodes.
 
 Models and LoRAs are downloaded on demand when their pipeline stages first need them:
 
-- LTX 2.3 FP8 checkpoint.
-- LTX 2.3 text encoder and audio VAE.
-- LTX 2.3 distilled LoRA used by the bundled outpainting workflow.
+- LTX 2.3 distilled GGUF Q4_K_M model for lightweight outpainting.
+- LTX 2.3 FP8 checkpoint for ComfyUI's LTX text/audio loader support.
+- LTX 2.3 text encoder, video VAE, and audio VAE.
 - LTX 2.3 outpainting IC-LoRA.
 - Qwen Image Edit 2509 FP8 diffusion model.
 - Qwen image text encoder and VAE.
@@ -247,4 +247,5 @@ Single still repair:
 ```bat
 generate_single_reference.bat --source-image intermediate\outpainted_references\clip\cut_0014.png --output intermediate\outpainted_references_color\clip\cut_0014.png --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --add-prompt "brown hair, no added text"
 ```
+Keep Qwen prompts short. Verbose restoration prompts can leak into the generated image as fake captions or logo-like text. The Qwen runner prints the exact prompt for each queued edit and clamps local continuity descriptions with `--reference-description-max-chars`.
 

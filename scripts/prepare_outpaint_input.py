@@ -118,21 +118,21 @@ def main():
     output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height)
     sig = signature(args, source, info, target_width, target_height)
     if not args.force and resumable_output(output, sig, video_like=source, width=target_width, height=target_height):
-        print(f'Reuse prepared outpaint input: {output}')
+        print(f'Reuse prepared outpaint input: {output}', flush=True)
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
     command = [ffmpeg, '-y', '-i', str(source), '-filter_complex', build_filter(args, info, target_width, target_height), '-map', '[v]', '-map', '0:a?', *encoder_args(args), '-c:a', 'copy', str(partial)]
-    print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}")
-    print(f'Prepared canvas: {target_width}x{target_height}, black_lift={args.black_lift}, gamma={args.gamma}')
-    print(' '.join(command))
+    print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}", flush=True)
+    print(f'Prepared canvas: {target_width}x{target_height}, black_lift={args.black_lift}, gamma={args.gamma}', flush=True)
+    print(' '.join(command), flush=True)
     if args.dry_run:
         return 0
     output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(command, check=True)
     partial.replace(output)
     write_signature(output, sig)
-    print(f'Wrote prepared outpaint input: {output}')
+    print(f'Wrote prepared outpaint input: {output}', flush=True)
     return 0
 
 

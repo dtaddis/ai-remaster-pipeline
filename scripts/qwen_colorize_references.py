@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import base64
 import csv
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -12,15 +13,14 @@ from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
 
-DEFAULT_PROMPT = 'Colorize this image.'
+DEFAULT_PROMPT = 'Colorize this image. Preserve the original image. Do not add text, captions, logos, labels, signs, subtitles, or new objects.'
 DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
 DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434'
 DEFAULT_OLLAMA_VISION_MODEL = 'qwen2.5vl:7b'
 REFERENCE_DESCRIPTION_PROMPT = (
-    'Describe only the colour palette and restoration-relevant visual details in this image. '
-    'Mention hair colour, skin tone, clothing colours, wood, wallpaper, curtains, lamps, exterior lighting, sky, foliage, and title/credit text colour if visible. '
-    'Do not identify the film, do not invent story context, and do not describe composition unless it affects colour continuity. '
-    'Keep it concise, factual, and useful as colour guidance for another black-and-white frame.'
+    'In one short sentence, describe only the reusable colour palette of this already-colourised film frame. '
+    'Mention skin, clothing, walls/wood/fabric/metal, and lighting only if clearly visible. '
+    'No markdown, no headings, no bullets, no film-history commentary, no composition summary. Maximum 35 words.'
 )
 
 
@@ -138,12 +138,31 @@ def continuity_reference_paths(args: argparse.Namespace, rows: list[dict[str, st
     return paths[: args.continuity_reference_count]
 
 
+def compact_reference_description(text: str, max_chars: int) -> str:
+    text = re.sub(r'(?m)^#+\s*', '', text)
+    text = re.sub(r'(?m)^\s*[-*]\s*', '', text)
+    text = re.sub(r'\*\*', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'(?i)\b(colou?r palette and restoration style|colou?r palette|restoration style)\s*:?', '', text).strip()
+    text = re.sub(
+        r'(?i)\b(skin tones?|clothing colou?rs?|wall/fabric/metal colou?rs?|lighting temperature|shadows?|overall grade)\s*:\s*',
+        '',
+        text,
+    )
+    text = re.sub(r'\bThis description should help.*$', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'\bThis palette and style should be applied.*$', '', text, flags=re.IGNORECASE).strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rsplit(' ', 1)[0].rstrip(' ,;:')
+    return cut + '.'
+
+
 def continuity_description(args: argparse.Namespace, refs: list[Path]) -> str:
     if args.reference_description_provider == 'none' or not refs:
         return ''
     lines = ['Local colour descriptions from already-colourised nearby reference frames:']
     for index, ref in enumerate(refs, start=1):
-        description = describe_reference(args, ref)
+        description = compact_reference_description(describe_reference(args, ref), args.reference_description_max_chars)
         if description:
             lines.append(f'{index}. {description}')
     return '\n'.join(lines) if len(lines) > 1 else ''
@@ -181,6 +200,7 @@ def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, 
         'save_node_id': str(args.save_node_id),
         'reference_description_provider': args.reference_description_provider,
         'continuity_reference_count': args.continuity_reference_count,
+        'reference_description_max_chars': args.reference_description_max_chars,
     }
 
 
@@ -224,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ollama-url', default=DEFAULT_OLLAMA_URL)
     parser.add_argument('--ollama-vision-model', default=DEFAULT_OLLAMA_VISION_MODEL)
     parser.add_argument('--force-reference-descriptions', action='store_true')
+    parser.add_argument('--reference-description-max-chars', type=int, default=220, help='Clamp each local continuity description before appending it to the Qwen prompt.')
     parser.add_argument('--continuity-reference-count', type=int, default=0, help='Describe this many previous colour references and append them to the prompt. 0 disables automatic continuity descriptions.')
     parser.add_argument('--output-root', type=Path, help='Override manifest color_reference destinations.')
     parser.add_argument('--load-image-node-id', default='1')
@@ -271,6 +292,7 @@ def main() -> int:
             continue
         ref_note = f', described refs={len(refs)}' if refs else ''
         print(f'Colorize {index:04d}: {src} -> {dst}{ref_note}')
+        print(f'Qwen prompt {index:04d}: {prompt}')
         if args.dry_run:
             continue
         if not src.exists():
@@ -291,3 +313,5 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
+

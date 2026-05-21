@@ -274,6 +274,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
         Git-Clone-IfMissing 'https://github.com/ltdrdata/ComfyUI-Manager.git' (Join-Path $CustomNodes 'ComfyUI-Manager')
     }
     Git-Clone-IfMissing 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo')
+    Git-Clone-IfMissing 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF')
     if (-not $SkipDeepExemplar) {
         Git-Clone-IfMissing 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization')
     }
@@ -281,6 +282,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
 
 Invoke-Step 'Install custom-node requirements' {
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-LTXVideo\requirements.txt')
+    Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-GGUF\requirements.txt')
     if (-not $SkipDeepExemplar) {
         Install-RequirementsIfPresent (Join-Path $CustomNodes 'reference-video-colorization\requirements.txt')
         Install-Pip @('scikit-image', 'einops', 'tqdm', 'matplotlib')
@@ -293,7 +295,7 @@ Invoke-Step 'Install custom-node requirements' {
 }
 
 Invoke-Step 'Create model directories' {
-    foreach ($dir in @('checkpoints','diffusion_models','loras','text_encoders','vae','latent_upscale_models')) {
+    foreach ($dir in @('checkpoints','diffusion_models','loras','text_encoders','unet','vae','latent_upscale_models')) {
         Ensure-Directory (Join-Path $ComfyDir "models\$dir")
     }
 }
@@ -304,10 +306,11 @@ Invoke-Step 'Install local FFmpeg tools' {
 
 if ($DownloadModels -and -not $SkipModelDownloads) {
     Invoke-Step 'Download LTX 2.3 models and outpainting LoRA' {
+        Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf')
         Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' (Join-Path $ComfyDir 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors')
         Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors')
+        Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_video_vae_bf16.safetensors')
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_audio_vae_bf16.safetensors')
-        Download-HfFile 'Lightricks/LTX-2.3' 'ltx-2.3-22b-distilled-lora-384.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-distilled-lora-384.safetensors')
         Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors')
     }
 

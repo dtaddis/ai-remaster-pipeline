@@ -142,6 +142,25 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
                         inputs[name] = values[widget_index]
             if has_widget:
                 widget_index += 1
+        if isinstance(widget_values, dict):
+            for key, value in widget_values.items():
+                if key not in inputs and not isinstance(value, dict):
+                    inputs[key] = value
+        elif not any('widget' in item for item in node.get('inputs', [])):
+            values = widget_values if isinstance(widget_values, list) else [widget_values]
+            fallback_names = {
+                'CheckpointLoaderSimple': ('ckpt_name',),
+                'LoadImage': ('image',),
+                'ManualSigmas': ('sigmas',),
+                'PrimitiveBoolean': ('value',),
+                'PrimitiveInt': ('value',),
+                'PrimitiveFloat': ('value',),
+                'PrimitiveString': ('value',),
+                'KSamplerSelect': ('sampler_name',),
+            }.get(node.get('type'), ())
+            for name, value in zip(fallback_names, values):
+                if name not in inputs:
+                    inputs[name] = value
         prompt[node_id] = {'class_type': node['type'], 'inputs': inputs}
         if node.get('title'):
             prompt[node_id]['_meta'] = {'title': node['title']}

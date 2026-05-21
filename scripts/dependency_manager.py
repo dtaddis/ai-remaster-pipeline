@@ -23,10 +23,11 @@ class HfModel:
 
 
 OUTPAINT_MODELS = [
+    HfModel("QuantStack/LTX-2.3-GGUF", "LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf", "models/unet/LTX-2.3-distilled-Q4_K_M.gguf"),
     HfModel("Lightricks/LTX-2.3-fp8", "ltx-2.3-22b-dev-fp8.safetensors", "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"),
     HfModel("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors", "models/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"),
+    HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_video_vae_bf16.safetensors", "models/vae/LTX23_video_vae_bf16.safetensors"),
     HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_audio_vae_bf16.safetensors", "models/vae/LTX23_audio_vae_bf16.safetensors"),
-    HfModel("Lightricks/LTX-2.3", "ltx-2.3-22b-distilled-lora-384.safetensors", "models/loras/ltx-2.3-22b-distilled-lora-384.safetensors"),
     HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
 ]
 
@@ -81,7 +82,8 @@ def ensure_huggingface_hub() -> None:
 
 def ensure_hf_models(comfy_dir: Path, models: list[HfModel]) -> None:
     ensure_huggingface_hub()
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, hf_hub_url
+    import urllib.request
 
     cache_root = ROOT / ".cache" / "huggingface"
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -94,14 +96,17 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel]) -> None:
     try:
         for model in models:
             destination = comfy_dir / model.destination
+            print(f"Checking model: {model.repo}/{model.file}", flush=True)
             if destination.exists():
-                print(f"Model already exists: {destination}")
+                print(f"Model already exists: {destination}", flush=True)
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            print(f"Downloading model: {model.repo}/{model.file}")
+            size = remote_file_size(model.repo, model.file)
+            size_text = f" ({format_bytes(size)})" if size else ""
+            print(f"Downloading model: {model.repo}/{model.file}{size_text}", flush=True)
             downloaded = Path(hf_hub_download(repo_id=model.repo, filename=model.file, local_dir=cache_root))
             shutil.copy2(downloaded, destination)
-            print(f"Downloaded: {destination}")
+            print(f"Downloaded: {destination}", flush=True)
     finally:
         restore_env("PYTHONUTF8", old_python_utf8)
         restore_env("PYTHONIOENCODING", old_python_io)
@@ -113,6 +118,25 @@ def restore_env(name: str, value: str | None) -> None:
         os.environ.pop(name, None)
     else:
         os.environ[name] = value
+
+
+def remote_file_size(repo: str, filename: str) -> int:
+    try:
+        request = urllib.request.Request(hf_hub_url(repo, filename), method="HEAD")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            length = response.headers.get("Content-Length")
+            return int(length) if length else 0
+    except Exception:
+        return 0
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
 
 
 def ensure_outpaint_models(comfy_dir: Path) -> None:
