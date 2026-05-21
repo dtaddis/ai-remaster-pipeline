@@ -83,7 +83,27 @@ def node_by_id(workflow: dict[str, Any], node_id: str) -> dict[str, Any]:
                 return node
     if str(node_id) in workflow and isinstance(workflow[str(node_id)], dict):
         return workflow[str(node_id)]
+    for value in workflow.values():
+        found = node_by_id_nested(value, node_id)
+        if found is not None:
+            return found
     raise KeyError(f'Workflow node not found: {node_id}')
+
+
+def node_by_id_nested(value: Any, node_id: str) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if ('type' in value or 'class_type' in value) and str(value.get('id')) == str(node_id):
+            return value
+        for child in value.values():
+            found = node_by_id_nested(child, node_id)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = node_by_id_nested(child, node_id)
+            if found is not None:
+                return found
+    return None
 
 
 def set_widget(node: dict[str, Any], key: str | int, value: Any) -> None:
@@ -210,6 +230,13 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
         'RandomNoise': ('noise_seed', 'control_after_generate'),
         'CFGGuider': ('cfg',),
         'VAEDecodeTiled': ('tile_size', 'overlap', 'temporal_size', 'temporal_overlap'),
+        'ModelSamplingAuraFlow': ('shift',),
+        'CFGNorm': ('strength',),
+        'FluxKontextMultiReferenceLatentMethod': ('reference_latents_method',),
+        'LoraLoaderModelOnly': ('lora_name', 'strength_model'),
+        'CLIPLoader': ('clip_name', 'type', 'device'),
+        'KSampler': ('seed', 'control_after_generate', 'steps', 'cfg', 'sampler_name', 'scheduler', 'denoise'),
+        'TextEncodeQwenImageEditPlus': ('prompt',),
     }
     names = simple_maps.get(class_type)
     return dict(zip(names, values)) if names else {}
