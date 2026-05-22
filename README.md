@@ -1,251 +1,194 @@
-﻿<p align="center">
+<p align="center">
   <img src="assets/branding/arp-logo.png" alt="ARP - AI Remaster Pipeline" width="520">
 </p>
 
 # ARP - AI Remaster Pipeline
 
-A staged toolkit for remastering public-domain or licensed film material with ComfyUI-assisted outpainting, shot-reference extraction, optional Qwen Image Edit still colorization, optional reference-based video colorization, and final Resolve-friendly compositing.
+ARP is a local GUI app for remastering public-domain or properly licensed film material with ComfyUI-powered AI tools.
 
-The pipeline is deliberately modular. Each stage writes obvious intermediate files, and the scripts use sidecar signatures plus media validation so reruns can resume completed work only when the existing files still match the expected duration, dimensions, and image/video format.
+It is built around an old-film workflow: choose a black-and-white source movie, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the outpainted video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
+
+The app is still alpha software, but the goal is simple: you should be able to run the whole remaster from the GUI, then inspect and adjust each stage when the AI needs a little human steering.
 
 <p align="center">
-  <img src="assets/screenshots/arp-gui-global.png" alt="ARP GUI showing source video previews, metadata, and remaster stages">
+  <img src="assets/screenshots/walkthrough/arp-walkthrough-overview.jpg" alt="ARP Overview tab showing source video metadata, preview frames, and whole-pipeline progress">
 </p>
 
-## Folder Layout
+## What It Does
 
-```text
-input/                                  Original movie exports or clips to process
-intermediate/outpaint_prepared/        Gamma/black-lifted 16:9 clips prepared for LTX outpainting
-intermediate/outpainted/                 Restored widescreen/outpainted clips from ComfyUI LTX
-intermediate/outpainted_references/      B&W source reference stills selected from cuts
-intermediate/outpainted_references_color/ Qwen/Comfy colorized reference stills
-intermediate/outpainted_colorized/       Deep Exemplar colorized video chunks
-manifests/references/                    Shot/reference manifests
-manifests/colorize/                      Video colorization manifests if you keep them separate
-output/reassembled/                      Final reassembled/composited masters
-workflows/                               ComfyUI workflow templates/placeholders
-wrappers/                                Batch-file entry points
-```
+- Outpaints 4:3 or similar archive footage into common target aspect ratios such as `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, and `1.85:1`.
+- Splits video into shots and lets you review, merge, enable, disable, and adjust shot boundaries.
+- Generates per-shot reference frames and colorizes them with Qwen Image Edit.
+- Uses reference-guided video colorization for the outpainted footage.
+- Recombines the original, outpainted, and colorized layers into a final output.
+- Keeps intermediate files deterministic and resumable, so reruns can reuse valid existing work.
 
-Runtime media and generated manifests are git-ignored by default. Commit workflow templates, scripts, docs, and small examples, not a whole movie.
+## Install
 
-## 1. Put A Movie In `input`
+### Windows
 
-Place your source movie or working segment in `input`. Keep filenames descriptive, for example:
-
-```bat
-input\Metropolis_00.00.00to00.10.00_source.mp4
-```
-
-## 2. Outpainting
-
-The LTX 2.3 outpainting LoRA fills pure black pixels. To stop it from treating genuine black pixels in the original movie as mask, prepare the input first:
-
-```bat
-outpaint_video.bat ^
-  --source input\Metropolis_00.00.00to00.10.00_source.mp4 ^
-  --target-aspect 16:9
-```
-
-This wraps the full outpainting stage. It lifts the source image away from pure black, centres it in the target canvas, queues the LTX 2.3 IC-LoRA outpainting workflow in ComfyUI, copies the raw ComfyUI render, and restores the lift into `intermediate/outpainted`.
-
-Common target aspects include `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, `2.35:1`, `1.85:1`, `3:2`, `2:3`, `5:4`, and `4:5`.
-
-The lower-level helpers still exist if you want to prepare and restore manually: `prepare_outpaint_input.bat` and `finalize_outpaint_output.bat`.
-
-See `docs/ltx-outpainting-prep.md` for the black-lift/gamma details.
-
-This repo does not lock you to a single ComfyUI install. A good arrangement is:
-
-```text
-ai-remaster-pipeline/
-  tools/comfyui/      optional local ComfyUI checkout or portable install
-```
-
-The `tools/` folder is ignored, so users can bring their own ComfyUI without polluting the repo.
-
-## 3. Detect Cuts And Extract Reference Stills
-
-```bat
-generate_references.bat --source-video intermediate\outpainted\Metropolis_00.00.00to00.10.00_outpaint.mp4
-```
-
-This writes:
-
-```text
-intermediate/outpainted_references/<clip-stem>/cut_XXXX_00.MM.SS.png
-manifests/references/colorize_manifest_<clip-stem>_shots_auto.csv
-```
-
-The detector compares frame structure, histograms, edges, fades, and dissolve-like changes. It writes only meaningful shot references, prunes stale screenshots by default, and can reuse existing color references if the selected frame is effectively the same after a later rerun.
-
-Useful options:
-
-```bat
-generate_references.bat --source-video intermediate\outpainted\clip.mp4 --dry-run
-generate_references.bat --source-video intermediate\outpainted\clip.mp4 --limit 10
-generate_references.bat --source-video intermediate\outpainted\clip.mp4 --keep-existing-source-frames
-generate_references.bat --source-video intermediate\outpainted\clip.mp4 --no-reuse-existing-references
-```
-
-## 4. Optional Still Colorization With Qwen Image Edit
-
-Create or export a ComfyUI workflow that loads one image, runs Qwen Image Edit, and saves one image. Then run:
-
-```bat
-qwen_colorize_references.bat ^
-  --manifest manifests\references\colorize_manifest_Metropolis_00.00.00to00.10.00_outpaint_shots_auto.csv ^
-  --workflow workflows\qwen_image_edit\Qwen Image Edit Reference Colorize.json ^
-  --load-image-node-id 1 ^
-  --prompt-node-id 2 ^
-  --save-node-id 9 ^
-  --prompt "Colorize this image. Preserve the drawing and composition. Use clean modern cartoon colours, not sepia. Do not add text or new objects." ^
-  --prompt-suffix "Keep black ink deep, whites clean, and props/backgrounds naturally coloured."
-```
-
-The exact node IDs depend on your workflow. For normal exported ComfyUI workflows, widget selectors are usually numeric indexes like `0`; for API-format workflows, they can be input names. If ComfyUI is not under `tools\comfyui`, add `--comfy-output-root D:\dtaddis\ComfyUI\output` or wherever your Comfy output folder lives. The script patches the input image, prompt, and save prefix, then copies ComfyUI's result to the `color_reference` path in the manifest.
-
-## 5. Optional Video Colorization
-
-The repository provides a lightweight wrapper for the reference-video colorization runner rather than hard-coding one person's ComfyUI graph:
-
-```bat
-colorize_video.bat --manifest manifests\references\colorize_manifest_clip_shots_auto.csv
-```
-
-By default it looks for:
-
-```text
-tools/comfyui/scripts/colorize_manifest_runner.py
-```
-
-You can point it at your own known-good runner with `--comfy-runner`.
-
-## 6. Final Composite / Reassembly
-
-The finishing idea is:
-
-1. Bottom: widescreen outpainted video.
-2. Middle: original source video centered over it, feathered at the left/right edges to preserve as much real footage as possible.
-3. Top: optional colorized video as a color/detail overlay with adjustable saturation and temperature.
-
-```bat
-final_composite.bat ^
-  --outpainted intermediate\outpainted\clip_outpaint.mp4 ^
-  --source input\clip_source.mp4 ^
-  --colorized intermediate\outpainted_colorized\clip_colorized.mp4 ^
-  --output output\reassembled\clip_final.mp4 ^
-  --feather-pixels 80 ^
-  --saturation 0.82 ^
-  --temperature -0.015
-```
-
-The FFmpeg blend is an approximation of a Resolve-style color layer. For final grading, Resolve is still the more comfortable place to finesse saturation, coolness, grain, and masks.
-
-## Resume Behavior
-
-Scripts write `.sig.json` sidecars beside outputs. If inputs and settings match, a rerun reuses the existing output. If a source video, source frame, prompt, workflow, or relevant parameter changes, the dependent output is regenerated.
-
-## GUI
-
-The repo also includes a cross-platform local web GUI for running and inspecting the pipeline:
-
-```bat
-launch_gui.bat
-```
-
-On macOS or Linux, use:
-
-```sh
-./launch_gui.sh
-```
-
-Or, from an activated Python environment on any platform:
-
-```bat
-python -m ai_remaster_gui
-```
-
-The GUI keeps the command-line scripts as the backend, so anything you configure in the tabs is shown as an equivalent command before it runs. It includes:
-
-- A Global tab with whole-pipeline progress and a one-shot run button.
-- Stage tabs for outpainting, shot detection, Qwen reference generation, video colourisation, and recomposition.
-- Image/video preview panes for intermediate files in each stage folder.
-- A manifest editor for enabling/disabling references and adjusting reference paths.
-- A ComfyUI tab for queue inspection and optional log-file tailing.
-
-The GUI stores local field history in `.ai_remaster_gui.json`, which is ignored by Git.
-
-When launched, the GUI checks whether ComfyUI is available at `http://127.0.0.1:8188`. If it is not running and `.ai_remaster_config.json` points at a valid ComfyUI directory, the GUI starts ComfyUI in a separate process/window with this repo's `.venv`. Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` to disable that behavior.
-
-## Branding
-
-Logo and thumbnail assets live in `assets/branding`:
-
-- `arp-logo.png` for the README and general project branding.
-- `arp-logo-wide.png` for the GUI Global page.
-- `arp-app-icon-512.png`, `arp-app-icon-192.png`, `favicon.png`, and `favicon.ico` for the GUI/browser icon.
-- `arp-github-social.png` for the GitHub repository social preview image.
-
-## Installation
-
-For a full Windows setup, run:
+Run:
 
 ```bat
 install_windows.bat
 ```
 
-The installer will ask whether to clone ComfyUI into this project or use an existing ComfyUI directory. Existing installs are expected to contain `main.py`; the installer will then add the required custom nodes, model folders, and models. Python packages are installed into this repo's `.venv`, not into the ComfyUI directory.
+The installer creates this repo's `.venv`, installs FFmpeg locally, and asks whether to clone ComfyUI into `tools\comfyui` or use an existing ComfyUI directory.
 
-For unattended installs, pass the ComfyUI directory explicitly or use the default clone location:
+If you already have ComfyUI somewhere else:
 
 ```bat
-install_windows.bat -ComfyDir D:\somewhere\ComfyUI
-install_windows.bat -NonInteractive
+install_windows.bat -ComfyDir D:\path\to\ComfyUI
 ```
 
-Depending on your choice, that script either creates `tools\comfyui` or uses your existing ComfyUI folder. It creates this repo's `.venv`, writes the local `.ai_remaster_config.json`, installs local FFmpeg/ffprobe tools under `.cache/tools/ffmpeg`, installs CUDA PyTorch, ComfyUI requirements, ComfyUI Manager, LTXVideo nodes, ComfyUI-GGUF, and Deep Exemplar reference colorization nodes.
+Python packages are installed into ARP's `.venv`, not into your ComfyUI virtual environment. ComfyUI itself is used as the AI backend.
 
-Models and LoRAs are downloaded on demand when their pipeline stages first need them:
+Models and LoRAs are downloaded on demand when a stage first needs them. If a large Hugging Face download is interrupted, rerun the same stage and the download should resume. You can prefetch the main model set with:
 
-- LTX 2.3 distilled GGUF Q4_K_M model for lightweight outpainting.
-- LTX 2.3 FP8 checkpoint for ComfyUI's LTX text/audio loader support.
-- LTX 2.3 text encoder, video VAE, and audio VAE.
-- LTX 2.3 outpainting IC-LoRA.
-- Qwen Image Edit 2511 GGUF Q4_K_M diffusion model.
-- Qwen image text encoder and VAE.
-- Qwen Image Edit 2511 Lightning 4-step LoRA.
+```bat
+install_windows.bat -DownloadModels
+```
 
 Useful installer options:
 
 ```bat
+install_windows.bat -NonInteractive
 install_windows.bat -SkipDeepExemplar
-install_windows.bat -ComfyDir D:\somewhere\comfyui
 install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu128
-install_windows.bat -DownloadModels
 ```
 
-Model downloads are huge and resumable. By default they happen on demand; pass `-DownloadModels` if you want the installer to prefetch the main model set. If a file already exists at the expected destination, the downloader skips it. See `docs/installer-model-sources.md` for the exact Hugging Face repo/file mapping.
+See [docs/installer-model-sources.md](docs/installer-model-sources.md) for the exact model and LoRA sources.
 
-The installer places FFmpeg and ffprobe under `.cache/tools/ffmpeg`; command-line scripts can still use a system FFmpeg from PATH or an explicit `--ffmpeg` where supported.
+### macOS And Linux
+
+The full installer is currently Windows-focused. On macOS or Linux, set up a Python virtual environment, install `requirements.txt`, configure an existing ComfyUI directory in `.ai_remaster_config.json`, and launch the GUI with `./launch_gui.sh` or `python -m ai_remaster_gui`.
+
+Cross-platform packaging is planned, but not polished yet.
+
+## Launch The GUI
+
+On Windows:
+
+```bat
+launch_gui.bat
+```
+
+On macOS or Linux:
+
+```sh
+./launch_gui.sh
+```
+
+Or from an activated environment:
+
+```sh
+python -m ai_remaster_gui
+```
+
+The GUI opens as a local web app. It checks ComfyUI at `http://127.0.0.1:8188`; if ComfyUI is configured but not running, ARP can start it in a separate process/window.
+
+Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
+
+## Basic Workflow
+
+1. Open the Overview tab.
+2. Choose your source material with Browse.
+3. Check the preview frames, duration, resolution, frame rate, codecs, and color/monochrome guess.
+4. Leave Colorize enabled for black-and-white sources, or turn it off if you only want outpainting.
+5. Click Run Whole Remaster for a first pass.
+6. Use the stage tabs to inspect or rerun individual phases.
+
+Every stage writes predictable intermediate files under `intermediate/`, manifests under `manifests/`, and final renders under `output/reassembled/`.
+
+## Tabs
+
+### Overview
+
+Choose the source video, see useful media info, and run the whole pipeline.
+
+![Overview tab](assets/screenshots/walkthrough/arp-walkthrough-overview.jpg)
+
+### Outpainting
+
+Set the target aspect ratio, output height, chunk length, overlap frames, and source crop. The target preview helps you see where ARP will add new canvas before LTX fills it.
+
+Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
+
+### Shot Detection
+
+Review the detected shots, inspect start/middle/end frames, merge shots that should share a reference, and nudge shot boundaries frame by frame.
+
+![Shot Detection tab](assets/screenshots/walkthrough/arp-walkthrough-shot-detection.jpg)
+
+### Reference Generation
+
+Pick the reference time inside each shot, regenerate individual Qwen color references, delete references you do not like, and add short per-shot prompt notes.
+
+![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg)
+
+### Colorization
+
+Review each shot's color reference alongside the corresponding colorized video segment. This stage uses the generated references to guide video colorization.
+
+![Colorization tab](assets/screenshots/walkthrough/arp-walkthrough-colorization.jpg)
+
+### Recomposition
+
+Preview and tune the final blend: outpainted video at the bottom, original source in the center with feathered edges, and the colorized layer contributing chroma on top.
+
+![Recomposition tab](assets/screenshots/walkthrough/arp-walkthrough-recomposition.jpg)
+
+### Output
+
+Once recomposition finishes, the Output tab plays the final render.
+
+![Output tab](assets/screenshots/walkthrough/arp-walkthrough-output.jpg)
+
+### Settings
+
+Settings contains ComfyUI connection details, queue/log inspection, and global pipeline defaults that are useful but too noisy for the main stage tabs.
+
+## ComfyUI And Models
+
+ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended stack includes:
+
+- LTX 2.3 distilled GGUF Q4_K_M for lightweight outpainting.
+- LTX 2.3 IC outpainting LoRA.
+- Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
+- Qwen Image Edit Lightning LoRA.
+- Deep Exemplar reference-guided video colorization.
+
+The repo stores orchestration code, GUI code, workflows, wrappers, docs, and small assets. Runtime media, model caches, ComfyUI installs, and generated outputs are ignored by Git.
+
+## Folder Layout
+
+```text
+input/                                   Optional source clips
+intermediate/outpaint_prepared/          Expanded/lifted clips prepared for LTX
+intermediate/outpainted/                 Widescreen/outpainted clips
+intermediate/outpainted_references/      Per-shot black-and-white reference stills
+intermediate/outpainted_references_color/ Qwen colorized reference stills
+intermediate/outpainted_colorized/       Reference-guided colorized video
+manifests/references/                    Shot/reference manifests
+output/reassembled/                      Final composited masters
+workflows/                               ComfyUI workflow templates
+wrappers/                                Batch/shell entry points
+assets/branding/                         Logo, icons, and GitHub artwork
+assets/screenshots/                      README screenshots
+```
+
+## Resume Behavior
+
+ARP writes `.sig.json` sidecars beside generated outputs. If inputs and settings still match, a rerun can reuse existing work. If the source, prompt, workflow, crop, aspect ratio, or other relevant setting changes, the dependent output is regenerated.
+
+The GUI is also designed around deterministic intermediate paths. When one stage completes, the next stage's input fields are populated automatically.
+
+## Direct Script Use
+
+The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
+
+Those scripts are what the GUI calls internally, and the GUI shows the equivalent command before running a stage.
+
 ## Licensing Notes
 
-Check the licenses for every model and workflow you use. This repo is only orchestration code; it does not grant commercial rights to source films, LoRAs, Qwen models, Deep Exemplar, or any other model weights.
-## Qwen Continuity Lessons
-
-The Qwen still-colourisation stage now follows the lessons from the HotB restoration work: use Qwen as a single-image edit, do not pass multiple reference images directly, and use text descriptions for continuity instead. `--add-prompt` is appended last, and `--print-final-prompt` shows exactly what the workflow receives.
-
-Optional local continuity guidance:
-
-```bat
-qwen_colorize_references.bat --manifest manifests\references\clip.csv --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --reference-description-provider ollama --ollama-vision-model qwen2.5vl:7b --continuity-reference-count 3
-```
-
-Single still repair:
-
-```bat
-generate_single_reference.bat --source-image intermediate\outpainted_references\clip\cut_0014.png --output intermediate\outpainted_references_color\clip\cut_0014.png --workflow workflows\qwen_image_edit\Qwen.json --load-image-node-id 1 --prompt-node-id 2 --save-node-id 9 --add-prompt "brown hair, no added text"
-```
-Keep Qwen prompts direct and visual. ARP's default starts with "Colorize this image" and stays short, because Qwen Image Edit tends to follow concise image-edit instructions better than long restoration briefs. The GUI also lets you add per-shot prompt notes from the Reference Generation tab.
-
+Check the licenses for every model, workflow, and source film you use. This repo is orchestration software; it does not grant rights to source films, model weights, LoRAs, ComfyUI custom nodes, Qwen models, Deep Exemplar, or other third-party components.
