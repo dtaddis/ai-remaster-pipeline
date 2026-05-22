@@ -108,8 +108,9 @@ def build_filter(args, has_color, fps: float):
             color_source = 'colblend'
         else:
             color_source = 'colfmt'
-        filters.append(f'[basefmt]extractplanes=y[basey];[{color_source}]extractplanes=u+v[colu][colv]')
-        filters.append('[basey][colu][colv]mergeplanes=0x001020:yuv444p,format=yuv420p[vout]')
+        filters.append(f'[basefmt]extractplanes=y,setsar=1[basey];[{color_source}]extractplanes=u+v[colu0][colv0]')
+        filters.append('[colu0]setsar=1[colu];[colv0]setsar=1[colv]')
+        filters.append('[basey][colu][colv]mergeplanes=0x001020:yuv444p,setsar=1,format=yuv420p[vout]')
     else:
         filters.append('[merged]copy[vout]')
     return ';'.join(filters)

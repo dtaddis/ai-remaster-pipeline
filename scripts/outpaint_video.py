@@ -18,6 +18,7 @@ from prepare_outpaint_input import even, parse_aspect, probe_video
 
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
+RECOMMENDED_OVERLAP_FRAMES = 8
 
 
 def aspect_slug(value: str) -> str:
@@ -279,7 +280,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
 
 def raw_signature(args, workflow_path: Path, prepared: Path) -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -340,25 +341,73 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     partial.replace(chunk_path)
 
 
-def stitch_chunks(ffmpeg: str, chunks: list[Path], output: Path, overlap_frames: int, force: bool) -> None:
+def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
+    vf = f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+
+
+def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fps: float) -> None:
+    if frame_count <= 0:
+        return
+    info = probe_video(source)
+    last = max(0, int(info["frames"]) - 1)
+    duration = frame_count / fps
+    vf = f"trim=start_frame={last}:end_frame={last + 1},setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={frame_count},fps={fps:.8f},setsar=1"
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+
+
+def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, force: bool) -> None:
     if output.exists() and not force:
         return
     output.parent.mkdir(parents=True, exist_ok=True)
+    if not chunks:
+        raise RuntimeError("No outpaint chunks were produced.")
+    if len(chunks) != len(ranges):
+        raise RuntimeError(f"Chunk/range mismatch: {len(chunks)} chunks for {len(ranges)} ranges.")
+    fps = float(probe_video(chunks[0])["fps"] or 24.0)
+    total_frames = ranges[-1][2]
     with tempfile.TemporaryDirectory(prefix="arp_stitch_") as tmp_text:
         tmp = Path(tmp_text)
         list_file = tmp / "chunks.txt"
-        trimmed_paths: list[Path] = []
-        for index, chunk in enumerate(chunks):
-            trimmed = tmp / f"trimmed_{index:04d}.mp4"
-            # LTX 2.3 can return fewer frames than were supplied for each chunk. In
-            # that case trimming the nominal overlap again shortens the final clip.
-            start_frame = 0
-            vf = f"trim=start_frame={start_frame},setpts=PTS-STARTPTS"
-            subprocess.run([ffmpeg, "-y", "-i", str(chunk), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(trimmed)], check=True)
-            trimmed_paths.append(trimmed)
-        list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in trimmed_paths), encoding="utf-8")
+        piece_paths: list[Path] = []
+        cursor = 0
+        previous_piece: Path | None = None
+        for index, (chunk, (_chunk_index, start_frame, end_frame)) in enumerate(zip(chunks, ranges)):
+            raw_frames = int(probe_video(chunk)["frames"])
+            expected_frames = end_frame - start_frame
+            print(f"Stitch chunk {index + 1}/{len(chunks)}: source frames {start_frame}-{end_frame}, expected {expected_frames}, got {raw_frames}", flush=True)
+            if cursor < start_frame:
+                gap = start_frame - cursor
+                print(f"Outpaint chunk gap before chunk {index + 1}: filling {gap} frame(s) by holding the previous frame. Increase overlap to at least {gap + 1} to avoid this.", flush=True)
+                if previous_piece is None:
+                    raise RuntimeError(f"First outpaint chunk starts after frame 0: {start_frame}")
+                gap_piece = tmp / f"gap_{index:04d}_{cursor:06d}_{start_frame:06d}.mp4"
+                make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps)
+                piece_paths.append(gap_piece)
+                previous_piece = gap_piece
+                cursor = start_frame
+            trim_start = max(0, cursor - start_frame)
+            available = max(0, raw_frames - trim_start)
+            if available <= 0:
+                print(f"Skipping exhausted outpaint chunk {index + 1}: trim_start={trim_start}, raw_frames={raw_frames}", flush=True)
+                continue
+            piece = tmp / f"piece_{index:04d}_{cursor:06d}.mp4"
+            make_piece(ffmpeg, chunk, piece, trim_start, available, fps)
+            piece_paths.append(piece)
+            previous_piece = piece
+            cursor += available
+        if cursor < total_frames:
+            gap = total_frames - cursor
+            print(f"Outpaint final gap: filling {gap} frame(s) by holding the last frame.", flush=True)
+            if previous_piece is None:
+                raise RuntimeError("No usable outpaint chunk frames were produced.")
+            gap_piece = tmp / f"gap_final_{cursor:06d}_{total_frames:06d}.mp4"
+            make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps)
+            piece_paths.append(gap_piece)
+            cursor = total_frames
+        list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(partial)], check=True)
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"fps={fps:.8f},setpts=N/({fps:.8f}*TB),setsar=1", "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
         partial.replace(output)
 
 
@@ -473,6 +522,12 @@ def main() -> int:
             ffmpeg = find_ffmpeg()
             ranges = chunk_ranges(prepared, args.chunk_seconds, args.overlap_frames)
             print(f"Splitting prepared canvas into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {args.overlap_frames} overlap frame(s)", flush=True)
+            if len(ranges) > 1 and args.overlap_frames < RECOMMENDED_OVERLAP_FRAMES:
+                print(
+                    f"Warning: overlap is {args.overlap_frames} frame(s). LTX can return short chunks; "
+                    f"{RECOMMENDED_OVERLAP_FRAMES}+ overlap frames is recommended to avoid held-frame seams.",
+                    flush=True,
+                )
             chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}"
             raw_chunks: list[Path] = []
             for chunk_index, start_frame, end_frame in ranges:
@@ -499,7 +554,7 @@ def main() -> int:
                 write_signature(chunk_raw, chunk_sig)
                 print(f"Wrote raw Comfy chunk: {chunk_raw}", flush=True)
                 raw_chunks.append(chunk_raw)
-            stitch_chunks(ffmpeg, raw_chunks, raw_output, args.overlap_frames, True)
+            stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, True)
             write_signature(raw_output, raw_sig)
             print(f"Wrote raw Comfy render: {raw_output}", flush=True)
 
