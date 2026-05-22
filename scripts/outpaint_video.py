@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 import subprocess
@@ -203,7 +204,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, seed: int | None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
     image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
@@ -214,9 +215,11 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
         set_widget(image_node, "0", image_name)
     except KeyError:
         pass
-    set_widget_if_node(workflow, args.positive_node_id, args.prompt_widget, args.prompt)
+    set_widget_if_node(workflow, args.positive_node_id, args.prompt_widget, prompt_text)
     set_widget_if_node(workflow, args.negative_node_id, args.prompt_widget, args.negative_prompt)
     set_widget_if_node(workflow, args.save_node_id, args.save_prefix_widget, output_prefix)
+    if seed is not None:
+        set_widget_if_node(workflow, args.seed_node_id, args.seed_widget, int(seed))
 
     for node_id in args.extra_save_node_id:
         set_widget_if_node(workflow, node_id, args.save_prefix_widget, output_prefix)
@@ -278,16 +281,19 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", chunk_manifest: Path | None = None) -> dict[str, Any]:
+    prompt_text = combine_prompt(args.prompt, prompt_suffix)
     return {
-        "version": 3,
+        "version": 4,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
         "workflow": root_relative(workflow_path),
         "workflow_fingerprint": file_fingerprint(workflow_path),
         "target_aspect": args.target_aspect,
-        "prompt": args.prompt,
+        "prompt": prompt_text,
+        "prompt_suffix": prompt_suffix,
+        "seed": seed,
         "negative_prompt": args.negative_prompt,
         "load_video_node_id": args.load_video_node_id,
         "save_node_id": args.save_node_id,
@@ -299,6 +305,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path) -> dict[str, Any]:
         "outpaint_lora": args.outpaint_lora,
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
+        "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
+        "chunk_manifest_fingerprint": file_fingerprint(chunk_manifest) if chunk_manifest and chunk_manifest.exists() else None,
     }
 
 
@@ -329,6 +337,66 @@ def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> l
             break
         start += step
     return ranges
+
+
+def combine_prompt(prompt: str, suffix: str) -> str:
+    return " ".join(part.strip() for part in (prompt, suffix) if part and part.strip())
+
+
+def default_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
+    crops = [int(getattr(args, key, 0) or 0) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    crop = "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
+    return ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop}_chunks.csv"
+
+
+def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return {int(row["chunk_index"]): row for row in csv.DictReader(handle) if row.get("chunk_index", "").isdigit()}
+
+
+def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "chunk_index",
+        "start_frame",
+        "end_frame",
+        "start_seconds",
+        "end_seconds",
+        "seed",
+        "prompt_suffix",
+        "prepared_path",
+        "raw_path",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: float, chunk_dir: Path, default_seed: int) -> dict[int, dict[str, str]]:
+    existing = read_chunk_manifest(path)
+    rows: list[dict[str, str]] = []
+    for chunk_index, start_frame, end_frame in ranges:
+        row = dict(existing.get(chunk_index, {}))
+        row.update(
+            {
+                "chunk_index": str(chunk_index),
+                "start_frame": str(start_frame),
+                "end_frame": str(end_frame),
+                "start_seconds": f"{start_frame / fps:.6f}",
+                "end_seconds": f"{end_frame / fps:.6f}",
+                "prepared_path": root_relative(chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"),
+                "raw_path": root_relative(chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"),
+            }
+        )
+        if not row.get("seed"):
+            row["seed"] = str(default_seed + chunk_index)
+        row.setdefault("prompt_suffix", "")
+        rows.append(row)
+    write_chunk_manifest(path, rows)
+    return {int(row["chunk_index"]): row for row in rows}
 
 
 def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, force: bool) -> None:
@@ -423,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-bottom", type=int, default=0)
     parser.add_argument("--chunk-seconds", type=float, default=20.0, help="Outpaint in chunks of roughly this many seconds. Use 0 to send the full clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated between neighbouring chunks before stitching.")
+    parser.add_argument("--chunk-manifest", help="CSV storing per-chunk seed and prompt suffix overrides.")
+    parser.add_argument("--only-chunk", type=int, help="Regenerate only one outpaint chunk, then restitch from existing chunks.")
     parser.add_argument("--model-backend", choices=["gguf", "checkpoint"], default="gguf")
     parser.add_argument("--gguf-model", default="LTX-2.3-distilled-Q4_K_M.gguf")
     parser.add_argument("--video-vae", default="LTX23_video_vae_bf16.safetensors")
@@ -446,6 +516,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--negative-node-id", default="2612")
     parser.add_argument("--prompt-widget", default="0")
     parser.add_argument("--prompt", default="naturalistic period film footage, coherent background extension, preserve camera motion, realistic cinematic lighting")
+    parser.add_argument("--seed-node-id", default="4832")
+    parser.add_argument("--seed-widget", default="0")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--negative-prompt", default="cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details")
     parser.add_argument("--black-lift", type=float, default=0.018)
     parser.add_argument("--gamma", type=float, default=1.06)
@@ -513,14 +586,18 @@ def main() -> int:
     output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
-        raw_sig = raw_signature(args, workflow_path, prepared)
-        if not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):
+        ffmpeg = find_ffmpeg()
+        ranges = chunk_ranges(prepared, args.chunk_seconds, args.overlap_frames)
+        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}{crop_slug(args)}"
+        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, width, height, args)
+        chunk_overrides = sync_chunk_manifest(chunk_manifest, ranges, float(probe_video(prepared)["fps"]), chunk_dir, args.seed)
+        print(f"Outpaint chunk manifest: {chunk_manifest}", flush=True)
+        raw_sig = raw_signature(args, workflow_path, prepared, chunk_manifest=chunk_manifest)
+        if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):
             print(f"Reuse raw Comfy render: {raw_output}", flush=True)
         else:
             print(f"Waiting for ComfyUI at {args.comfy_url}...", flush=True)
             wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-            ffmpeg = find_ffmpeg()
-            ranges = chunk_ranges(prepared, args.chunk_seconds, args.overlap_frames)
             print(f"Splitting prepared canvas into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {args.overlap_frames} overlap frame(s)", flush=True)
             if len(ranges) > 1 and args.overlap_frames < RECOMMENDED_OVERLAP_FRAMES:
                 print(
@@ -528,21 +605,32 @@ def main() -> int:
                     f"{RECOMMENDED_OVERLAP_FRAMES}+ overlap frames is recommended to avoid held-frame seams.",
                     flush=True,
                 )
-            chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}"
             raw_chunks: list[Path] = []
             for chunk_index, start_frame, end_frame in ranges:
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, args.force)
-                chunk_sig = raw_signature(args, workflow_path, chunk_prepared)
+                chunk_row = chunk_overrides.get(chunk_index, {})
+                chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
+                chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
+                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix)
+                if args.only_chunk is not None and chunk_index != args.only_chunk:
+                    if not chunk_raw.exists():
+                        raise FileNotFoundError(f"Cannot regenerate only chunk {args.only_chunk}; chunk {chunk_index} is missing: {chunk_raw}")
+                    raw_chunks.append(chunk_raw)
+                    continue
                 if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_prepared):
                     print(f"Reuse raw Comfy chunk: {chunk_raw}", flush=True)
                     raw_chunks.append(chunk_raw)
                     continue
                 workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
                 chunk_prefix = f"{output_prefix}_chunk_{chunk_index:04d}"
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix)
+                prompt_text = combine_prompt(args.prompt, chunk_prompt_suffix)
+                print(f"Chunk {chunk_index + 1} seed: {chunk_seed}", flush=True)
+                if chunk_prompt_suffix:
+                    print(f"Chunk {chunk_index + 1} prompt suffix: {chunk_prompt_suffix}", flush=True)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, chunk_seed)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

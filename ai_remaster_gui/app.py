@@ -453,6 +453,7 @@ class PipelineApp:
                 "source_info": info,
                 "source_monochrome": source_monochrome(source_text),
                 "aspect_preview": aspect_preview(source_text, self.settings.get("outpaint", {}).get("target_aspect", "16:9")),
+                "outpaint_chunks": outpaint_chunks_state(self.settings),
                 "shot_views": shot_views(self.settings),
                 "running": running,
                 "running_stage": self.running_stage,
@@ -570,6 +571,9 @@ class PipelineApp:
             add(["--target-height", values.get("target_height", "720")])
             add(["--chunk-seconds", values.get("chunk_seconds", "20")])
             add(["--overlap-frames", values.get("overlap_frames", "8")])
+            manifest = outpaint_chunk_manifest_for(self.settings.get("global", {}).get("source", ""), values)
+            if manifest:
+                add(["--chunk-manifest", manifest])
             for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
                 add([f"--{key.replace('_', '-')}", values.get(key, "0")])
             add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
@@ -657,6 +661,30 @@ class PipelineApp:
             self.process = subprocess.Popen(cmd, **kwargs)
             threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
         return True, "Started " + stage.title
+
+    def run_outpaint_chunk(self, index: int) -> tuple[bool, str]:
+        if not self.settings.get("global", {}).get("source"):
+            return False, "Choose source material on the Overview tab first."
+        ok, message = ensure_comfy_available_for_stage("Outpainting")
+        if not ok:
+            return False, message
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = f"Outpainting chunk {index + 1}"
+            self.running_stage_key = "outpaint"
+            self.run_started_at = time.time()
+            cmd = self.command_for("outpaint")
+            cmd.extend(["--only-chunk", str(index), "--force"])
+            self.log.append("> " + " ".join(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            self.process = subprocess.Popen(cmd, **kwargs)
+            threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
+        return True, f"Started outpaint chunk {index + 1}"
 
     def run_reference_regeneration(self, manifest_text: str, index: int) -> tuple[bool, str]:
         ok, message = ensure_comfy_available_for_stage("Reference Generation")
@@ -926,6 +954,143 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     crop = "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
     return rel(ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop}_outpainted.mp4")
+
+
+def outpaint_size_for(aspect: str, target_height_text: str = "720") -> tuple[int, int]:
+    try:
+        height = int(float(target_height_text or "720"))
+    except ValueError:
+        height = 720
+    return even_int(height * parse_aspect(aspect)), even_int(height)
+
+
+def outpaint_crop_slug(values: dict[str, str]) -> str:
+    crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    return "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
+
+
+def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
+    source = resolve(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    return ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}"
+
+
+def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
+    if not source_text:
+        return ""
+    source = resolve(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
+
+
+def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return {int(row["chunk_index"]): row for row in csv.DictReader(handle) if row.get("chunk_index", "").isdigit()}
+
+
+def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "seed", "prompt_suffix", "prepared_path", "raw_path"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def outpaint_chunks_state(settings: dict) -> dict:
+    source_text = settings.get("global", {}).get("source", "")
+    if not source_text:
+        return {"manifest": "", "rows": []}
+    source = resolve(source_text)
+    if not source.exists():
+        return {"manifest": "", "rows": []}
+    values = settings.get("outpaint", {})
+    info = ffprobe_info(source)
+    fps = parse_rate(info.get("frame_rate")) or 24.0
+    frames_text = str(info.get("frames", "")).replace(",", "")
+    duration = parse_duration(info.get("duration")) or 0
+    try:
+        total_frames = int(frames_text)
+    except ValueError:
+        total_frames = int(round(duration * fps)) if duration else 0
+    if total_frames <= 0:
+        return {"manifest": "", "rows": []}
+    try:
+        chunk_seconds = float(values.get("chunk_seconds", "20") or 20)
+    except ValueError:
+        chunk_seconds = 20.0
+    try:
+        overlap_frames = int(float(values.get("overlap_frames", "8") or 8))
+    except ValueError:
+        overlap_frames = 8
+    chunk_frames = total_frames if chunk_seconds <= 0 else max(1, int(round(chunk_seconds * fps)))
+    overlap = max(0, min(overlap_frames, chunk_frames - 1))
+    step = max(1, chunk_frames - overlap)
+    ranges = []
+    start = 0
+    while start < total_frames:
+        end = min(total_frames, start + chunk_frames)
+        ranges.append((len(ranges), start, end))
+        if end >= total_frames:
+            break
+        start += step
+    chunk_dir = outpaint_chunk_dir_for(source_text, values)
+    manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
+    existing = read_outpaint_chunk_rows(manifest)
+    rows = []
+    for index, start_frame, end_frame in ranges:
+        row = dict(existing.get(index, {}))
+        prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        row.update({
+            "chunk_index": str(index),
+            "start_frame": str(start_frame),
+            "end_frame": str(end_frame),
+            "start_seconds": f"{start_frame / fps:.6f}",
+            "end_seconds": f"{end_frame / fps:.6f}",
+            "prepared_path": rel(prepared),
+            "raw_path": rel(raw),
+        })
+        if not row.get("seed"):
+            row["seed"] = str(42 + index)
+        row.setdefault("prompt_suffix", "")
+        rows.append(row)
+    write_outpaint_chunk_rows(manifest, rows)
+    view_rows = []
+    for row in rows:
+        raw = resolve(row["raw_path"])
+        prepared = resolve(row["prepared_path"])
+        view_rows.append(row | {
+            "index": int(row["chunk_index"]),
+            "start": float(row["start_seconds"]),
+            "end": float(row["end_seconds"]),
+            "start_label": format_timecode(float(row["start_seconds"])),
+            "end_label": format_timecode(float(row["end_seconds"])),
+            "raw_exists": raw.exists(),
+            "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
+            "prepared_exists": prepared.exists(),
+        })
+    return {"manifest": rel(manifest), "rows": view_rows}
+
+
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str) -> None:
+    state = outpaint_chunks_state(APP.settings)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    rows = read_outpaint_chunk_rows(resolve(str(manifest_text)))
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+    row = rows[index]
+    row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
+    row["prompt_suffix"] = prompt_suffix
+    ordered = [rows[key] for key in sorted(rows)]
+    write_outpaint_chunk_rows(resolve(str(manifest_text)), ordered)
+    APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -1941,6 +2106,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 APP.log.append(f"Reference delete failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-chunk":
+            try:
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")))
+                self.send_json({"ok": True, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Outpaint chunk save failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-chunk-regenerate":
+            try:
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")))
+                ok, message = APP.run_outpaint_chunk(int(data.get("index", 0)))
+                self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
+            except Exception as exc:
+                APP.log.append(f"Outpaint chunk regeneration failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:
                 selected = browse_path(str(data.get("kind", "file")), str(data.get("current", "")))
@@ -2066,6 +2246,7 @@ button{background:#26333b;color:var(--text);border:1px solid #43545f;border-radi
 table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left}th{color:#b8cbd1;background:#202a31}.status-ready{color:#75d6b9}.status-waiting{color:var(--warn)}
 .shot-page{display:grid;grid-template-columns:minmax(280px,360px) 1fr;gap:16px;align-items:start}.shot-list{display:grid;gap:12px}.shot-card{display:grid;grid-template-columns:120px minmax(220px,.8fr) minmax(220px,.8fr) 1fr;gap:12px;align-items:start;background:#11181d;border:1px solid var(--line);border-radius:8px;padding:10px}.shot-number{font-size:18px;font-weight:800}.shot-time{color:var(--muted);font-size:12px}.shot-card img,.shot-card video{width:100%;aspect-ratio:16/9;object-fit:cover;background:#050607;border:1px solid var(--line);border-radius:6px}.shot-card textarea{min-height:88px;resize:vertical}.shot-card input[type=range]{padding:0}.shot-card label input[type=checkbox]{width:auto;margin-right:6px}.shot-tools{display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap}.shot-tools button{flex:0 0 auto}.shot-empty{color:var(--muted)}.inline-warning{border:1px solid #8a6a28;background:#211a0b;color:#ffd27d;border-radius:6px;padding:9px 10px;margin:10px 0;font-size:13px}.missing-image{display:grid;place-items:center;gap:6px;width:100%;aspect-ratio:16/9;background:#0c1114;border:1px dashed #45555e;border-radius:6px;color:#8fa3ab;text-align:center;font-size:12px}.missing-image .missing-icon{font-size:28px;line-height:1}.thumb-wrap{position:relative}.icon-button{position:absolute;right:6px;top:6px;width:28px;height:28px;padding:0;border-radius:999px;background:rgba(16,19,22,.82);border-color:#5b6b74;font-size:15px;line-height:1}.mini-progress{margin-top:8px;color:var(--muted);font-size:12px}.mini-progress progress{width:100%;height:12px}.spinner{width:14px;height:14px;border:2px solid #43545f;border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .editor-page{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:16px;align-items:start}.editor-viewer video{width:100%;max-height:64vh;background:#050607;border:1px solid var(--line);border-radius:8px}.live-composite{position:relative;width:100%;aspect-ratio:16/9;background:#050607;border:1px solid var(--line);border-radius:8px;overflow:hidden}.live-composite video{position:absolute;inset:0;width:100%;height:100%;max-height:none;border:0;border-radius:0;object-fit:contain;background:transparent}.live-composite .live-outpaint{object-fit:cover}.live-composite .live-original{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 10%,#000 90%,transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 10%,#000 90%,transparent 100%)}.live-composite .live-color{mix-blend-mode:color;opacity:.88}.layer-preview-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}.layer-preview-grid video{width:100%;aspect-ratio:16/9;object-fit:cover;max-height:none}.layer-preview-grid .layer-original{box-shadow:0 0 0 1px rgba(255,255,255,.12), inset 0 0 28px rgba(255,255,255,.18)}.timeline{margin-top:12px;background:#0b0e10;border:1px solid var(--line);border-radius:8px;padding:10px}.timeline input[type=range]{padding:0}.track{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center;margin:8px 0}.track-name{color:#b8cbd1;font-size:12px}.track-bar{height:18px;border:1px solid #3b4b55;border-radius:4px;background:#223038;position:relative;overflow:hidden}.track-bar::after{content:"";display:block;height:100%;width:100%;opacity:.85}.track-outpaint::after{background:#52636d}.track-original::after{background:#d6d6d6}.track-colour::after{background:#2d8f7d}.layer-grid{display:grid;gap:8px}.layer-item{background:#11181d;border:1px solid var(--line);border-radius:6px;padding:8px}.layer-item span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.layer-item strong{display:block;word-break:break-word}.editor-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.editor-controls label{margin-top:0}
+.chunk-section{margin-top:16px}.chunk-list{display:grid;gap:12px}.chunk-card{display:grid;grid-template-columns:130px minmax(240px,1fr) minmax(240px,1fr) minmax(220px,.8fr);gap:12px;background:#11181d;border:1px solid var(--line);border-radius:8px;padding:10px}.chunk-card video{width:100%;aspect-ratio:16/9;object-fit:cover;background:#050607;border:1px solid var(--line);border-radius:6px}.chunk-card textarea{min-height:84px;resize:vertical}.chunk-card input[type=number]{max-width:160px}.preview.compact img{max-height:42vh}
 .hidden{display:none}.command{font-size:12px;color:#c5d5da;word-break:break-all}
 </style>
 </head>
@@ -2080,7 +2261,7 @@ const mediaClip=(p,start,end,key)=>'/media?path='+encodeURIComponent(p)+'&clip_s
 async function api(path, opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});return await r.json();}
 async function refresh(force=false){const snap=captureScrollState(),editing=isEditingField(),mediaActive=hasMediaOnPage();state=await api('/api/state');pruneSelected();if(!availableTabs().includes(active))active='global';document.getElementById('root').textContent=state.root+(state.running?'  |  Running: '+state.running_stage:'');const sig=renderSignature();if(!force&&(editing||mediaActive||sig===lastRenderSignature)){updateRunLogs();return}drawTabs();draw(false);wireColourShotVideos();lastRenderSignature=sig;restoreScrollState(snap);}
 function renderSignature(){if(!state)return '';return JSON.stringify({active,stages:state.stages,settings:state.settings,expected_outputs:state.expected_outputs,source_previews:state.source_previews,source_info:state.source_info,source_monochrome:state.source_monochrome,aspect_preview:state.aspect_preview,shot_views:state.shot_views,progress:state.progress,phase_progress:state.phase_progress,running:state.running,running_stage:state.running_stage,running_reference:state.running_reference})}
-function hasMediaOnPage(){return active==='colour'||active==='recomp'?document.querySelectorAll('video').length>0:false}
+function hasMediaOnPage(){return active==='outpaint'||active==='colour'||active==='recomp'?document.querySelectorAll('video').length>0:false}
 function updateRunLogs(){document.querySelectorAll('[data-run-log]').forEach(el=>{const html=logHtml(state.log);if(el.innerHTML!==html)el.innerHTML=html})}
 function availableTabs(){return ['global',...state.stages.map(s=>s.key),'settings']}
 function drawTabs(){const tabs=availableTabs();const names={global:'Overview',settings:'Settings'};document.getElementById('tabs').innerHTML=tabs.map(t=>`<button class="tab ${active===t?'active':''}" onclick="active='${t}';draw();wireColourShotVideos();lastRenderSignature=renderSignature()">${names[t]||stage(t).title}</button>`).join('');}
@@ -2095,9 +2276,10 @@ function sourceInfoHtml(info){const labels={resolution:'Resolution',aspect:'Aspe
 function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}if(kind.startsWith('range:')){const [min,max,step]=kind.slice(6).split('|');return `<label>${label}: <span id="${key}Value">${esc(v)}</span></label><input data-field="${key}" data-kind="${kind}" type="range" min="${esc(min)}" max="${esc(max)}" step="${esc(step||'1')}" value="${esc(v)}" oninput="document.getElementById('${key}Value').textContent=this.value">`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
 function aspectPreviewHtml(st){if(st.key!=='outpaint')return '';const img=state.aspect_preview;const outputs=(state.expected_outputs&&state.expected_outputs.outpaint)||[],duration=parseDuration((state.source_info&&state.source_info.duration)||'0');return `<h3>Target Preview</h3>${img?`<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">`:'<p>Choose source material on the Overview tab to preview the target frame.</p>'}${duration?`<label>Preview time: <span id="aspectPreviewLabel">${formatSeconds(10)}</span></label><input type="range" min="0" max="${duration}" step="0.041" value="${Math.min(10,duration)}" oninput="updateAspectPreview(this.value)">`:''}${outputs.length?`<h3>Output Path</h3><ul class="output-list">${outputs.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}`}
 function outpaintOverlapWarning(s){const value=Number(s.overlap_frames??8);return Number.isFinite(value)&&value<8?`<div class="inline-warning">Overlap below 8 frames can cause held-frame seams if LTX returns short chunks. 8 or 9 frames is recommended.</div>`:''}
+function outpaintChunkCards(){const chunks=state.outpaint_chunks||{},rows=chunks.rows||[],source=(state.settings.global&&state.settings.global.source)||'';if(!rows.length)return '<p class="shot-empty">Choose source material to preview outpaint chunks.</p>';return `<div class="chunk-list">${rows.map(row=>{const idx=row.index,start=Number(row.start||0).toFixed(3),end=Number(row.end||0).toFixed(3),seedId=`chunkSeed_${idx}`,promptId=`chunkPrompt_${idx}`;return `<article class="chunk-card"><div><div class="shot-number">Chunk ${idx+1}</div><div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div><p class="shot-time">Frames ${esc(row.start_frame)}-${esc(row.end_frame)}</p><label>Seed</label><input id="${seedId}" type="number" value="${esc(row.seed||'42')}"><div class="shot-tools"><button type="button" onclick="saveOutpaintChunk(${idx})">Save</button><button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running?'disabled':''}>Regenerate Chunk</button></div></div><div><label>Original chunk</label>${source?`<video src="${mediaClip(source,start,end,'outpaint_src_'+idx)}" controls preload="metadata"></video>`:missingImage('Video not present')}</div><div><label>Outpainted chunk</label>${row.raw_exists?`<video src="${media(row.raw_path)}&t=${row.raw_mtime}" controls preload="metadata"></video>`:missingImage('Outpainted chunk not present')}</div><div><label>Prompt suffix</label><textarea id="${promptId}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix||'')}</textarea><p class="shot-time">Use this to nudge LTX away from odd extra objects, warped geometry, or missing details.</p></div></article>`}).join('')}</div>`}
 function fileRow(st,f){const thumb=f.preview?`<img class="file-thumb" src="${media(f.preview)}" alt="">`:'';return `<div class="file ${thumb?'':'no-thumb'}" onclick="selected['${st.key}']='${esc(f.path)}';draw()">${thumb}<div class="file-path">${esc(f.path)}</div></div>`}
 function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];const sp=stageProgress(st.key);if(st.key==='outpaint')return drawOutpaint(st,s,expected,sp);document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('${st.key}')" ${state.running?'disabled':''}>Run ${st.title}</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key)}
-function drawOutpaint(st,s,expected,sp){const mainFields=st.fields.filter(f=>!f[0].startsWith('crop_')),cropFields=st.fields.filter(f=>f[0].startsWith('crop_'));document.getElementById('app').innerHTML=`<div class="editor-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${mainFields.map(f=>fieldHtml(st,f)).join('')}${outpaintOverlapWarning(s)}<h3>Source Crop</h3><p class="shot-empty">Crop away black borders before ARP expands the frame.</p><div class="editor-controls">${cropFields.map(f=>`<div>${fieldHtml(st,f)}</div>`).join('')}</div><div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('outpaint')" ${state.running?'disabled':''}>Run Outpainting</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card preview">${aspectPreviewHtml(st)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('outpaint',true)));showCommand('outpaint')}
+function drawOutpaint(st,s,expected,sp){const mainFields=st.fields.filter(f=>!f[0].startsWith('crop_')),cropFields=st.fields.filter(f=>f[0].startsWith('crop_'));document.getElementById('app').innerHTML=`<div class="editor-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${mainFields.map(f=>fieldHtml(st,f)).join('')}${outpaintOverlapWarning(s)}<h3>Source Crop</h3><p class="shot-empty">Crop away black borders before ARP expands the frame.</p><div class="editor-controls">${cropFields.map(f=>`<div>${fieldHtml(st,f)}</div>`).join('')}</div><div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('outpaint')" ${state.running?'disabled':''}>Run Outpainting</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card preview compact">${aspectPreviewHtml(st)}</section></div><section class="card chunk-section"><h2>Outpaint Chunks</h2><p class="shot-empty">Chunks are the fixed video segments sent to LTX. They are separate from shot detection and can be regenerated individually.</p>${outpaintChunkCards()}</section><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('outpaint',true)));showCommand('outpaint')}
 function drawShots(followLogs=false){const st=stage('shots'),s=settings('shots'),expected=(state.expected_outputs&&state.expected_outputs.shots)||[],sp=stageProgress('shots');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('shots')" ${state.running?'disabled':''}>Run Shot Detection</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>Shots</h2>${shotCards('shots')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('shots',true)));showCommand('shots')}
 function drawReferences(followLogs=false){const st=stage('references'),s=settings('references'),expected=(state.expected_outputs&&state.expected_outputs.references)||[],sp=stageProgress('references');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.slice(0,8).map(p=>`<li>${esc(p)}</li>`).join('')}${expected.length>8?`<li>${expected.length-8} more...</li>`:''}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('references')" ${state.running?'disabled':''}>Run Reference Generation</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>References</h2>${shotCards('references')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('references',true)));wireReferenceTimeControls();showCommand('references')}
 function drawColour(followLogs=false){const st=stage('colour'),s=settings('colour'),expected=(state.expected_outputs&&state.expected_outputs.colour)||[],sp=stageProgress('colour');document.getElementById('app').innerHTML=`<div class="shot-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('colour')" ${state.running?'disabled':''}>Run Colorization</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card"><h2>Shot Segments</h2>${shotCards('colour')}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('colour',true)));showCommand('colour')}
@@ -2119,6 +2301,8 @@ let aspectPreviewTimer=null;
 function updateAspectPreview(time){const label=document.getElementById('aspectPreviewLabel');if(label)label.textContent=formatSeconds(time);clearTimeout(aspectPreviewTimer);aspectPreviewTimer=setTimeout(async()=>{const r=await api('/api/aspect-preview?time='+encodeURIComponent(time));const img=document.getElementById('aspectPreviewImg');if(r.ok&&r.path&&img)img.src=media(r.path)+'&t='+Date.now()},160)}
 async function scrubShot(manifest,index,time){const snap=captureScrollState();const r=await api('/api/shot-scrub',{method:'POST',body:JSON.stringify({manifest,index,time})});if(!r.ok){alert(r.error||'Could not update shot frame');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
 async function saveShotPrompt(manifest,index,prompt){const r=await api('/api/shot-prompt',{method:'POST',body:JSON.stringify({manifest,index,prompt})});if(!r.ok){alert(r.error||'Could not save prompt');return}state=await api('/api/state')}
+async function saveOutpaintChunk(index){const seed=document.getElementById(`chunkSeed_${index}`).value,prompt_suffix=document.getElementById(`chunkPrompt_${index}`).value;const snap=captureScrollState();const r=await api('/api/outpaint-chunk',{method:'POST',body:JSON.stringify({index,seed,prompt_suffix})});if(!r.ok){alert(r.error||'Could not save chunk');return}state=r.state;draw(false);restoreScrollState(snap)}
+async function regenerateOutpaintChunk(index){const seed=document.getElementById(`chunkSeed_${index}`).value,prompt_suffix=document.getElementById(`chunkPrompt_${index}`).value;const r=await api('/api/outpaint-chunk-regenerate',{method:'POST',body:JSON.stringify({index,seed,prompt_suffix})});if(!r.ok){alert(r.error||r.message||'Could not regenerate chunk');return}state=r.state;draw(false);setTimeout(()=>refresh(true),500)}
 async function saveShotEnabled(manifest,index,enabled){const snap=captureScrollState();const r=await api('/api/shot-enabled',{method:'POST',body:JSON.stringify({manifest,index,enabled})});if(!r.ok){alert(r.error||'Could not save shot setting');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
 async function mergeShot(manifest,index){if(!confirm('Merge this shot with the next one and use the same reference?'))return;const snap=captureScrollState();const r=await api('/api/shot-merge',{method:'POST',body:JSON.stringify({manifest,index})});if(!r.ok){alert(r.error||'Could not merge shots');return}state=r.state||await api('/api/state');draw(false);lastRenderSignature=renderSignature();restoreScrollState(snap)}
 async function setShotBoundary(manifest,index,edge,time){const snap=captureScrollState();const r=await api('/api/shot-boundary',{method:'POST',body:JSON.stringify({manifest,index,edge,time})});if(!r.ok){alert(r.error||'Could not update shot boundary');return}state=r.state||await api('/api/state');draw(false);lastRenderSignature=renderSignature();restoreScrollState(snap)}
