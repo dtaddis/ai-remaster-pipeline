@@ -55,9 +55,21 @@ def encoder_args(args):
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
 
 
+def crop_values(args, info: dict) -> tuple[int, int, int, int, int, int]:
+    left = max(0, int(args.crop_left))
+    right = max(0, int(args.crop_right))
+    top = max(0, int(args.crop_top))
+    bottom = max(0, int(args.crop_bottom))
+    width = max(2, info["width"] - left - right)
+    height = max(2, info["height"] - top - bottom)
+    width = width if width % 2 == 0 else width - 1
+    height = height if height % 2 == 0 else height - 1
+    return left, right, top, bottom, width, height
+
+
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 1,
+        'version': 2,
         'tool': 'prepare_outpaint_input.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -66,6 +78,10 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
         'target_width': target_width,
         'target_height': target_height,
         'target_aspect': args.target_aspect,
+        'crop_left': max(0, int(args.crop_left)),
+        'crop_right': max(0, int(args.crop_right)),
+        'crop_top': max(0, int(args.crop_top)),
+        'crop_bottom': max(0, int(args.crop_bottom)),
         'black_lift': args.black_lift,
         'gamma': args.gamma,
         'encoder': args.encoder,
@@ -77,11 +93,12 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
 def build_filter(args, info: dict, target_width: int, target_height: int) -> str:
     lift = max(0.0, min(0.25, args.black_lift))
     gamma = max(0.1, args.gamma)
+    left, _right, top, _bottom, crop_width, crop_height = crop_values(args, info)
     # The source image is lifted away from exact 0 before padding. The synthetic 16:9 margins stay exact black.
     lut = f"r=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):g=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):b=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma}))"
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
-        f"[0:v]scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1,format=rgb24,lutrgb={lut}[src]",
+        f"[0:v]crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1,format=rgb24,lutrgb={lut}[src]",
         '[bg][src]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1:format=auto,format=yuv420p[v]',
     ])
 
@@ -96,6 +113,10 @@ def build_parser():
     parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
     parser.add_argument('--target-aspect', default='16:9')
     parser.add_argument('--target-height', type=int, help='Output height. Defaults to the source height.')
+    parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
+    parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
+    parser.add_argument('--crop-top', type=int, default=0, help='Pixels to crop from the source before padding.')
+    parser.add_argument('--crop-bottom', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--black-lift', type=float, default=0.018, help='Raise source pixels away from pure black before padding. 0.018 is about 5/255.')
     parser.add_argument('--gamma', type=float, default=1.06, help='Additional source gamma lift before padding. Values above 1 brighten shadows.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
@@ -124,7 +145,7 @@ def main():
     partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
     command = [ffmpeg, '-y', '-i', str(source), '-filter_complex', build_filter(args, info, target_width, target_height), '-map', '[v]', '-map', '0:a?', *encoder_args(args), '-c:a', 'copy', str(partial)]
     print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}", flush=True)
-    print(f'Prepared canvas: {target_width}x{target_height}, black_lift={args.black_lift}, gamma={args.gamma}', flush=True)
+    print(f'Prepared canvas: {target_width}x{target_height}, crop LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, black_lift={args.black_lift}, gamma={args.gamma}', flush=True)
     print(' '.join(command), flush=True)
     if args.dry_run:
         return 0

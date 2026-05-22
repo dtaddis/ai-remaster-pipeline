@@ -97,7 +97,7 @@ def detect_shots(samples,info,args):
             if boundary-last>=min_frames and not near(boundaries,boundary,dedupe): boundaries.append(boundary); last=boundary; anchor=cur
             fade_start=None; continue
         dissolve=ds[i]; pd=ds[i-1] if i>1 else 0.0; nd=ds[i+1] if i+1<len(ds) else 0.0; dissolve_peak=dissolve>=pd and dissolve>=nd
-        hard=local_peak and adjacent>=threshold and peak_margin>=args.peak_margin
+        hard=(local_peak and adjacent>=threshold and peak_margin>=args.peak_margin) or adjacent>=threshold*1.8
         gradual=args.anchor_threshold>0 and cur.frame-last>=int(round(args.anchor_min_seconds*info.fps)) and adjacent>=args.anchor_adjacent_floor and transition_score(anchor,cur)>=args.anchor_threshold
         cross=args.dissolve_threshold>0 and dissolve_peak and dissolve>=args.dissolve_threshold and cur.frame-last>=dgap and not near(boundaries,cur.frame,dgap)
         if far and (hard or gradual or cross):
@@ -176,11 +176,11 @@ def build_parser():
     parser.add_argument('--color-reference-root',type=Path,default=DEFAULT_COLOR_REFERENCE_ROOT,help='Root for colorized reference frames.')
     parser.add_argument('--reference-set',help='Folder name under the reference roots. Defaults to the source-video stem.')
     parser.add_argument('--sample-seconds',type=float,default=0.0,help='Analysis interval. 0 means every frame.')
-    parser.add_argument('--shot-threshold',type=float,default=0.09)
-    parser.add_argument('--dynamic-threshold-scale',type=float,default=3.2)
+    parser.add_argument('--shot-threshold',type=float,default=0.075)
+    parser.add_argument('--dynamic-threshold-scale',type=float,default=2.4)
     parser.add_argument('--peak-margin',type=float,default=0.01)
-    parser.add_argument('--anchor-threshold',type=float,default=0.36)
-    parser.add_argument('--anchor-min-seconds',type=float,default=4.0)
+    parser.add_argument('--anchor-threshold',type=float,default=0.50)
+    parser.add_argument('--anchor-min-seconds',type=float,default=8.0)
     parser.add_argument('--anchor-adjacent-floor',type=float,default=0.004)
     parser.add_argument('--dissolve-threshold',type=float,default=0.20)
     parser.add_argument('--dissolve-window-seconds',type=float,default=1.5)

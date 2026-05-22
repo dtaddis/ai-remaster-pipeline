@@ -42,21 +42,27 @@ def target_size(source: Path, aspect: str, target_height: int | None) -> tuple[i
     return width, height
 
 
-def default_output(source: Path, aspect: str, target_height: int | None) -> Path:
+def crop_slug(args: Any) -> str:
+    values = [int(getattr(args, key, 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    return "" if not any(values) else f"_crop{values[0]}-{values[1]}-{values[2]}-{values[3]}"
+
+
+def default_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = target_size(source, aspect, target_height)
-    return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}_outpainted.mp4"
+    return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop_slug(args) if args else ''}_outpainted.mp4"
 
 
-def default_raw_output(source: Path, aspect: str, target_height: int | None) -> Path:
+def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = target_size(source, aspect, target_height)
-    return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}_raw_comfy.mp4"
+    return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop_slug(args) if args else ''}_raw_comfy.mp4"
 
 
-def prepared_for(source: Path, aspect: str, target_height: int | None) -> Path:
+def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     info = probe_video(source)
     height = even(target_height or info["height"])
     width = even(height * parse_aspect(aspect))
-    return default_prepared_output(source, width, height)
+    prepared = default_prepared_output(source, width, height)
+    return prepared.with_name(prepared.stem + (crop_slug(args) if args else "") + prepared.suffix)
 
 
 def run_command(command: list[str], dry_run: bool) -> None:
@@ -273,7 +279,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
 
 def raw_signature(args, workflow_path: Path, prepared: Path) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -362,6 +368,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True)
     parser.add_argument("--target-aspect", default="16:9")
     parser.add_argument("--target-height", type=int, default=720)
+    parser.add_argument("--crop-left", type=int, default=0)
+    parser.add_argument("--crop-right", type=int, default=0)
+    parser.add_argument("--crop-top", type=int, default=0)
+    parser.add_argument("--crop-bottom", type=int, default=0)
     parser.add_argument("--chunk-seconds", type=float, default=20.0, help="Outpaint in chunks of roughly this many seconds. Use 0 to send the full clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated between neighbouring chunks before stitching.")
     parser.add_argument("--model-backend", choices=["gguf", "checkpoint"], default="gguf")
@@ -412,9 +422,9 @@ def main() -> int:
     if args.model_backend == "gguf" and not (comfy_dir / "custom_nodes" / "ComfyUI-GGUF").exists():
         raise FileNotFoundError(f"ComfyUI-GGUF is required for lightweight outpainting. Re-run install_windows.bat, then restart ComfyUI: {comfy_dir / 'custom_nodes' / 'ComfyUI-GGUF'}")
 
-    output = resolve_path(args.output) if args.output else default_output(source, args.target_aspect, args.target_height)
-    raw_output = resolve_path(args.raw_output) if args.raw_output else default_raw_output(source, args.target_aspect, args.target_height)
-    prepared = prepared_for(source, args.target_aspect, args.target_height)
+    output = resolve_path(args.output) if args.output else default_output(source, args.target_aspect, args.target_height, args)
+    raw_output = resolve_path(args.raw_output) if args.raw_output else default_raw_output(source, args.target_aspect, args.target_height, args)
+    prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
         ensure_outpaint_models(comfy_dir)
@@ -430,6 +440,16 @@ def main() -> int:
         str(args.black_lift),
         "--gamma",
         str(args.gamma),
+        "--output",
+        str(prepared),
+        "--crop-left",
+        str(args.crop_left),
+        "--crop-right",
+        str(args.crop_right),
+        "--crop-top",
+        str(args.crop_top),
+        "--crop-bottom",
+        str(args.crop_bottom),
     ]
     if args.target_height:
         prepare_command += ["--target-height", str(args.target_height)]
