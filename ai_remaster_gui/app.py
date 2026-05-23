@@ -985,6 +985,13 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
     return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
 
 
+def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
+    source = resolve(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
+
+
 def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
     if not path.exists():
         return {}
@@ -1009,7 +1016,9 @@ def outpaint_chunks_state(settings: dict) -> dict:
     if not source.exists():
         return {"manifest": "", "rows": []}
     values = settings.get("outpaint", {})
-    info = ffprobe_info(source)
+    prepared = outpaint_prepared_for(source_text, values)
+    range_source = prepared if prepared.exists() else source
+    info = ffprobe_info(range_source)
     fps = parse_rate(info.get("frame_rate")) or 24.0
     frames_text = str(info.get("frames", "")).replace(",", "")
     duration = parse_duration(info.get("duration")) or 0
@@ -2153,7 +2162,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def send_text(self, text: str, content_type: str) -> None:
         body = text.encode("utf-8")
@@ -2302,7 +2314,8 @@ function updateAspectPreview(time){const label=document.getElementById('aspectPr
 async function scrubShot(manifest,index,time){const snap=captureScrollState();const r=await api('/api/shot-scrub',{method:'POST',body:JSON.stringify({manifest,index,time})});if(!r.ok){alert(r.error||'Could not update shot frame');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
 async function saveShotPrompt(manifest,index,prompt){const r=await api('/api/shot-prompt',{method:'POST',body:JSON.stringify({manifest,index,prompt})});if(!r.ok){alert(r.error||'Could not save prompt');return}state=await api('/api/state')}
 async function saveOutpaintChunk(index){const seed=document.getElementById(`chunkSeed_${index}`).value,prompt_suffix=document.getElementById(`chunkPrompt_${index}`).value;const snap=captureScrollState();const r=await api('/api/outpaint-chunk',{method:'POST',body:JSON.stringify({index,seed,prompt_suffix})});if(!r.ok){alert(r.error||'Could not save chunk');return}state=r.state;draw(false);restoreScrollState(snap)}
-async function regenerateOutpaintChunk(index){const seed=document.getElementById(`chunkSeed_${index}`).value,prompt_suffix=document.getElementById(`chunkPrompt_${index}`).value;const r=await api('/api/outpaint-chunk-regenerate',{method:'POST',body:JSON.stringify({index,seed,prompt_suffix})});if(!r.ok){alert(r.error||r.message||'Could not regenerate chunk');return}state=r.state;draw(false);setTimeout(()=>refresh(true),500)}
+function releaseChunkMedia(index){const card=document.querySelectorAll('.chunk-card')[index];if(!card)return;card.querySelectorAll('video').forEach(video=>{try{video.pause();video.removeAttribute('src');video.load()}catch{}})}
+async function regenerateOutpaintChunk(index){releaseChunkMedia(index);const seed=document.getElementById(`chunkSeed_${index}`).value,prompt_suffix=document.getElementById(`chunkPrompt_${index}`).value;const r=await api('/api/outpaint-chunk-regenerate',{method:'POST',body:JSON.stringify({index,seed,prompt_suffix})});if(!r.ok){alert(r.error||r.message||'Could not regenerate chunk');return}state=r.state;draw(false);setTimeout(()=>refresh(true),500)}
 async function saveShotEnabled(manifest,index,enabled){const snap=captureScrollState();const r=await api('/api/shot-enabled',{method:'POST',body:JSON.stringify({manifest,index,enabled})});if(!r.ok){alert(r.error||'Could not save shot setting');return}state=await api('/api/state');draw(false);restoreScrollState(snap)}
 async function mergeShot(manifest,index){if(!confirm('Merge this shot with the next one and use the same reference?'))return;const snap=captureScrollState();const r=await api('/api/shot-merge',{method:'POST',body:JSON.stringify({manifest,index})});if(!r.ok){alert(r.error||'Could not merge shots');return}state=r.state||await api('/api/state');draw(false);lastRenderSignature=renderSignature();restoreScrollState(snap)}
 async function setShotBoundary(manifest,index,edge,time){const snap=captureScrollState();const r=await api('/api/shot-boundary',{method:'POST',body:JSON.stringify({manifest,index,edge,time})});if(!r.ok){alert(r.error||'Could not update shot boundary');return}state=r.state||await api('/api/state');draw(false);lastRenderSignature=renderSignature();restoreScrollState(snap)}

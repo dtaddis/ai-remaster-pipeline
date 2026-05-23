@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,18 @@ from prepare_outpaint_input import even, parse_aspect, probe_video
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 RECOMMENDED_OVERLAP_FRAMES = 8
+
+
+def replace_with_retry(partial: Path, target: Path, label: str, attempts: int = 20, delay: float = 0.5) -> None:
+    for attempt in range(attempts):
+        try:
+            partial.replace(target)
+            return
+        except PermissionError:
+            if attempt >= attempts - 1:
+                raise
+            print(f"{label} is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
+            time.sleep(delay)
 
 
 def aspect_slug(value: str) -> str:
@@ -406,7 +419,7 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     partial = chunk_path.with_suffix(chunk_path.suffix + ".partial" + chunk_path.suffix)
     vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
     subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
-    partial.replace(chunk_path)
+    replace_with_retry(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
 
 
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
@@ -476,7 +489,7 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
         subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"fps={fps:.8f},setpts=N/({fps:.8f}*TB),setsar=1", "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
-        partial.replace(output)
+        replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -638,13 +651,27 @@ def main() -> int:
                 chunk_raw.parent.mkdir(parents=True, exist_ok=True)
                 chunk_tmp = chunk_raw.with_suffix(chunk_raw.suffix + ".partial")
                 shutil.copy2(produced, chunk_tmp)
-                chunk_tmp.replace(chunk_raw)
+                replace_with_retry(chunk_tmp, chunk_raw, f"Outpaint chunk {chunk_index + 1}")
                 write_signature(chunk_raw, chunk_sig)
                 print(f"Wrote raw Comfy chunk: {chunk_raw}", flush=True)
                 raw_chunks.append(chunk_raw)
-            stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, True)
-            write_signature(raw_output, raw_sig)
-            print(f"Wrote raw Comfy render: {raw_output}", flush=True)
+            restitched = True
+            try:
+                stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, True)
+            except PermissionError as exc:
+                if args.only_chunk is None:
+                    raise
+                restitched = False
+                print(
+                    f"Warning: regenerated chunk {args.only_chunk + 1}, but could not replace the stitched raw outpaint video because it is open in another process: {raw_output}",
+                    flush=True,
+                )
+                print("Close any preview/player using that video, then run Outpainting or regenerate the chunk again to restitch.", flush=True)
+            if restitched:
+                write_signature(raw_output, raw_sig)
+                print(f"Wrote raw Comfy render: {raw_output}", flush=True)
+            elif args.only_chunk is not None:
+                return 0
 
     finalize_command = [
         sys.executable,
