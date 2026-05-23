@@ -5,6 +5,7 @@ import csv
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -93,14 +94,27 @@ def default_output(source_video: Path) -> Path:
     return ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source_video.name)}_deepexemplar_colorized.mp4"
 
 
-def signature(args: argparse.Namespace, manifest: Path, source_video: Path) -> dict[str, Any]:
+def reference_signature(row: dict[str, str]) -> dict[str, Any]:
+    ref = row_reference(row)
     return {
-        "version": 1,
+        "start": row.get("start", ""),
+        "end": row.get("end", ""),
+        "start_frame": row.get("start_frame", ""),
+        "end_frame": row.get("end_frame", ""),
+        "reference": root_relative(ref),
+        "reference_fingerprint": file_fingerprint(ref),
+    }
+
+
+def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "version": 2,
         "tool": "colorize_video.py",
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
+        "references": [reference_signature(row) for row in rows],
         "method": "DeepExemplar",
         "frame_propagate": args.frame_propagate,
         "use_half_resolution": args.use_half_resolution,
@@ -185,6 +199,64 @@ def newest_output(files: list[Path]) -> Path:
     return max(paths, key=lambda path: path.stat().st_mtime_ns)
 
 
+def segment_signature(
+    args: argparse.Namespace,
+    source_video: Path,
+    row: dict[str, str],
+    reference: Path,
+    start_frame: int,
+    end_frame: int,
+    width: int,
+    height: int,
+    fps: float,
+) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "tool": "colorize_video.py",
+        "kind": "DeepExemplar segment",
+        "source_video": root_relative(source_video),
+        "source_fingerprint": file_fingerprint(source_video),
+        "reference": root_relative(reference),
+        "reference_fingerprint": file_fingerprint(reference),
+        "row_start": row.get("start", ""),
+        "row_end": row.get("end", ""),
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frame_propagate": args.frame_propagate,
+        "use_half_resolution": args.use_half_resolution,
+        "use_torch_compile": args.use_torch_compile,
+        "use_sage_attention": args.use_sage_attention,
+        "video_format": args.video_format,
+        "crf": args.crf,
+    }
+
+
+def segment_resumable(chunk: Path, chunk_sig: dict[str, Any], width: int, height: int, expected_frames: int) -> bool:
+    if not resumable_output(chunk, chunk_sig, width=width, height=height):
+        return False
+    try:
+        info = video_info(chunk)
+    except Exception:
+        return False
+    return abs(int(info["frames"]) - expected_frames) <= 3
+
+
+def replace_with_retry(source: Path, target: Path, attempts: int = 12, delay: float = 0.5) -> None:
+    last_exc: PermissionError | None = None
+    for _attempt in range(attempts):
+        try:
+            source.replace(target)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def stitch(ffmpeg: str, chunks: list[Path], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     concat = output.with_suffix(".concat.txt")
@@ -193,7 +265,7 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path) -> None:
     cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(partial)]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
-    partial.replace(output)
+    replace_with_retry(partial, output)
     concat.unlink(missing_ok=True)
 
 
@@ -232,7 +304,7 @@ def main() -> int:
     if not source_video.exists():
         raise FileNotFoundError(f"Source video not found for colourisation: {source_video}")
     output = resolve_path(args.output) if args.output else default_output(source_video)
-    sig = signature(args, manifest, source_video)
+    sig = signature(args, manifest, source_video, rows)
     if not args.force and resumable_output(output, sig, video_like=source_video):
         print(f"Reuse colorized video: {output}", flush=True)
         return 0
@@ -257,9 +329,11 @@ def main() -> int:
         if index == len(rows) - 1:
             end_frame = total_frames
         frame_count = max(1, end_frame - start_frame)
-        ref_name = copy_to_comfy_input(row_reference(row), comfy_dir, "arp_colorize_refs")
+        reference = row_reference(row)
+        ref_name = copy_to_comfy_input(reference, comfy_dir, "arp_colorize_refs")
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        if chunk.exists() and not args.force:
+        chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, width, height, fps)
+        if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
             print(f"Reuse colorized segment {index + 1}/{len(rows)}: {chunk}", flush=True)
             chunks.append(chunk)
             start_frame = end_frame
@@ -271,6 +345,7 @@ def main() -> int:
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
         produced = newest_output(extract_output_files(history, comfy_output_root))
         shutil.copy2(produced, chunk)
+        write_signature(chunk, chunk_sig)
         chunks.append(chunk)
         start_frame = end_frame
 
