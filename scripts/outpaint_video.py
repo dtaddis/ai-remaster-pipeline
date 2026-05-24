@@ -176,6 +176,8 @@ def ensure_widget_input(node: dict[str, Any], name: str, input_type: str = "COMB
     node["inputs"].append({"name": name, "type": input_type, "widget": {"name": name}})
 
 
+# The LTX example workflow is a frontend graph with stable-but-opaque node IDs.
+# Keep ARP's edits explicit here so model/backend assumptions remain auditable.
 def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     model_node = node_by_id(workflow, "3940")
     model_node["type"] = "UnetLoaderGGUF"

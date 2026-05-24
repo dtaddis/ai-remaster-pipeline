@@ -3,6 +3,7 @@
 import argparse
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
@@ -44,6 +45,20 @@ def encoder_args(args):
     if args.encoder == 'prores':
         return ['-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le']
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
+
+
+def replace_with_retry(source: Path, target: Path, attempts: int = 30, delay: float = 0.5) -> None:
+    last_exc: PermissionError | None = None
+    for attempt in range(attempts):
+        try:
+            source.replace(target)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            print(f"Final output is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def parse_rate(value: str) -> float:
@@ -131,18 +146,27 @@ def run(args):
     if colorized:
         cmd += ['-i', str(colorized)]
     cmd += ['-filter_complex', build_filter(args, bool(colorized), fps), '-map', '[vout]', '-map', '1:a?', '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
+    partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
-    cmd += ['-c:a', 'copy', str(output.with_suffix(output.suffix + '.partial' + output.suffix))]
+    cmd += ['-c:a', 'copy', str(partial)]
     print(' '.join(cmd))
     if args.dry_run:
         return 0
     output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
     subprocess.run(cmd, check=True)
-    partial.replace(output)
+    replace_with_retry(partial, output)
     write_signature(output, sig)
     print(f'Wrote composite: {output}')
     return 0
+
+
+def os_safe_pid() -> str:
+    try:
+        import os
+
+        return str(os.getpid())
+    except Exception:
+        return str(int(time.time()))
 
 
 def build_parser():

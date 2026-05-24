@@ -14,99 +14,255 @@ DEFAULT_MANIFEST_ROOT = ROOT / 'manifests' / 'references'
 
 @dataclass
 class VideoInfo:
-    width:int; height:int; fps:float; frame_count:int; duration:float
+    width: int
+    height: int
+    fps: float
+    frame_count: int
+    duration: float
+
+
 @dataclass
 class Sample:
-    frame:int; time:float; mean_luma:float; black_ratio:float; sharpness:float; hist:np.ndarray; color_hist:np.ndarray; edge_hist:np.ndarray; dhash:np.ndarray; gray_small:np.ndarray
+    frame: int
+    time: float
+    mean_luma: float
+    black_ratio: float
+    sharpness: float
+    hist: np.ndarray
+    color_hist: np.ndarray
+    edge_hist: np.ndarray
+    dhash: np.ndarray
+    gray_small: np.ndarray
+
+
 @dataclass
 class Shot:
-    index:int; start_frame:int; end_frame:int; samples:list[Sample]
+    index: int
+    start_frame: int
+    end_frame: int
+    samples: list[Sample]
+
+
 @dataclass
 class ReferenceRow:
-    index:int; end_frame:int; selected_frame:int; selected_time:float; source_reference:Path; color_reference:Path; reused_color_from:Path|None=None
+    index: int
+    end_frame: int
+    selected_frame: int
+    selected_time: float
+    source_reference: Path
+    color_reference: Path
+    reused_color_from: Path | None = None
 
-def probe_video(path:Path)->VideoInfo:
-    cap=cv2.VideoCapture(str(path))
-    if not cap.isOpened(): raise RuntimeError(f'Could not open video: {path}')
-    fps=cap.get(cv2.CAP_PROP_FPS) or 24.0; fc=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0); w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0); cap.release()
-    if fc<=0 or w<=0 or h<=0: raise RuntimeError(f'Could not read video metadata: {path}')
-    return VideoInfo(w,h,fps,fc,fc/fps)
+
+def probe_video(path: Path) -> VideoInfo:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f'Could not open video: {path}')
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+    if frame_count <= 0 or width <= 0 or height <= 0:
+        raise RuntimeError(f'Could not read video metadata: {path}')
+    return VideoInfo(width, height, fps, frame_count, frame_count / fps)
 
 def frame_hist(gray):
-    hist=cv2.calcHist([gray],[0],None,[32],[0,256]); return cv2.normalize(hist,hist).flatten().astype(np.float32)
+    hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+    return cv2.normalize(hist, hist).flatten().astype(np.float32)
+
+
 def color_hist(frame):
-    small=cv2.resize(frame,(160,90),interpolation=cv2.INTER_AREA); hsv=cv2.cvtColor(small,cv2.COLOR_BGR2HSV); hist=cv2.calcHist([hsv],[0,1],None,[24,16],[0,180,0,256]); return cv2.normalize(hist,hist).flatten().astype(np.float32)
+    small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [24, 16], [0, 180, 0, 256])
+    return cv2.normalize(hist, hist).flatten().astype(np.float32)
+
+
 def edge_hist(gray):
-    edges=cv2.Canny(gray,60,140); hist=cv2.calcHist([edges],[0],None,[16],[0,256]); return cv2.normalize(hist,hist).flatten().astype(np.float32)
+    edges = cv2.Canny(gray, 60, 140)
+    hist = cv2.calcHist([edges], [0], None, [16], [0, 256])
+    return cv2.normalize(hist, hist).flatten().astype(np.float32)
+
+
 def dhash(gray):
-    tiny=cv2.resize(gray,(17,16),interpolation=cv2.INTER_AREA); return (tiny[:,1:]>tiny[:,:-1]).astype(np.uint8).flatten()
-def hist_distance(a,b):
-    corr=cv2.compareHist(a.astype(np.float32),b.astype(np.float32),cv2.HISTCMP_CORREL)
-    return 1.0 if np.isnan(corr) else float(max(0,min(2,1-corr)))
-def array_distance(a,b): return float(np.mean(np.abs(a.astype(np.float32)-b.astype(np.float32)))/255.0)
-def hash_distance(a,b): return float(np.mean(a!=b))
+    tiny = cv2.resize(gray, (17, 16), interpolation=cv2.INTER_AREA)
+    return (tiny[:, 1:] > tiny[:, :-1]).astype(np.uint8).flatten()
 
-def analyze_frame(frame,idx,fps):
-    gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); small=cv2.resize(gray,(160,90),interpolation=cv2.INTER_AREA)
-    return Sample(idx,idx/fps,float(np.mean(small)),float(np.mean(small<12)),float(cv2.Laplacian(gray,cv2.CV_64F).var()),frame_hist(small),color_hist(frame),edge_hist(small),dhash(small),small)
-def analyze_image(path:Path)->Sample:
-    frame=cv2.imread(str(path),cv2.IMREAD_COLOR)
-    if frame is None: raise RuntimeError(f'Could not read image: {path}')
-    return analyze_frame(frame,0,1.0)
-def transition_score(a,b):
-    return .28*hist_distance(a.color_hist,b.color_hist)+.22*array_distance(a.gray_small,b.gray_small)+.18*hash_distance(a.dhash,b.dhash)+.14*hist_distance(a.hist,b.hist)+.08*hist_distance(a.edge_hist,b.edge_hist)+.06*abs(a.mean_luma-b.mean_luma)/255+.04*abs(a.black_ratio-b.black_ratio)
-def reuse_similarity_score(a,b):
-    return .26*array_distance(a.gray_small,b.gray_small)+.22*hash_distance(a.dhash,b.dhash)+.18*hist_distance(a.hist,b.hist)+.14*hist_distance(a.color_hist,b.color_hist)+.10*hist_distance(a.edge_hist,b.edge_hist)+.06*abs(a.mean_luma-b.mean_luma)/255+.04*abs(a.black_ratio-b.black_ratio)
-def is_fade(s,args): return s.black_ratio>=args.fade_black_ratio or s.mean_luma<=args.fade_luma
-def near(boundaries,frame,gap): return any(abs(frame-b)<gap for b in boundaries)
 
-def sample_video(path,info,args):
-    step=1 if args.sample_seconds<=0 else max(1,int(round(args.sample_seconds*info.fps))); cap=cv2.VideoCapture(str(path)); out=[]; idx=0
+def hist_distance(a, b):
+    corr = cv2.compareHist(a.astype(np.float32), b.astype(np.float32), cv2.HISTCMP_CORREL)
+    return 1.0 if np.isnan(corr) else float(max(0, min(2, 1 - corr)))
+
+
+def array_distance(a, b):
+    return float(np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0)
+
+
+def hash_distance(a, b):
+    return float(np.mean(a != b))
+
+
+def analyze_frame(frame, idx, fps):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+    return Sample(
+        idx,
+        idx / fps,
+        float(np.mean(small)),
+        float(np.mean(small < 12)),
+        float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+        frame_hist(small),
+        color_hist(frame),
+        edge_hist(small),
+        dhash(small),
+        small,
+    )
+
+
+def analyze_image(path: Path) -> Sample:
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError(f'Could not read image: {path}')
+    return analyze_frame(frame, 0, 1.0)
+def transition_score(a, b):
+    return (
+        0.28 * hist_distance(a.color_hist, b.color_hist)
+        + 0.22 * array_distance(a.gray_small, b.gray_small)
+        + 0.18 * hash_distance(a.dhash, b.dhash)
+        + 0.14 * hist_distance(a.hist, b.hist)
+        + 0.08 * hist_distance(a.edge_hist, b.edge_hist)
+        + 0.06 * abs(a.mean_luma - b.mean_luma) / 255
+        + 0.04 * abs(a.black_ratio - b.black_ratio)
+    )
+
+
+def reuse_similarity_score(a, b):
+    return (
+        0.26 * array_distance(a.gray_small, b.gray_small)
+        + 0.22 * hash_distance(a.dhash, b.dhash)
+        + 0.18 * hist_distance(a.hist, b.hist)
+        + 0.14 * hist_distance(a.color_hist, b.color_hist)
+        + 0.10 * hist_distance(a.edge_hist, b.edge_hist)
+        + 0.06 * abs(a.mean_luma - b.mean_luma) / 255
+        + 0.04 * abs(a.black_ratio - b.black_ratio)
+    )
+
+
+def is_fade(sample, args):
+    return sample.black_ratio >= args.fade_black_ratio or sample.mean_luma <= args.fade_luma
+
+
+def near(boundaries, frame, gap):
+    return any(abs(frame - boundary) < gap for boundary in boundaries)
+
+def sample_video(path, info, args):
+    step = 1 if args.sample_seconds <= 0 else max(1, int(round(args.sample_seconds * info.fps)))
+    cap = cv2.VideoCapture(str(path))
+    out = []
+    idx = 0
     while True:
-        ok,frame=cap.read()
-        if not ok: break
-        if idx%step==0: out.append(analyze_frame(frame,idx,info.fps))
-        idx+=1
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx % step == 0:
+            out.append(analyze_frame(frame, idx, info.fps))
+        idx += 1
     cap.release()
-    if not out: raise RuntimeError(f'No frames sampled from {path}')
+    if not out:
+        raise RuntimeError(f'No frames sampled from {path}')
     return out
 
-def dissolve_score(samples,i,window):
-    before=max(0,i-window); after=min(len(samples)-1,i+window)
-    return 0.0 if before==i or after==i else transition_score(samples[before],samples[after])
-def refine_boundary(samples,start,end):
-    if end<=start: return samples[end].frame
-    return samples[max(range(start+1,end+1),key=lambda i:transition_score(samples[i-1],samples[i]))].frame
 
-def detect_shots(samples,info,args):
-    min_frames=max(1,int(round(args.min_shot_seconds*info.fps))); dedupe=max(1,int(round(args.boundary_dedupe_seconds*info.fps))); dw=max(1,int(round(args.dissolve_window_seconds*info.fps))); dgap=max(min_frames,int(round(args.dissolve_min_gap_seconds*info.fps)))
-    scores=[0.0]+[transition_score(samples[i-1],samples[i]) for i in range(1,len(samples))]
-    nz=np.array([s for s in scores[1:] if s>0],dtype=np.float32)
+def dissolve_score(samples, i, window):
+    before = max(0, i - window)
+    after = min(len(samples) - 1, i + window)
+    return 0.0 if before == i or after == i else transition_score(samples[before], samples[after])
+
+
+def refine_boundary(samples, start, end):
+    if end <= start:
+        return samples[end].frame
+    strongest_index = max(range(start + 1, end + 1), key=lambda i: transition_score(samples[i - 1], samples[i]))
+    return samples[strongest_index].frame
+
+def detect_shots(samples, info, args):
+    min_frames = max(1, int(round(args.min_shot_seconds * info.fps)))
+    dedupe = max(1, int(round(args.boundary_dedupe_seconds * info.fps)))
+    dissolve_window = max(1, int(round(args.dissolve_window_seconds * info.fps)))
+    dissolve_gap = max(min_frames, int(round(args.dissolve_min_gap_seconds * info.fps)))
+    scores = [0.0] + [transition_score(samples[i - 1], samples[i]) for i in range(1, len(samples))]
+    nz = np.array([score for score in scores[1:] if score > 0], dtype=np.float32)
     if nz.size:
-        med=float(np.median(nz)); mad=float(np.median(np.abs(nz-med))); threshold=max(args.shot_threshold,med+args.dynamic_threshold_scale*max(mad*1.4826,0.001))
-    else: threshold=args.shot_threshold
-    ds=[dissolve_score(samples,i,dw) for i in range(len(samples))]
-    boundaries=[0]; last=0; anchor=samples[0]; fade_start=None
-    for i in range(1,len(samples)):
-        prev,cur=samples[i-1],samples[i]; far=cur.frame-last>=min_frames; prev_f=is_fade(prev,args); cur_f=is_fade(cur,args)
-        adjacent=scores[i]; prev_score=scores[i-1] if i>1 else 0.0; next_score=scores[i+1] if i+1<len(scores) else 0.0
-        local_peak=adjacent>=prev_score and adjacent>=next_score; peak_margin=adjacent-max(prev_score,next_score)
-        if cur_f and not prev_f and fade_start is None: fade_start=i
-        if fade_start is not None and prev_f and not cur_f:
-            boundary=refine_boundary(samples,fade_start,i)
-            if boundary-last>=min_frames and not near(boundaries,boundary,dedupe): boundaries.append(boundary); last=boundary; anchor=cur
-            fade_start=None; continue
-        dissolve=ds[i]; pd=ds[i-1] if i>1 else 0.0; nd=ds[i+1] if i+1<len(ds) else 0.0; dissolve_peak=dissolve>=pd and dissolve>=nd
-        hard=(local_peak and adjacent>=threshold and peak_margin>=args.peak_margin) or adjacent>=threshold*1.8
-        gradual=args.anchor_threshold>0 and cur.frame-last>=int(round(args.anchor_min_seconds*info.fps)) and adjacent>=args.anchor_adjacent_floor and transition_score(anchor,cur)>=args.anchor_threshold
-        cross=args.dissolve_threshold>0 and dissolve_peak and dissolve>=args.dissolve_threshold and cur.frame-last>=dgap and not near(boundaries,cur.frame,dgap)
+        median = float(np.median(nz))
+        mad = float(np.median(np.abs(nz - median)))
+        threshold = max(args.shot_threshold, median + args.dynamic_threshold_scale * max(mad * 1.4826, 0.001))
+    else:
+        threshold = args.shot_threshold
+    dissolve_scores = [dissolve_score(samples, i, dissolve_window) for i in range(len(samples))]
+    boundaries = [0]
+    last = 0
+    anchor = samples[0]
+    fade_start = None
+    for i in range(1, len(samples)):
+        prev, cur = samples[i - 1], samples[i]
+        far = cur.frame - last >= min_frames
+        prev_fade = is_fade(prev, args)
+        cur_fade = is_fade(cur, args)
+        adjacent = scores[i]
+        prev_score = scores[i - 1] if i > 1 else 0.0
+        next_score = scores[i + 1] if i + 1 < len(scores) else 0.0
+        local_peak = adjacent >= prev_score and adjacent >= next_score
+        peak_margin = adjacent - max(prev_score, next_score)
+        if cur_fade and not prev_fade and fade_start is None:
+            fade_start = i
+        if fade_start is not None and prev_fade and not cur_fade:
+            boundary = refine_boundary(samples, fade_start, i)
+            if boundary - last >= min_frames and not near(boundaries, boundary, dedupe):
+                boundaries.append(boundary)
+                last = boundary
+                anchor = cur
+            fade_start = None
+            continue
+
+        dissolve = dissolve_scores[i]
+        previous_dissolve = dissolve_scores[i - 1] if i > 1 else 0.0
+        next_dissolve = dissolve_scores[i + 1] if i + 1 < len(dissolve_scores) else 0.0
+        dissolve_peak = dissolve >= previous_dissolve and dissolve >= next_dissolve
+        hard = (local_peak and adjacent >= threshold and peak_margin >= args.peak_margin) or adjacent >= threshold * 1.8
+        gradual = (
+            args.anchor_threshold > 0
+            and cur.frame - last >= int(round(args.anchor_min_seconds * info.fps))
+            and adjacent >= args.anchor_adjacent_floor
+            and transition_score(anchor, cur) >= args.anchor_threshold
+        )
+        cross = (
+            args.dissolve_threshold > 0
+            and dissolve_peak
+            and dissolve >= args.dissolve_threshold
+            and cur.frame - last >= dissolve_gap
+            and not near(boundaries, cur.frame, dissolve_gap)
+        )
         if far and (hard or gradual or cross):
-            if hard: boundary=cur.frame; this_dedupe=min_frames
-            elif cross: boundary=cur.frame; this_dedupe=dedupe
-            else: boundary=refine_boundary(samples,max(0,i-3),i); this_dedupe=dedupe
-            if boundary-last>=min_frames and not near(boundaries,boundary,this_dedupe): boundaries.append(boundary); last=boundary; anchor=cur; fade_start=None
+            if hard:
+                boundary = cur.frame
+                this_dedupe = min_frames
+            elif cross:
+                boundary = cur.frame
+                this_dedupe = dedupe
+            else:
+                boundary = refine_boundary(samples, max(0, i - 3), i)
+                this_dedupe = dedupe
+            if boundary - last >= min_frames and not near(boundaries, boundary, this_dedupe):
+                boundaries.append(boundary)
+                last = boundary
+                anchor = cur
+                fade_start = None
     boundaries.append(info.frame_count)
-    return [Shot(idx,start,end,[s for s in samples if start<=s.frame<end]) for idx,(start,end) in enumerate(zip(boundaries,boundaries[1:]))]
+    return [
+        Shot(idx, start, end, [sample for sample in samples if start <= sample.frame < end])
+        for idx, (start, end) in enumerate(zip(boundaries, boundaries[1:]))
+    ]
 
 def representative_sample(samples,start,end,fps):
     usable=[s for s in samples if s.black_ratio<0.82 and 14<=s.mean_luma<=242]; candidates=usable or samples
