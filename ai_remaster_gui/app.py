@@ -195,6 +195,37 @@ def resolve(text: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def resolve_video_source(text: str) -> Path:
+    path = resolve(text)
+    if path.exists():
+        return path
+    if path.suffix.lower() not in VIDEO_EXTS:
+        return path
+    name = path.name
+    if not any(ch in name for ch in '<>:"|?*'):
+        return path
+    parent = path.parent
+    if not parent.exists():
+        return path
+
+    def comparable(filename: str) -> str:
+        stripped = "".join("" if ch in '<>:"|?*｜¦' else ch for ch in filename)
+        return " ".join(stripped.lower().split())
+
+    wanted = comparable(name)
+    matches = sorted(
+        (
+            candidate
+            for candidate in parent.iterdir()
+            if candidate.is_file()
+            and candidate.suffix.lower() == path.suffix.lower()
+            and comparable(candidate.name) == wanted
+        ),
+        key=lambda candidate: candidate.name.lower(),
+    )
+    return matches[0] if len(matches) == 1 else path
+
+
 def newest(folder: Path, exts: set[str]) -> Path | None:
     if not folder.exists():
         return None
@@ -214,22 +245,8 @@ def load_settings() -> dict[str, dict[str, str]]:
         except json.JSONDecodeError:
             pass
     source = newest(ROOT / "input", VIDEO_EXTS)
-    outpainted = newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS)
-    manifest = newest(ROOT / "manifests" / "references", {".csv"})
-    colorized = newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS)
     if source and not defaults["global"].get("source"):
         defaults["global"]["source"] = rel(source)
-    for stage_key, values in defaults.items():
-        if stage_key == "global":
-            continue
-        if outpainted and not values.get("outpainted_video"):
-            values["outpainted_video"] = rel(outpainted)
-        if manifest and not values.get("manifest"):
-            values["manifest"] = rel(manifest)
-        if colorized and not values.get("colorized_video"):
-            values["colorized_video"] = rel(colorized)
-    if outpainted and not defaults["recomp"].get("output"):
-        defaults["recomp"]["output"] = rel(ROOT / "output" / "reassembled" / f"{outpainted.stem}_final.mp4")
     if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
         defaults["recomp"]["colorized_video"] = ""
     bundled_output = rel(ROOT / "tools" / "comfyui" / "output")
@@ -286,6 +303,16 @@ class PipelineApp:
         self.run_started_at = 0.0
         self.lock = threading.Lock()
 
+    def normalize_loaded_source_state(self) -> None:
+        source_text = self.settings.get("global", {}).get("source", "")
+        if source_text:
+            source = resolve_video_source(source_text)
+            if source.exists() and str(source) != source_text:
+                self.settings.setdefault("global", {})["source"] = str(source)
+                self.log.append(f"Resolved source material path to: {source}")
+            self.clear_derived_stage_inputs()
+            self.hydrate_stage_inputs("global")
+
     def colorize_enabled(self) -> bool:
         return self.settings.get("global", {}).get("colorize", "true") == "true"
 
@@ -333,15 +360,14 @@ class PipelineApp:
         return any(name == prefix or name.startswith(prefix + "_") for prefix in prefixes)
 
     def progress(self) -> list[dict[str, str]]:
-        checks = {
-            "Outpainting": newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS),
-            "Shot Detection": newest(ROOT / "manifests" / "references", {".csv"}),
-            "Reference Generation": newest(ROOT / "intermediate" / "outpainted_references_color", IMAGE_EXTS),
-            "Colorization": newest(ROOT / "intermediate" / "outpainted_colorized", VIDEO_EXTS),
-            "Recomposition": newest(ROOT / "output" / "reassembled", VIDEO_EXTS),
-        }
-        active_titles = {stage.title for stage in self.active_stages()}
-        return [{"stage": key, "status": "Ready" if value else "Waiting", "latest": rel(value) if value else ""} for key, value in checks.items() if key in active_titles]
+        rows = []
+        for stage in self.active_stages():
+            expected = [resolve(path) for path in self.expected_outputs(stage.key) if path]
+            existing = [path for path in expected if path.exists()]
+            ready = bool(expected) and len(existing) == len(expected)
+            latest = max(existing, key=lambda path: path.stat().st_mtime_ns) if existing else None
+            rows.append({"stage": stage.title, "status": "Ready" if ready else "Waiting", "latest": rel(latest) if latest else ""})
+        return rows
 
     def phase_progress(self) -> dict:
         current = self.estimate_running_progress()
@@ -465,10 +491,17 @@ class PipelineApp:
             }
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
+        if stage == "global" and "source" in values:
+            source = resolve_video_source(str(values.get("source", "")))
+            if source.exists() and str(source) != str(values.get("source", "")):
+                values = dict(values)
+                values["source"] = str(source)
+                self.log.append(f"Resolved source material path to: {source}")
         self.settings.setdefault(stage, {}).update({key: str(value) for key, value in values.items()})
         if stage == "global" and "source" in values:
             self.log.append(f"Loading source material: {values.get('source')}")
             self.settings.setdefault("global", {})["colorize"] = "true" if source_monochrome(str(values.get("source", ""))) else "false"
+            self.clear_derived_stage_inputs()
             self.hydrate_stage_inputs("global")
         elif stage == "global" and "colorize" in values:
             self.hydrate_stage_inputs("global")
@@ -480,19 +513,22 @@ class PipelineApp:
 
     def clear_overview(self) -> None:
         self.settings.setdefault("global", {}).update({"source": "", "colorize": "true"})
+        self.clear_derived_stage_inputs()
+        self.log.append("Cleared source material from the Overview.")
+        self.save()
+
+    def clear_derived_stage_inputs(self) -> None:
         for stage_key, keys in {
-            "outpaint": ("source", "output"),
-            "shots": ("outpainted_video", "manifest"),
-            "references": ("manifest",),
+            "outpaint": ("source", "output", "outpainted_video", "manifest", "colorized_video"),
+            "shots": ("outpainted_video", "manifest", "colorized_video"),
+            "references": ("manifest", "outpainted_video", "colorized_video"),
             "colour": ("manifest", "outpainted_video", "colorized_video"),
             "recomp": ("outpainted_video", "source", "colorized_video", "output"),
-            "output": ("output",),
+            "output": ("output", "outpainted_video", "manifest", "colorized_video"),
         }.items():
             stage_settings = self.settings.setdefault(stage_key, {})
             for key in keys:
                 stage_settings[key] = ""
-        self.log.append("Cleared source material from the Overview.")
-        self.save()
 
     def hydrate_stage_inputs(self, completed_stage: str = "") -> None:
         expected_outpainted = resolve(self.expected_outputs("outpaint")[0]) if self.expected_outputs("outpaint") else None
@@ -916,7 +952,7 @@ def update_shot_boundary(manifest_text: str, index: int, edge: str, seconds: flo
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
     if not source_text:
         return None
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     if not source.exists() or source.suffix.lower() not in VIDEO_EXTS:
         return None
     stat = source.stat()
@@ -943,7 +979,7 @@ def safe_stem(path_text: str) -> str:
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
     if not source_text:
         return ""
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     try:
         target_height = int(float(target_height_text or "720"))
     except ValueError:
@@ -970,7 +1006,7 @@ def outpaint_crop_slug(values: dict[str, str]) -> str:
 
 
 def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
     return ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}"
@@ -979,14 +1015,14 @@ def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
 def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
     if not source_text:
         return ""
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
     return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
 
 
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
     return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
@@ -1012,22 +1048,19 @@ def outpaint_chunks_state(settings: dict) -> dict:
     source_text = settings.get("global", {}).get("source", "")
     if not source_text:
         return {"manifest": "", "rows": []}
-    source = resolve(source_text)
+    source = resolve_video_source(source_text)
     if not source.exists():
-        return {"manifest": "", "rows": []}
+        return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
     values = settings.get("outpaint", {})
     prepared = outpaint_prepared_for(source_text, values)
     range_source = prepared if prepared.exists() else source
-    info = ffprobe_info(range_source)
-    fps = parse_rate(info.get("frame_rate")) or 24.0
-    frames_text = str(info.get("frames", "")).replace(",", "")
-    duration = parse_duration(info.get("duration")) or 0
-    try:
-        total_frames = int(frames_text)
-    except ValueError:
-        total_frames = int(round(duration * fps)) if duration else 0
+    metrics = video_metrics(range_source)
+    fps = metrics.get("fps") or 24.0
+    total_frames = int(metrics.get("frames") or 0)
     if total_frames <= 0:
-        return {"manifest": "", "rows": []}
+        message = f"Outpaint chunk preview skipped; could not count frames in: {range_source}"
+        APP.log.append(message)
+        return {"manifest": "", "rows": [], "error": message}
     try:
         chunk_seconds = float(values.get("chunk_seconds", "20") or 20)
     except ValueError:
@@ -1700,6 +1733,52 @@ def ffprobe_info(source: Path) -> dict[str, str]:
     return out
 
 
+def video_metrics(source: Path) -> dict[str, float]:
+    found = local_tool("ffprobe")
+    if found:
+        command = [
+            str(found),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(source),
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                stream = (data.get("streams") or [{}])[0]
+                fmt = data.get("format") or {}
+                fps = parse_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate")) or 24.0
+                duration = float(stream.get("duration") or fmt.get("duration") or 0)
+                frames = int(str(stream.get("nb_frames") or "0").replace(",", "") or "0")
+                if frames <= 0 and duration > 0:
+                    frames = int(round(duration * fps))
+                if frames > 0:
+                    return {"fps": fps, "frames": float(frames), "duration": duration or frames / fps}
+            except (ValueError, TypeError, json.JSONDecodeError, IndexError):
+                pass
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(source))
+        if not cap.isOpened():
+            return {}
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        return {"fps": fps, "frames": float(frames), "duration": frames / fps if frames and fps else 0.0}
+    except Exception:
+        return {}
+
+
 def local_tool(name: str) -> str | None:
     exe = f"{name}.exe" if os.name == "nt" else name
     local = ROOT / ".cache" / "tools" / "ffmpeg" / exe
@@ -2288,7 +2367,7 @@ function sourceInfoHtml(info){const labels={resolution:'Resolution',aspect:'Aspe
 function fieldHtml(st,[key,label,kind,def]){const v=settings(st.key)[key]??def??'';if(kind.startsWith('select:')){return `<label>${label}</label><select data-field="${key}">${kind.slice(7).split('|').map(o=>`<option ${v===o?'selected':''}>${o}</option>`).join('')}</select>`}if(kind.startsWith('range:')){const [min,max,step]=kind.slice(6).split('|');return `<label>${label}: <span id="${key}Value">${esc(v)}</span></label><input data-field="${key}" data-kind="${kind}" type="range" min="${esc(min)}" max="${esc(max)}" step="${esc(step||'1')}" value="${esc(v)}" oninput="document.getElementById('${key}Value').textContent=this.value">`}const input=`<input data-field="${key}" data-kind="${kind}" type="${kind==='number'?'number':'text'}" step="any" value="${esc(v)}">`;if(['file','folder','save'].includes(kind)){return `<label>${label}</label><div class="field-row">${input}<button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button></div>`}return `<label>${label}</label>${input}`}
 function aspectPreviewHtml(st){if(st.key!=='outpaint')return '';const img=state.aspect_preview;const outputs=(state.expected_outputs&&state.expected_outputs.outpaint)||[],duration=parseDuration((state.source_info&&state.source_info.duration)||'0');return `<h3>Target Preview</h3>${img?`<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">`:'<p>Choose source material on the Overview tab to preview the target frame.</p>'}${duration?`<label>Preview time: <span id="aspectPreviewLabel">${formatSeconds(10)}</span></label><input type="range" min="0" max="${duration}" step="0.041" value="${Math.min(10,duration)}" oninput="updateAspectPreview(this.value)">`:''}${outputs.length?`<h3>Output Path</h3><ul class="output-list">${outputs.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}`}
 function outpaintOverlapWarning(s){const value=Number(s.overlap_frames??8);return Number.isFinite(value)&&value<8?`<div class="inline-warning">Overlap below 8 frames can cause held-frame seams if LTX returns short chunks. 8 or 9 frames is recommended.</div>`:''}
-function outpaintChunkCards(){const chunks=state.outpaint_chunks||{},rows=chunks.rows||[],source=(state.settings.global&&state.settings.global.source)||'';if(!rows.length)return '<p class="shot-empty">Choose source material to preview outpaint chunks.</p>';return `<div class="chunk-list">${rows.map(row=>{const idx=row.index,start=Number(row.start||0).toFixed(3),end=Number(row.end||0).toFixed(3),seedId=`chunkSeed_${idx}`,promptId=`chunkPrompt_${idx}`;return `<article class="chunk-card"><div><div class="shot-number">Chunk ${idx+1}</div><div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div><p class="shot-time">Frames ${esc(row.start_frame)}-${esc(row.end_frame)}</p><label>Seed</label><input id="${seedId}" type="number" value="${esc(row.seed||'42')}"><div class="shot-tools"><button type="button" onclick="saveOutpaintChunk(${idx})">Save</button><button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running?'disabled':''}>Regenerate Chunk</button></div></div><div><label>Original chunk</label>${source?`<video src="${mediaClip(source,start,end,'outpaint_src_'+idx)}" controls preload="metadata"></video>`:missingImage('Video not present')}</div><div><label>Outpainted chunk</label>${row.raw_exists?`<video src="${media(row.raw_path)}&t=${row.raw_mtime}" controls preload="metadata"></video>`:missingImage('Outpainted chunk not present')}</div><div><label>Prompt suffix</label><textarea id="${promptId}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix||'')}</textarea><p class="shot-time">Use this to nudge LTX away from odd extra objects, warped geometry, or missing details.</p></div></article>`}).join('')}</div>`}
+function outpaintChunkCards(){const chunks=state.outpaint_chunks||{},rows=chunks.rows||[],source=(state.settings.global&&state.settings.global.source)||'';if(!rows.length)return `<p class="shot-empty">${esc(chunks.error||'Choose source material to preview outpaint chunks.')}</p>`;return `<div class="chunk-list">${rows.map(row=>{const idx=row.index,start=Number(row.start||0).toFixed(3),end=Number(row.end||0).toFixed(3),seedId=`chunkSeed_${idx}`,promptId=`chunkPrompt_${idx}`;return `<article class="chunk-card"><div><div class="shot-number">Chunk ${idx+1}</div><div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div><p class="shot-time">Frames ${esc(row.start_frame)}-${esc(row.end_frame)}</p><label>Seed</label><input id="${seedId}" type="number" value="${esc(row.seed||'42')}"><div class="shot-tools"><button type="button" onclick="saveOutpaintChunk(${idx})">Save</button><button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running?'disabled':''}>Regenerate Chunk</button></div></div><div><label>Original chunk</label>${source?`<video src="${mediaClip(source,start,end,'outpaint_src_'+idx)}" controls preload="metadata"></video>`:missingImage('Video not present')}</div><div><label>Outpainted chunk</label>${row.raw_exists?`<video src="${media(row.raw_path)}&t=${row.raw_mtime}" controls preload="metadata"></video>`:missingImage('Outpainted chunk not present')}</div><div><label>Prompt suffix</label><textarea id="${promptId}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix||'')}</textarea><p class="shot-time">Use this to nudge LTX away from odd extra objects, warped geometry, or missing details.</p></div></article>`}).join('')}</div>`}
 function fileRow(st,f){const thumb=f.preview?`<img class="file-thumb" src="${media(f.preview)}" alt="">`:'';return `<div class="file ${thumb?'':'no-thumb'}" onclick="selected['${st.key}']='${esc(f.path)}';draw()">${thumb}<div class="file-path">${esc(f.path)}</div></div>`}
 function drawStage(st,followLogs=false){const s=settings(st.key);const file=selected[st.key];const expected=(state.expected_outputs&&state.expected_outputs[st.key])||[];const sp=stageProgress(st.key);if(st.key==='outpaint')return drawOutpaint(st,s,expected,sp);document.getElementById('app').innerHTML=`<div class="grid"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${st.fields.map(f=>fieldHtml(st,f)).join('')}${expected.length&&st.key!=='outpaint'?`<h3>Output Path</h3><ul class="output-list">${expected.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`:''}<div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('${st.key}')" ${state.running?'disabled':''}>Run ${st.title}</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card files"><h3>Intermediate Files</h3>${st.files.map(f=>fileRow(st,f)).join('')||'<p>No files yet.</p>'}</section><section class="card preview">${aspectPreviewHtml(st)}<h3>${file?esc(file):'Preview'}</h3>${preview(file)}</section></div><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage(st.key,true)));showCommand(st.key)}
 function drawOutpaint(st,s,expected,sp){const mainFields=st.fields.filter(f=>!f[0].startsWith('crop_')),cropFields=st.fields.filter(f=>f[0].startsWith('crop_'));document.getElementById('app').innerHTML=`<div class="editor-page"><section class="card"><h2>${st.title}</h2><p>${st.description}</p>${progressHtml(sp.percent,sp.label)}${mainFields.map(f=>fieldHtml(st,f)).join('')}${outpaintOverlapWarning(s)}<h3>Source Crop</h3><p class="shot-empty">Crop away black borders before ARP expands the frame.</p><div class="editor-controls">${cropFields.map(f=>`<div>${fieldHtml(st,f)}</div>`).join('')}</div><div class="checks"><label><input data-field="force" type="checkbox" ${s.force==='true'?'checked':''}>Regenerate</label><label><input data-field="dry_run" type="checkbox" ${s.dry_run==='true'?'checked':''}>Dry run</label></div><div class="actions"><button class="primary" onclick="runStage('outpaint')" ${state.running?'disabled':''}>Run Outpainting</button><button class="warn" onclick="stopRun()" ${state.running?'':'disabled'}>Stop</button></div><div class="command" id="cmd"></div></section><section class="card preview compact">${aspectPreviewHtml(st)}</section></div><section class="card chunk-section"><h2>Outpaint Chunks</h2><p class="shot-empty">Chunks are the fixed video segments sent to LTX. They are separate from shot detection and can be regenerated individually.</p>${outpaintChunkCards()}</section><section class="card" style="margin-top:16px">${runLogHtml()}</section>`;document.querySelectorAll('[data-field]').forEach(el=>el.addEventListener('change',()=>saveStage('outpaint',true)));showCommand('outpaint')}
@@ -2541,6 +2620,9 @@ def create_server(host: str, requested_port: int) -> ThreadingHTTPServer:
                 print(f"GUI port {port} was unavailable ({exc}); trying a free port.")
     assert last_error is not None
     raise last_error
+
+
+APP.normalize_loaded_source_state()
 
 
 def main() -> int:
