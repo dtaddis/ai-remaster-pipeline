@@ -379,6 +379,7 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "end_frame",
         "start_seconds",
         "end_seconds",
+        "custom_seconds",
         "seed",
         "prompt_suffix",
         "prepared_path",
@@ -388,6 +389,31 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
+    if default_seconds <= 0 or total_frames <= 0:
+        return [(0, 0, total_frames)]
+    ranges: list[tuple[int, int, int]] = []
+    start = 0
+    index = 0
+    while start < total_frames:
+        seconds = default_seconds
+        custom = existing.get(index, {}).get("custom_seconds", "")
+        if custom:
+            try:
+                seconds = float(custom)
+            except ValueError:
+                seconds = default_seconds
+        chunk_frames = max(1, int(round(seconds * fps)))
+        end = min(total_frames, start + chunk_frames)
+        ranges.append((index, start, end))
+        if end >= total_frames:
+            break
+        overlap = max(0, min(int(overlap_frames), chunk_frames - 1))
+        start += max(1, chunk_frames - overlap)
+        index += 1
+    return ranges
 
 
 def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: float, chunk_dir: Path, default_seed: int) -> dict[int, dict[str, str]]:
@@ -409,6 +435,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
         if not row.get("seed"):
             row["seed"] = str(default_seed + chunk_index)
         row.setdefault("prompt_suffix", "")
+        row.setdefault("custom_seconds", "")
         rows.append(row)
     write_chunk_manifest(path, rows)
     return {int(row["chunk_index"]): row for row in rows}
@@ -602,10 +629,12 @@ def main() -> int:
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
-        ranges = chunk_ranges(prepared, args.chunk_seconds, args.overlap_frames)
         chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}{crop_slug(args)}"
         chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, width, height, args)
-        chunk_overrides = sync_chunk_manifest(chunk_manifest, ranges, float(probe_video(prepared)["fps"]), chunk_dir, args.seed)
+        prepared_info = probe_video(prepared)
+        chunk_existing = read_chunk_manifest(chunk_manifest)
+        ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
+        chunk_overrides = sync_chunk_manifest(chunk_manifest, ranges, float(prepared_info["fps"]), chunk_dir, args.seed)
         print(f"Outpaint chunk manifest: {chunk_manifest}", flush=True)
         raw_sig = raw_signature(args, workflow_path, prepared, chunk_manifest=chunk_manifest)
         if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):

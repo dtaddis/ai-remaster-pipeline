@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime, timezone
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,11 +44,12 @@ from .models import COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
 from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, resolve_video_source, safe_stem
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
+PROJECT_SCHEMA_VERSION = 1
 
 
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": "", "colorize": "true"}
+    defaults["global"] = {"source": "", "colorize": "true", "section_start": "0", "section_end": ""}
     if SETTINGS_FILE.exists():
         try:
             stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -61,6 +63,8 @@ def load_settings() -> dict[str, dict[str, str]]:
         defaults["global"]["source"] = rel(source)
     if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
         defaults["recomp"]["colorized_video"] = ""
+    defaults["colour"].setdefault("method", "deepexemplar")
+    defaults["recomp"].setdefault("colorization_method", "deepexemplar")
     bundled_output = rel(ROOT / "tools" / "comfyui" / "output")
     config = current_config()
     if not defaults["references"].get("comfy_output_root") or (CONFIG_FILE.exists() and defaults["references"].get("comfy_output_root") == bundled_output):
@@ -106,6 +110,7 @@ def load_settings() -> dict[str, dict[str, str]]:
 class PipelineApp:
     def __init__(self) -> None:
         self.settings = load_settings()
+        self.project_path: Path | None = None
         self.log: list[str] = []
         self.process: subprocess.Popen[str] | None = None
         self.running_stage = ""
@@ -287,6 +292,7 @@ class PipelineApp:
             source_text = self.settings.get("global", {}).get("source", "")
             previews = source_previews(source_text)
             info = source_info(source_text)
+            section = source_section_state(self.settings)
             return {
                 "root": str(ROOT),
                 "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in (*self.active_stages(), output_stage())],
@@ -296,8 +302,10 @@ class PipelineApp:
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
                 "source_previews": previews,
                 "source_info": info,
+                "source_section": section,
+                "project_path": str(self.project_path) if self.project_path else "",
                 "source_monochrome": source_monochrome(source_text),
-                "aspect_preview": aspect_preview(source_text, self.settings.get("outpaint", {}).get("target_aspect", "16:9")),
+                "aspect_preview": aspect_preview_for_settings(self.settings),
                 "outpaint_chunks": outpaint_chunks_state(self.settings),
                 "shot_views": shot_views(self.settings),
                 "cache": cache_state(),
@@ -318,13 +326,22 @@ class PipelineApp:
                 values["source"] = str(source)
                 self.log.append(f"Resolved source material path to: {source}")
         self.settings.setdefault(stage, {}).update({key: str(value) for key, value in values.items()})
-        if stage == "global" and "source" in values:
+        if stage == "global" and {"source", "section_start", "section_end"} & set(values):
             self.log.append(f"Loading source material: {values.get('source')}")
-            self.settings.setdefault("global", {})["colorize"] = "true" if source_monochrome(str(values.get("source", ""))) else "false"
+            if "source" in values:
+                self.settings.setdefault("global", {})["colorize"] = "true" if source_monochrome(str(values.get("source", ""))) else "false"
             self.clear_derived_stage_inputs()
             self.hydrate_stage_inputs("global")
         elif stage == "global" and "colorize" in values:
             self.hydrate_stage_inputs("global")
+        elif stage == "colour" and "method" in values:
+            if values.get("method") in {"deepexemplar", "colormnet"}:
+                self.settings.setdefault("recomp", {})["colorization_method"] = str(values["method"])
+            self.hydrate_stage_inputs("colour")
+        elif stage == "recomp" and "colorization_method" in values:
+            preferred = colorized_output_for_manifest(self.settings.get("colour", {}).get("manifest", ""), str(values.get("colorization_method", "deepexemplar")))
+            if preferred:
+                self.settings.setdefault("recomp", {})["colorized_video"] = preferred
         if stage == "shots" and "outpainted_video" in values:
             manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
             self.settings.setdefault("references", {}).setdefault("manifest", manifest)
@@ -332,10 +349,41 @@ class PipelineApp:
         self.save()
 
     def clear_overview(self) -> None:
-        self.settings.setdefault("global", {}).update({"source": "", "colorize": "true"})
+        self.settings.setdefault("global", {}).update({"source": "", "colorize": "true", "section_start": "0", "section_end": ""})
         self.clear_derived_stage_inputs()
         self.log.append("Cleared source material from the Overview.")
         self.save()
+
+    def save_project(self, save_as: bool = False) -> dict[str, str]:
+        if save_as or not self.project_path:
+            suggested = self.project_path or project_default_path(self.settings)
+            selected = browse_path("project_save", str(suggested))
+            if not selected:
+                return {"path": ""}
+            path = resolve(selected)
+            if path.suffix.lower() != ".arpp":
+                path = path.with_suffix(".arpp")
+            self.project_path = path
+        else:
+            path = self.project_path
+        payload = project_payload(self.settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self.log.append(f"Saved ARP project: {path}")
+        return {"path": str(path)}
+
+    def load_project(self) -> dict[str, str]:
+        selected = browse_path("project_open", str(ROOT))
+        if not selected:
+            return {"path": ""}
+        path = resolve(selected)
+        loaded = read_project_file(path)
+        self.settings = loaded
+        self.project_path = path
+        self.hydrate_stage_inputs("")
+        self.save()
+        self.log.append(f"Loaded ARP project: {path}")
+        return {"path": str(path)}
 
     def clear_derived_stage_inputs(self) -> None:
         for stage_key, keys in {
@@ -377,6 +425,12 @@ class PipelineApp:
             self.settings.setdefault("colour", {})["manifest"] = manifest_text
             self.log.append(f"Updated manifest inputs: {manifest_text}")
         expected_colorized_text = self.expected_outputs("colour")[0] if self.expected_outputs("colour") else ""
+        preferred_colorized_text = colorized_output_for_manifest(
+            self.settings.get("colour", {}).get("manifest", ""),
+            self.settings.get("recomp", {}).get("colorization_method", self.settings.get("colour", {}).get("method", "deepexemplar")),
+        )
+        if preferred_colorized_text and resolve(preferred_colorized_text).exists():
+            expected_colorized_text = preferred_colorized_text
         expected_colorized = resolve(expected_colorized_text) if expected_colorized_text else None
         colorized = expected_colorized if expected_colorized and expected_colorized.exists() else None
         if self.colorize_enabled() and colorized:
@@ -385,7 +439,7 @@ class PipelineApp:
             self.settings.setdefault("recomp", {})["colorized_video"] = ""
         source = self.settings.get("global", {}).get("source")
         if source:
-            self.settings.setdefault("recomp", {})["source"] = source
+            self.settings.setdefault("recomp", {})["source"] = pipeline_source_text(self.settings)
         output = recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
         if output:
             self.settings.setdefault("recomp", {})["output"] = output
@@ -395,15 +449,14 @@ class PipelineApp:
     def expected_outputs(self, stage_key: str) -> list[str]:
         values = self.settings.get(stage_key, {})
         if stage_key == "outpaint":
-            source = self.settings.get("global", {}).get("source", "")
+            source = pipeline_source_text(self.settings)
             return [outpaint_output_for(source, values.get("target_aspect", "16:9"), values.get("target_height", "720"))] if source else []
         if stage_key == "shots":
             return [manifest_for_outpainted(values.get("outpainted_video", ""))]
         if stage_key == "references":
             return color_reference_outputs(values.get("manifest", ""))
         if stage_key == "colour":
-            output = colorized_output_for_manifest(values.get("manifest", ""))
-            return [output] if output else []
+            return colorized_outputs_for_manifest(values.get("manifest", ""), values.get("method", "deepexemplar"))
         if stage_key == "recomp":
             return [values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))]
         if stage_key == "output":
@@ -422,12 +475,12 @@ class PipelineApp:
         add = cmd.extend
         if stage_key == "outpaint":
             cmd.append(str(SCRIPTS / "outpaint_video.py"))
-            add(["--source", self.settings.get("global", {}).get("source", "")])
+            add(["--source", pipeline_source_text(self.settings)])
             add(["--target-aspect", values.get("target_aspect", "16:9")])
             add(["--target-height", values.get("target_height", "720")])
             add(["--chunk-seconds", values.get("chunk_seconds", "20")])
             add(["--overlap-frames", values.get("overlap_frames", "8")])
-            manifest = outpaint_chunk_manifest_for(self.settings.get("global", {}).get("source", ""), values)
+            manifest = outpaint_chunk_manifest_for(pipeline_source_text(self.settings), values)
             if manifest:
                 add(["--chunk-manifest", manifest])
             for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
@@ -461,13 +514,19 @@ class PipelineApp:
         elif stage_key == "colour":
             cmd.append(str(SCRIPTS / "colorize_video.py"))
             add(["--manifest", values.get("manifest", "")])
-            output = colorized_output_for_manifest(values.get("manifest", ""))
+            method = values.get("method", "deepexemplar")
+            add(["--method", method])
+            output = colorized_output_for_manifest(values.get("manifest", ""), method)
             if output:
                 add(["--output", output])
             add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
             add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
             add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
             add(["--crf", values.get("crf", "18")])
+            add(["--colormnet-memory-mode", values.get("colormnet_memory_mode", "balanced")])
+            add(["--colormnet-feature-encoder", values.get("colormnet_feature_encoder", "resnet50")])
+            if values.get("colormnet_text_guidance"):
+                add(["--colormnet-text-guidance", values["colormnet_text_guidance"]])
             for key in ("frame_propagate", "use_half_resolution", "use_torch_compile", "use_sage_attention"):
                 flag = "--" + key.replace("_", "-")
                 add([flag if values.get(key, "false") == "true" else "--no-" + flag[2:]])
@@ -497,6 +556,10 @@ class PipelineApp:
             missing = ["source material on the Global tab"]
         if missing:
             return False, "Missing settings: " + ", ".join(missing)
+        try:
+            self.ensure_pipeline_source()
+        except Exception as exc:
+            return False, f"Could not prepare selected source section: {exc}"
         if stage_key in {"outpaint", "references", "colour"}:
             ok, message = ensure_comfy_available_for_stage(stage.title)
             if not ok:
@@ -521,6 +584,10 @@ class PipelineApp:
     def run_outpaint_chunk(self, index: int) -> tuple[bool, str]:
         if not self.settings.get("global", {}).get("source"):
             return False, "Choose source material on the Overview tab first."
+        try:
+            self.ensure_pipeline_source()
+        except Exception as exc:
+            return False, f"Could not prepare selected source section: {exc}"
         ok, message = ensure_comfy_available_for_stage("Outpainting")
         if not ok:
             return False, message
@@ -593,6 +660,9 @@ class PipelineApp:
                 time.sleep(0.5)
             if self.process and self.process.returncode:
                 break
+
+    def ensure_pipeline_source(self) -> None:
+        ensure_source_section_clip(self.settings)
 
     def _collect_output(self, stage_key: str) -> None:
         assert self.process and self.process.stdout
@@ -779,6 +849,137 @@ def source_signature(source_text: str) -> tuple[str, int, int] | None:
     return str(source), stat.st_size, stat.st_mtime_ns
 
 
+def project_payload(settings: dict[str, dict[str, str]]) -> dict:
+    return {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "app": "AI Remaster Pipeline",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "settings": settings,
+    }
+
+
+def read_project_file(path: Path) -> dict[str, dict[str, str]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Project file is not valid JSON: {exc}") from exc
+    version = int(data.get("schema_version", 0) or 0)
+    if version < 1:
+        raise RuntimeError("Project file does not include a supported schema_version.")
+    if version > PROJECT_SCHEMA_VERSION:
+        raise RuntimeError(f"Project schema {version} is newer than this ARP build supports.")
+    settings = data.get("settings")
+    if not isinstance(settings, dict):
+        raise RuntimeError("Project file does not contain settings.")
+    loaded = load_settings()
+    for stage, values in settings.items():
+        if stage in loaded and isinstance(values, dict):
+            loaded[stage].update({str(key): str(value) for key, value in values.items()})
+    return loaded
+
+
+def project_default_path(settings: dict[str, dict[str, str]]) -> Path:
+    source = resolve_video_source(settings.get("global", {}).get("source", ""))
+    stem = safe_stem(source.name if source.name else "arp_project")
+    return ROOT / "projects" / f"{stem}.arpp"
+
+
+def pipeline_source_text(settings: dict) -> str:
+    global_settings = settings.get("global", {})
+    source_text = global_settings.get("source", "")
+    if not source_text or not source_section_is_active(settings):
+        return source_text
+    return rel(source_section_output_for(settings))
+
+
+def source_section_state(settings: dict) -> dict:
+    global_settings = settings.get("global", {})
+    source_text = global_settings.get("source", "")
+    start = section_float(global_settings.get("section_start", "0"), 0.0)
+    end = section_float(global_settings.get("section_end", ""), 0.0)
+    enabled = source_section_is_active(settings)
+    output = source_section_output_for(settings) if source_text and enabled else None
+    return {
+        "enabled": enabled,
+        "start": start,
+        "end": end,
+        "start_label": format_timecode(start),
+        "end_label": format_timecode(end) if end > 0 else "",
+        "output": rel(output) if output else "",
+        "output_exists": bool(output and output.exists()),
+    }
+
+
+def source_section_output_for(settings: dict) -> Path:
+    global_settings = settings.get("global", {})
+    source = resolve_video_source(global_settings.get("source", ""))
+    start = section_float(global_settings.get("section_start", "0"), 0.0)
+    end = section_float(global_settings.get("section_end", ""), 0.0)
+    suffix = f"{int(round(start * 1000)):010d}_{int(round(end * 1000)):010d}"
+    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}{source.suffix or '.mp4'}"
+
+
+def source_section_is_active(settings: dict) -> bool:
+    global_settings = settings.get("global", {})
+    start = section_float(global_settings.get("section_start", "0"), 0.0)
+    end = section_float(global_settings.get("section_end", ""), 0.0)
+    return end > start
+
+
+def ensure_source_section_clip(settings: dict) -> str:
+    global_settings = settings.get("global", {})
+    source_text = global_settings.get("source", "")
+    if not source_text or not source_section_is_active(settings):
+        return source_text
+    source = resolve_video_source(source_text)
+    start = section_float(global_settings.get("section_start", "0"), 0.0)
+    end = section_float(global_settings.get("section_end", ""), 0.0)
+    if end <= start:
+        return source_text
+    output = source_section_output_for(settings)
+    if output.exists() and output.stat().st_size > 0:
+        return rel(output)
+    ffmpeg = local_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("Run install_windows.bat to install local FFmpeg for source section trimming.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    command = [
+        ffmpeg,
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        str(source),
+        "-t",
+        f"{max(0.041, end - start):.3f}",
+        "-map",
+        "0",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "14",
+        "-preset",
+        "veryfast",
+        "-c:a",
+        "copy",
+        str(partial),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg source section trim failed").strip())
+    partial.replace(output)
+    APP.log.append(f"Prepared source section clip: {rel(output)}")
+    return rel(output)
+
+
+def section_float(value: str, default: float) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def manifest_for_outpainted(outpainted_text: str) -> str:
     if not outpainted_text:
         return ""
@@ -848,7 +1049,7 @@ def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
 
 def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "seed", "prompt_suffix", "prepared_path", "raw_path"]
+    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "custom_seconds", "seed", "prompt_suffix", "prepared_path", "raw_path"]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -856,7 +1057,12 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 def outpaint_chunks_state(settings: dict) -> dict:
-    source_text = settings.get("global", {}).get("source", "")
+    try:
+        ensure_source_section_clip(settings)
+    except Exception as exc:
+        return {"manifest": "", "rows": [], "error": f"Could not prepare selected source section: {exc}"}
+
+    source_text = pipeline_source_text(settings)
     if not source_text:
         return {"manifest": "", "rows": []}
     source = resolve_video_source(source_text)
@@ -880,20 +1086,10 @@ def outpaint_chunks_state(settings: dict) -> dict:
         overlap_frames = int(float(values.get("overlap_frames", "8") or 8))
     except ValueError:
         overlap_frames = 8
-    chunk_frames = total_frames if chunk_seconds <= 0 else max(1, int(round(chunk_seconds * fps)))
-    overlap = max(0, min(overlap_frames, chunk_frames - 1))
-    step = max(1, chunk_frames - overlap)
-    ranges = []
-    start = 0
-    while start < total_frames:
-        end = min(total_frames, start + chunk_frames)
-        ranges.append((len(ranges), start, end))
-        if end >= total_frames:
-            break
-        start += step
     chunk_dir = outpaint_chunk_dir_for(source_text, values)
     manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
     existing = read_outpaint_chunk_rows(manifest)
+    ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)
     rows = []
     for index, start_frame, end_frame in ranges:
         row = dict(existing.get(index, {}))
@@ -908,6 +1104,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "prepared_path": rel(prepared),
             "raw_path": rel(raw),
         })
+        row.setdefault("custom_seconds", "")
         if not row.get("seed"):
             row["seed"] = str(42 + index)
         row.setdefault("prompt_suffix", "")
@@ -917,20 +1114,62 @@ def outpaint_chunks_state(settings: dict) -> dict:
     for row in rows:
         raw = resolve(row["raw_path"])
         prepared = resolve(row["prepared_path"])
+        start_seconds = float(row["start_seconds"])
+        end_seconds = float(row["end_seconds"])
+        middle_seconds = (start_seconds + end_seconds) / 2
         view_rows.append(row | {
             "index": int(row["chunk_index"]),
             "start": float(row["start_seconds"]),
             "end": float(row["end_seconds"]),
+            "fps": fps,
+            "total_frames": total_frames,
+            "length_frames": int(row["end_frame"]) - int(row["start_frame"]),
+            "max_length_frames": max(1, total_frames - int(row["start_frame"])),
             "start_label": format_timecode(float(row["start_seconds"])),
             "end_label": format_timecode(float(row["end_seconds"])),
             "raw_exists": raw.exists(),
             "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
             "prepared_exists": prepared.exists(),
+            "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
+            "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
+            "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
+            "raw_start_preview": chunk_frame_preview(raw, 0.0, "raw_start") if raw.exists() else "",
+            "raw_middle_preview": chunk_frame_preview(raw, max(0.0, (end_seconds - start_seconds) / 2), "raw_middle") if raw.exists() else "",
+            "raw_end_preview": chunk_frame_preview(raw, max(0.0, end_seconds - start_seconds - (1 / max(1.0, fps))), "raw_end") if raw.exists() else "",
         })
     return {"manifest": rel(manifest), "rows": view_rows}
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str) -> None:
+def chunk_frame_preview(source: Path, seconds: float, suffix: str) -> str:
+    if not source.exists():
+        return ""
+    return extract_video_frame_at(source, FILE_PREVIEW_DIR / "chunks", f"{suffix}_{int(seconds * 1000):010d}", seconds)
+
+
+def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
+    ranges = []
+    start = 0
+    index = 0
+    while start < total_frames:
+        seconds = default_seconds
+        custom = existing.get(index, {}).get("custom_seconds", "")
+        if custom:
+            try:
+                seconds = float(custom)
+            except ValueError:
+                seconds = default_seconds
+        chunk_frames = total_frames if seconds <= 0 else max(1, int(round(seconds * fps)))
+        end = min(total_frames, start + chunk_frames)
+        ranges.append((index, start, end))
+        if end >= total_frames:
+            break
+        overlap = max(0, min(overlap_frames, chunk_frames - 1))
+        start += max(1, chunk_frames - overlap)
+        index += 1
+    return ranges
+
+
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "") -> None:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -941,6 +1180,10 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str) -> None:
     row = rows[index]
     row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
     row["prompt_suffix"] = prompt_suffix
+    if custom_seconds:
+        row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
+    else:
+        row["custom_seconds"] = ""
     ordered = [rows[key] for key in sorted(rows)]
     write_outpaint_chunk_rows(resolve(str(manifest_text)), ordered)
     APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
@@ -953,17 +1196,27 @@ def recomposition_output_for(outpainted_text: str) -> str:
     return rel(ROOT / "output" / "reassembled" / f"{safe_stem(outpainted.name)}_final.mp4")
 
 
-def colorized_output_for_manifest(manifest_text: str) -> str:
+def colorized_outputs_for_manifest(manifest_text: str, method: str = "deepexemplar") -> list[str]:
+    if method == "both":
+        return [path for path in (colorized_output_for_manifest(manifest_text, "deepexemplar"), colorized_output_for_manifest(manifest_text, "colormnet")) if path]
+    output = colorized_output_for_manifest(manifest_text, method)
+    return [output] if output else []
+
+
+def colorized_output_for_manifest(manifest_text: str, method: str = "deepexemplar") -> str:
     if not manifest_text:
         return ""
+    if method == "both":
+        return ""
+    suffix = "colormnet" if method == "colormnet" else "deepexemplar"
     manifest = resolve(manifest_text)
     source_video = manifest_source_video(manifest)
     if source_video:
         source = resolve(source_video)
-        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source.name)}_deepexemplar_colorized.mp4")
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{safe_stem(source.name)}_{suffix}_colorized.mp4")
     if manifest_text:
         stem = safe_stem(Path(manifest_text).stem.replace("colorize_manifest_", "").replace("_shots_auto", ""))
-        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{stem}_deepexemplar_colorized.mp4")
+        return rel(ROOT / "intermediate" / "outpainted_colorized" / f"{stem}_{suffix}_colorized.mp4")
     return ""
 
 
@@ -1125,6 +1378,38 @@ def delete_color_reference(manifest_text: str, index: int) -> dict[str, str]:
             deleted.append(rel(item))
     APP.log.append(f"Deleted colour reference for shot {index + 1}: {target}")
     return {"deleted": ", ".join(deleted), "color_reference": target}
+
+
+def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, str]:
+    manifest = resolve(manifest_text)
+    _source, _fields, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError("Shot index out of range.")
+
+    selected = browse_path("file", rows[index].get("color_reference", "") or rows[index].get("source_reference", ""))
+    if not selected:
+        return {"selected": "", "color_reference": rows[index].get("color_reference", "")}
+
+    source = resolve(selected)
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise RuntimeError("Choose a PNG or JPEG image for the custom color reference.")
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    current_target = rows[index].get("color_reference", "")
+    if current_target:
+        target_base = resolve(current_target)
+        target = target_base.with_suffix(source.suffix.lower())
+    elif rows[index].get("source_reference"):
+        target = resolve(color_reference_for_source(rows[index]["source_reference"])).with_suffix(source.suffix.lower())
+    else:
+        target = ROOT / "intermediate" / "outpainted_references_color" / "custom" / f"shot_{index + 1:04d}{source.suffix.lower()}"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    update_manifest_row(manifest, index, {"color_reference": rel(target)})
+    APP.log.append(f"Installed custom color reference for shot {index + 1}: {rel(target)}")
+    return {"selected": selected, "color_reference": rel(target)}
 
 
 def extract_reference_frame(manifest_text: str, index: int, seconds: float) -> dict[str, str]:
@@ -1331,11 +1616,53 @@ def aspect_preview(source_text: str, aspect: str) -> str:
     return aspect_preview_cached(signature[0], signature[1], signature[2], aspect, current_crop_values(), 10.0)
 
 
+def aspect_preview_for_settings(settings: dict) -> str:
+    source_text = preview_pipeline_source_text(settings)
+    if not source_text:
+        return ""
+    signature = source_signature(source_text)
+    if signature is None:
+        return ""
+    seconds = 0.0 if source_section_is_active(settings) else 10.0
+    return aspect_preview_cached(
+        signature[0],
+        signature[1],
+        signature[2],
+        settings.get("outpaint", {}).get("target_aspect", "16:9"),
+        current_crop_values(),
+        seconds,
+    )
+
+
 def aspect_preview_at(source_text: str, aspect: str, seconds: float) -> str:
     signature = source_signature(source_text)
     if signature is None:
         return ""
     return aspect_preview_cached(signature[0], signature[1], signature[2], aspect, current_crop_values(), round(max(0.0, seconds), 3))
+
+
+def aspect_preview_at_for_settings(settings: dict, seconds: float) -> str:
+    source_text = preview_pipeline_source_text(settings)
+    if not source_text:
+        return ""
+    relative_seconds = section_relative_seconds(settings, seconds)
+    return aspect_preview_at(source_text, settings.get("outpaint", {}).get("target_aspect", "16:9"), relative_seconds)
+
+
+def preview_pipeline_source_text(settings: dict) -> str:
+    try:
+        ensure_source_section_clip(settings)
+    except Exception as exc:
+        APP.log.append(f"Could not prepare selected source section for preview: {exc}")
+    return pipeline_source_text(settings)
+
+
+def section_relative_seconds(settings: dict, seconds: float) -> float:
+    if not source_section_is_active(settings):
+        return seconds
+    start = section_float(settings.get("global", {}).get("section_start", "0"), 0.0)
+    end = section_float(settings.get("global", {}).get("section_end", ""), 0.0)
+    return max(0.0, min(end - start, seconds - start))
 
 
 @lru_cache(maxsize=96)
@@ -1615,55 +1942,51 @@ def human_size(size: int) -> str:
 def cache_categories() -> tuple[dict, ...]:
     return (
         {
-            "key": "previews",
-            "title": "Preview Cache",
+            "key": "overview_previews",
+            "title": "Overview / UI Previews",
             "description": "Generated thumbnails, aspect previews, and small browser video clips.",
             "folders": (PREVIEW_DIR, FILE_PREVIEW_DIR, ASPECT_PREVIEW_DIR, MEDIA_CLIP_DIR),
         },
         {
-            "key": "outpaint_chunks",
-            "title": "Outpainted Chunks",
-            "description": "Temporary prepared and raw LTX chunk files used to rebuild an outpainted movie.",
-            "folders": (ROOT / ".cache" / "outpaint_chunks",),
-        },
-        {
-            "key": "colorized_chunks",
-            "title": "Colorized Chunks",
-            "description": "Per-shot or per-segment colorized video pieces generated before stitching.",
-            "folders": (ROOT / ".cache" / "colorized_chunks",),
-        },
-        {
-            "key": "prepared_outpaint",
-            "title": "Prepared Outpaint Inputs",
-            "description": "Expanded canvas videos prepared before being sent to ComfyUI/LTX.",
-            "folders": (ROOT / "intermediate" / "outpaint_prepared",),
-        },
-        {
-            "key": "outpainted_videos",
-            "title": "Outpainted Videos",
-            "description": "Raw and restored widescreen video outputs from the outpainting phase.",
-            "folders": (ROOT / "intermediate" / "outpainted",),
-        },
-        {
-            "key": "shot_references",
-            "title": "Shot Reference Images",
-            "description": "Black-and-white shot screenshots and Qwen color reference images.",
+            "key": "outpaint",
+            "title": "Outpainting",
+            "description": "Prepared inputs, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
             "folders": (
-                ROOT / "intermediate" / "outpainted_references",
-                ROOT / "intermediate" / "outpainted_references_color",
+                ROOT / ".cache" / "outpaint_chunks",
+                ROOT / "intermediate" / "outpaint_prepared",
+                ROOT / "intermediate" / "outpainted",
+                ROOT / "manifests" / "outpaint_chunks",
             ),
         },
         {
-            "key": "colorized_videos",
-            "title": "Colorized Videos",
-            "description": "Deep Exemplar/Colorization intermediate video outputs.",
-            "folders": (ROOT / "intermediate" / "outpainted_colorized",),
+            "key": "shots",
+            "title": "Shot Detection",
+            "description": "Shot manifests and black-and-white reference screenshots.",
+            "folders": (
+                ROOT / "intermediate" / "outpainted_references",
+                ROOT / "manifests" / "references",
+            ),
         },
         {
-            "key": "manifests",
-            "title": "Manifests",
-            "description": "Shot/reference manifests generated by ARP. Deleting these loses manual shot and prompt edits.",
-            "folders": (ROOT / "manifests",),
+            "key": "references",
+            "title": "Reference Generation",
+            "description": "Qwen color reference stills generated from the shot screenshots.",
+            "folders": (ROOT / "intermediate" / "outpainted_references_color",),
+        },
+        {
+            "key": "colour",
+            "title": "Colorization",
+            "description": "Per-shot colorized chunks and stitched Deep Exemplar colorized videos.",
+            "folders": (
+                ROOT / ".cache" / "colorized_chunks",
+                ROOT / "intermediate" / "outpainted_colorized",
+            ),
+        },
+        {
+            "key": "recomp",
+            "title": "Recomposition / Output",
+            "description": "Final recomposited outputs. Clear this to force ARP to rebuild the final movie.",
+            "folders": (ROOT / "output" / "reassembled",),
         },
     )
 
@@ -1881,6 +2204,24 @@ def media_clip_path(source: Path, start: float, end: float, key: str = "") -> Pa
     return target
 
 
+def export_media_file(path_text: str) -> dict[str, str]:
+    source = resolve(path_text)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    target_text = browse_path("save", str(source))
+    if not target_text:
+        return {"saved": ""}
+    target = resolve(target_text)
+    if target.suffix == "":
+        target = target.with_suffix(source.suffix)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.resolve() != source.resolve():
+        shutil.copy2(source, target)
+    APP.log.append(f"Saved media file: {rel(source)} -> {target}")
+    return {"saved": str(target)}
+
+
 def generate_video_previews(source: Path, target_dir: Path) -> None:
     ffmpeg = local_tool("ffmpeg")
     if not ffmpeg:
@@ -1930,9 +2271,9 @@ def browse_path(kind: str, current: str = "") -> str:
     initial = ROOT
     if current:
         current_path = resolve(current)
-        initial = current_path if current_path.is_dir() else current_path.parent
+        initial = current_path if kind == "save" else (current_path if current_path.is_dir() else current_path.parent)
         if not initial.exists():
-            initial = ROOT
+            initial = initial.parent if kind == "save" and initial.parent.exists() else ROOT
     if os.name == "nt":
         return browse_path_windows(kind, initial)
     if sys.platform == "darwin":
@@ -1941,7 +2282,9 @@ def browse_path(kind: str, current: str = "") -> str:
 
 
 def browse_path_windows(kind: str, initial: Path) -> str:
-    initial_text = str(initial).replace("'", "''")
+    initial_dir = initial if initial.is_dir() else initial.parent
+    initial_text = str(initial_dir).replace("'", "''")
+    initial_file = "" if initial.is_dir() else initial.name.replace("'", "''")
     if kind == "folder":
         script = f"""
 Add-Type -AssemblyName System.Windows.Forms
@@ -1949,20 +2292,31 @@ $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.SelectedPath = '{initial_text}'
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dialog.SelectedPath) }}
 """
-    elif kind == "save":
+    elif kind in {"save", "project_save"}:
+        filter_text = (
+            "ARP project files (*.arpp)|*.arpp|All files (*.*)|*.*"
+            if kind == "project_save"
+            else "Video files (*.mp4;*.mov;*.mkv;*.webm)|*.mp4;*.mov;*.mkv;*.webm|All files (*.*)|*.*"
+        )
         script = f"""
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.SaveFileDialog
 $dialog.InitialDirectory = '{initial_text}'
-$dialog.Filter = 'Video files (*.mp4;*.mov;*.mkv;*.webm)|*.mp4;*.mov;*.mkv;*.webm|All files (*.*)|*.*'
+$dialog.FileName = '{initial_file}'
+$dialog.Filter = '{filter_text}'
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dialog.FileName) }}
 """
     else:
+        filter_text = (
+            "ARP project files (*.arpp)|*.arpp|All files (*.*)|*.*"
+            if kind == "project_open"
+            else "Media/workflow files (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.jpg;*.jpeg;*.json;*.csv)|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.jpg;*.jpeg;*.json;*.csv|All files (*.*)|*.*"
+        )
         script = f"""
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
 $dialog.InitialDirectory = '{initial_text}'
-$dialog.Filter = 'Media/workflow files (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.jpg;*.jpeg;*.json;*.csv)|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.jpg;*.jpeg;*.json;*.csv|All files (*.*)|*.*'
+$dialog.Filter = '{filter_text}'
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dialog.FileName) }}
 """
     result = subprocess.run(
@@ -1982,11 +2336,13 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Consol
 
 
 def browse_path_macos(kind: str, initial: Path) -> str:
-    initial_script = applescript_quote(str(initial))
+    initial_dir = initial if initial.is_dir() else initial.parent
+    initial_script = applescript_quote(str(initial_dir))
     if kind == "folder":
         script = f'set chosen to choose folder with prompt "Choose folder" default location POSIX file {initial_script}\nPOSIX path of chosen'
-    elif kind == "save":
-        script = f'set chosen to choose file name with prompt "Choose output path" default location POSIX file {initial_script}\nPOSIX path of chosen'
+    elif kind in {"save", "project_save"}:
+        default_name = applescript_quote("" if initial.is_dir() else initial.name)
+        script = f'set chosen to choose file name with prompt "Choose output path" default location POSIX file {initial_script} default name {default_name}\nPOSIX path of chosen'
     else:
         script = f'set chosen to choose file with prompt "Choose file" default location POSIX file {initial_script}\nPOSIX path of chosen'
     result = subprocess.run(["osascript", "-e", script], check=False, capture_output=True, text=True)
@@ -2017,10 +2373,11 @@ def browse_path_linux(kind: str, initial: Path) -> str:
 
 
 def browse_path_zenity(kind: str, initial: Path) -> str:
-    command = ["zenity", "--file-selection", f"--filename={initial}/"]
+    filename = str(initial if kind == "save" and not initial.is_dir() else initial) + ("" if kind == "save" and not initial.is_dir() else os.sep)
+    command = ["zenity", "--file-selection", f"--filename={filename}"]
     if kind == "folder":
         command.append("--directory")
-    elif kind == "save":
+    elif kind in {"save", "project_save"}:
         command.append("--save")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2035,7 +2392,7 @@ def browse_path_zenity(kind: str, initial: Path) -> str:
 def browse_path_kdialog(kind: str, initial: Path) -> str:
     if kind == "folder":
         command = ["kdialog", "--getexistingdirectory", str(initial)]
-    elif kind == "save":
+    elif kind in {"save", "project_save"}:
         command = ["kdialog", "--getsavefilename", str(initial)]
     else:
         command = ["kdialog", "--getopenfilename", str(initial)]
@@ -2108,7 +2465,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/aspect-preview":
             query = parse_qs(parsed.query)
             try:
-                path = aspect_preview_at(APP.settings.get("global", {}).get("source", ""), APP.settings.get("outpaint", {}).get("target_aspect", "16:9"), float(query.get("time", ["0"])[0]))
+                path = aspect_preview_at_for_settings(APP.settings, float(query.get("time", ["0"])[0]))
                 self.send_json({"ok": True, "path": path})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)})
@@ -2193,16 +2550,30 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 APP.log.append(f"Reference delete failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/reference-custom":
+            try:
+                result = install_custom_color_reference(str(data.get("manifest", "")), int(data.get("index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Custom reference install failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/export-media":
+            try:
+                result = export_media_file(str(data.get("path", "")))
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                APP.log.append(f"Media export failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")))
                 self.send_json({"ok": True, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Outpaint chunk save failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")))
                 ok, message = APP.run_outpaint_chunk(int(data.get("index", 0)))
                 self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
             except Exception as exc:
@@ -2225,6 +2596,20 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/overview-clear":
             APP.clear_overview()
             self.send_json({"ok": True, "state": APP.state()})
+        elif parsed.path == "/api/project-save":
+            try:
+                result = APP.save_project(bool(data.get("save_as")))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Project save failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/project-load":
+            try:
+                result = APP.load_project()
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Project load failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/cache-delete":
             try:
                 if data.get("all"):

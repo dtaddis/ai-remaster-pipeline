@@ -11,6 +11,7 @@ from unittest import mock
 from pathlib import Path
 
 from ai_remaster_gui import app
+from ai_remaster_gui import server
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -90,7 +91,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(rows[0]["source_reference"], "bw.png")
 
     def test_command_construction_for_outpaint_uses_overview_source(self) -> None:
-        app.APP.settings["global"]["source"] = "input/example.mp4"
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
         app.APP.settings["outpaint"].update(
             {
                 "target_aspect": "16:9",
@@ -109,6 +110,66 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--source", command)
         self.assertIn("input/example.mp4", command)
         self.assertIn("--chunk-manifest", command)
+
+    def test_source_section_names_include_trim_points(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
+
+        first = app.source_section_output_for(app.APP.settings)
+        app.APP.settings["global"].update({"section_start": "45", "section_end": "60"})
+        second = app.source_section_output_for(app.APP.settings)
+
+        self.assertNotEqual(first, second)
+        self.assertIn("0000012000_0000024000", first.name)
+        self.assertIn("0000045000_0000060000", second.name)
+
+    def test_pipeline_source_uses_section_when_trim_points_are_set(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
+
+        self.assertIn("source_sections", app.pipeline_source_text(app.APP.settings))
+
+    def test_project_payload_round_trips_settings_with_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            path = Path(tmp_text) / "demo.arpp"
+            app.APP.settings["global"].update({"source": "input/example.mp4"})
+            path.write_text(json.dumps(app.project_payload(app.APP.settings)), encoding="utf-8")
+
+            loaded = app.read_project_file(path)
+
+        self.assertEqual(loaded["global"]["source"], "input/example.mp4")
+        self.assertIn("schema_version", app.project_payload(app.APP.settings))
+
+    def test_colorized_outputs_include_both_methods(self) -> None:
+        outputs = app.colorized_outputs_for_manifest("manifests/references/colorize_manifest_demo_shots_auto.csv", "both")
+
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(outputs[0].endswith("_deepexemplar_colorized.mp4"))
+        self.assertTrue(outputs[1].endswith("_colormnet_colorized.mp4"))
+
+    def test_colorization_command_can_request_both_methods(self) -> None:
+        app.APP.settings["colour"].update({"manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "both"})
+
+        command = app.APP.command_for("colour")
+
+        self.assertIn("--method", command)
+        self.assertIn("both", command)
+        self.assertNotIn("--output", command)
+
+    def test_section_preview_times_are_relative_to_trim_start(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
+
+        self.assertAlmostEqual(app.section_relative_seconds(app.APP.settings, 12), 0.0)
+        self.assertAlmostEqual(app.section_relative_seconds(app.APP.settings, 18.5), 6.5)
+        self.assertAlmostEqual(app.section_relative_seconds(app.APP.settings, 30), 12.0)
+
+    def test_outpaint_chunks_prepares_section_before_reading_it(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
+
+        with mock.patch.object(server, "ensure_source_section_clip") as ensure, mock.patch.object(server, "resolve_video_source") as resolve_source:
+            resolve_source.return_value = Path("missing-section.mp4")
+            state = app.outpaint_chunks_state(app.APP.settings)
+
+        ensure.assert_called_once_with(app.APP.settings)
+        self.assertIn("not a readable file", state["error"])
 
     def test_media_clip_rejects_missing_source(self) -> None:
         with self.assertRaises(FileNotFoundError):

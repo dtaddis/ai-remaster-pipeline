@@ -33,7 +33,7 @@ async function refresh(force = false) {
   );
 
   const sig = renderSignature();
-  if (!force && (editing || shouldPreserveMediaDom(mediaActive) || sig === lastRenderSignature)) {
+  if (!force && (editing || shouldPreserveInteractiveDom(mediaActive) || sig === lastRenderSignature)) {
     updateRunLogs();
     return;
   }
@@ -73,7 +73,10 @@ function hasMediaOnPage() {
     : false;
 }
 
-function shouldPreserveMediaDom(mediaActive) {
+function shouldPreserveInteractiveDom(mediaActive) {
+  const app = document.getElementById('app');
+  if (!app || !app.children.length) return false;
+  if (['global', 'outpaint'].includes(active)) return true;
   if (!mediaActive) return false;
 
   // Normal polling must not recreate video elements while the user is inspecting
@@ -117,7 +120,8 @@ function drawTabs() {
 
 function selectTab(tab) {
   active = tab;
-  draw();
+  drawTabs();
+  draw(false);
   wireColourShotVideos();
   lastRenderSignature = renderSignature();
 }

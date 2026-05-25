@@ -38,6 +38,7 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
         <h2>${st.title}</h2>
         <p>${st.description}</p>
         ${progressHtml(sp.percent, sp.label)}
+        ${key === 'colour' ? colorizationMethodWarning(s) : ''}
         ${st.fields.map(f => fieldHtml(st, f)).join('')}
         ${shotOutputList(expected, outputLimit)}
         ${stageCheckboxes(s)}
@@ -58,6 +59,11 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   bindStageFields(key);
   if (afterRender) afterRender();
   showCommand(key);
+}
+
+function colorizationMethodWarning(s) {
+  if (!['colormnet', 'both'].includes(s.method)) return '';
+  return '<div class="inline-warning">ColorMNet is available for comparison, but its custom node reports a CC BY-NC-SA 4.0 license. Use it only for non-commercial work unless you have separate rights.</div>';
 }
 
 function shotCards(mode) {
@@ -165,13 +171,15 @@ function boundaryFrameCard({ manifest, row, idx }, edge) {
 }
 
 function colourSegmentCard(context) {
-  const { row, enabled, colorReady, colorUrl } = context;
+  const { row, idx, enabled, colorReady, colorUrl } = context;
   const start = Math.max(0, Number(row.start) || 0).toFixed(3);
   const end = Math.max(0, Number(row.end) || 0).toFixed(3);
-  const colourVideo = (state.expected_outputs && state.expected_outputs.colour && state.expected_outputs.colour[0])
+  const colourVideo = row.colorized_video
+    || (state.expected_outputs && state.expected_outputs.colour && state.expected_outputs.colour[0])
     || settings('recomp').colorized_video
     || '';
-  const status = enabled ? (colorReady ? 'Ready for Deep Exemplar' : 'Missing color reference') : 'Disabled in manifest';
+  const method = settings('colour').method || 'deepexemplar';
+  const status = enabled ? (colorReady ? `Ready for ${colorizationLabel(method)}` : 'Missing color reference') : 'Disabled in manifest';
 
   return `
     <article class="shot-card">
@@ -182,14 +190,20 @@ function colourSegmentCard(context) {
       </div>
       <div>
         <label>Colorized shot video</label>
-        ${colourVideo ? `<video src="${media(colourVideo)}#t=${start},${end}" controls preload="metadata"></video>` : missingImage('Video not present')}
+        ${colourVideo ? `<video src="${mediaClip(colourVideo, start, end, 'colour_' + idx)}" controls preload="metadata"></video>` : missingImage('Video not present')}
       </div>
       <div>
         <label>Segment</label>
-        <p class="shot-time">Deep Exemplar uses this reference for the selected shot range.</p>
+        <p class="shot-time">${esc(colorizationLabel(method))} uses this reference for the selected shot range.</p>
       </div>
     </article>
   `;
+}
+
+function colorizationLabel(method) {
+  if (method === 'colormnet') return 'ColorMNet';
+  if (method === 'both') return 'Deep Exemplar and ColorMNet';
+  return 'Deep Exemplar';
 }
 
 function referenceCard(context) {
@@ -250,6 +264,9 @@ function referencePromptTools({ manifest, row, idx }) {
     <label>Shot prompt</label>
     <textarea data-shot-prompt="${idx}" onblur="saveShotPrompt('${esc(manifest)}',${idx},this.value)" placeholder="Optional extra direction for this shot">${esc(row.prompt || '')}</textarea>
     <div class="shot-tools">
+      <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx})">
+        Use Custom Image
+      </button>
       <button type="button" onclick="regenerateReference('${esc(manifest)}',${idx})" ${state.running ? 'disabled' : ''}>
         ${regenerating ? 'Regenerating...' : 'Regenerate Reference'}
       </button>

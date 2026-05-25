@@ -41,8 +41,17 @@ function outpaintChunkForm(index) {
   return {
     index,
     seed: document.getElementById(`chunkSeed_${index}`).value,
+    custom_seconds: outpaintChunkCustomSeconds(index),
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
   };
+}
+
+function outpaintChunkCustomSeconds(index) {
+  const checkbox = document.getElementById(`chunkCustom_${index}`);
+  const slider = document.getElementById(`chunkFrames_${index}`);
+  if (!(checkbox && checkbox.checked && slider)) return '';
+  const fps = Math.max(1, Number(slider.dataset.fps || 24));
+  return (Math.max(1, Number(slider.value) || 1) / fps).toFixed(6);
 }
 
 function releaseChunkMedia(index) {
@@ -142,6 +151,21 @@ async function deleteReference(manifest, index) {
   await redrawWithState(result.state, snap);
 }
 
+async function chooseCustomReference(manifest, index) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/reference-custom', { manifest, index });
+  if (!result.ok) return alert(result.error || 'Could not install custom reference');
+  if (!result.selected) return;
+
+  await redrawWithState(result.state, snap);
+}
+
+async function exportMedia(path) {
+  const result = await postJson('/api/export-media', { path });
+  if (!result.ok) return alert(result.error || 'Could not save media file');
+  if (result.saved) alert('Saved:\n' + result.saved);
+}
+
 async function saveStage(key, redraw = false) {
   const snap = captureScrollState();
   await postJson('/api/settings', { stage: key, values: formValues() });
@@ -195,6 +219,34 @@ async function saveGlobalColorize() {
   restoreScrollState(snap);
 }
 
+async function saveGlobalSection() {
+  const snap = captureScrollState();
+  await postJson('/api/settings', {
+    stage: 'global',
+    values: {
+      section_start: document.getElementById('sectionStart')?.value || '0',
+      section_end: document.getElementById('sectionEnd')?.value || '',
+    },
+  });
+  state = await api('/api/state');
+  pruneSelected();
+  draw(false);
+  restoreScrollState(snap);
+  lastRenderSignature = renderSignature();
+}
+
+async function markSourceSection(edge) {
+  const video = document.getElementById('sourceSectionVideo');
+  const target = document.getElementById(edge === 'start' ? 'sectionStart' : 'sectionEnd');
+  if (!video || !target) return;
+
+  target.value = Math.max(0, video.currentTime || 0).toFixed(3);
+  const label = document.getElementById(edge === 'start' ? 'sectionStartLabel' : 'sectionEndLabel');
+  if (label) label.textContent = formatSeconds(target.value);
+
+  await saveGlobalSection();
+}
+
 async function browseGlobalSource() {
   const el = document.getElementById('globalSource');
   const result = await postJson('/api/browse-global-source', { current: el.value });
@@ -216,6 +268,40 @@ async function clearOverview() {
   const result = await postJson('/api/overview-clear', {});
   if (!result.ok) return alert(result.error || 'Could not clear overview');
 
+  state = result.state;
+  pruneSelected();
+  active = 'global';
+  drawTabs();
+  draw();
+  lastRenderSignature = renderSignature();
+}
+
+async function saveProject() {
+  const result = await postJson('/api/project-save', { save_as: false });
+  if (!result.ok) return alert(result.error || 'Could not save project');
+  if (result.path) alert('Saved ARP project:\n' + result.path);
+  if (result.state) {
+    state = result.state;
+    lastRenderSignature = renderSignature();
+  }
+}
+
+async function saveProjectAs() {
+  const result = await postJson('/api/project-save', { save_as: true });
+  if (!result.ok) return alert(result.error || 'Could not save project');
+  if (result.path) alert('Saved ARP project:\n' + result.path);
+  if (result.state) {
+    state = result.state;
+    lastRenderSignature = renderSignature();
+  }
+}
+
+async function loadProject() {
+  const result = await postJson('/api/project-load', {});
+  if (!result.ok) return alert(result.error || 'Could not load project');
+  if (!result.path) return;
+
+  selected = {};
   state = result.state;
   pruneSelected();
   active = 'global';
@@ -323,7 +409,7 @@ async function clearCacheCategory(category, title) {
 async function clearAllCache() {
   const message = 'Clear ALL ARP cached/intermediate files?\n\n'
     + 'This deletes generated previews, outpaint chunks, prepared videos, references, colorized intermediates, and manifests. '
-    + 'Source videos, installed tools, downloaded models, and final output files are left alone.\n\n'
+    + 'Source videos, installed tools, and downloaded models are left alone.\n\n'
     + 'This cannot be undone.';
   if (!confirm(message)) return;
 

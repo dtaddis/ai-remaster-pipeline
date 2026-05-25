@@ -12,20 +12,16 @@ function outpaintChunkCards() {
 
 function outpaintChunkCard(row) {
   const idx = row.index;
-  const source = (state.settings.global && state.settings.global.source) || '';
-  const start = Number(row.start || 0).toFixed(3);
-  const end = Number(row.end || 0).toFixed(3);
-
   return `
     <article class="chunk-card">
       ${outpaintChunkSummary(row)}
       <div>
-        <label>Original chunk</label>
-        ${source ? `<video src="${mediaClip(source, start, end, 'outpaint_src_' + idx)}" controls preload="metadata"></video>` : missingImage('Video not present')}
+        <label>Original frames</label>
+        ${chunkStillStrip(row, 'source')}
       </div>
       <div>
-        <label>Outpainted chunk</label>
-        ${row.raw_exists ? `<video src="${media(row.raw_path)}&t=${row.raw_mtime}" controls preload="metadata"></video>` : missingImage('Outpainted chunk not present')}
+        <label>Outpainted frames</label>
+        ${row.raw_exists ? chunkStillStrip(row, 'raw') : missingImage('Outpainted chunk not present')}
       </div>
       ${outpaintChunkPrompt(row)}
     </article>
@@ -34,12 +30,25 @@ function outpaintChunkCard(row) {
 
 function outpaintChunkSummary(row) {
   const idx = row.index;
+  const fps = Math.max(1, Number(row.fps || 24));
+  const projectFrames = Math.max(1, Math.round(Number(settings('outpaint').chunk_seconds || 20) * fps));
+  const frameCount = Math.max(1, Number(row.custom_seconds ? Math.round(Number(row.custom_seconds) * fps) : row.length_frames || projectFrames));
+  const maxFrames = Math.max(frameCount, Number(row.max_length_frames || frameCount));
+  const custom = !!row.custom_seconds;
 
   return `
     <div>
       <div class="shot-number">Chunk ${idx + 1}</div>
       <div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div>
       <p class="shot-time">Frames ${esc(row.start_frame)}-${esc(row.end_frame)}</p>
+      <label><input id="chunkCustom_${idx}" type="checkbox" ${custom ? 'checked' : ''} onchange="toggleChunkLength(${idx})"> Custom length</label>
+      <label>Length: <span id="chunkFramesLabel_${idx}">${chunkLengthLabel(frameCount, fps)}</span></label>
+      <input id="chunkFrames_${idx}" data-fps="${fps}" type="range" min="1" max="${maxFrames}" step="1" value="${frameCount}" ${custom ? '' : 'disabled'} oninput="updateChunkLengthLabel(${idx})">
+      <div class="shot-tools">
+        <button type="button" onclick="nudgeChunkLength(${idx},-1)" ${custom ? '' : 'disabled'}>-1 frame</button>
+        <input id="chunkFramesInput_${idx}" class="frame-input" type="number" min="1" max="${maxFrames}" step="1" value="${frameCount}" ${custom ? '' : 'disabled'} onchange="setChunkLengthFrames(${idx},this.value)">
+        <button type="button" onclick="nudgeChunkLength(${idx},1)" ${custom ? '' : 'disabled'}>+1 frame</button>
+      </div>
       <label>Seed</label>
       <input id="chunkSeed_${idx}" type="number" value="${esc(row.seed || '42')}">
       <div class="shot-tools">
@@ -58,6 +67,58 @@ function outpaintChunkPrompt(row) {
       <label>Prompt suffix</label>
       <textarea id="chunkPrompt_${idx}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix || '')}</textarea>
       <p class="shot-time">Use this to nudge LTX away from odd extra objects, warped geometry, or missing details.</p>
+    </div>
+  `;
+}
+
+function toggleChunkLength(index) {
+  const checkbox = document.getElementById(`chunkCustom_${index}`);
+  const slider = document.getElementById(`chunkFrames_${index}`);
+  const input = document.getElementById(`chunkFramesInput_${index}`);
+  const buttons = slider ? slider.parentElement.querySelectorAll('.shot-tools button') : [];
+  if (slider) slider.disabled = !(checkbox && checkbox.checked);
+  if (input) input.disabled = !(checkbox && checkbox.checked);
+  buttons.forEach(button => { button.disabled = !(checkbox && checkbox.checked); });
+}
+
+function updateChunkLengthLabel(index) {
+  const slider = document.getElementById(`chunkFrames_${index}`);
+  const label = document.getElementById(`chunkFramesLabel_${index}`);
+  if (!slider || !label) return;
+  label.textContent = chunkLengthLabel(Number(slider.value), Number(slider.dataset.fps || 24));
+  const input = document.getElementById(`chunkFramesInput_${index}`);
+  if (input) input.value = slider.value;
+}
+
+function setChunkLengthFrames(index, value) {
+  const slider = document.getElementById(`chunkFrames_${index}`);
+  if (!slider) return;
+  const next = Math.max(Number(slider.min || 1), Math.min(Number(slider.max || value), Math.round(Number(value) || 1)));
+  slider.value = next;
+  updateChunkLengthLabel(index);
+}
+
+function nudgeChunkLength(index, delta) {
+  const slider = document.getElementById(`chunkFrames_${index}`);
+  if (!slider || slider.disabled) return;
+  setChunkLengthFrames(index, Number(slider.value) + Number(delta || 0));
+}
+
+function chunkLengthLabel(frames, fps) {
+  const safeFrames = Math.max(1, Math.round(Number(frames) || 1));
+  const safeFps = Math.max(1, Number(fps) || 24);
+  return `${safeFrames} frames (${(safeFrames / safeFps).toFixed(3)}s)`;
+}
+
+function chunkStillStrip(row, prefix) {
+  const frames = [
+    [prefix + '_start_preview', 'Start'],
+    [prefix + '_middle_preview', 'Middle'],
+    [prefix + '_end_preview', 'End'],
+  ];
+  return `
+    <div class="chunk-stills">
+      ${frames.map(([key, label]) => row[key] ? `<figure><img src="${media(row[key])}" alt=""><figcaption>${label}</figcaption></figure>` : missingImage(label + ' frame not present')).join('')}
     </div>
   `;
 }

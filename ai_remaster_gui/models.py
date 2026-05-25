@@ -46,7 +46,7 @@ STAGES = (
     Stage(
         "shots",
         "Shot Detection",
-        "Detect cuts and extract one useful reference frame per shot.",
+        "Detect cuts and divide the video into sections for independent colorization.",
         ("intermediate/outpainted", "intermediate/outpainted_references", "manifests/references"),
         (
             ("outpainted_video", "Outpainted video", "file", ""),
@@ -73,14 +73,18 @@ STAGES = (
     Stage(
         "colour",
         "Colorization",
-        "Run Deep Exemplar in ComfyUI over the outpainted video, using the generated color references.",
+        "Run reference-guided video colorization over the outpainted video.",
         ("intermediate/outpainted_references_color", "intermediate/outpainted_colorized", "manifests/references"),
         (
             ("manifest", "Manifest", "file", ""),
+            ("method", "Method", "select:deepexemplar|colormnet|both", "deepexemplar"),
             ("frame_propagate", "Frame propagation", "select:true|false", "true"),
             ("use_half_resolution", "Half-resolution processing", "select:true|false", "true"),
             ("use_torch_compile", "Torch compile", "select:false|true", "false"),
             ("use_sage_attention", "SageAttention", "select:false|true", "false"),
+            ("colormnet_memory_mode", "ColorMNet memory", "select:balanced|low_memory|high_quality", "balanced"),
+            ("colormnet_feature_encoder", "ColorMNet encoder", "select:resnet50|vgg19|dinov2_vits|dinov2_vitb|dinov2_vitl|clip_vitb", "resnet50"),
+            ("colormnet_text_guidance", "ColorMNet text guidance", "text", ""),
             ("crf", "CRF", "number", "18"),
         ),
         ("manifest",),
@@ -93,6 +97,7 @@ STAGES = (
         (
             ("outpainted_video", "Outpainted video", "file", ""),
             ("source", "Original source", "file", ""),
+            ("colorization_method", "Colorization layer", "select:deepexemplar|colormnet", "deepexemplar"),
             ("colorized_video", "Colorized video", "file", ""),
             ("feather_pixels", "Feather pixels", "number", "80"),
             ("saturation", "Saturation", "number", "0.82"),

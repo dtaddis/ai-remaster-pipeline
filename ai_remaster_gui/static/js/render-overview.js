@@ -14,10 +14,16 @@ function drawGlobal() {
           <p class="hero">AI Remaster Pipeline</p>
           <p>Choose the source material, then run or inspect each stage.</p>
         </div>
-        <button type="button" onclick="clearOverview()">Clear</button>
+        <div class="actions compact-actions">
+          <button type="button" onclick="saveProject()">Save</button>
+          <button type="button" onclick="saveProjectAs()">Save As...</button>
+          <button type="button" onclick="loadProject()">Load Project</button>
+          <button type="button" onclick="clearOverview()">Clear</button>
+        </div>
       </div>
       <img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline">
       ${overviewSourcePicker(source)}
+      ${overviewSectionPicker(global, source)}
       <div class="checks">
         <label><input id="globalColorize" type="checkbox" ${colorize ? 'checked' : ''}>Colorize</label>
         <span class="shot-time">${esc(sourceTone)}</span>
@@ -33,6 +39,7 @@ function drawGlobal() {
 
   document.getElementById('globalSource').addEventListener('change', saveGlobal);
   document.getElementById('globalColorize').addEventListener('change', saveGlobalColorize);
+  bindOverviewSectionControls();
 }
 
 function overviewSourcePicker(source) {
@@ -50,6 +57,40 @@ function overviewFilmstrip() {
     .map(path => `<img src="${media(path)}" alt="">`)
     .join('');
   return thumbs ? `<div class="filmstrip">${thumbs}</div>` : '';
+}
+
+function overviewSectionPicker(global, source) {
+  const start = Number(global.section_start || 0);
+  const duration = parseDuration((state.source_info && state.source_info.duration) || '0');
+  const end = Number(global.section_end || duration || 0);
+  return `
+    <div class="section-picker">
+      ${source ? `<video id="sourceSectionVideo" class="section-video" src="${media(source)}" controls preload="metadata"></video>` : ''}
+      <div class="editor-controls">
+        <div>
+          <label>Start: <span id="sectionStartLabel">${formatSeconds(start)}</span></label>
+          <input id="sectionStart" type="range" min="0" max="${Math.max(duration, end, 1)}" step="0.041" value="${start}">
+        </div>
+        <div>
+          <label>End: <span id="sectionEndLabel">${end ? formatSeconds(end) : 'End'}</span></label>
+          <input id="sectionEnd" type="range" min="0" max="${Math.max(duration, end, 1)}" step="0.041" value="${end || duration || 0}">
+        </div>
+      </div>
+      <div class="shot-tools">
+        <button type="button" onclick="markSourceSection('start')">Mark Start</button>
+        <button type="button" onclick="markSourceSection('end')">Mark End</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindOverviewSectionControls() {
+  const start = document.getElementById('sectionStart');
+  const end = document.getElementById('sectionEnd');
+  if (start) start.addEventListener('input', () => document.getElementById('sectionStartLabel').textContent = formatSeconds(start.value));
+  if (end) end.addEventListener('input', () => document.getElementById('sectionEndLabel').textContent = formatSeconds(end.value));
+  if (start) start.addEventListener('change', saveGlobalSection);
+  if (end) end.addEventListener('change', saveGlobalSection);
 }
 
 function overviewActions() {

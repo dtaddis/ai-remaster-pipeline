@@ -99,21 +99,33 @@ function aspectPreviewHtml(st) {
 
   const img = state.aspect_preview;
   const outputs = (state.expected_outputs && state.expected_outputs.outpaint) || [];
-  const duration = parseDuration((state.source_info && state.source_info.duration) || '0');
+  const range = aspectPreviewRange();
 
   return `
     <h3>Target Preview</h3>
     ${img ? `<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">` : '<p>Choose source material on the Overview tab to preview the target frame.</p>'}
-    ${duration ? aspectPreviewSlider(duration) : ''}
+    ${range.duration ? aspectPreviewSlider(range) : ''}
     ${shotOutputList(outputs, null)}
   `;
 }
 
-function aspectPreviewSlider(duration) {
-  const value = Math.min(10, duration);
+function aspectPreviewRange() {
+  const sourceDuration = parseDuration((state.source_info && state.source_info.duration) || '0');
+  const section = state.source_section || {};
+  const start = Number(section.enabled ? section.start : 0) || 0;
+  const end = Number(section.enabled ? section.end : sourceDuration) || sourceDuration;
+  return {
+    start,
+    end: Math.max(start, end),
+    value: section.enabled ? start : Math.min(10, sourceDuration),
+    duration: Math.max(0, end - start),
+  };
+}
+
+function aspectPreviewSlider(range) {
   return `
-    <label>Preview time: <span id="aspectPreviewLabel">${formatSeconds(10)}</span></label>
-    <input type="range" min="0" max="${duration}" step="0.041" value="${value}" oninput="updateAspectPreview(this.value)">
+    <label>Preview time: <span id="aspectPreviewLabel">${formatSeconds(range.value)}</span></label>
+    <input type="range" min="${range.start}" max="${range.end}" step="0.041" value="${range.value}" oninput="updateAspectPreview(this.value)">
   `;
 }
 

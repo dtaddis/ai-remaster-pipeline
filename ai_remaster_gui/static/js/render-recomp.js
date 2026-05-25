@@ -40,24 +40,33 @@ function drawRecomp() {
 function recompLayerSummary(s) {
   return `
     <div class="layer-grid">
-      <div class="layer-item">
-        <span>Top layer - Color blend</span>
-        <strong>${esc(s.colorized_video || 'Colorized video not set')}</strong>
-      </div>
-      <div class="layer-item">
-        <span>Middle layer</span>
-        <strong>${esc(s.source || 'Original source not set')}</strong>
-      </div>
-      <div class="layer-item">
-        <span>Bottom layer</span>
-        <strong>${esc(s.outpainted_video || 'Outpainted video not set')}</strong>
+      ${recompLayerItem('Top layer - Color blend', s.colorized_video, 'Colorized video not set')}
+      ${recompLayerItem('Middle layer', s.source, 'Original source not set')}
+      ${recompLayerItem('Bottom layer', s.outpainted_video, 'Outpainted video not set')}
+    </div>
+  `;
+}
+
+function recompLayerItem(label, path, fallback) {
+  return `
+    <div class="layer-item">
+      <span>${esc(label)}</span>
+      <div class="layer-file-row">
+        <strong>${esc(path || fallback)}</strong>
+        <button
+          class="icon-button inline"
+          type="button"
+          title="Save this layer as..."
+          onclick="exportMedia(${jsArg(path)})"
+          ${path ? '' : 'disabled'}
+        >&#128190;</button>
       </div>
     </div>
   `;
 }
 
 function recompPathFields(st) {
-  return ['outpainted_video', 'source', 'colorized_video']
+  return ['outpainted_video', 'source', 'colorization_method', 'colorized_video']
     .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
     .join('');
 }
@@ -71,22 +80,22 @@ function recompControlFields(st) {
   `;
 }
 
-function recompTimelineHtml() {
+function recompLayerToggles() {
   return `
-    <div class="timeline">
-      <input id="recompScrub" type="range" min="0" max="1000" value="0" oninput="scrubEditorVideo(this.value)">
-      ${timelineTrack('Color', 'track-colour')}
-      ${timelineTrack('Original', 'track-original')}
-      ${timelineTrack('Outpainted', 'track-outpaint')}
+    <div class="checks layer-toggles">
+      <label><input type="checkbox" id="showLayerColor" checked onchange="updateRecompPreview()">Color</label>
+      <label><input type="checkbox" id="showLayerOriginal" checked onchange="updateRecompPreview()">Original</label>
+      <label><input type="checkbox" id="showLayerOutpaint" checked onchange="updateRecompPreview()">Outpainted</label>
     </div>
   `;
 }
 
-function timelineTrack(name, cls) {
+function recompTimelineHtml() {
   return `
-    <div class="track">
-      <div class="track-name">${name}</div>
-      <div class="track-bar ${cls}"></div>
+    <div class="timeline">
+      <input id="recompScrub" type="range" min="0" max="1000" value="0" oninput="scrubEditorVideo(this.value)">
+      <p class="shot-empty">Use the checkboxes below to inspect the contribution of each layer.</p>
+      ${recompLayerToggles()}
     </div>
   `;
 }
@@ -119,8 +128,8 @@ function liveCompositeHtml(s) {
   return `
     <div class="live-composite">
       ${s.outpainted_video ? `<video id="recompVideo" class="sync-layer-video live-outpaint" src="${media(s.outpainted_video)}" controls preload="metadata"></video>` : ''}
-      ${s.source ? `<video class="sync-layer-video live-original" src="${media(s.source)}" muted preload="metadata"></video>` : ''}
-      ${s.colorized_video ? `<video class="sync-layer-video live-color" src="${media(s.colorized_video)}" muted preload="metadata"></video>` : ''}
+      ${s.source ? `<video class="sync-layer-video live-original" src="${media(s.source)}" muted preload="metadata" style="${originalLayerStyle(s)}"></video>` : ''}
+      ${s.colorized_video ? `<video class="sync-layer-video live-color" src="${media(s.colorized_video)}" muted preload="metadata" style="${colorLayerStyle(s)}"></video>` : ''}
     </div>
   `;
 }
@@ -129,15 +138,63 @@ function layerPreviewHtml(s) {
   return `
     <div class="layer-preview-grid">
       <div><label>Outpainted</label>${layerVideo(s.outpainted_video, 'layer-outpaint')}</div>
-      <div><label>Original, feathered</label>${layerVideo(s.source, 'layer-original')}</div>
-      <div><label>Color</label>${layerVideo(s.colorized_video, 'layer-colour')}</div>
+      <div><label>Original, feathered</label>${layerVideo(s.source, 'layer-original', originalFeatherStyle(s))}</div>
+      <div><label>Color</label>${layerVideo(s.colorized_video, 'layer-colour', colorLayerStyle(s))}</div>
     </div>
   `;
 }
 
-function layerVideo(path, cls) {
+function layerVideo(path, cls, style = '') {
   if (!path) return missingImage('Video not present');
-  return `<video class="sync-layer-video ${cls}" src="${media(path)}" muted preload="metadata"></video>`;
+  return `<video class="sync-layer-video ${cls}" src="${media(path)}" muted preload="metadata" style="${style}"></video>`;
+}
+
+function colorLayerStyle(s) {
+  const saturation = Math.max(0, Number(s.saturation || 1));
+  const temp = Number(s.temperature || 0);
+  const opacity = Math.max(0, Math.min(1, Number(s.color_opacity || 1)));
+  const hue = temp === 0 ? 0 : (temp > 0 ? -10 : 10) * Math.min(3, Math.abs(temp) * 30);
+  return `filter:saturate(${saturation});opacity:${opacity};hue-rotate(${hue}deg)`;
+}
+
+function originalFeatherStyle(s) {
+  const feather = Math.max(1, Number(s.feather_pixels || 80));
+  const edge = Math.max(2, Math.min(45, feather / 8));
+  return `-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`;
+}
+
+function originalLayerStyle(s) {
+  return `${originalLayerBoxStyle()};${originalFeatherStyle(s)};object-fit:fill`;
+}
+
+function originalLayerBoxStyle() {
+  const sourceAspect = sourceAspectRatio();
+  const targetAspect = targetAspectRatio();
+  if (!sourceAspect || !targetAspect) return '';
+
+  if (sourceAspect <= targetAspect) {
+    const width = Math.max(1, Math.min(100, (sourceAspect / targetAspect) * 100));
+    const left = (100 - width) / 2;
+    return `width:${width}%;height:100%;left:${left}%;right:auto;top:0;bottom:auto`;
+  }
+
+  const height = Math.max(1, Math.min(100, (targetAspect / sourceAspect) * 100));
+  const top = (100 - height) / 2;
+  return `width:100%;height:${height}%;top:${top}%;bottom:auto;left:0;right:auto`;
+}
+
+function sourceAspectRatio() {
+  const text = (state.source_info && state.source_info.aspect) || '';
+  const value = Number(String(text).split(':')[0]);
+  return Number.isFinite(value) && value > 0 ? value : 4 / 3;
+}
+
+function targetAspectRatio() {
+  const value = settings('outpaint').target_aspect || '16:9';
+  const parts = String(value).split(':').map(Number);
+  if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) return parts[0] / parts[1];
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 16 / 9;
 }
 
 function wireEditorVideo() {
@@ -179,6 +236,7 @@ function wireEditorVideo() {
       item.playbackRate = mainVideo.playbackRate;
     });
   });
+  updateRecompPreview();
 }
 
 function scrubEditorVideo(value) {
@@ -191,4 +249,13 @@ function scrubEditorVideo(value) {
       item.currentTime = mainVideo.currentTime;
     } catch {}
   });
+}
+
+function updateRecompPreview() {
+  const showOutpaint = document.getElementById('showLayerOutpaint')?.checked ?? true;
+  const showOriginal = document.getElementById('showLayerOriginal')?.checked ?? true;
+  const showColor = document.getElementById('showLayerColor')?.checked ?? true;
+  document.querySelectorAll('.live-outpaint,.layer-outpaint').forEach(el => { el.style.visibility = showOutpaint ? 'visible' : 'hidden'; });
+  document.querySelectorAll('.live-original,.layer-original').forEach(el => { el.style.visibility = showOriginal ? 'visible' : 'hidden'; });
+  document.querySelectorAll('.live-color,.layer-colour').forEach(el => { el.style.visibility = showColor ? 'visible' : 'hidden'; });
 }
