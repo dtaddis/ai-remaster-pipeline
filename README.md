@@ -25,6 +25,14 @@ The app is still alpha software, but the goal is simple: you should be able to r
 
 ## Install
 
+### Requirements
+
+- Windows with an NVIDIA GPU is the currently supported installer path. The installer defaults to CUDA 12.8 PyTorch wheels.
+- Python 3.13 is required. On Windows, install it from [python.org](https://www.python.org/downloads/) with the Python Launcher option enabled, or make sure `python.exe` is on `PATH`.
+- Git is required so the installer can clone ComfyUI and the ComfyUI custom nodes.
+- Internet access is required during installation for Python packages, ComfyUI/custom-node repositories, FFmpeg, and optional model downloads.
+- ComfyUI is required as the AI backend. The installer can clone it for you, or you can point ARP at an existing ComfyUI checkout.
+
 ### Windows
 
 Run:
@@ -35,7 +43,7 @@ install_windows.bat
 
 The installer creates this repo's `.venv`, installs FFmpeg locally, and asks whether to clone ComfyUI into `tools\comfyui` or use an existing ComfyUI directory.
 
-ARP currently requires Python 3.13 on Windows. If the installer cannot find Python 3.13, it will prompt you to install it from python.org and retry detection.
+If the installer cannot find Python 3.13, it will prompt you to install it and retry detection.
 
 If you already have ComfyUI somewhere else:
 
