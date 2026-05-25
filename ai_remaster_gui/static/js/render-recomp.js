@@ -101,21 +101,142 @@ function recompTimelineHtml() {
 }
 
 function drawOutput() {
-  const expected = (state.expected_outputs && state.expected_outputs.output) || [];
-  const path = expected[0] || settings('recomp').output || '';
+  const selection = state.output_selection || {};
+  const path = selection.path || '';
 
   document.getElementById('app').innerHTML = `
     <section class="card editor-viewer">
       <h2>Output</h2>
-      ${path ? outputVideoHtml(path) : '<p class="shot-empty">Run Recomposition to create the final movie.</p>'}
+      ${path ? outputVideoHtml(path, selection) : '<p class="shot-empty">Run Recomposition to create a composited render.</p>'}
     </section>
   `;
 }
 
-function outputVideoHtml(path) {
+function drawUpscale() {
+  const st = stage('upscale');
+  const s = settings('upscale');
+  const expected = (state.expected_outputs && state.expected_outputs.upscale) || [];
+  const sp = stageProgress('upscale');
+
+  document.getElementById('app').innerHTML = `
+    <div class="editor-page">
+      <section class="card">
+        <h2>${st.title}</h2>
+        <p>${st.description}</p>
+        ${progressHtml(sp.percent, sp.label)}
+        ${upscaleDependencyNote(s)}
+        ${upscaleFields(st)}
+        ${shotOutputList(expected, null)}
+        ${stageCheckboxes(s)}
+        <div class="actions">
+          <button type="button" onclick="generateUpscalePreview()" ${state.running ? 'disabled' : ''}>Generate Preview</button>
+          <button class="primary" onclick="runStage('upscale')" ${state.running ? 'disabled' : ''}>Run Upscaling</button>
+          <button class="warn" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
+        </div>
+        <div class="command" id="cmd"></div>
+      </section>
+      <section class="card editor-viewer">
+        <h2>Upscale Preview</h2>
+        ${upscalePreviewHtml(s, expected[0] || s.output || '')}
+      </section>
+    </div>
+    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
+  `;
+
+  bindStageFields('upscale');
+  wireUpscaleComparison();
+  showCommand('upscale');
+}
+
+function upscaleFields(st) {
+  return ['input_video', 'method', 'scale', 'output', 'preview_seconds']
+    .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
+    .join('');
+}
+
+function upscaleDependencyNote(s) {
   return `
+    <div class="inline-warning">
+      RealBasicVSR runs after Recomposition. ARP will try the current Python environment first; if the repo or checkpoint is missing, the run log will tell you what to install.
+    </div>
+  `;
+}
+
+function upscalePreviewHtml(s, outputPath) {
+  const input = s.input_video || settings('recomp').output || '';
+  const seconds = Math.max(1, Number(s.preview_seconds || 6));
+  const preview = state.upscale_preview || {};
+  const compareOutput = preview.exists ? preview.output : (preview.full_output_exists ? (preview.full_output || outputPath) : '');
+  const sourceClip = input ? mediaClip(input, 0, seconds, 'upscale_compare_input_' + seconds) : '';
+  const outputClip = compareOutput
+    ? (preview.exists ? media(compareOutput) : mediaClip(compareOutput, 0, seconds, 'upscale_compare_output_' + seconds))
+    : '';
+  if (!input) return missingImage('Input video not present');
+  if (!compareOutput) return missingImage('Generate a preview or run upscaling to compare output');
+
+  return `
+    <div class="comparison-player" style="--split:50%">
+      <video id="upscaleBefore" src="${sourceClip}" controls preload="metadata"></video>
+      <div class="comparison-after">
+        <video id="upscaleAfter" src="${outputClip}" muted preload="metadata"></video>
+      </div>
+      <div class="comparison-divider"></div>
+      <div class="comparison-label before">Before</div>
+      <div class="comparison-label after">After</div>
+    </div>
+    <div class="comparison-controls">
+      <input id="upscaleSplit" type="range" min="0" max="100" value="50" oninput="setUpscaleSplit(this.value)">
+      <div class="comparison-meta">
+        <span>${preview.exists ? 'Preview output' : 'Upscaled output sample'}</span>
+        <strong>${esc(compareOutput)}</strong>
+      </div>
+    </div>
+    <p class="shot-empty">The comparison uses the first ${esc(seconds)} seconds. Drag the split to inspect before and after on the same frame.</p>
+  `;
+}
+
+function setUpscaleSplit(value) {
+  const player = document.querySelector('.comparison-player');
+  if (!player) return;
+  const split = Math.max(0, Math.min(100, Number(value) || 0));
+  player.style.setProperty('--split', split + '%');
+}
+
+function wireUpscaleComparison() {
+  const before = document.getElementById('upscaleBefore');
+  const after = document.getElementById('upscaleAfter');
+  if (!(before && after)) return;
+
+  const syncAfter = force => {
+    if (!after.readyState) return;
+    const tolerance = force ? 0.02 : 0.16;
+    if (Math.abs((after.currentTime || 0) - (before.currentTime || 0)) <= tolerance) return;
+    try {
+      after.currentTime = before.currentTime || 0;
+    } catch {}
+  };
+
+  before.addEventListener('loadedmetadata', () => syncAfter(true));
+  before.addEventListener('play', () => {
+    syncAfter(true);
+    after.play().catch(() => {});
+  });
+  before.addEventListener('pause', () => after.pause());
+  before.addEventListener('seeking', () => syncAfter(true));
+  before.addEventListener('timeupdate', () => syncAfter(false));
+  before.addEventListener('ratechange', () => {
+    after.playbackRate = before.playbackRate;
+  });
+}
+
+function outputVideoHtml(path, selection = {}) {
+  return `
+    <div class="source-info output-choice">
+      <div><span>Selected output</span><strong>${esc(selection.label || 'Output')}</strong></div>
+      <div><span>Preference</span><strong>${selection.kind === 'upscaled' ? 'Upscaled output found' : 'Using composited render'}</strong></div>
+    </div>
     <video src="${media(path)}" controls preload="metadata"></video>
-    <h3>Final output</h3>
+    <h3>${esc(selection.label || 'Output')}</h3>
     <ul class="output-list"><li>${esc(path)}</li></ul>
   `;
 }

@@ -6,6 +6,8 @@
     [switch]$DownloadModels,
     [switch]$SkipDeepExemplar,
     [switch]$SkipComfyManager,
+    [switch]$SkipRealBasicVSR,
+    [switch]$SetupRealBasicVSREnv,
     [switch]$InstallCorrelationExtension,
     [switch]$NonInteractive
 )
@@ -14,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $DownloadCache = Join-Path $Root '.cache\huggingface'
 $DefaultComfyDir = Join-Path $Root 'tools\comfyui'
+$DefaultRealBasicVsrDir = Join-Path $Root 'tools\realbasicvsr'
 $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
 $UseExistingComfy = $false
 $ResolvedPythonLauncher = $null
@@ -309,6 +312,21 @@ Invoke-Step 'Configure ComfyUI directory' {
     }
 }
 
+if (-not $SkipRealBasicVSR) {
+    Invoke-Step 'Install RealBasicVSR upscaling backend' {
+        Git-Clone-IfMissing 'https://github.com/ckkelvinchan/RealBasicVSR.git' $DefaultRealBasicVsrDir
+        $script = Join-Path $DefaultRealBasicVsrDir 'inference_realbasicvsr.py'
+        $config = Join-Path $DefaultRealBasicVsrDir 'configs\realbasicvsr_x4.py'
+        if (-not ((Test-Path -LiteralPath $script) -and (Test-Path -LiteralPath $config))) {
+            throw "RealBasicVSR did not install correctly at: $DefaultRealBasicVsrDir"
+        }
+        Ensure-Directory (Join-Path $DefaultRealBasicVsrDir 'checkpoints')
+        Write-Host "RealBasicVSR backend: $DefaultRealBasicVsrDir"
+    }
+} else {
+    Write-Host 'Skipping RealBasicVSR checkout. Upscaling will require setting a RealBasicVSR repo path in the GUI.'
+}
+
 function Install-FfmpegIfMissing {
     $ToolDir = Join-Path $Root '.cache\tools\ffmpeg'
     $FfmpegExe = Join-Path $ToolDir 'ffmpeg.exe'
@@ -395,6 +413,12 @@ Invoke-Step 'Install local FFmpeg tools' {
     Install-FfmpegIfMissing
 }
 
+if ($SetupRealBasicVSREnv -and -not $SkipRealBasicVSR) {
+    Invoke-Step 'Create RealBasicVSR Python environment' {
+        Invoke-External -Command @($PipelinePython, (Join-Path $Root 'scripts\setup_realbasicvsr_env.py'))
+    }
+}
+
 if ($DownloadModels -and -not $SkipModelDownloads) {
     Invoke-Step 'Download LTX 2.3 models and outpainting LoRA' {
         Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf')
@@ -410,6 +434,12 @@ if ($DownloadModels -and -not $SkipModelDownloads) {
         Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\qwen_2.5_vl_7b_fp8_scaled.safetensors')
         Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/vae/qwen_image_vae.safetensors' (Join-Path $ComfyDir 'models\vae\qwen_image_vae.safetensors')
         Download-HfFile 'lightx2v/Qwen-Image-Edit-2511-Lightning' 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors' (Join-Path $ComfyDir 'models\loras\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
+    }
+
+    if (-not $SkipRealBasicVSR) {
+        Invoke-Step 'Download RealBasicVSR x4 checkpoint' {
+            Download-HfFile 'akhaliq/RealBasicVSR_x4' 'RealBasicVSR_x4.pth' (Join-Path $DefaultRealBasicVsrDir 'checkpoints\RealBasicVSR_x4.pth')
+        }
     }
 } else {
     Write-Host 'Skipping model downloads. Models and LoRAs will download on demand when their pipeline stages run.'

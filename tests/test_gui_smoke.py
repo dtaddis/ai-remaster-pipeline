@@ -182,6 +182,82 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("both", command)
         self.assertNotIn("--output", command)
 
+    def test_recomposition_output_path_uses_composited_suffix(self) -> None:
+        output = app.recomposition_output_for("intermediate/outpainted/demo_outpainted.mp4")
+
+        self.assertEqual(output, "output/reassembled/demo_outpainted_composited.mp4")
+
+    def test_upscale_output_path_uses_recomposite_name(self) -> None:
+        output = app.upscale_output_for("output/reassembled/demo_composited.mp4", {"method": "realbasicvsr", "scale": "4"})
+
+        self.assertEqual(output, "output/upscaled/demo_composited_realbasicvsr_x4.mp4")
+
+    def test_upscale_preview_output_path_uses_preview_seconds(self) -> None:
+        output = app.upscale_preview_output_for(
+            "output/reassembled/demo_composited.mp4",
+            {"method": "realbasicvsr", "scale": "4", "preview_seconds": "8"},
+        )
+
+        self.assertEqual(output, "output/upscaled/previews/demo_composited_realbasicvsr_x4_preview_8s.mp4")
+
+    def test_command_construction_for_upscale_uses_realbasicvsr(self) -> None:
+        app.APP.settings["upscale"].update(
+            {
+                "input_video": "output/reassembled/demo_composited.mp4",
+                "method": "realbasicvsr",
+                "scale": "4",
+                "output": "output/upscaled/demo_composited_realbasicvsr_x4.mp4",
+                "realbasicvsr_repo": "tools/realbasicvsr",
+                "max_seq_len": "0",
+            }
+        )
+
+        command = app.APP.command_for("upscale")
+
+        self.assertIn(str(app.SCRIPTS / "upscale_video.py"), command)
+        self.assertIn("--input", command)
+        self.assertIn("output/reassembled/demo_composited.mp4", command)
+        self.assertIn("--realbasicvsr-repo", command)
+
+    def test_upscale_preview_state_reports_expected_paths(self) -> None:
+        app.APP.settings["upscale"].update(
+            {
+                "input_video": "output/reassembled/demo_composited.mp4",
+                "method": "realbasicvsr",
+                "scale": "4",
+                "preview_seconds": "6",
+            }
+        )
+
+        state = app.upscale_preview_state(app.APP.settings)
+
+        self.assertEqual(state["input"], "output/reassembled/demo_composited.mp4")
+        self.assertEqual(state["output"], "output/upscaled/previews/demo_composited_realbasicvsr_x4_preview_6s.mp4")
+
+    def test_output_selection_prefers_existing_upscale(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            composited = folder / "demo_composited.mp4"
+            upscaled = folder / "demo_composited_realbasicvsr_x4.mp4"
+            composited.write_bytes(b"composited")
+            upscaled.write_bytes(b"upscaled")
+            app.APP.settings["recomp"]["output"] = app.rel(composited)
+            app.APP.settings["upscale"]["output"] = app.rel(upscaled)
+
+            selection = app.output_selection_state(app.APP.settings)
+
+        self.assertEqual(selection["kind"], "upscaled")
+        self.assertEqual(selection["path"], app.rel(upscaled))
+
+    def test_output_selection_falls_back_to_composited(self) -> None:
+        app.APP.settings["recomp"]["output"] = "output/reassembled/demo_composited.mp4"
+        app.APP.settings["upscale"]["output"] = "output/upscaled/demo_composited_realbasicvsr_x4.mp4"
+
+        selection = app.output_selection_state(app.APP.settings)
+
+        self.assertEqual(selection["kind"], "composited")
+        self.assertEqual(selection["path"], "output/reassembled/demo_composited.mp4")
+
     def test_section_preview_times_are_relative_to_trim_start(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
 

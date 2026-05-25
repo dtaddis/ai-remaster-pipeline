@@ -37,3 +37,4 @@ venv/
 *.tmp
 *.log
 /tools/comfyui/
+/tools/realbasicvsr/

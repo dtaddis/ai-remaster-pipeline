@@ -284,6 +284,15 @@ class PipelineApp:
                 percent, label = 100, "Composite written"
             else:
                 label = "Compositing"
+        elif self.running_stage_key == "upscale":
+            if "reuse upscaled video" in lower:
+                percent, label = 100, "Existing upscale reused"
+            elif "wrote upscaled video" in lower:
+                percent, label = 100, "Upscale written"
+            elif "realbasicvsr" in lower:
+                percent, label = max(percent, 25), "Running RealBasicVSR"
+            else:
+                label = "Upscaling"
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
     def state(self) -> dict:
@@ -306,6 +315,8 @@ class PipelineApp:
                 "project_path": str(self.project_path) if self.project_path else "",
                 "source_monochrome": source_monochrome(source_text),
                 "aspect_preview": aspect_preview_for_settings(self.settings),
+                "upscale_preview": upscale_preview_state(self.settings),
+                "output_selection": output_selection_state(self.settings),
                 "outpaint_chunks": outpaint_chunks_state(self.settings),
                 "shot_views": shot_views(self.settings),
                 "cache": cache_state(),
@@ -392,6 +403,7 @@ class PipelineApp:
             "references": ("manifest", "outpainted_video", "colorized_video"),
             "colour": ("manifest", "outpainted_video", "colorized_video"),
             "recomp": ("outpainted_video", "source", "colorized_video", "output"),
+            "upscale": ("input_video", "output"),
             "output": ("output", "outpainted_video", "manifest", "colorized_video"),
         }.items():
             stage_settings = self.settings.setdefault(stage_key, {})
@@ -440,10 +452,14 @@ class PipelineApp:
         source = self.settings.get("global", {}).get("source")
         if source:
             self.settings.setdefault("recomp", {})["source"] = pipeline_source_text(self.settings)
-        output = recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+        output = preferred_recomposition_output(self.settings)
         if output:
             self.settings.setdefault("recomp", {})["output"] = output
-            self.settings.setdefault("output", {})["output"] = output
+            self.settings.setdefault("upscale", {})["input_video"] = output
+            upscale_output = upscale_output_for(output, self.settings.get("upscale", {}))
+            self.settings.setdefault("upscale", {})["output"] = upscale_output
+            final_output = upscale_output if resolve(upscale_output).exists() else output
+            self.settings.setdefault("output", {})["output"] = final_output
         self.save()
 
     def expected_outputs(self, stage_key: str) -> list[str]:
@@ -459,13 +475,38 @@ class PipelineApp:
             return colorized_outputs_for_manifest(values.get("manifest", ""), values.get("method", "deepexemplar"))
         if stage_key == "recomp":
             return [values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))]
+        if stage_key == "upscale":
+            output = values.get("output") or upscale_output_for(values.get("input_video", ""), values)
+            return [output] if output else []
         if stage_key == "output":
-            output = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+            upscale_output = self.settings.get("upscale", {}).get("output", "")
+            if upscale_output and resolve(upscale_output).exists():
+                return [upscale_output]
+            output = preferred_recomposition_output(self.settings)
             return [output] if output else []
         return []
 
     def existing_outputs(self, stage_key: str) -> list[str]:
         return [path for path in self.expected_outputs(stage_key) if path and resolve(path).exists()]
+
+    def upscale_command(self, values: dict[str, str], input_video: str, output: str) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "upscale_video.py")]
+        add = cmd.extend
+        add(["--input", input_video])
+        add(["--method", values.get("method", "realbasicvsr")])
+        add(["--scale", values.get("scale", "4")])
+        if output:
+            add(["--output", output])
+        add(["--realbasicvsr-repo", values.get("realbasicvsr_repo", "tools/realbasicvsr")])
+        if values.get("python_executable"):
+            add(["--python-executable", values["python_executable"]])
+        if values.get("config"):
+            add(["--config", values["config"]])
+        if values.get("checkpoint"):
+            add(["--checkpoint", values["checkpoint"]])
+        if values.get("max_seq_len"):
+            add(["--max-seq-len", values["max_seq_len"]])
+        return [part for part in cmd if part != ""]
 
     def command_for(self, stage_key: str) -> list[str]:
         values = self.settings[stage_key]
@@ -540,6 +581,9 @@ class PipelineApp:
             outpaint_values = self.settings.get("outpaint", {})
             for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
                 add([f"--{key.replace('_', '-')}", outpaint_values.get(key, "0")])
+        elif stage_key == "upscale":
+            output = values.get("output") or upscale_output_for(values.get("input_video", ""), values)
+            cmd = self.upscale_command(values, values.get("input_video", ""), output)
         if values.get("force") == "true":
             cmd.append("--force")
         if values.get("dry_run") == "true":
@@ -644,6 +688,42 @@ class PipelineApp:
                 return False, f"Could not start reference regeneration: {exc}"
             threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
         return True, f"Started reference regeneration for shot {index + 1}."
+
+    def run_upscale_preview(self) -> tuple[bool, str]:
+        values = self.settings.get("upscale", {})
+        input_text = values.get("input_video", "") or self.settings.get("recomp", {}).get("output", "")
+        if not input_text:
+            return False, "Missing settings: input_video"
+        source = resolve(input_text)
+        if not source.exists() or not source.is_file():
+            return False, f"Input video not found for upscaling preview: {source}"
+        seconds = max(1.0, float(values.get("preview_seconds", "6") or "6"))
+        output = upscale_preview_output_for(input_text, values)
+        try:
+            preview_input = media_clip_path(source, 0.0, seconds, f"upscale-preview-{seconds:.3f}")
+        except Exception as exc:
+            return False, f"Could not prepare upscaling preview clip: {exc}"
+        cmd = self.upscale_command(values, rel(preview_input), output)
+        if values.get("force") == "true":
+            cmd.append("--force")
+        if values.get("dry_run") == "true":
+            cmd.append("--dry-run")
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = "Upscale Preview"
+            self.running_stage_key = "upscale"
+            self.run_started_at = time.time()
+            self.log.append(f"Generating upscaling preview: {rel(preview_input)} -> {output}")
+            self.log.append("> " + " ".join(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            self.process = subprocess.Popen(cmd, **kwargs)
+            threading.Thread(target=self._collect_output, args=("upscale",), daemon=True).start()
+        return True, "Started upscaling preview."
 
     def run_all(self) -> tuple[bool, str]:
         threading.Thread(target=self._run_all_worker, daemon=True).start()
@@ -1210,7 +1290,65 @@ def recomposition_output_for(outpainted_text: str) -> str:
     if not outpainted_text:
         return ""
     outpainted = resolve(outpainted_text)
+    return rel(ROOT / "output" / "reassembled" / f"{safe_stem(outpainted.name)}_composited.mp4")
+
+
+def legacy_recomposition_output_for(outpainted_text: str) -> str:
+    if not outpainted_text:
+        return ""
+    outpainted = resolve(outpainted_text)
     return rel(ROOT / "output" / "reassembled" / f"{safe_stem(outpainted.name)}_final.mp4")
+
+
+def preferred_recomposition_output(settings: dict[str, dict[str, str]]) -> str:
+    generated = recomposition_output_for(settings.get("recomp", {}).get("outpainted_video", ""))
+    current = settings.get("recomp", {}).get("output", "")
+    if current and current.endswith("_final.mp4") and generated:
+        return generated
+    return current or generated
+
+
+def upscale_output_for(input_text: str, values: dict[str, str]) -> str:
+    if not input_text:
+        return ""
+    source = resolve(input_text)
+    method = values.get("method", "realbasicvsr") or "realbasicvsr"
+    scale = str(values.get("scale", "4") or "4")
+    return rel(ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{method}_x{scale}.mp4")
+
+
+def upscale_preview_output_for(input_text: str, values: dict[str, str]) -> str:
+    if not input_text:
+        return ""
+    source = resolve(input_text)
+    method = values.get("method", "realbasicvsr") or "realbasicvsr"
+    scale = str(values.get("scale", "4") or "4")
+    seconds = max(1, int(float(values.get("preview_seconds", "6") or "6")))
+    return rel(ROOT / "output" / "upscaled" / "previews" / f"{safe_stem(source.name)}_{method}_x{scale}_preview_{seconds}s.mp4")
+
+
+def upscale_preview_state(settings: dict[str, dict[str, str]]) -> dict[str, str | bool]:
+    values = settings.get("upscale", {})
+    input_text = values.get("input_video", "") or settings.get("recomp", {}).get("output", "")
+    full_output = values.get("output") or upscale_output_for(input_text, values)
+    output = upscale_preview_output_for(input_text, values)
+    return {
+        "input": input_text,
+        "full_output": full_output,
+        "full_output_exists": bool(full_output and resolve(full_output).exists()),
+        "output": output,
+        "exists": bool(output and resolve(output).exists()),
+    }
+
+
+def output_selection_state(settings: dict[str, dict[str, str]]) -> dict[str, str | bool]:
+    recomposed = preferred_recomposition_output(settings)
+    upscale = settings.get("upscale", {}).get("output", "")
+    if upscale and resolve(upscale).exists():
+        return {"path": upscale, "kind": "upscaled", "label": "Upscaled master", "exists": True}
+    if recomposed:
+        return {"path": recomposed, "kind": "composited", "label": "Composited render", "exists": resolve(recomposed).exists()}
+    return {"path": "", "kind": "", "label": "", "exists": False}
 
 
 def colorized_outputs_for_manifest(manifest_text: str, method: str = "deepexemplar") -> list[str]:
@@ -2002,8 +2140,14 @@ def cache_categories() -> tuple[dict, ...]:
         {
             "key": "recomp",
             "title": "Recomposition / Output",
-            "description": "Final recomposited outputs. Clear this to force ARP to rebuild the final movie.",
+            "description": "Composited recomposition renders. Clear this to force ARP to rebuild the composited movie.",
             "folders": (ROOT / "output" / "reassembled",),
+        },
+        {
+            "key": "upscale",
+            "title": "Upscaling",
+            "description": "Upscaled masters and preview artifacts.",
+            "folders": (ROOT / "output" / "upscaled",),
         },
     )
 
@@ -2606,6 +2750,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **result, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Custom reference install failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/upscale-preview":
+            try:
+                ok, message = APP.run_upscale_preview()
+                self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
+            except Exception as exc:
+                APP.log.append(f"Upscaling preview failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/export-media":
             try:

@@ -3,12 +3,14 @@ function drawSettings() {
   const outpaint = settings('outpaint');
   const colour = settings('colour');
   const recomp = settings('recomp');
+  const upscale = settings('upscale');
 
   document.getElementById('app').innerHTML = `
     <section class="card">
       <h2>Settings</h2>
       ${comfySettingsHtml()}
       ${qwenSettingsHtml(refs)}
+      ${upscaleSettingsHtml(upscale)}
       ${pipelineDefaultsHtml(outpaint, colour, recomp)}
       ${logFileSettingsHtml()}
     </section>
@@ -39,6 +41,33 @@ function qwenSettingsHtml(refs) {
     <textarea readonly>${esc(refs.prompt || '')}</textarea>
     <label>Prompt suffix</label>
     <textarea readonly>${esc(refs.prompt_suffix || '')}</textarea>
+  `;
+}
+
+function upscaleSettingsHtml(upscale) {
+  return `
+    <h3>Upscaling Backend</h3>
+    <div id="upscaleAdvanced" class="settings-fields">
+      ${settingsPathField('realbasicvsr_repo', 'RealBasicVSR repo', 'folder', upscale.realbasicvsr_repo || 'tools/realbasicvsr')}
+      ${settingsPathField('python_executable', 'Upscaler Python', 'file', upscale.python_executable || '')}
+      ${settingsPathField('config', 'Config', 'file', upscale.config || '')}
+      ${settingsPathField('checkpoint', 'Checkpoint', 'file', upscale.checkpoint || '')}
+      <label>Max sequence length</label>
+      <input data-upscale-field="max_seq_len" type="number" step="1" value="${esc(upscale.max_seq_len || '0')}">
+      <div class="actions">
+        <button type="button" onclick="saveUpscaleAdvanced()">Save Upscaling Settings</button>
+      </div>
+    </div>
+  `;
+}
+
+function settingsPathField(key, label, kind, value) {
+  return `
+    <label>${label}</label>
+    <div class="field-row">
+      <input data-field="${key}" data-upscale-field="${key}" data-kind="${kind}" value="${esc(value)}">
+      <button type="button" onclick="browseField('upscale','${key}','${kind}')">Browse</button>
+    </div>
   `;
 }
 
@@ -77,4 +106,14 @@ async function loadLogFile() {
   const path = document.getElementById('comfyLog').value;
   const result = await api('/api/logfile?path=' + encodeURIComponent(path));
   document.getElementById('comfyLogText').textContent = result.text;
+}
+
+async function saveUpscaleAdvanced() {
+  const values = {};
+  document.querySelectorAll('#upscaleAdvanced [data-upscale-field]').forEach(el => {
+    values[el.dataset.upscaleField] = el.value;
+  });
+  await postJson('/api/settings', { stage: 'upscale', values });
+  state = await api('/api/state');
+  drawSettings();
 }

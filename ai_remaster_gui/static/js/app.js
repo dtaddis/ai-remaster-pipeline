@@ -7,6 +7,7 @@ function draw(followLogs = false) {
   if (active === 'references') return drawReferences(followLogs);
   if (active === 'colour') return drawColour(followLogs);
   if (active === 'recomp') return drawRecomp(followLogs);
+  if (active === 'upscale') return drawUpscale(followLogs);
 
   return drawStage(stage(active), followLogs);
 }

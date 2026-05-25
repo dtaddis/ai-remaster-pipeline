@@ -5,6 +5,7 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 ## LTX 2.3
 
 - Base checkpoint: `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors`
+- RealBasicVSR x4 checkpoint: `akhaliq/RealBasicVSR_x4/RealBasicVSR_x4.pth`
 - Text encoder: `Comfy-Org/ltx-2/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors`
 - Audio VAE: `Kijai/LTX2.3_comfy/vae/LTX23_audio_vae_bf16.safetensors`
 - Distilled LoRA: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384.safetensors`

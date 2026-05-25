@@ -348,6 +348,18 @@ async function runStage(key) {
   setTimeout(() => refresh(true), 500);
 }
 
+async function generateUpscalePreview() {
+  releaseFinalOutputVideos();
+  await saveStage('upscale');
+
+  const result = await postJson('/api/upscale-preview', {});
+  if (!result.ok) return alert(result.error || result.message || 'Could not generate upscaling preview');
+
+  if (result.state) state = result.state;
+  draw(false);
+  setTimeout(() => refresh(true), 500);
+}
+
 function releaseFinalOutputVideos() {
   const output = ((state.expected_outputs && state.expected_outputs.output) || [])[0]
     || settings('recomp').output

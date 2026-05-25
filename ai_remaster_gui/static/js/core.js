@@ -57,6 +57,8 @@ function renderSignature() {
     source_info: state.source_info,
     source_monochrome: state.source_monochrome,
     aspect_preview: state.aspect_preview,
+    upscale_preview: state.upscale_preview,
+    output_selection: state.output_selection,
     shot_views: state.shot_views,
     cache: state.cache,
     progress: state.progress,
@@ -68,7 +70,7 @@ function renderSignature() {
 }
 
 function hasMediaOnPage() {
-  return ['outpaint', 'colour', 'recomp', 'output'].includes(active)
+  return ['outpaint', 'colour', 'recomp', 'upscale', 'output'].includes(active)
     ? document.querySelectorAll('video').length > 0
     : false;
 }
@@ -81,7 +83,7 @@ function shouldPreserveInteractiveDom(mediaActive) {
 
   // Normal polling must not recreate video elements while the user is inspecting
   // chunk, shot, or recomposition previews. A manual Refresh still redraws.
-  return ['outpaint', 'colour', 'recomp', 'output'].includes(active);
+  return ['outpaint', 'colour', 'recomp', 'upscale', 'output'].includes(active);
 }
 
 function updateRunLogs() {
@@ -124,6 +126,11 @@ function selectTab(tab) {
   draw(false);
   wireColourShotVideos();
   lastRenderSignature = renderSignature();
+}
+
+function wireColourShotVideos() {
+  // Older colour-shot views used a post-render video sync hook. Keep this
+  // harmless shim so refreshes remain stable when that view has no wiring.
 }
 
 function stage(key) {

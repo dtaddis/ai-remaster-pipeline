@@ -55,7 +55,7 @@ def replace_with_retry(source: Path, target: Path, attempts: int = 30, delay: fl
             return
         except PermissionError as exc:
             last_exc = exc
-            print(f"Final output is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
+            print(f"Composited output is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
             time.sleep(delay)
     assert last_exc is not None
     raise last_exc
@@ -170,7 +170,7 @@ def os_safe_pid() -> str:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Composite outpainted, original-source centre, and optional color layer into a final master.')
+    parser = argparse.ArgumentParser(description='Composite outpainted, original-source centre, and optional color layer into a composited render.')
     parser.add_argument('--outpainted', required=True)
     parser.add_argument('--source', required=True)
     parser.add_argument('--colorized')

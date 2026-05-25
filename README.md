@@ -20,7 +20,7 @@ The app is still alpha software, but the goal is simple: you should be able to r
 - Splits video into shots and lets you review, merge, enable, disable, and adjust shot boundaries.
 - Generates per-shot reference frames and colorizes them with Qwen Image Edit.
 - Uses reference-guided video colorization for the outpainted footage.
-- Recombines the original, outpainted, and colorized layers into a final output.
+- Recombines the original, outpainted, and colorized layers into a composited render.
 - Keeps intermediate files deterministic and resumable, so reruns can reuse valid existing work.
 
 ## Install
@@ -33,7 +33,7 @@ Run:
 install_windows.bat
 ```
 
-The installer creates this repo's `.venv`, installs FFmpeg locally, and asks whether to clone ComfyUI into `tools\comfyui` or use an existing ComfyUI directory.
+The installer creates this repo's `.venv`, installs FFmpeg locally, clones the RealBasicVSR upscaling backend into `tools\realbasicvsr`, and asks whether to clone ComfyUI into `tools\comfyui` or use an existing ComfyUI directory.
 
 If you already have ComfyUI somewhere else:
 
@@ -41,7 +41,7 @@ If you already have ComfyUI somewhere else:
 install_windows.bat -ComfyDir D:\path\to\ComfyUI
 ```
 
-Python packages are installed into ARP's `.venv`, not into your ComfyUI virtual environment. ComfyUI itself is used as the AI backend.
+Python packages are installed into ARP's `.venv`, not into your ComfyUI virtual environment. ComfyUI itself is used as the AI backend. RealBasicVSR is an older OpenMMLab project, so ARP can create a separate `.venv-realbasicvsr` environment with `install_windows.bat -SetupRealBasicVSREnv`; if you use your own environment, set it in Settings > Upscaling Backend.
 
 Models and LoRAs are downloaded on demand when a stage first needs them. If a large Hugging Face download is interrupted, rerun the same stage and the download should resume. You can prefetch the main model set with:
 
@@ -54,6 +54,8 @@ Useful installer options:
 ```bat
 install_windows.bat -NonInteractive
 install_windows.bat -SkipDeepExemplar
+install_windows.bat -SkipRealBasicVSR
+install_windows.bat -SetupRealBasicVSREnv
 install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu128
 ```
 
@@ -98,7 +100,7 @@ Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
 5. Click Run Whole Remaster for a first pass.
 6. Use the stage tabs to inspect or rerun individual phases.
 
-Every stage writes predictable intermediate files under `intermediate/`, manifests under `manifests/`, and final renders under `output/reassembled/`.
+Every stage writes predictable intermediate files under `intermediate/`, manifests under `manifests/`, composited renders under `output/reassembled/`, and upscaled masters under `output/upscaled/`.
 
 ## Tabs
 
@@ -134,13 +136,13 @@ Review each shot's color reference alongside the corresponding colorized video s
 
 ### Recomposition
 
-Preview and tune the final blend: outpainted video at the bottom, original source in the center with feathered edges, and the colorized layer contributing chroma on top.
+Preview and tune the composited blend: outpainted video at the bottom, original source in the center with feathered edges, and the colorized layer contributing chroma on top.
 
 ![Recomposition tab](assets/screenshots/walkthrough/arp-walkthrough-recomposition.jpg)
 
 ### Output
 
-Once recomposition finishes, the Output tab plays the final render.
+Once recomposition or upscaling finishes, the Output tab plays the best available render and identifies whether it selected the composited or upscaled version.
 
 ![Output tab](assets/screenshots/walkthrough/arp-walkthrough-output.jpg)
 
@@ -170,7 +172,8 @@ intermediate/outpainted_references/      Per-shot black-and-white reference stil
 intermediate/outpainted_references_color/ Qwen colorized reference stills
 intermediate/outpainted_colorized/       Reference-guided colorized video
 manifests/references/                    Shot/reference manifests
-output/reassembled/                      Final composited masters
+output/reassembled/                      Composited recomposition renders
+output/upscaled/                         Upscaled masters and preview clips
 workflows/                               ComfyUI workflow templates
 wrappers/                                Batch/shell entry points
 assets/branding/                         Logo, icons, and GitHub artwork

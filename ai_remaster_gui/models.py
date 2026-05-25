@@ -36,14 +36,6 @@ STAGES = (
         (),
     ),
     Stage(
-        "output",
-        "Output",
-        "Preview the final remastered movie once recomposition has finished.",
-        ("output/reassembled",),
-        (("output", "Final output", "file", ""),),
-        (),
-    ),
-    Stage(
         "shots",
         "Shot Detection",
         "Detect cuts and divide the video into sections for independent colorization.",
@@ -106,6 +98,33 @@ STAGES = (
             ("encoder", "Encoder", "select:h264|prores", "h264"),
         ),
         ("outpainted_video", "source"),
+    ),
+    Stage(
+        "upscale",
+        "Upscaling",
+        "Optionally upscale the composited render after ARP has built the recomposition.",
+        ("output/reassembled", "output/upscaled"),
+        (
+            ("input_video", "Input video", "file", ""),
+            ("method", "Method", "select:realbasicvsr", "realbasicvsr"),
+            ("scale", "Scale", "select:2|4", "4"),
+            ("output", "Upscaled output", "save", ""),
+            ("realbasicvsr_repo", "RealBasicVSR repo", "folder", "tools/realbasicvsr"),
+            ("python_executable", "Upscaler Python", "file", ""),
+            ("config", "Config", "file", ""),
+            ("checkpoint", "Checkpoint", "file", ""),
+            ("max_seq_len", "Max sequence length", "number", "0"),
+            ("preview_seconds", "Preview seconds", "number", "6"),
+        ),
+        ("input_video",),
+    ),
+    Stage(
+        "output",
+        "Output",
+        "Preview the best available render, preferring the upscaled master when it exists.",
+        ("output/reassembled", "output/upscaled"),
+        (("output", "Selected output", "file", ""),),
+        (),
     ),
 )
 
