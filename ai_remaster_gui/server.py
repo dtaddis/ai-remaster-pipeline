@@ -49,7 +49,7 @@ PROJECT_SCHEMA_VERSION = 1
 
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": "", "colorize": "true", "section_start": "0", "section_end": ""}
+    defaults["global"] = {"source": "", "colorize": "true", "section_start": "0", "section_end": "", "last_browse_dir": ""}
     if SETTINGS_FILE.exists():
         try:
             stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -356,7 +356,7 @@ class PipelineApp:
 
     def save_project(self, save_as: bool = False) -> dict[str, str]:
         if save_as or not self.project_path:
-            suggested = self.project_path or project_default_path(self.settings)
+            suggested = project_save_suggestion(self.settings, self.project_path)
             selected = browse_path("project_save", str(suggested))
             if not selected:
                 return {"path": ""}
@@ -373,7 +373,7 @@ class PipelineApp:
         return {"path": str(path)}
 
     def load_project(self) -> dict[str, str]:
-        selected = browse_path("project_open", str(ROOT))
+        selected = browse_path("project_open", "")
         if not selected:
             return {"path": ""}
         path = resolve(selected)
@@ -882,6 +882,23 @@ def project_default_path(settings: dict[str, dict[str, str]]) -> Path:
     source = resolve_video_source(settings.get("global", {}).get("source", ""))
     stem = safe_stem(source.name if source.name else "arp_project")
     return ROOT / "projects" / f"{stem}.arpp"
+
+
+def project_save_suggestion(settings: dict[str, dict[str, str]], project_path: Path | None = None) -> Path:
+    if project_path:
+        return project_path
+    default_path = project_default_path(settings)
+    last_dir = last_browse_dir(settings)
+    return (last_dir / default_path.name) if last_dir else default_path
+
+
+def last_browse_dir(settings: dict[str, dict[str, str]] | None = None) -> Path | None:
+    values = settings or (APP.settings if "APP" in globals() else {})
+    text = values.get("global", {}).get("last_browse_dir", "") if isinstance(values, dict) else ""
+    if not text:
+        return None
+    path = resolve(str(text))
+    return path if path.exists() and path.is_dir() else None
 
 
 def pipeline_source_text(settings: dict) -> str:
@@ -2268,17 +2285,49 @@ def parse_duration(value: str | None) -> float | None:
 
 
 def browse_path(kind: str, current: str = "") -> str:
-    initial = ROOT
-    if current:
-        current_path = resolve(current)
-        initial = current_path if kind == "save" else (current_path if current_path.is_dir() else current_path.parent)
-        if not initial.exists():
-            initial = initial.parent if kind == "save" and initial.parent.exists() else ROOT
+    initial = browse_initial_path(kind, current)
     if os.name == "nt":
-        return browse_path_windows(kind, initial)
-    if sys.platform == "darwin":
-        return browse_path_macos(kind, initial)
-    return browse_path_linux(kind, initial)
+        selected = browse_path_windows(kind, initial)
+    elif sys.platform == "darwin":
+        selected = browse_path_macos(kind, initial)
+    else:
+        selected = browse_path_linux(kind, initial)
+    remember_browse_dir(selected)
+    return selected
+
+
+def browse_initial_path(kind: str, current: str = "") -> Path:
+    save_kinds = {"save", "project_save"}
+    last_dir = last_browse_dir()
+    if not current:
+        return last_dir or ROOT
+
+    current_path = resolve(current)
+    if kind in save_kinds:
+        if last_dir:
+            return last_dir / (current_path.name or "output")
+        if current_path.parent.exists():
+            return current_path
+        return current_path
+
+    if last_dir:
+        return last_dir
+    if current_path.exists():
+        return current_path if current_path.is_dir() else current_path.parent
+    if current_path.parent.exists():
+        return current_path.parent
+    return ROOT
+
+
+def remember_browse_dir(selected: str) -> None:
+    if not selected or "APP" not in globals():
+        return
+    path = resolve(selected)
+    folder = path if path.is_dir() else path.parent
+    if not folder.exists():
+        return
+    APP.settings.setdefault("global", {})["last_browse_dir"] = str(folder)
+    APP.save()
 
 
 def browse_path_windows(kind: str, initial: Path) -> str:
@@ -2373,7 +2422,8 @@ def browse_path_linux(kind: str, initial: Path) -> str:
 
 
 def browse_path_zenity(kind: str, initial: Path) -> str:
-    filename = str(initial if kind == "save" and not initial.is_dir() else initial) + ("" if kind == "save" and not initial.is_dir() else os.sep)
+    save_kind = kind in {"save", "project_save"}
+    filename = str(initial if save_kind and not initial.is_dir() else initial) + ("" if save_kind and not initial.is_dir() else os.sep)
     command = ["zenity", "--file-selection", f"--filename={filename}"]
     if kind == "folder":
         command.append("--directory")

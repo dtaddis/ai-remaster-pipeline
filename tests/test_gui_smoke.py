@@ -138,6 +138,34 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(loaded["global"]["source"], "input/example.mp4")
         self.assertIn("schema_version", app.project_payload(app.APP.settings))
 
+    def test_project_save_suggestion_uses_last_browse_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            app.APP.settings["global"].update({"source": "input/example.mp4", "last_browse_dir": str(folder)})
+
+            suggestion = app.project_save_suggestion(app.APP.settings)
+
+        self.assertEqual(suggestion.parent, folder)
+        self.assertEqual(suggestion.name, "example.arpp")
+
+    def test_browse_initial_path_uses_last_browse_dir_without_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            app.APP.settings["global"]["last_browse_dir"] = str(folder)
+
+            self.assertEqual(app.browse_initial_path("project_open", ""), folder)
+
+    def test_browse_initial_path_prefers_last_dir_over_existing_current_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text, tempfile.TemporaryDirectory() as old_text:
+            remembered = Path(tmp_text)
+            old = Path(old_text)
+            current = old / "layer.mp4"
+            current.write_bytes(b"placeholder")
+            app.APP.settings["global"]["last_browse_dir"] = str(remembered)
+
+            self.assertEqual(app.browse_initial_path("save", str(current)), remembered / "layer.mp4")
+            self.assertEqual(app.browse_initial_path("file", str(current)), remembered)
+
     def test_colorized_outputs_include_both_methods(self) -> None:
         outputs = app.colorized_outputs_for_manifest("manifests/references/colorize_manifest_demo_shots_auto.csv", "both")
 
