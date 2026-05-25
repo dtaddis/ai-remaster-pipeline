@@ -112,7 +112,7 @@ def reference_signature(row: dict[str, str]) -> dict[str, Any]:
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "tool": "colorize_video.py",
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
@@ -236,7 +236,7 @@ def segment_signature(
     fps: float,
 ) -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "source_video": root_relative(source_video),
@@ -285,12 +285,68 @@ def replace_with_retry(source: Path, target: Path, attempts: int = 12, delay: fl
     raise last_exc
 
 
-def stitch(ffmpeg: str, chunks: list[Path], output: Path) -> None:
+def normalize_clip(ffmpeg: str, source: Path, output: Path, fps: float, expected_frames: int) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    vf = f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},trim=end_frame={expected_frames},setpts=N/({fps:.8f}*TB),setsar=1"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        vf,
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        str(partial),
+    ]
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    replace_with_retry(partial, output)
+
+
+def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     concat = output.with_suffix(".concat.txt")
     concat.write_text("".join(f"file '{str(chunk).replace("'", "'\\''")}'\n" for chunk in chunks), encoding="utf-8")
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-    cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(partial)]
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat),
+        "-vf",
+        f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1",
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        str(partial),
+    ]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
     replace_with_retry(partial, output)
@@ -388,12 +444,12 @@ def run(args: argparse.Namespace) -> int:
         prompt_id = queue_prompt(args.comfy_url, prompt)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
         produced = newest_output(extract_output_files(history, comfy_output_root))
-        shutil.copy2(produced, chunk)
+        normalize_clip(ffmpeg, produced, chunk, fps, frame_count)
         write_signature(chunk, chunk_sig)
         chunks.append(chunk)
         start_frame = end_frame
 
-    stitch(ffmpeg, chunks, output)
+    stitch(ffmpeg, chunks, output, fps)
     write_signature(output, sig)
     print(f"Wrote colorized video: {output}", flush=True)
     return 0

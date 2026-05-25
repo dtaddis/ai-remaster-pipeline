@@ -69,7 +69,7 @@ def crop_values(args, info: dict) -> tuple[int, int, int, int, int, int]:
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 2,
+        'version': 3,
         'tool': 'prepare_outpaint_input.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -143,7 +143,27 @@ def main():
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
-    command = [ffmpeg, '-y', '-i', str(source), '-filter_complex', build_filter(args, info, target_width, target_height), '-map', '[v]', '-map', '0:a?', *encoder_args(args), '-c:a', 'copy', str(partial)]
+    fps = float(info["fps"] or 24.0)
+    command = [
+        ffmpeg,
+        '-y',
+        '-i',
+        str(source),
+        '-filter_complex',
+        build_filter(args, info, target_width, target_height),
+        '-map',
+        '[v]',
+        '-map',
+        '0:a?',
+        '-r',
+        f'{fps:.8f}',
+        '-fps_mode',
+        'cfr',
+        *encoder_args(args),
+        '-c:a',
+        'copy',
+        str(partial),
+    ]
     print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}", flush=True)
     print(f'Prepared canvas: {target_width}x{target_height}, crop LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, black_lift={args.black_lift}, gamma={args.gamma}', flush=True)
     print(' '.join(command), flush=True)

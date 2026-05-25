@@ -4,7 +4,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
-from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
+from common import file_fingerprint, resolve_path, root_relative, resumable_output, video_info, write_signature
 
 
 def find_ffmpeg(explicit: str | None) -> str:
@@ -38,7 +38,7 @@ def inverse_filter(args) -> str:
 
 def signature(args, source: Path) -> dict:
     return {
-        'version': 1,
+        'version': 2,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -82,8 +82,28 @@ def main():
         print(f'Reuse restored outpaint: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
+    fps = float(video_info(source)["fps"] or 24.0)
     partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
-    command = [ffmpeg, '-y', '-i', str(source), '-filter_complex', inverse_filter(args), '-map', '[v]', '-map', '0:a?', *encoder_args(args), '-c:a', 'copy', str(partial)]
+    command = [
+        ffmpeg,
+        '-y',
+        '-i',
+        str(source),
+        '-filter_complex',
+        inverse_filter(args),
+        '-map',
+        '[v]',
+        '-map',
+        '0:a?',
+        '-r',
+        f'{fps:.8f}',
+        '-fps_mode',
+        'cfr',
+        *encoder_args(args),
+        '-c:a',
+        'copy',
+        str(partial),
+    ]
     print(' '.join(command))
     if args.dry_run:
         return 0

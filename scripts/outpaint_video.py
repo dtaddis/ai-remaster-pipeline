@@ -299,7 +299,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
 def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     return {
-        "version": 4,
+        "version": 5,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -441,19 +441,19 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
     return {int(row["chunk_index"]): row for row in rows}
 
 
-def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, force: bool) -> None:
+def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool) -> None:
     if chunk_path.exists() and not force:
         return
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
     partial = chunk_path.with_suffix(chunk_path.suffix + ".partial" + chunk_path.suffix)
-    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
-    subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
+    subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
     replace_with_retry(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
 
 
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
     vf = f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
-    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
 
 
 def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fps: float) -> None:
@@ -463,10 +463,10 @@ def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fp
     last = max(0, int(info["frames"]) - 1)
     duration = frame_count / fps
     vf = f"trim=start_frame={last}:end_frame={last + 1},setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={frame_count},fps={fps:.8f},setsar=1"
-    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
 
 
-def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, force: bool) -> None:
+def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool) -> None:
     if output.exists() and not force:
         return
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -474,7 +474,6 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
         raise RuntimeError("No outpaint chunks were produced.")
     if len(chunks) != len(ranges):
         raise RuntimeError(f"Chunk/range mismatch: {len(chunks)} chunks for {len(ranges)} ranges.")
-    fps = float(probe_video(chunks[0])["fps"] or 24.0)
     total_frames = ranges[-1][2]
     with tempfile.TemporaryDirectory(prefix="arp_stitch_") as tmp_text:
         tmp = Path(tmp_text)
@@ -517,7 +516,7 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             cursor = total_frames
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"fps={fps:.8f},setpts=N/({fps:.8f}*TB),setsar=1", "-an", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 
@@ -654,7 +653,7 @@ def main() -> int:
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
-                split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, args.force)
+                split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), args.force)
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
@@ -688,7 +687,7 @@ def main() -> int:
                 raw_chunks.append(chunk_raw)
             restitched = True
             try:
-                stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, True)
+                stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
             except PermissionError as exc:
                 if args.only_chunk is None:
                     raise
