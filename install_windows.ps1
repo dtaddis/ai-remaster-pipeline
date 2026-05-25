@@ -18,6 +18,30 @@ $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
 $UseExistingComfy = $false
 $ResolvedPythonLauncher = $null
 
+function Get-ArpVersion {
+    $versionPath = Join-Path $Root 'VERSION'
+    if (Test-Path -LiteralPath $versionPath) {
+        return (Get-Content -LiteralPath $versionPath -TotalCount 1).Trim()
+    }
+    return '0.0.0'
+}
+
+function Get-ArpCommitHash {
+    try {
+        $commit = (& git -C $Root rev-parse --short HEAD 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($commit)) {
+            return $commit.Trim()
+        }
+    } catch {
+    }
+    return 'unknown'
+}
+
+function Write-ArpBanner {
+    Write-Host "ARP $(Get-ArpVersion)"
+    Write-Host "Commit $(Get-ArpCommitHash)"
+}
+
 function Invoke-Step {
     param([string]$Label, [scriptblock]$Block)
     Write-Host "`n==> $Label" -ForegroundColor Cyan
@@ -95,6 +119,53 @@ function Test-PythonLauncher {
     return ($LASTEXITCODE -eq 0 -and $version -eq '3.13')
 }
 
+function Find-PythonLauncher {
+    param([array]$Candidates)
+    foreach ($candidate in $candidates) {
+        try {
+            if (Test-PythonLauncher $candidate) {
+                Write-Host "Using Python launcher: $($candidate -join ' ')"
+                return $candidate
+            }
+        } catch {
+            continue
+        }
+    }
+    return $null
+}
+
+function Update-ProcessPathFromRegistry {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $paths = @($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($paths) {
+        $env:Path = ($paths -join ';')
+    }
+}
+
+function Show-PythonInstallPrompt {
+    param([array]$Candidates)
+    $candidateText = (($Candidates | ForEach-Object { $_ -join ' ' }) -join ', ')
+    Write-Host ''
+    Write-Host 'Python 3.13 is required before ARP can create its virtual environment.' -ForegroundColor Yellow
+    Write-Host "The installer looked for Python 3.13 with: $candidateText"
+    Write-Host 'Install Python 3.13 from https://www.python.org/downloads/'
+    Write-Host 'On Windows, enable the Python Launcher option or add python.exe to PATH.'
+    Write-Host 'After installing Python 3.13, press R to retry. Press Q to quit.'
+    Write-Host 'If Python 3.13 is already installed somewhere custom, rerun with: install_windows.bat -PythonLauncher C:\Path\To\python.exe'
+    while ($true) {
+        $answer = Read-Host 'Retry Python detection? (R/Q)'
+        if ($answer -ieq 'R') {
+            Update-ProcessPathFromRegistry
+            return
+        }
+        if ($answer -ieq 'Q') {
+            throw 'Install cancelled because Python 3.13 was not found.'
+        }
+        Write-Host 'Please enter R to retry or Q to quit.' -ForegroundColor Yellow
+    }
+}
+
 function Resolve-PythonLauncher {
     $requested = Split-CommandLine $PythonLauncher
     if (-not $requested -or $requested.Count -eq 0) {
@@ -107,18 +178,16 @@ function Resolve-PythonLauncher {
         $candidates += ,@('python')
     }
 
-    foreach ($candidate in $candidates) {
-        try {
-            if (Test-PythonLauncher $candidate) {
-                Write-Host "Using Python launcher: $($candidate -join ' ')"
-                return $candidate
-            }
-        } catch {
-            continue
+    while ($true) {
+        $launcher = Find-PythonLauncher $candidates
+        if ($launcher) {
+            return $launcher
         }
+        if ($NonInteractive) {
+            throw "Could not find Python 3.13. Install Python 3.13 from https://www.python.org/downloads/ with the Python Launcher option enabled, or rerun with -PythonLauncher pointing at a Python 3.13 executable."
+        }
+        Show-PythonInstallPrompt $candidates
     }
-
-    throw "Could not find Python 3.13. Install Python 3.13 from python.org with the Python Launcher option enabled, or rerun with -PythonLauncher pointing at a Python 3.13 executable."
 }
 
 function Invoke-PythonLauncher {
@@ -164,6 +233,8 @@ function Read-Choice {
         Write-Host "Please enter one of: $($Valid -join ', ')." -ForegroundColor Yellow
     }
 }
+
+Write-ArpBanner
 
 function Resolve-ComfyInstallMode {
     if ($ComfyDir) {

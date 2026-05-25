@@ -35,6 +35,8 @@ install_windows.bat
 
 The installer creates this repo's `.venv`, installs FFmpeg locally, and asks whether to clone ComfyUI into `tools\comfyui` or use an existing ComfyUI directory.
 
+ARP currently requires Python 3.13 on Windows. If the installer cannot find Python 3.13, it will prompt you to install it from python.org and retry detection.
+
 If you already have ComfyUI somewhere else:
 
 ```bat
