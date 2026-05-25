@@ -1068,9 +1068,23 @@ def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
 
 def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "custom_seconds", "seed", "prompt_suffix", "negative_suffix", "prepared_path", "raw_path"]
+    fields = [
+        "chunk_index",
+        "start_frame",
+        "end_frame",
+        "start_seconds",
+        "end_seconds",
+        "custom_seconds",
+        "seed",
+        "prompt_suffix",
+        "negative_suffix",
+        "anchor_image",
+        "anchor_position",
+        "prepared_path",
+        "raw_path",
+    ]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1128,6 +1142,8 @@ def outpaint_chunks_state(settings: dict) -> dict:
             row["seed"] = str(42 + index)
         row.setdefault("prompt_suffix", "")
         row.setdefault("negative_suffix", "")
+        row.setdefault("anchor_image", "")
+        row.setdefault("anchor_position", "")
         rows.append(row)
     write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
@@ -1150,6 +1166,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "raw_exists": raw.exists(),
             "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
             "prepared_exists": prepared.exists(),
+            "anchor_exists": bool(row.get("anchor_image") and resolve(row["anchor_image"]).exists()),
             "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
             "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
             "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
@@ -1208,6 +1225,40 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     ordered = [rows[key] for key in sorted(rows)]
     write_outpaint_chunk_rows(resolve(str(manifest_text)), ordered)
     APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
+
+
+def install_outpaint_anchor(index: int, position: str) -> dict[str, str]:
+    state = outpaint_chunks_state(APP.settings)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+
+    current = rows[index].get("anchor_image", "")
+    selected = browse_path("image", current)
+    if not selected:
+        return {"selected": "", "anchor_image": current}
+
+    source = resolve(selected)
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise RuntimeError("Choose a PNG or JPEG image for the outpaint anchor frame.")
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    safe_position = position if position in {"start", "middle", "end"} else "custom"
+    target_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+    target = target_dir / f"chunk_{index:04d}_{safe_position}{source.suffix.lower()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+    rows[index]["anchor_image"] = rel(target)
+    rows[index]["anchor_position"] = safe_position
+    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+    APP.log.append(f"Installed outpaint anchor for chunk {index + 1} ({safe_position}): {rel(target)}")
+    return {"selected": selected, "anchor_image": rel(target), "anchor_position": safe_position}
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -2230,7 +2281,7 @@ def export_media_file(path_text: str) -> dict[str, str]:
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(source)
 
-    target_text = browse_path("save", str(source))
+    target_text = browse_path("save_image" if source.suffix.lower() in IMAGE_EXTS else "save", str(source))
     if not target_text:
         return {"saved": ""}
     target = resolve(target_text)
@@ -2301,7 +2352,7 @@ def browse_path(kind: str, current: str = "") -> str:
 
 
 def browse_initial_path(kind: str, current: str = "") -> Path:
-    save_kinds = {"save", "project_save"}
+    save_kinds = {"save", "save_image", "project_save"}
     last_dir = last_browse_dir()
     if not current:
         return last_dir or ROOT
@@ -2345,10 +2396,12 @@ $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.SelectedPath = '{initial_text}'
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dialog.SelectedPath) }}
 """
-    elif kind in {"save", "project_save"}:
+    elif kind in {"save", "save_image", "project_save"}:
         filter_text = (
             "ARP project files (*.arpp)|*.arpp|All files (*.*)|*.*"
             if kind == "project_save"
+            else "Image files (*.png;*.jpg;*.jpeg;*.webp)|*.png;*.jpg;*.jpeg;*.webp|All files (*.*)|*.*"
+            if kind == "save_image"
             else "Video files (*.mp4;*.mov;*.mkv;*.webm)|*.mp4;*.mov;*.mkv;*.webm|All files (*.*)|*.*"
         )
         script = f"""
@@ -2393,7 +2446,7 @@ def browse_path_macos(kind: str, initial: Path) -> str:
     initial_script = applescript_quote(str(initial_dir))
     if kind == "folder":
         script = f'set chosen to choose folder with prompt "Choose folder" default location POSIX file {initial_script}\nPOSIX path of chosen'
-    elif kind in {"save", "project_save"}:
+    elif kind in {"save", "save_image", "project_save"}:
         default_name = applescript_quote("" if initial.is_dir() else initial.name)
         script = f'set chosen to choose file name with prompt "Choose output path" default location POSIX file {initial_script} default name {default_name}\nPOSIX path of chosen'
     else:
@@ -2426,12 +2479,12 @@ def browse_path_linux(kind: str, initial: Path) -> str:
 
 
 def browse_path_zenity(kind: str, initial: Path) -> str:
-    save_kind = kind in {"save", "project_save"}
+    save_kind = kind in {"save", "save_image", "project_save"}
     filename = str(initial if save_kind and not initial.is_dir() else initial) + ("" if save_kind and not initial.is_dir() else os.sep)
     command = ["zenity", "--file-selection", f"--filename={filename}"]
     if kind == "folder":
         command.append("--directory")
-    elif kind in {"save", "project_save"}:
+    elif kind in {"save", "save_image", "project_save"}:
         command.append("--save")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2446,7 +2499,7 @@ def browse_path_zenity(kind: str, initial: Path) -> str:
 def browse_path_kdialog(kind: str, initial: Path) -> str:
     if kind == "folder":
         command = ["kdialog", "--getexistingdirectory", str(initial)]
-    elif kind in {"save", "project_save"}:
+    elif kind in {"save", "save_image", "project_save"}:
         command = ["kdialog", "--getsavefilename", str(initial)]
     else:
         command = ["kdialog", "--getopenfilename", str(initial)]
@@ -2632,6 +2685,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
             except Exception as exc:
                 APP.log.append(f"Outpaint chunk regeneration failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-anchor":
+            try:
+                result = install_outpaint_anchor(int(data.get("index", 0)), str(data.get("position", "")))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Outpaint anchor install failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:

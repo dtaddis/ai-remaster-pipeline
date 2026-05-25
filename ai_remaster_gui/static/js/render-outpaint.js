@@ -116,24 +116,28 @@ function chunkLengthLabel(frames, fps) {
 
 function chunkStillStrip(row, prefix) {
   const frames = [
-    [prefix + '_start_preview', 'Start'],
-    [prefix + '_middle_preview', 'Middle'],
-    [prefix + '_end_preview', 'End'],
+    [prefix + '_start_preview', 'Start', 'start'],
+    [prefix + '_middle_preview', 'Middle', 'middle'],
+    [prefix + '_end_preview', 'End', 'end'],
   ];
   return `
     <div class="chunk-stills">
-      ${frames.map(([key, label]) => row[key] ? chunkStillFigure(row[key], label) : missingImage(label + ' frame not present')).join('')}
+      ${frames.map(([key, label, position]) => row[key] ? chunkStillFigure(row, row[key], label, position) : missingImage(label + ' frame not present')).join('')}
     </div>
   `;
 }
 
-function chunkStillFigure(path, label) {
+function chunkStillFigure(row, path, label, position) {
   const src = media(path);
+  const activeAnchor = row.anchor_image && row.anchor_position === position;
   return `
-    <figure>
-      <button type="button" class="image-inspect" onclick="openImageModal(${jsArg(src)},${jsArg(label)})" title="Inspect ${esc(label)} frame">
-        <img src="${src}" alt="">
-      </button>
+    <figure class="still-figure ${activeAnchor ? 'has-anchor' : ''}">
+      <img src="${src}" alt="" onclick="openImageModal(${jsArg(src)},${jsArg(label + ' frame')})">
+      <div class="still-actions">
+        <button type="button" onclick="event.stopPropagation(); exportMedia(${jsArg(path)})" title="Save this frame">&#128190;</button>
+        <button type="button" onclick="event.stopPropagation(); chooseOutpaintAnchor(${row.index},${jsArg(position)})" title="Upload anchor frame for this chunk">&#9875;</button>
+      </div>
+      ${activeAnchor ? '<span class="anchor-badge">Anchor</span>' : ''}
       <figcaption>${esc(label)}</figcaption>
     </figure>
   `;

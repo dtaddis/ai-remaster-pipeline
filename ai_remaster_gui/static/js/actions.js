@@ -199,6 +199,15 @@ async function exportMedia(path) {
   if (result.saved) alert('Saved:\n' + result.saved);
 }
 
+async function chooseOutpaintAnchor(index, position) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/outpaint-anchor', { index, position });
+  if (!result.ok) return alert(result.error || 'Could not install anchor frame');
+  if (!result.selected) return;
+
+  await redrawWithState(result.state, snap, true);
+}
+
 async function saveStage(key, redraw = false) {
   const snap = captureScrollState();
   await postJson('/api/settings', { stage: key, values: formValues() });
