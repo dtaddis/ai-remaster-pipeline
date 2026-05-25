@@ -34,7 +34,59 @@ function Get-ArpCommitHash {
         }
     } catch {
     }
+    $commit = Get-ArpCommitHashFromGitDir
+    if (-not [string]::IsNullOrWhiteSpace($commit)) {
+        return $commit
+    }
     return 'unknown'
+}
+
+function Get-ArpCommitHashFromGitDir {
+    $gitPath = Join-Path $Root '.git'
+    if (-not (Test-Path -LiteralPath $gitPath)) {
+        return $null
+    }
+
+    $gitDir = $gitPath
+    if (-not (Test-Path -LiteralPath $gitPath -PathType Container)) {
+        $gitFile = Get-Content -LiteralPath $gitPath -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($gitFile -notmatch '^gitdir:\s*(.+)$') {
+            return $null
+        }
+        $gitDir = $Matches[1]
+        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+            $gitDir = Join-Path $Root $gitDir
+        }
+    }
+
+    $headPath = Join-Path $gitDir 'HEAD'
+    if (-not (Test-Path -LiteralPath $headPath)) {
+        return $null
+    }
+    $head = (Get-Content -LiteralPath $headPath -TotalCount 1 -ErrorAction SilentlyContinue).Trim()
+    if ($head -match '^ref:\s*(.+)$') {
+        $refName = $Matches[1]
+        $refPath = Join-Path $gitDir $refName
+        if (-not (Test-Path -LiteralPath $refPath)) {
+            $packedRefs = Join-Path $gitDir 'packed-refs'
+            if (-not (Test-Path -LiteralPath $packedRefs)) {
+                return $null
+            }
+            $packedRefLine = Get-Content -LiteralPath $packedRefs -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "^[0-9a-fA-F]{40}\s+$([regex]::Escape($refName))$" } |
+                Select-Object -First 1
+            if (-not $packedRefLine) {
+                return $null
+            }
+            $head = ($packedRefLine -split '\s+')[0]
+        } else {
+            $head = (Get-Content -LiteralPath $refPath -TotalCount 1 -ErrorAction SilentlyContinue).Trim()
+        }
+    }
+    if ($head -match '^[0-9a-fA-F]{7,40}$') {
+        return $head.Substring(0, 7)
+    }
+    return $null
 }
 
 function Write-ArpBanner {
