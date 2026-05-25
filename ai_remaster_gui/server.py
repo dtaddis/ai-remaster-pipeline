@@ -480,6 +480,8 @@ class PipelineApp:
             add(["--target-height", values.get("target_height", "720")])
             add(["--chunk-seconds", values.get("chunk_seconds", "20")])
             add(["--overlap-frames", values.get("overlap_frames", "8")])
+            if values.get("negative_prompt"):
+                add(["--negative-prompt", values.get("negative_prompt", "")])
             manifest = outpaint_chunk_manifest_for(pipeline_source_text(self.settings), values)
             if manifest:
                 add(["--chunk-manifest", manifest])
@@ -1066,7 +1068,7 @@ def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
 
 def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "custom_seconds", "seed", "prompt_suffix", "prepared_path", "raw_path"]
+    fields = ["chunk_index", "start_frame", "end_frame", "start_seconds", "end_seconds", "custom_seconds", "seed", "prompt_suffix", "negative_suffix", "prepared_path", "raw_path"]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -1125,6 +1127,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         if not row.get("seed"):
             row["seed"] = str(42 + index)
         row.setdefault("prompt_suffix", "")
+        row.setdefault("negative_suffix", "")
         rows.append(row)
     write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
@@ -1186,7 +1189,7 @@ def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float,
     return ranges
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "") -> None:
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "") -> None:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -1197,6 +1200,7 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     row = rows[index]
     row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
     row["prompt_suffix"] = prompt_suffix
+    row["negative_suffix"] = negative_suffix
     if custom_seconds:
         row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
     else:
@@ -2616,14 +2620,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")))
                 self.send_json({"ok": True, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Outpaint chunk save failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")))
                 ok, message = APP.run_outpaint_chunk(int(data.get("index", 0)))
                 self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
             except Exception as exc:

@@ -28,6 +28,7 @@ STAGES = (
             ("target_height", "Output height", "select:544|576|720|768|1080", "720"),
             ("chunk_seconds", "Chunk seconds", "number", "4"),
             ("overlap_frames", "Overlap frames", "range:0|48|1", "8"),
+            ("negative_prompt", "Negative prompt", "text", "cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands"),
             ("crop_left", "Crop left", "range:0|240|1", "0"),
             ("crop_right", "Crop right", "range:0|240|1", "0"),
             ("crop_top", "Crop top", "range:0|240|1", "0"),

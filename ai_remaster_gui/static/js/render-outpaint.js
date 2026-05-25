@@ -15,13 +15,15 @@ function outpaintChunkCard(row) {
   return `
     <article class="chunk-card">
       ${outpaintChunkSummary(row)}
-      <div>
-        <label>Original frames</label>
-        ${chunkStillStrip(row, 'source')}
-      </div>
-      <div>
-        <label>Outpainted frames</label>
-        ${row.raw_exists ? chunkStillStrip(row, 'raw') : missingImage('Outpainted chunk not present')}
+      <div class="chunk-frame-rows">
+        <div class="chunk-frame-row">
+          <label>Original frames</label>
+          ${chunkStillStrip(row, 'source')}
+        </div>
+        <div class="chunk-frame-row">
+          <label>Outpainted frames</label>
+          ${row.raw_exists ? chunkStillStrip(row, 'raw') : missingImage('Outpainted chunk not present')}
+        </div>
       </div>
       ${outpaintChunkPrompt(row)}
     </article>
@@ -66,7 +68,9 @@ function outpaintChunkPrompt(row) {
     <div>
       <label>Prompt suffix</label>
       <textarea id="chunkPrompt_${idx}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix || '')}</textarea>
-      <p class="shot-time">Use this to nudge LTX away from odd extra objects, warped geometry, or missing details.</p>
+      <label>Negative suffix</label>
+      <textarea id="chunkNegative_${idx}" placeholder="Optional things to avoid in this chunk">${esc(row.negative_suffix || '')}</textarea>
+      <p class="shot-time">Use these to nudge LTX away from odd extra objects, warped geometry, hands, or missing details.</p>
     </div>
   `;
 }
@@ -118,8 +122,20 @@ function chunkStillStrip(row, prefix) {
   ];
   return `
     <div class="chunk-stills">
-      ${frames.map(([key, label]) => row[key] ? `<figure><img src="${media(row[key])}" alt=""><figcaption>${label}</figcaption></figure>` : missingImage(label + ' frame not present')).join('')}
+      ${frames.map(([key, label]) => row[key] ? chunkStillFigure(row[key], label) : missingImage(label + ' frame not present')).join('')}
     </div>
+  `;
+}
+
+function chunkStillFigure(path, label) {
+  const src = media(path);
+  return `
+    <figure>
+      <button type="button" class="image-inspect" onclick="openImageModal(${jsArg(src)},${jsArg(label)})" title="Inspect ${esc(label)} frame">
+        <img src="${src}" alt="">
+      </button>
+      <figcaption>${esc(label)}</figcaption>
+    </figure>
   `;
 }
 

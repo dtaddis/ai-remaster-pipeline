@@ -219,7 +219,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, seed: int | None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
     image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
@@ -231,7 +231,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     except KeyError:
         pass
     set_widget_if_node(workflow, args.positive_node_id, args.prompt_widget, prompt_text)
-    set_widget_if_node(workflow, args.negative_node_id, args.prompt_widget, args.negative_prompt)
+    set_widget_if_node(workflow, args.negative_node_id, args.prompt_widget, negative_text)
     set_widget_if_node(workflow, args.save_node_id, args.save_prefix_widget, output_prefix)
     if seed is not None:
         set_widget_if_node(workflow, args.seed_node_id, args.seed_widget, int(seed))
@@ -296,10 +296,11 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", chunk_manifest: Path | None = None) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
+    negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 5,
+        "version": 6,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -308,8 +309,9 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "target_aspect": args.target_aspect,
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
+        "negative_suffix": negative_suffix,
         "seed": seed,
-        "negative_prompt": args.negative_prompt,
+        "negative_prompt": negative_text,
         "load_video_node_id": args.load_video_node_id,
         "save_node_id": args.save_node_id,
         "extra_save_node_id": args.extra_save_node_id,
@@ -382,6 +384,7 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "custom_seconds",
         "seed",
         "prompt_suffix",
+        "negative_suffix",
         "prepared_path",
         "raw_path",
     ]
@@ -435,6 +438,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
         if not row.get("seed"):
             row["seed"] = str(default_seed + chunk_index)
         row.setdefault("prompt_suffix", "")
+        row.setdefault("negative_suffix", "")
         row.setdefault("custom_seconds", "")
         rows.append(row)
     write_chunk_manifest(path, rows)
@@ -560,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-node-id", default="4832")
     parser.add_argument("--seed-widget", default="0")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--negative-prompt", default="cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details")
+    parser.add_argument("--negative-prompt", default="cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands")
     parser.add_argument("--black-lift", type=float, default=0.018)
     parser.add_argument("--gamma", type=float, default=1.06)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
@@ -657,7 +661,8 @@ def main() -> int:
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
-                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix)
+                chunk_negative_suffix = chunk_row.get("negative_suffix", "")
+                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
                         raise FileNotFoundError(f"Cannot regenerate only chunk {args.only_chunk}; chunk {chunk_index} is missing: {chunk_raw}")
@@ -670,10 +675,13 @@ def main() -> int:
                 workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
                 chunk_prefix = f"{output_prefix}_chunk_{chunk_index:04d}"
                 prompt_text = combine_prompt(args.prompt, chunk_prompt_suffix)
+                negative_text = combine_prompt(args.negative_prompt, chunk_negative_suffix)
                 print(f"Chunk {chunk_index + 1} seed: {chunk_seed}", flush=True)
                 if chunk_prompt_suffix:
                     print(f"Chunk {chunk_index + 1} prompt suffix: {chunk_prompt_suffix}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, chunk_seed)
+                if chunk_negative_suffix:
+                    print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

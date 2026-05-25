@@ -43,7 +43,40 @@ function outpaintChunkForm(index) {
     seed: document.getElementById(`chunkSeed_${index}`).value,
     custom_seconds: outpaintChunkCustomSeconds(index),
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
+    negative_suffix: document.getElementById(`chunkNegative_${index}`).value,
   };
+}
+
+function openImageModal(src, title) {
+  let modal = document.getElementById('imageModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'imageModal';
+    modal.className = 'image-modal hidden';
+    modal.innerHTML = `
+      <div class="image-modal-backdrop" onclick="closeImageModal()"></div>
+      <div class="image-modal-panel">
+        <div class="image-modal-heading">
+          <strong id="imageModalTitle"></strong>
+          <button type="button" onclick="closeImageModal()" aria-label="Close image preview">Close</button>
+        </div>
+        <img id="imageModalImg" alt="">
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  document.getElementById('imageModalTitle').textContent = title || 'Image preview';
+  document.getElementById('imageModalImg').src = src;
+  modal.classList.remove('hidden');
+}
+
+function closeImageModal() {
+  const modal = document.getElementById('imageModal');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  const img = document.getElementById('imageModalImg');
+  if (img) img.removeAttribute('src');
 }
 
 function outpaintChunkCustomSeconds(index) {
