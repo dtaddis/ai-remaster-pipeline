@@ -16,6 +16,7 @@ $DownloadCache = Join-Path $Root '.cache\huggingface'
 $DefaultComfyDir = Join-Path $Root 'tools\comfyui'
 $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
 $UseExistingComfy = $false
+$ResolvedPythonLauncher = $null
 
 function Invoke-Step {
     param([string]$Label, [scriptblock]$Block)
@@ -25,17 +26,107 @@ function Invoke-Step {
 
 function Invoke-External {
     param([string[]]$Command, [string]$WorkingDirectory = $Root)
+    if (-not $Command -or $Command.Count -eq 0) {
+        throw 'No command was provided.'
+    }
     Write-Host ($Command -join ' ')
-    $process = Start-Process -FilePath $Command[0] -ArgumentList $Command[1..($Command.Count-1)] -WorkingDirectory $WorkingDirectory -NoNewWindow -Wait -PassThru
+    $executable = Resolve-CommandExecutable $Command[0] ($Command -join ' ')
+    $startArgs = @{
+        FilePath = $executable
+        WorkingDirectory = $WorkingDirectory
+        NoNewWindow = $true
+        Wait = $true
+        PassThru = $true
+    }
+    if ($Command.Count -gt 1) {
+        $startArgs.ArgumentList = @($Command[1..($Command.Count - 1)])
+    }
+    $process = Start-Process @startArgs
     if ($process.ExitCode -ne 0) {
         throw "Command failed with exit code $($process.ExitCode): $($Command -join ' ')"
     }
 }
 
+function Resolve-CommandExecutable {
+    param([string]$FilePath, [string]$DisplayCommand = $FilePath)
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        throw "Command has an empty executable: $DisplayCommand"
+    }
+    if ([System.IO.Path]::IsPathRooted($FilePath) -or $FilePath.Contains('\') -or $FilePath.Contains('/')) {
+        if (Test-Path -LiteralPath $FilePath) {
+            return $FilePath
+        }
+    } else {
+        $resolved = Get-Command $FilePath -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($resolved) {
+            return $resolved.Source
+        }
+    }
+    throw "Could not find executable '$FilePath' while running: $DisplayCommand"
+}
+
+function Split-CommandLine {
+    param([string]$CommandLine)
+    $matches = [regex]::Matches($CommandLine, '("[^"]+"|''[^'']+''|\S+)')
+    $parts = @()
+    foreach ($match in $matches) {
+        $part = $match.Value
+        if (($part.StartsWith('"') -and $part.EndsWith('"')) -or ($part.StartsWith("'") -and $part.EndsWith("'"))) {
+            $part = $part.Substring(1, $part.Length - 2)
+        }
+        $parts += $part
+    }
+    return $parts
+}
+
+function Get-CommandTail {
+    param([string[]]$Command)
+    if ($Command.Count -le 1) {
+        return @()
+    }
+    return @($Command[1..($Command.Count - 1)])
+}
+
+function Test-PythonLauncher {
+    param([string[]]$Command)
+    $executable = Resolve-CommandExecutable $Command[0] ($Command -join ' ')
+    $arguments = (Get-CommandTail $Command) + @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    $version = (& $executable @arguments 2>$null | Select-Object -First 1)
+    return ($LASTEXITCODE -eq 0 -and $version -eq '3.13')
+}
+
+function Resolve-PythonLauncher {
+    $requested = Split-CommandLine $PythonLauncher
+    if (-not $requested -or $requested.Count -eq 0) {
+        throw 'Python launcher command is empty.'
+    }
+
+    $candidates = @(@($requested))
+    if (($requested -join ' ') -eq 'py -3.13') {
+        $candidates += ,@('python3.13')
+        $candidates += ,@('python')
+    }
+
+    foreach ($candidate in $candidates) {
+        try {
+            if (Test-PythonLauncher $candidate) {
+                Write-Host "Using Python launcher: $($candidate -join ' ')"
+                return $candidate
+            }
+        } catch {
+            continue
+        }
+    }
+
+    throw "Could not find Python 3.13. Install Python 3.13 from python.org with the Python Launcher option enabled, or rerun with -PythonLauncher pointing at a Python 3.13 executable."
+}
+
 function Invoke-PythonLauncher {
     param([string[]]$Arguments, [string]$WorkingDirectory = $Root)
-    $parts = $PythonLauncher -split ' '
-    Invoke-External -Command ($parts + $Arguments) -WorkingDirectory $WorkingDirectory
+    if (-not $script:ResolvedPythonLauncher) {
+        $script:ResolvedPythonLauncher = Resolve-PythonLauncher
+    }
+    Invoke-External -Command ($script:ResolvedPythonLauncher + $Arguments) -WorkingDirectory $WorkingDirectory
 }
 
 function Ensure-Directory {
@@ -174,7 +265,7 @@ function Download-HfFile {
         $env:PYTHONIOENCODING = 'utf-8'
         $env:HF_HUB_DISABLE_PROGRESS_BARS = '1'
         $process = Start-Process `
-            -FilePath $HfExe `
+            -FilePath (Resolve-CommandExecutable $HfExe 'hf download') `
             -ArgumentList @('download', $Repo, $File, '--local-dir', $DownloadCache) `
             -NoNewWindow `
             -Wait `
