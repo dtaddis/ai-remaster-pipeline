@@ -47,6 +47,26 @@ STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 PROJECT_SCHEMA_VERSION = 1
 
 
+def default_qwen_workflow(config: dict[str, str]) -> str:
+    comfy_dir = Path(config.get("comfy_dir", ROOT / "tools" / "comfyui"))
+    search_dirs = [
+        ROOT / "workflows" / "qwen_image_edit",
+        ROOT / "blueprints",
+        comfy_dir / "user" / "default" / "workflows",
+    ]
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        matches = sorted(
+            path
+            for path in directory.glob("*.json")
+            if "qwen" in path.name.lower() and path.is_file()
+        )
+        if matches:
+            return rel(matches[0])
+    return ""
+
+
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
     defaults["global"] = {"source": "", "colorize": "true", "section_start": "0", "section_end": "", "last_browse_dir": ""}

@@ -155,6 +155,25 @@ function Split-CommandLine {
     return $parts
 }
 
+function Convert-PythonLauncherArgument {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    $trimmed = $Value.Trim()
+    if (($trimmed.StartsWith('"') -and $trimmed.EndsWith('"')) -or ($trimmed.StartsWith("'") -and $trimmed.EndsWith("'"))) {
+        $trimmed = $trimmed.Substring(1, $trimmed.Length - 2)
+    }
+
+    $isPathLike = [System.IO.Path]::IsPathRooted($trimmed) -or $trimmed.Contains('\') -or $trimmed.Contains('/')
+    if ($isPathLike) {
+        return @($trimmed)
+    }
+
+    return Split-CommandLine $trimmed
+}
+
 function Get-CommandTail {
     param([string[]]$Command)
     if ($Command.Count -le 1) {
@@ -163,25 +182,101 @@ function Get-CommandTail {
     return @($Command[1..($Command.Count - 1)])
 }
 
-function Test-PythonLauncher {
+function Add-PythonLauncherCandidate {
+    param(
+        [System.Collections.ArrayList]$Candidates,
+        [string[]]$Command
+    )
+    if (-not $Command -or $Command.Count -eq 0) {
+        return
+    }
+    $display = $Command -join "`0"
+    foreach ($candidate in $Candidates) {
+        if (($candidate -join "`0") -eq $display) {
+            return
+        }
+    }
+    [void]$Candidates.Add([string[]]$Command)
+}
+
+function Expand-PythonLauncherCandidates {
+    param([string[]]$Requested)
+    $candidates = [System.Collections.ArrayList]::new()
+    Add-PythonLauncherCandidate $candidates $Requested
+
+    if ($Requested.Count -eq 1) {
+        $requestedPath = $Requested[0]
+        if ([System.IO.Path]::IsPathRooted($requestedPath) -or $requestedPath.Contains('\') -or $requestedPath.Contains('/')) {
+            if (Test-Path -LiteralPath $requestedPath -PathType Container) {
+                Add-PythonLauncherCandidate $candidates @((Join-Path $requestedPath 'python.exe'))
+                Add-PythonLauncherCandidate $candidates @((Join-Path $requestedPath 'Python313.exe'))
+            } else {
+                $parent = Split-Path -Path $requestedPath -Parent
+                $leaf = Split-Path -Path $requestedPath -Leaf
+                if (-not [string]::IsNullOrWhiteSpace($parent)) {
+                    if ($leaf -ieq 'python.exe') {
+                        $parentLeaf = Split-Path -Path $parent -Leaf
+                        if ($parentLeaf -ieq 'Python313') {
+                            $grandparent = Split-Path -Path $parent -Parent
+                            if (-not [string]::IsNullOrWhiteSpace($grandparent)) {
+                                Add-PythonLauncherCandidate $candidates @((Join-Path $grandparent 'Python313.exe'))
+                            }
+                        } else {
+                            Add-PythonLauncherCandidate $candidates @((Join-Path $parent 'Python313.exe'))
+                            Add-PythonLauncherCandidate $candidates @((Join-Path (Join-Path $parent 'Python313') 'python.exe'))
+                        }
+                    } elseif ($leaf -ieq 'Python313.exe') {
+                        Add-PythonLauncherCandidate $candidates @((Join-Path (Join-Path $parent 'Python313') 'python.exe'))
+                    }
+                }
+            }
+        }
+    }
+
+    return ,$candidates
+}
+
+function Get-PythonLauncherCheck {
     param([string[]]$Command)
-    $executable = Resolve-CommandExecutable $Command[0] ($Command -join ' ')
+    $display = $Command -join ' '
+    $executable = $null
+    try {
+        $executable = Resolve-CommandExecutable $Command[0] $display
+    } catch {
+        return [pscustomobject]@{
+            Success = $false
+            Reason = $_.Exception.Message
+        }
+    }
     $arguments = (Get-CommandTail $Command) + @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     $version = (& $executable @arguments 2>$null | Select-Object -First 1)
-    return ($LASTEXITCODE -eq 0 -and $version -eq '3.13')
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{
+            Success = $false
+            Reason = "exited with code $LASTEXITCODE"
+        }
+    }
+    if ($version -ne '3.13') {
+        return [pscustomobject]@{
+            Success = $false
+            Reason = "found Python $version"
+        }
+    }
+    return [pscustomobject]@{
+        Success = $true
+        Reason = 'found Python 3.13'
+    }
 }
 
 function Find-PythonLauncher {
     param([array]$Candidates)
     foreach ($candidate in $candidates) {
-        try {
-            if (Test-PythonLauncher $candidate) {
-                Write-Host "Using Python launcher: $($candidate -join ' ')"
-                return $candidate
-            }
-        } catch {
-            continue
+        $check = Get-PythonLauncherCheck $candidate
+        if ($check.Success) {
+            Write-Host "Using Python launcher: $($candidate -join ' ')"
+            return $candidate
         }
+        Write-Host "Skipping Python launcher $($candidate -join ' '): $($check.Reason)" -ForegroundColor DarkGray
     }
     return $null
 }
@@ -219,15 +314,15 @@ function Show-PythonInstallPrompt {
 }
 
 function Resolve-PythonLauncher {
-    $requested = Split-CommandLine $PythonLauncher
+    $requested = Convert-PythonLauncherArgument $PythonLauncher
     if (-not $requested -or $requested.Count -eq 0) {
         throw 'Python launcher command is empty.'
     }
 
-    $candidates = @(@($requested))
+    $candidates = Expand-PythonLauncherCandidates $requested
     if (($requested -join ' ') -eq 'py -3.13') {
-        $candidates += ,@('python3.13')
-        $candidates += ,@('python')
+        Add-PythonLauncherCandidate $candidates @('python3.13')
+        Add-PythonLauncherCandidate $candidates @('python')
     }
 
     while ($true) {

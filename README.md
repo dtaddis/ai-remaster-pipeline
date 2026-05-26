@@ -45,6 +45,13 @@ The installer creates this repo's `.venv`, installs FFmpeg locally, and asks whe
 
 If the installer cannot find Python 3.13, it will prompt you to install it and retry detection.
 
+If Python 3.13 is installed somewhere custom, point the installer at the actual executable. Common python.org install paths are:
+
+```bat
+install_windows.bat -PythonLauncher "%LocalAppData%\Programs\Python\Python313\python.exe"
+install_windows.bat -PythonLauncher "C:\Program Files\Python313\python.exe"
+```
+
 If you already have ComfyUI somewhere else:
 
 ```bat
