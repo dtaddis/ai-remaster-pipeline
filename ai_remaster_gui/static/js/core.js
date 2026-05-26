@@ -2,6 +2,7 @@ let state = null;
 let active = 'global';
 let selected = {};
 let lastRenderSignature = '';
+let lastOutpaintVisualSignature = '';
 
 const media = path => '/media?path=' + encodeURIComponent(path);
 const mediaClip = (path, start, end, key) => (
@@ -35,7 +36,9 @@ async function refresh(force = false) {
   if (version) version.textContent = state.version || '';
 
   const sig = renderSignature();
-  if (!force && (editing || shouldPreserveInteractiveDom(mediaActive) || sig === lastRenderSignature)) {
+  const outpaintVisualChanged = active === 'outpaint'
+    && outpaintVisualSignature() !== lastOutpaintVisualSignature;
+  if (!force && (editing || (shouldPreserveInteractiveDom(mediaActive) && !outpaintVisualChanged) || sig === lastRenderSignature)) {
     updateOutpaintGuidePreviews();
     updateRunLogs();
     return;
@@ -45,6 +48,7 @@ async function refresh(force = false) {
   draw(false);
   wireColourShotVideos();
   lastRenderSignature = sig;
+  lastOutpaintVisualSignature = outpaintVisualSignature();
   restoreScrollState(snap);
 }
 
@@ -86,6 +90,22 @@ function shouldPreserveInteractiveDom(mediaActive) {
   // Normal polling must not recreate video elements while the user is inspecting
   // chunk, shot, or recomposition previews. A manual Refresh still redraws.
   return ['outpaint', 'colour', 'recomp', 'output'].includes(active);
+}
+
+function outpaintVisualSignature() {
+  if (!state || !state.outpaint_chunks) return '';
+  return JSON.stringify((state.outpaint_chunks.rows || []).map(row => ({
+    index: row.index,
+    raw_exists: row.raw_exists,
+    raw_mtime: row.raw_mtime,
+    anchor_exists: row.anchor_exists,
+    anchor_mtime: row.anchor_mtime,
+    anchor_seconds: row.anchor_seconds,
+    anchor_frame_preview: row.anchor_frame_preview,
+    raw_start_preview: row.raw_start_preview,
+    raw_middle_preview: row.raw_middle_preview,
+    raw_end_preview: row.raw_end_preview,
+  })));
 }
 
 function updateRunLogs() {
@@ -135,6 +155,7 @@ function selectTab(tab) {
   draw(false);
   wireColourShotVideos();
   lastRenderSignature = renderSignature();
+  lastOutpaintVisualSignature = outpaintVisualSignature();
 }
 
 function stage(key) {

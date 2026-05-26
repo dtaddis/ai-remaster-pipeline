@@ -344,7 +344,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 14,
+        "version": 16,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -356,7 +356,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "negative_suffix": negative_suffix,
         "anchor_image": root_relative(anchor_image) if anchor_image else "",
         "anchor_fingerprint": file_fingerprint(anchor_image) if anchor_image and anchor_image.exists() else None,
-        "anchor_injected_into_video": False,
+        "anchor_injected_into_video": bool(anchor_image),
         "preserve_author_image_guide_path": True,
         "bypass_optional_preview_nodes": True,
         "seed": seed,
@@ -519,15 +519,23 @@ def anchor_frame_index(position: str, frame_count: int) -> int:
     return 0
 
 
+def guide_frame_index(seconds: str, fps: float, frame_count: int, fallback_position: str = "middle") -> int:
+    try:
+        return max(0, min(max(0, frame_count - 1), int(round(float(seconds or 0) * fps))))
+    except ValueError:
+        return anchor_frame_index(fallback_position, frame_count)
+
+
 def anchored_chunk_path(chunk_path: Path, anchor: Path, position: str) -> Path:
     return chunk_path.with_name(f"{chunk_path.stem}_anchor_{position}_{safe_stem(anchor.name)}{chunk_path.suffix}")
 
 
-def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, position: str, fps: float, force: bool) -> Path:
+def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, seconds: str, fps: float, force: bool, position: str = "middle") -> Path:
     info = probe_video(chunk_path)
     frame_count = int(info["frames"] or 1)
-    frame_index = anchor_frame_index(position, frame_count)
-    target = anchored_chunk_path(chunk_path, anchor, position)
+    frame_index = guide_frame_index(seconds, fps, frame_count, position)
+    safe_time = f"{frame_index:06d}"
+    target = chunk_path.with_name(f"{chunk_path.stem}_guide_{safe_time}_{safe_stem(anchor.name)}{chunk_path.suffix}")
     if target.exists() and not force and target.stat().st_mtime_ns >= max(chunk_path.stat().st_mtime_ns, anchor.stat().st_mtime_ns):
         return target
 
@@ -536,8 +544,7 @@ def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, position: s
     width = int(info["width"])
     height = int(info["height"])
     filter_text = (
-        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[anchor];"
+        f"[1:v]scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p[anchor];"
         f"[0:v][anchor]overlay=enable='eq(n\\,{frame_index})',"
         f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[v]"
     )
@@ -569,7 +576,7 @@ def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, position: s
         "veryfast",
         str(partial),
     ]
-    print(f"Injecting anchor into prepared chunk frame {frame_index + 1}/{frame_count}: {anchor}", flush=True)
+    print(f"Injecting guide into prepared chunk frame {frame_index + 1}/{frame_count}: {anchor}", flush=True)
     subprocess.run(command, check=True)
     replace_with_retry(partial, target, f"Anchored prepared chunk {target.name}")
     return target
@@ -788,6 +795,18 @@ def main() -> int:
                     print(f"Warning: chunk {chunk_index + 1} anchor image was not found and will be ignored: {anchor_image}", flush=True)
                     anchor_image = None
                 chunk_conditioning = chunk_prepared
+                anchor_seconds = chunk_row.get("anchor_seconds", "")
+                if anchor_image:
+                    anchor_position = chunk_row.get("anchor_position", "middle") or "middle"
+                    chunk_conditioning = inject_anchor_frame(
+                        ffmpeg,
+                        chunk_prepared,
+                        anchor_image,
+                        anchor_seconds,
+                        float(prepared_info["fps"] or 24.0),
+                        args.force,
+                        anchor_position,
+                    )
                 chunk_sig = raw_signature(args, workflow_path, chunk_conditioning, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, anchor_image)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
