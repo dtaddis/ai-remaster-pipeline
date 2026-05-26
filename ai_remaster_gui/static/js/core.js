@@ -34,6 +34,7 @@ async function refresh(force = false) {
 
   const sig = renderSignature();
   if (!force && (editing || shouldPreserveInteractiveDom(mediaActive) || sig === lastRenderSignature)) {
+    updateOutpaintGuidePreviews();
     updateRunLogs();
     return;
   }
@@ -58,6 +59,7 @@ function renderSignature() {
     source_monochrome: state.source_monochrome,
     aspect_preview: state.aspect_preview,
     shot_views: state.shot_views,
+    outpaint_chunks: state.outpaint_chunks,
     cache: state.cache,
     progress: state.progress,
     phase_progress: state.phase_progress,

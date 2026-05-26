@@ -177,12 +177,45 @@ def clear_input_link(workflow: dict[str, Any], node_id: str, input_name: str) ->
             return
 
 
+def input_link(workflow: dict[str, Any], node_id: str, input_name: str) -> int | None:
+    node = node_by_id(workflow, node_id)
+    for item in node.get("inputs", []):
+        if item.get("name") == input_name:
+            link = item.get("link")
+            return int(link) if link is not None else None
+    return None
+
+
 def ensure_widget_input(node: dict[str, Any], name: str, input_type: str = "COMBO") -> None:
     for item in node.setdefault("inputs", []):
         if item.get("name") == name:
             item.setdefault("widget", {"name": name})
             return
     node["inputs"].append({"name": name, "type": input_type, "widget": {"name": name}})
+
+
+def bypass_optional_preview_nodes(workflow: dict[str, Any]) -> None:
+    """Author workflows may include optional MTB color-correct nodes.
+
+    They are behind Crystools switches, but Comfy validates every linked input in
+    the API prompt. If MTB/Crystools are not installed, those unused linked
+    branches still fail validation. Route downstream nodes through the plain
+    image links so the LTX guide path still works on a minimal install.
+    """
+    try:
+        plain_guide_link = input_link(workflow, "5087", "on_false")
+        if plain_guide_link is not None:
+            set_input_link(workflow, "5012", "image", plain_guide_link)
+    except KeyError:
+        pass
+
+    try:
+        plain_decode_link = input_link(workflow, "5089", "on_false")
+        if plain_decode_link is not None:
+            set_input_link(workflow, "5076", "images", plain_decode_link)
+            set_input_link(workflow, "5067", "image1", plain_decode_link)
+    except KeyError:
+        pass
 
 
 # The LTX example workflow is a frontend graph with stable-but-opaque node IDs.
@@ -248,6 +281,8 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     for node_id in args.extra_save_node_id:
         set_widget_if_node(workflow, node_id, args.save_prefix_widget, output_prefix)
 
+    bypass_optional_preview_nodes(workflow)
+
     # Avoid depending on the optional ComfyMath CM_FloatToInt node; the audio latent node accepts
     # a normal integer widget value when its frame_rate link is cleared.
     try:
@@ -268,13 +303,13 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     except KeyError:
         pass
 
-    # ARP already prepares an exact target-size canvas, so bypass the demo workflow's
-    # pad/resize/reference-image branch. This avoids optional/dynamic helper nodes and
-    # feeds the prepared video frames directly into LTX conditioning.
+    # Preserve the workflow author's image-guide path:
+    # LoadImage -> ResizeImageMaskNode -> LTXVPreprocess -> LTXVImgToVideoConditionOnly.
+    # That path is how custom/Qwen anchor frames influence the LTX IC-LoRA render. The
+    # video input still carries ARP's prepared expanded canvas into LTXAddVideoICLoRAGuide.
     try:
-        set_input_link(workflow, "3336", "image", 13586)
-        set_input_link(workflow, "5012", "image", 13586)
-        set_input_link(workflow, args.save_node_id, "images", 13594)
+        if args.save_node_id != "5076":
+            set_input_link(workflow, args.save_node_id, "images", 13594)
     except KeyError:
         pass
 
@@ -309,7 +344,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 8,
+        "version": 14,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -321,7 +356,9 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "negative_suffix": negative_suffix,
         "anchor_image": root_relative(anchor_image) if anchor_image else "",
         "anchor_fingerprint": file_fingerprint(anchor_image) if anchor_image and anchor_image.exists() else None,
-        "anchor_injected_into_video": bool(anchor_image),
+        "anchor_injected_into_video": False,
+        "preserve_author_image_guide_path": True,
+        "bypass_optional_preview_nodes": True,
         "seed": seed,
         "negative_prompt": negative_text,
         "load_video_node_id": args.load_video_node_id,
@@ -399,6 +436,7 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "negative_suffix",
         "anchor_image",
         "anchor_position",
+        "anchor_seconds",
         "prepared_path",
         "raw_path",
     ]
@@ -455,6 +493,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
         row.setdefault("negative_suffix", "")
         row.setdefault("anchor_image", "")
         row.setdefault("anchor_position", "")
+        row.setdefault("anchor_seconds", "")
         row.setdefault("custom_seconds", "")
         rows.append(row)
     write_chunk_manifest(path, rows)
@@ -749,16 +788,6 @@ def main() -> int:
                     print(f"Warning: chunk {chunk_index + 1} anchor image was not found and will be ignored: {anchor_image}", flush=True)
                     anchor_image = None
                 chunk_conditioning = chunk_prepared
-                if anchor_image:
-                    anchor_position = chunk_row.get("anchor_position", "start") or "start"
-                    chunk_conditioning = inject_anchor_frame(
-                        ffmpeg,
-                        chunk_prepared,
-                        anchor_image,
-                        anchor_position,
-                        float(prepared_info["fps"] or 24.0),
-                        args.force,
-                    )
                 chunk_sig = raw_signature(args, workflow_path, chunk_conditioning, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, anchor_image)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
@@ -779,7 +808,7 @@ def main() -> int:
                 if chunk_negative_suffix:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
                 if anchor_image:
-                    print(f"Chunk {chunk_index + 1} anchor frame: {anchor_image}", flush=True)
+                    print(f"Chunk {chunk_index + 1} guide frame: {anchor_image}", flush=True)
                 prompt = patch_workflow(args, workflow, chunk_conditioning, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, anchor_image)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)

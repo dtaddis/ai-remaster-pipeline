@@ -202,21 +202,20 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
         return dict(zip(('left', 'right', 'top', 'bottom', 'extra_padding', 'pad_mode', 'color'), values))
     if class_type == 'ResizeImageMaskNode':
         resize_type = str(values[0]) if values else 'scale by multiplier'
-        resize: dict[str, Any] = {'resize_type': resize_type}
+        out: dict[str, Any] = {'resize_type': resize_type}
         if resize_type == 'scale by multiplier' and len(values) > 1:
-            resize['multiplier'] = values[1]
+            out['resize_type.multiplier'] = values[1]
         elif resize_type == 'scale to multiple' and len(values) > 1:
-            resize['multiple'] = values[1]
+            out['resize_type.multiple'] = values[1]
         elif resize_type == 'match size' and len(values) > 1:
-            resize['crop'] = values[1]
+            out['resize_type.crop'] = values[1]
         elif resize_type == 'scale dimensions':
             if len(values) > 1:
-                resize['width'] = values[1]
+                out['resize_type.width'] = values[1]
             if len(values) > 2:
-                resize['height'] = values[2]
+                out['resize_type.height'] = values[2]
             if len(values) > 3:
-                resize['crop'] = values[3]
-        out = {'resize_type': resize}
+                out['resize_type.crop'] = values[3]
         if values:
             out['scale_method'] = values[-1]
         return out
