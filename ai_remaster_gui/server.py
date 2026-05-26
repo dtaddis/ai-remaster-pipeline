@@ -45,6 +45,25 @@ from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, re
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 PROJECT_SCHEMA_VERSION = 1
+
+
+def app_version() -> str:
+    version_file = ROOT / "VERSION"
+    base = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else "0.0.0"
+    try:
+        commit = subprocess.run(
+            ["git", "-c", f"safe.directory={ROOT.as_posix()}", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        commit = ""
+    return "v" + base.lstrip("v") + (f"-{commit}" if commit else "")
+
+
+APP_VERSION = app_version()
 DEFAULT_ANCHOR_PROMPT = (
     "Fill the black outpaint margins with a natural continuation of this black-and-white film frame. "
     "Preserve the centre/original frame area, composition, lighting, paper, clothing, and background. "
@@ -321,6 +340,7 @@ class PipelineApp:
             section = source_section_state(self.settings)
             return {
                 "root": str(ROOT),
+                "version": APP_VERSION,
                 "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in (*self.active_stages(), output_stage())],
                 "settings": self.settings,
                 "progress": self.progress(),
@@ -872,6 +892,41 @@ def merge_manifest_shots(manifest_text: str, index: int) -> dict[str, str]:
     write_manifest_details(manifest, source_video, fieldnames, rows)
     APP.log.append(f"Merged shot {index + 1} with shot {index + 2}; shared reference: {rows[index].get('source_reference', '')}")
     return {"manifest": rel(manifest), "removed_reference": removed.get("source_reference", ""), "new_end": rows[index].get("end", "")}
+
+
+def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = None) -> dict[str, str]:
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+
+    for key in ("enabled", "end", "source_reference", "color_reference", "prompt"):
+        if key not in fieldnames:
+            fieldnames.append(key)
+
+    start = parse_time_seconds(rows[index - 1].get("end", "")) if index > 0 else 0.0
+    end = parse_time_seconds(rows[index].get("end", ""))
+    if end <= start:
+        raise RuntimeError(f"Shot {index + 1} cannot be split because its duration is not valid.")
+
+    split_at = (start + end) / 2 if seconds is None else float(seconds)
+    split_at = max(start + 0.001, min(end - 0.001, split_at))
+    if end - start < 0.1:
+        raise RuntimeError(f"Shot {index + 1} is too short to split.")
+
+    first = dict(rows[index])
+    second = dict(rows[index])
+    first["end"] = format_timecode(split_at)
+    first["source_reference"] = ""
+    first["color_reference"] = ""
+    second["end"] = rows[index].get("end", "")
+    second["source_reference"] = ""
+    second["color_reference"] = ""
+    rows[index] = first
+    rows.insert(index + 1, second)
+    write_manifest_details(manifest, source_video, fieldnames, rows)
+    APP.log.append(f"Split shot {index + 1} at {format_timecode(split_at)}")
+    return {"manifest": rel(manifest), "split": format_timecode(split_at)}
 
 
 def update_shot_boundary(manifest_text: str, index: int, edge: str, seconds: float) -> dict[str, str]:
@@ -1539,6 +1594,7 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 "source_reference_mtime": file_mtime(row.get("source_reference", "")),
                 "color_reference_mtime": file_mtime(row.get("color_reference", "")),
                 "can_merge_next": index < len(rows) - 1,
+                "can_split": end - start >= 0.1,
                 "prompt": row.get("prompt", ""),
             }
         if include_previews:
@@ -2831,6 +2887,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 APP.log.append(f"Shot merge failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/shot-split":
+            try:
+                result = split_manifest_shot(str(data.get("manifest", "")), int(data.get("index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Shot split failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/shot-boundary":
             try:
                 result = update_shot_boundary(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("edge", "")), float(data.get("time", 0)))
@@ -3210,7 +3273,7 @@ def main() -> int:
     requested_port = int(os.environ.get("AI_REMASTER_GUI_PORT", "8765"))
     server = create_server(host, requested_port)
     url = f"http://{host}:{server.server_port}/"
-    print(f"AI Remaster GUI running at {url}")
+    print(f"AI Remaster GUI {APP_VERSION} running at {url}")
     if os.environ.get("AI_REMASTER_NO_BROWSER") != "1":
         webbrowser.open(url)
     try:

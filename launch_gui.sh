@@ -32,8 +32,11 @@ git_head_commit() {
   printf '%.7s' "$head_value"
 }
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || git_head_commit || printf 'unknown')
-printf 'ARP %s\n' "$VERSION"
-printf 'Commit %s\n' "$COMMIT"
+if [ "$COMMIT" = "unknown" ]; then
+  printf 'ARP %s\n' "$VERSION"
+else
+  printf 'ARP %s-%s\n' "$VERSION" "$COMMIT"
+fi
 if [ -x "$ROOT/.venv/bin/python" ]; then
   PY="$ROOT/.venv/bin/python"
 else

@@ -31,6 +31,8 @@ async function refresh(force = false) {
   document.getElementById('root').textContent = state.root + (
     state.running ? '  |  Running: ' + state.running_stage : ''
   );
+  const version = document.getElementById('version');
+  if (version) version.textContent = state.version || '';
 
   const sig = renderSignature();
   if (!force && (editing || shouldPreserveInteractiveDom(mediaActive) || sig === lastRenderSignature)) {
@@ -89,8 +91,15 @@ function shouldPreserveInteractiveDom(mediaActive) {
 function updateRunLogs() {
   document.querySelectorAll('[data-run-log]').forEach(el => {
     const html = logHtml(state.log);
-    if (el.innerHTML !== html) el.innerHTML = html;
+    if (el.innerHTML === html) return;
+    const shouldFollow = isNearLogBottom(el);
+    el.innerHTML = html;
+    if (shouldFollow) el.scrollTop = el.scrollHeight;
   });
+}
+
+function isNearLogBottom(el) {
+  return el.scrollHeight - el.clientHeight - el.scrollTop < 28;
 }
 
 function availableTabs() {

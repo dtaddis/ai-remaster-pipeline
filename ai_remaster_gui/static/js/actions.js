@@ -129,6 +129,16 @@ async function mergeShot(manifest, index) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function splitShot(manifest, index) {
+  if (!confirm('Split this shot at its midpoint? Existing generated references for the two halves will be cleared.')) return;
+
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-split', { manifest, index });
+  if (!result.ok) return alert(result.error || 'Could not split shot');
+
+  await redrawWithState(result.state, snap, true);
+}
+
 async function setShotBoundary(manifest, index, edge, time) {
   const snap = captureScrollState();
   const result = await postJson('/api/shot-boundary', { manifest, index, edge, time });

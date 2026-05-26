@@ -6,8 +6,11 @@ if exist "%ROOT%VERSION" set /p ARP_VERSION=<"%ROOT%VERSION"
 set "ARP_COMMIT=unknown"
 for /f "usebackq delims=" %%H in (`git -C "%ROOT%" rev-parse --short HEAD 2^>nul`) do set "ARP_COMMIT=%%H"
 if "%ARP_COMMIT%"=="unknown" call :read_git_head
-echo ARP %ARP_VERSION%
-echo Commit %ARP_COMMIT%
+if "%ARP_COMMIT%"=="unknown" (
+    echo ARP %ARP_VERSION%
+) else (
+    echo ARP %ARP_VERSION%-%ARP_COMMIT%
+)
 call "%ROOT%wrappers\_python.bat" -m ai_remaster_gui %*
 exit /b %ERRORLEVEL%
 

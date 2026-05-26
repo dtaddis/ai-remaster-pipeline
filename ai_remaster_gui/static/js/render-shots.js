@@ -125,10 +125,13 @@ function shotBoundaryCard(context) {
   const mergeButton = row.can_merge_next
     ? `<button type="button" onclick="mergeShot('${esc(manifest)}',${idx})">Merge Next</button>`
     : '';
+  const splitButton = row.can_split
+    ? `<button type="button" onclick="splitShot('${esc(manifest)}',${idx})">Split</button>`
+    : '';
 
   return `
     <article class="shot-card">
-      ${shotSummary(context, `<div class="shot-tools">${mergeButton}</div>`)}
+      ${shotSummary(context, `<div class="shot-tools">${mergeButton}${splitButton}</div>`)}
       ${boundaryFrameCard(context, 'start')}
       <div>
         <label>Middle</label>

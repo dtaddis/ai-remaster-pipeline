@@ -249,6 +249,7 @@ function captureScrollState() {
     key: scrollElementKey(el, index),
     top: el.scrollTop,
     left: el.scrollLeft,
+    atBottom: el.classList.contains('log') && el.scrollHeight - el.clientHeight - el.scrollTop < 28,
   }));
 
   return { windowX: window.scrollX, windowY: window.scrollY, entries };
@@ -262,7 +263,7 @@ function restoreScrollState(snap) {
     scrollableElements().forEach((el, index) => {
       const saved = byKey.get(scrollElementKey(el, index));
       if (!saved) return;
-      el.scrollTop = saved.top;
+      el.scrollTop = saved.atBottom ? el.scrollHeight : saved.top;
       el.scrollLeft = saved.left;
     });
     window.scrollTo(snap.windowX || 0, snap.windowY || 0);
