@@ -2,6 +2,7 @@
 
 import argparse
 import subprocess
+import time
 from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, video_info, write_signature
@@ -53,6 +54,23 @@ def signature(args, source: Path) -> dict:
 
 def default_output(source: Path) -> Path:
     return resolve_path(Path('intermediate') / 'outpainted' / f'{source.stem}_restored.mp4')
+
+
+def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: float = 0.5) -> None:
+    last_exc: PermissionError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            partial.replace(output)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt == 1:
+                print(f'Waiting for file lock to clear before replacing outpaint output: {output}', flush=True)
+            time.sleep(delay)
+    raise PermissionError(
+        f'Could not replace outpaint output because it is open in another process: {output}. '
+        'Close any ARP preview, media player, Resolve bin/timeline item, or Explorer preview using this file and try again.'
+    ) from last_exc
 
 
 def build_parser():
@@ -109,7 +127,7 @@ def main():
         return 0
     output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(command, check=True)
-    partial.replace(output)
+    replace_with_retry(partial, output)
     write_signature(output, sig)
     print(f'Wrote restored outpaint: {output}')
     return 0

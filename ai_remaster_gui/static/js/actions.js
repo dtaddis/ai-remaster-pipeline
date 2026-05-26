@@ -201,10 +201,26 @@ async function exportMedia(path) {
 
 async function chooseOutpaintAnchor(index, position) {
   const snap = captureScrollState();
-  const result = await postJson('/api/outpaint-anchor', { index, position });
-  if (!result.ok) return alert(result.error || 'Could not install anchor frame');
+  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
+  const result = await postJson('/api/outpaint-anchor', { index, seconds });
+  if (!result.ok) return alert(result.error || 'Could not install guide frame');
   if (!result.selected) return;
 
+  await redrawWithState(result.state, snap, true);
+}
+
+async function clearOutpaintAnchor(index) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/outpaint-anchor-clear', { index });
+  if (!result.ok) return alert(result.error || 'Could not clear guide frame');
+  await redrawWithState(result.state, snap, true);
+}
+
+async function saveOutpaintGuideTime(index) {
+  const snap = captureScrollState();
+  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
+  const result = await postJson('/api/outpaint-guide-time', { index, seconds });
+  if (!result.ok) return alert(result.error || 'Could not update guide source frame');
   await redrawWithState(result.state, snap, true);
 }
 
@@ -220,14 +236,14 @@ function openAnchorPromptModal(index, position) {
       <div class="image-modal-backdrop" onclick="closeAnchorPromptModal()"></div>
       <div class="prompt-modal-panel">
         <div class="image-modal-heading">
-          <strong>Generate Anchor Frame</strong>
+          <strong>Generate Guide Frame</strong>
           <button type="button" onclick="closeAnchorPromptModal()">Close</button>
         </div>
         <p class="shot-empty">Qwen will turn this expanded still into a guide image for LTX. The default prompt asks it to replace the black outpaint margins while preserving the original centre frame.</p>
         <label>Qwen edit prompt</label>
         <textarea id="anchorPromptText"></textarea>
         <div class="actions">
-          <button class="primary" type="button" onclick="submitAnchorPrompt()">Generate Anchor</button>
+          <button class="primary" type="button" onclick="submitAnchorPrompt()">Generate Guide</button>
           <button type="button" onclick="closeAnchorPromptModal()">Cancel</button>
         </div>
       </div>
@@ -250,12 +266,12 @@ async function submitAnchorPrompt() {
   const modal = document.getElementById('anchorPromptModal');
   if (!modal) return;
   const index = Number(modal.dataset.index || 0);
-  const position = modal.dataset.position || 'middle';
+  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
   const prompt = document.getElementById('anchorPromptText')?.value || DEFAULT_ANCHOR_PROMPT;
   closeAnchorPromptModal();
 
-  const result = await postJson('/api/outpaint-anchor-generate', { index, position, prompt });
-  if (!result.ok) return alert(result.error || result.message || 'Could not generate anchor frame');
+  const result = await postJson('/api/outpaint-anchor-generate', { index, seconds, prompt });
+  if (!result.ok) return alert(result.error || result.message || 'Could not generate guide frame');
   if (result.state) {
     state = result.state;
     draw(false);

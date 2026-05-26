@@ -18,11 +18,14 @@ function outpaintChunkCard(row) {
       <div class="chunk-frame-rows">
         <div class="chunk-frame-row">
           <label>Original frames</label>
-          ${chunkStillStrip(row, 'source', true)}
+          ${chunkStillStrip(row, 'source', false)}
+        </div>
+        <div class="chunk-frame-row">
+          ${outpaintChunkGuide(row)}
         </div>
         <div class="chunk-frame-row">
           <label>Outpainted frames</label>
-          ${row.raw_exists ? chunkStillStrip(row, 'raw', false) : missingImage('Outpainted chunk not present')}
+          ${row.raw_exists ? chunkStillStrip(row, 'raw', false) : missingChunkStillStrip('Outpainted chunk not present')}
         </div>
       </div>
       ${outpaintChunkPrompt(row)}
@@ -53,13 +56,81 @@ function outpaintChunkSummary(row) {
       </div>
       <label>Seed</label>
       <input id="chunkSeed_${idx}" type="number" value="${esc(row.seed || '42')}">
-      ${outpaintAnchorInputStatus(row)}
       <div class="shot-tools">
         <button type="button" onclick="saveOutpaintChunk(${idx})">Save</button>
         <button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running ? 'disabled' : ''}>Regenerate Chunk</button>
       </div>
     </div>
   `;
+}
+
+function outpaintChunkGuide(row) {
+  const idx = row.index;
+  const length = Math.max(0, Number(row.end || 0) - Number(row.start || 0));
+  const seconds = Math.max(0, Math.min(length, Number(row.anchor_seconds || length / 2 || 0)));
+  const label = formatSeconds(seconds);
+  const guidePath = row.anchor_exists ? row.anchor_image : row.anchor_frame_preview;
+  const guideTitle = row.anchor_exists ? 'Current guide frame' : 'Guide source frame';
+  const src = guidePath ? media(guidePath) + (row.anchor_exists && row.anchor_mtime ? '&t=' + row.anchor_mtime : '') : '';
+  const guideStatus = outpaintGuideStatus(row);
+
+  return `
+    <div class="chunk-guide">
+      <div>
+        <label>Guide frame</label>
+        ${guidePath ? `
+          <figure id="chunkGuideFigure_${idx}" class="still-figure ${row.anchor_exists ? 'has-anchor' : ''}">
+            <img id="chunkGuideImg_${idx}" src="${src}" alt="" onclick="openImageModal(this.src,${jsArg(guideTitle)})">
+            <span id="chunkGuideBadge_${idx}" class="anchor-badge ${row.anchor_exists ? '' : 'hidden'}">Guide</span>
+            <figcaption id="chunkGuideCaption_${idx}">${esc(guideTitle)}</figcaption>
+          </figure>
+        ` : missingImage('Guide source frame not present')}
+      </div>
+      <div>
+        <p id="chunkGuideStatus_${idx}" class="shot-time">${esc(guideStatus)}</p>
+        <label>Guide time: <span id="chunkGuideLabel_${idx}">${label}</span></label>
+        <input id="chunkGuideSeconds_${idx}" type="range" min="0" max="${Math.max(0, length).toFixed(6)}" step="${(1 / Math.max(1, Number(row.fps || 24))).toFixed(6)}" value="${seconds.toFixed(6)}" oninput="updateChunkGuideLabel(${idx})" onchange="saveOutpaintGuideTime(${idx})">
+        <div class="shot-tools">
+          <button type="button" onclick="chooseOutpaintAnchor(${idx},'guide')">Upload Guide</button>
+          <button type="button" onclick="openAnchorPromptModal(${idx},'guide')" ${state.running ? 'disabled' : ''}>Generate Guide</button>
+          <button type="button" onclick="clearOutpaintAnchor(${idx})" ${row.anchor_exists ? '' : 'disabled'}>Clear</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function outpaintGuideStatus(row) {
+  return row.anchor_exists
+    ? 'Guide frame set. LTX will use this as a soft visual reference for the chunk.'
+    : 'No guide frame set. This chunk will outpaint normally; move the slider only if you want to choose a source frame before generating or uploading a guide.';
+}
+
+function updateOutpaintGuidePreviews() {
+  if (active !== 'outpaint') return;
+  const rows = (state.outpaint_chunks && state.outpaint_chunks.rows) || [];
+  for (const row of rows) {
+    const idx = row.index;
+    const img = document.getElementById(`chunkGuideImg_${idx}`);
+    if (!img) continue;
+    const guidePath = row.anchor_exists ? row.anchor_image : row.anchor_frame_preview;
+    if (!guidePath) continue;
+    const title = row.anchor_exists ? 'Current guide frame' : 'Guide source frame';
+    const src = media(guidePath) + (row.anchor_exists && row.anchor_mtime ? '&t=' + row.anchor_mtime : '');
+    if (img.getAttribute('src') !== src) {
+      img.setAttribute('src', src);
+      img.setAttribute('onclick', `openImageModal(this.src,${jsArg(title)})`);
+    }
+
+    const figure = document.getElementById(`chunkGuideFigure_${idx}`);
+    if (figure) figure.classList.toggle('has-anchor', !!row.anchor_exists);
+    const badge = document.getElementById(`chunkGuideBadge_${idx}`);
+    if (badge) badge.classList.toggle('hidden', !row.anchor_exists);
+    const caption = document.getElementById(`chunkGuideCaption_${idx}`);
+    if (caption) caption.textContent = title;
+    const status = document.getElementById(`chunkGuideStatus_${idx}`);
+    if (status) status.textContent = outpaintGuideStatus(row);
+  }
 }
 
 function outpaintChunkPrompt(row) {
@@ -115,6 +186,17 @@ function chunkLengthLabel(frames, fps) {
   return `${safeFrames} frames (${(safeFrames / safeFps).toFixed(3)}s)`;
 }
 
+function updateChunkGuideLabel(index) {
+  const slider = document.getElementById(`chunkGuideSeconds_${index}`);
+  const label = document.getElementById(`chunkGuideLabel_${index}`);
+  if (!slider || !label) return;
+  label.textContent = formatSeconds(Number(slider.value || 0));
+}
+
+function formatSeconds(seconds) {
+  return `${Math.max(0, Number(seconds) || 0).toFixed(3)}s`;
+}
+
 function chunkStillStrip(row, prefix, canAnchor) {
   const frames = [
     [prefix + '_start_preview', 'Start', 'start'],
@@ -128,33 +210,31 @@ function chunkStillStrip(row, prefix, canAnchor) {
   `;
 }
 
-function outpaintAnchorInputStatus(row) {
-  if (!row.anchor_image) return '';
-  if (!row.anchored_prepared_exists) {
-    return '<p class="shot-time">Anchor set. Regenerate this chunk to inject it into the LTX input video.</p>';
-  }
-  return `
-    <p class="shot-time">Anchor input video ready:</p>
-    <div class="mini-path">${esc(row.anchored_prepared_path || '')}</div>
-  `;
-}
-
 function chunkStillFigure(row, path, label, position, canAnchor) {
-  const activeAnchor = row.anchor_image && row.anchor_position === position;
-  const shownPath = activeAnchor && row.anchor_exists ? row.anchor_image : path;
-  const src = media(shownPath) + (activeAnchor && row.anchor_mtime ? '&t=' + row.anchor_mtime : '');
-  const title = activeAnchor ? `${label} anchor frame` : `${label} frame`;
+  const shownPath = path;
+  const src = media(shownPath);
+  const title = `${label} frame`;
   return `
-    <figure class="still-figure ${activeAnchor ? 'has-anchor' : ''}">
+    <figure class="still-figure">
       <img src="${src}" alt="" onclick="openImageModal(${jsArg(src)},${jsArg(title)})">
       <div class="still-actions">
         <button type="button" onclick="event.stopPropagation(); exportMedia(${jsArg(shownPath)})" title="Save this frame">&#128190;</button>
-        ${canAnchor ? `<button type="button" onclick="event.stopPropagation(); chooseOutpaintAnchor(${row.index},${jsArg(position)})" title="Upload anchor frame for this chunk">&#9875;</button>` : ''}
-        ${canAnchor ? `<button type="button" onclick="event.stopPropagation(); openAnchorPromptModal(${row.index},${jsArg(position)})" title="Generate anchor frame with Qwen">&#10022;</button>` : ''}
       </div>
-      ${activeAnchor ? '<span class="anchor-badge">Anchor</span>' : ''}
       <figcaption>${esc(label)}</figcaption>
     </figure>
+  `;
+}
+
+function missingChunkStillStrip(text) {
+  return `
+    <div class="chunk-stills">
+      ${['Start', 'Middle', 'End'].map(label => `
+        <figure>
+          ${missingImage(`${label}: ${text}`)}
+          <figcaption>${esc(label)}</figcaption>
+        </figure>
+      `).join('')}
+    </div>
   `;
 }
 

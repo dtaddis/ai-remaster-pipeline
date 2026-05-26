@@ -2,6 +2,7 @@
 
 import argparse
 import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -107,6 +108,23 @@ def default_output(source: Path, target_width: int, target_height: int) -> Path:
     return resolve_path(Path('intermediate') / 'outpaint_prepared' / f'{source.stem}_{target_width}x{target_height}_lifted.mp4')
 
 
+def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: float = 0.5) -> None:
+    last_exc: PermissionError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            partial.replace(output)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt == 1:
+                print(f'Waiting for file lock to clear before replacing prepared input: {output}', flush=True)
+            time.sleep(delay)
+    raise PermissionError(
+        f'Could not replace prepared input because it is open in another process: {output}. '
+        'Close any ARP preview, media player, Resolve bin/timeline item, or Explorer preview using this file and try again.'
+    ) from last_exc
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Prepare a source clip for LTX IC-LoRA outpainting by lifting source blacks and padding exact-black 16:9 margins.')
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
@@ -171,7 +189,7 @@ def main():
         return 0
     output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(command, check=True)
-    partial.replace(output)
+    replace_with_retry(partial, output)
     write_signature(output, sig)
     print(f'Wrote prepared outpaint input: {output}', flush=True)
     return 0
