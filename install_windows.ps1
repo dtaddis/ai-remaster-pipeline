@@ -90,8 +90,13 @@ function Get-ArpCommitHashFromGitDir {
 }
 
 function Write-ArpBanner {
-    Write-Host "ARP $(Get-ArpVersion)"
-    Write-Host "Commit $(Get-ArpCommitHash)"
+    $version = Get-ArpVersion
+    $commit = Get-ArpCommitHash
+    if ([string]::IsNullOrWhiteSpace($commit) -or $commit -eq 'unknown') {
+        Write-Host "ARP $version"
+    } else {
+        Write-Host "ARP $version-$commit"
+    }
 }
 
 function Invoke-Step {
@@ -182,6 +187,34 @@ function Get-CommandTail {
     return @($Command[1..($Command.Count - 1)])
 }
 
+function Invoke-CapturedProcess {
+    param([string]$FilePath, [string[]]$Arguments = @(), [string]$WorkingDirectory = $Root)
+    $stdout = [System.IO.Path]::GetTempFileName()
+    $stderr = [System.IO.Path]::GetTempFileName()
+    try {
+        $startArgs = @{
+            FilePath = $FilePath
+            WorkingDirectory = $WorkingDirectory
+            NoNewWindow = $true
+            Wait = $true
+            PassThru = $true
+            RedirectStandardOutput = $stdout
+            RedirectStandardError = $stderr
+        }
+        if ($Arguments.Count -gt 0) {
+            $startArgs.ArgumentList = $Arguments
+        }
+        $process = Start-Process @startArgs
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = (Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue)
+            Stderr = (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue)
+        }
+    } finally {
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Add-PythonLauncherCandidate {
     param(
         [System.Collections.ArrayList]$Candidates,
@@ -249,17 +282,26 @@ function Get-PythonLauncherCheck {
         }
     }
     $arguments = (Get-CommandTail $Command) + @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    $version = (& $executable @arguments 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0) {
+    $probe = Invoke-CapturedProcess -FilePath $executable -Arguments $arguments
+    if ($probe.ExitCode -ne 0) {
+        $detail = (($probe.Stdout, $probe.Stderr) -join "`n").Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = "exited with code $($probe.ExitCode)"
+        }
         return [pscustomobject]@{
             Success = $false
-            Reason = "exited with code $LASTEXITCODE"
+            Reason = $detail
         }
     }
+    $version = (($probe.Stdout, $probe.Stderr) -join "`n").Split("`n") |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -match '^\d+\.\d+$' } |
+        Select-Object -First 1
     if ($version -ne '3.13') {
+        $found = if ([string]::IsNullOrWhiteSpace($version)) { 'unknown version' } else { "Python $version" }
         return [pscustomobject]@{
             Success = $false
-            Reason = "found Python $version"
+            Reason = "found $found"
         }
     }
     return [pscustomobject]@{
