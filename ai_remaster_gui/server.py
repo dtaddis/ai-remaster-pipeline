@@ -1172,6 +1172,50 @@ def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
 
 
+def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
+    source = resolve_video_source(source_text)
+    prepared = outpaint_prepared_for(source_text, values)
+    if prepared.exists():
+        return prepared
+
+    cmd = [
+        sys.executable,
+        str(SCRIPTS / "prepare_outpaint_input.py"),
+        "--source",
+        str(source),
+        "--target-aspect",
+        values.get("target_aspect", "16:9"),
+        "--black-lift",
+        str(values.get("black_lift", "0.018") or "0.018"),
+        "--gamma",
+        str(values.get("gamma", "1.06") or "1.06"),
+        "--output",
+        str(prepared),
+        "--crop-left",
+        str(values.get("crop_left", "0") or "0"),
+        "--crop-right",
+        str(values.get("crop_right", "0") or "0"),
+        "--crop-top",
+        str(values.get("crop_top", "0") or "0"),
+        "--crop-bottom",
+        str(values.get("crop_bottom", "0") or "0"),
+        "--target-height",
+        str(values.get("target_height", "720") or "720"),
+    ]
+    APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
+    APP.log.append("> " + " ".join(cmd))
+    result = subprocess.run(cmd, cwd=ROOT, check=False, capture_output=True, text=True)
+    for line in (result.stdout or "").splitlines():
+        APP.log.append(line)
+    for line in (result.stderr or "").splitlines():
+        APP.log.append(line)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or "Could not prepare expanded outpaint canvas.")
+    if not prepared.exists():
+        raise RuntimeError(f"Prepared expanded canvas was not created: {prepared}")
+    return prepared
+
+
 def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
     if not path.exists():
         return {}
@@ -1450,10 +1494,8 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
     source_text = pipeline_source_text(APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = outpaint_prepared_for(source_text, APP.settings.get("outpaint", {}))
-    if not resolve(range_source).exists():
-        range_source = resolve_video_source(source_text)
-    source = resolve(chunk_frame_preview(resolve(range_source), float(row.get("start", 0.0)) + guide_seconds, "source_guide_qwen"))
+    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    source = resolve(chunk_frame_preview(range_source, float(row.get("start", 0.0)) + guide_seconds, "source_guide_qwen"))
     if not source.exists():
         raise FileNotFoundError(source)
 

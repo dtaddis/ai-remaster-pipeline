@@ -119,8 +119,8 @@ function updateOutpaintGuidePreviews() {
     const src = media(guidePath) + (row.anchor_exists && row.anchor_mtime ? '&t=' + row.anchor_mtime : '');
     if (img.getAttribute('src') !== src) {
       img.setAttribute('src', src);
-      img.setAttribute('onclick', `openImageModal(this.src,${jsArg(title)})`);
     }
+    img.onclick = () => openImageModal(img.src, title);
 
     const figure = document.getElementById(`chunkGuideFigure_${idx}`);
     if (figure) figure.classList.toggle('has-anchor', !!row.anchor_exists);
