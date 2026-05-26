@@ -126,6 +126,15 @@ def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
     return f"arp_outpaint/{target.name}"
 
 
+def copy_anchor_frame_to_comfy_input(anchor: Path, comfy_dir: Path) -> str:
+    target_dir = comfy_dir / "input" / "arp_outpaint"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"anchor_{anchor.stem}{anchor.suffix.lower()}"
+    if not target.exists() or anchor.stat().st_mtime_ns != target.stat().st_mtime_ns or anchor.stat().st_size != target.stat().st_size:
+        shutil.copy2(anchor, target)
+    return f"arp_outpaint/{target.name}"
+
+
 def set_widget_if_node(workflow: dict[str, Any], node_id: str | None, widget: str | int, value: Any) -> None:
     if not node_id:
         return
@@ -219,9 +228,9 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, anchor_image: Path | None = None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
-    image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
+    image_name = copy_anchor_frame_to_comfy_input(anchor_image, comfy_dir) if anchor_image else copy_reference_frame_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
     try:
@@ -296,11 +305,11 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", chunk_manifest: Path | None = None) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", anchor_image: Path | None = None, chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 6,
+        "version": 8,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -310,6 +319,9 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
         "negative_suffix": negative_suffix,
+        "anchor_image": root_relative(anchor_image) if anchor_image else "",
+        "anchor_fingerprint": file_fingerprint(anchor_image) if anchor_image and anchor_image.exists() else None,
+        "anchor_injected_into_video": bool(anchor_image),
         "seed": seed,
         "negative_prompt": negative_text,
         "load_video_node_id": args.load_video_node_id,
@@ -385,6 +397,8 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "seed",
         "prompt_suffix",
         "negative_suffix",
+        "anchor_image",
+        "anchor_position",
         "prepared_path",
         "raw_path",
     ]
@@ -439,6 +453,8 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
             row["seed"] = str(default_seed + chunk_index)
         row.setdefault("prompt_suffix", "")
         row.setdefault("negative_suffix", "")
+        row.setdefault("anchor_image", "")
+        row.setdefault("anchor_position", "")
         row.setdefault("custom_seconds", "")
         rows.append(row)
     write_chunk_manifest(path, rows)
@@ -453,6 +469,71 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
     replace_with_retry(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
+
+
+def anchor_frame_index(position: str, frame_count: int) -> int:
+    last = max(0, frame_count - 1)
+    if position == "end":
+        return last
+    if position == "middle":
+        return max(0, min(last, frame_count // 2))
+    return 0
+
+
+def anchored_chunk_path(chunk_path: Path, anchor: Path, position: str) -> Path:
+    return chunk_path.with_name(f"{chunk_path.stem}_anchor_{position}_{safe_stem(anchor.name)}{chunk_path.suffix}")
+
+
+def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, position: str, fps: float, force: bool) -> Path:
+    info = probe_video(chunk_path)
+    frame_count = int(info["frames"] or 1)
+    frame_index = anchor_frame_index(position, frame_count)
+    target = anchored_chunk_path(chunk_path, anchor, position)
+    if target.exists() and not force and target.stat().st_mtime_ns >= max(chunk_path.stat().st_mtime_ns, anchor.stat().st_mtime_ns):
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    width = int(info["width"])
+    height = int(info["height"])
+    filter_text = (
+        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[anchor];"
+        f"[0:v][anchor]overlay=enable='eq(n\\,{frame_index})',"
+        f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[v]"
+    )
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(chunk_path),
+        "-loop",
+        "1",
+        "-i",
+        str(anchor),
+        "-filter_complex",
+        filter_text,
+        "-map",
+        "[v]",
+        "-frames:v",
+        str(frame_count),
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "12",
+        "-preset",
+        "veryfast",
+        str(partial),
+    ]
+    print(f"Injecting anchor into prepared chunk frame {frame_index + 1}/{frame_count}: {anchor}", flush=True)
+    subprocess.run(command, check=True)
+    replace_with_retry(partial, target, f"Anchored prepared chunk {target.name}")
+    return target
 
 
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
@@ -662,13 +743,29 @@ def main() -> int:
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
                 chunk_negative_suffix = chunk_row.get("negative_suffix", "")
-                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix)
+                anchor_text = chunk_row.get("anchor_image", "")
+                anchor_image = resolve_path(anchor_text) if anchor_text else None
+                if anchor_image and not anchor_image.exists():
+                    print(f"Warning: chunk {chunk_index + 1} anchor image was not found and will be ignored: {anchor_image}", flush=True)
+                    anchor_image = None
+                chunk_conditioning = chunk_prepared
+                if anchor_image:
+                    anchor_position = chunk_row.get("anchor_position", "start") or "start"
+                    chunk_conditioning = inject_anchor_frame(
+                        ffmpeg,
+                        chunk_prepared,
+                        anchor_image,
+                        anchor_position,
+                        float(prepared_info["fps"] or 24.0),
+                        args.force,
+                    )
+                chunk_sig = raw_signature(args, workflow_path, chunk_conditioning, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, anchor_image)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
                         raise FileNotFoundError(f"Cannot regenerate only chunk {args.only_chunk}; chunk {chunk_index} is missing: {chunk_raw}")
                     raw_chunks.append(chunk_raw)
                     continue
-                if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_prepared):
+                if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_conditioning):
                     print(f"Reuse raw Comfy chunk: {chunk_raw}", flush=True)
                     raw_chunks.append(chunk_raw)
                     continue
@@ -681,7 +778,9 @@ def main() -> int:
                     print(f"Chunk {chunk_index + 1} prompt suffix: {chunk_prompt_suffix}", flush=True)
                 if chunk_negative_suffix:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed)
+                if anchor_image:
+                    print(f"Chunk {chunk_index + 1} anchor frame: {anchor_image}", flush=True)
+                prompt = patch_workflow(args, workflow, chunk_conditioning, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, anchor_image)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

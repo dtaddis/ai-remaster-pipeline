@@ -199,6 +199,71 @@ async function exportMedia(path) {
   if (result.saved) alert('Saved:\n' + result.saved);
 }
 
+async function chooseOutpaintAnchor(index, position) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/outpaint-anchor', { index, position });
+  if (!result.ok) return alert(result.error || 'Could not install anchor frame');
+  if (!result.selected) return;
+
+  await redrawWithState(result.state, snap, true);
+}
+
+const DEFAULT_ANCHOR_PROMPT = 'Fill the black outpaint margins with a natural continuation of this black-and-white film frame. Preserve the centre/original frame area, composition, lighting, paper, clothing, and background. If hands or fingers extend into the new margins, make them anatomically natural with five fingers and normal joints. Do not colorize. Do not add text, captions, logos, or unrelated new objects.';
+
+function openAnchorPromptModal(index, position) {
+  let modal = document.getElementById('anchorPromptModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'anchorPromptModal';
+    modal.className = 'image-modal hidden';
+    modal.innerHTML = `
+      <div class="image-modal-backdrop" onclick="closeAnchorPromptModal()"></div>
+      <div class="prompt-modal-panel">
+        <div class="image-modal-heading">
+          <strong>Generate Anchor Frame</strong>
+          <button type="button" onclick="closeAnchorPromptModal()">Close</button>
+        </div>
+        <p class="shot-empty">Qwen will turn this expanded still into a guide image for LTX. The default prompt asks it to replace the black outpaint margins while preserving the original centre frame.</p>
+        <label>Qwen edit prompt</label>
+        <textarea id="anchorPromptText"></textarea>
+        <div class="actions">
+          <button class="primary" type="button" onclick="submitAnchorPrompt()">Generate Anchor</button>
+          <button type="button" onclick="closeAnchorPromptModal()">Cancel</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  modal.dataset.index = String(index);
+  modal.dataset.position = position;
+  document.getElementById('anchorPromptText').value = DEFAULT_ANCHOR_PROMPT;
+  modal.classList.remove('hidden');
+}
+
+function closeAnchorPromptModal() {
+  const modal = document.getElementById('anchorPromptModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function submitAnchorPrompt() {
+  const modal = document.getElementById('anchorPromptModal');
+  if (!modal) return;
+  const index = Number(modal.dataset.index || 0);
+  const position = modal.dataset.position || 'middle';
+  const prompt = document.getElementById('anchorPromptText')?.value || DEFAULT_ANCHOR_PROMPT;
+  closeAnchorPromptModal();
+
+  const result = await postJson('/api/outpaint-anchor-generate', { index, position, prompt });
+  if (!result.ok) return alert(result.error || result.message || 'Could not generate anchor frame');
+  if (result.state) {
+    state = result.state;
+    draw(false);
+    lastRenderSignature = renderSignature();
+  }
+  setTimeout(() => refresh(true), 1000);
+}
+
 async function saveStage(key, redraw = false) {
   const snap = captureScrollState();
   await postJson('/api/settings', { stage: key, values: formValues() });

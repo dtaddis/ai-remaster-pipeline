@@ -18,11 +18,11 @@ function outpaintChunkCard(row) {
       <div class="chunk-frame-rows">
         <div class="chunk-frame-row">
           <label>Original frames</label>
-          ${chunkStillStrip(row, 'source')}
+          ${chunkStillStrip(row, 'source', true)}
         </div>
         <div class="chunk-frame-row">
           <label>Outpainted frames</label>
-          ${row.raw_exists ? chunkStillStrip(row, 'raw') : missingImage('Outpainted chunk not present')}
+          ${row.raw_exists ? chunkStillStrip(row, 'raw', false) : missingImage('Outpainted chunk not present')}
         </div>
       </div>
       ${outpaintChunkPrompt(row)}
@@ -53,6 +53,7 @@ function outpaintChunkSummary(row) {
       </div>
       <label>Seed</label>
       <input id="chunkSeed_${idx}" type="number" value="${esc(row.seed || '42')}">
+      ${outpaintAnchorInputStatus(row)}
       <div class="shot-tools">
         <button type="button" onclick="saveOutpaintChunk(${idx})">Save</button>
         <button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running ? 'disabled' : ''}>Regenerate Chunk</button>
@@ -114,26 +115,44 @@ function chunkLengthLabel(frames, fps) {
   return `${safeFrames} frames (${(safeFrames / safeFps).toFixed(3)}s)`;
 }
 
-function chunkStillStrip(row, prefix) {
+function chunkStillStrip(row, prefix, canAnchor) {
   const frames = [
-    [prefix + '_start_preview', 'Start'],
-    [prefix + '_middle_preview', 'Middle'],
-    [prefix + '_end_preview', 'End'],
+    [prefix + '_start_preview', 'Start', 'start'],
+    [prefix + '_middle_preview', 'Middle', 'middle'],
+    [prefix + '_end_preview', 'End', 'end'],
   ];
   return `
     <div class="chunk-stills">
-      ${frames.map(([key, label]) => row[key] ? chunkStillFigure(row[key], label) : missingImage(label + ' frame not present')).join('')}
+      ${frames.map(([key, label, position]) => row[key] ? chunkStillFigure(row, row[key], label, position, canAnchor) : missingImage(label + ' frame not present')).join('')}
     </div>
   `;
 }
 
-function chunkStillFigure(path, label) {
-  const src = media(path);
+function outpaintAnchorInputStatus(row) {
+  if (!row.anchor_image) return '';
+  if (!row.anchored_prepared_exists) {
+    return '<p class="shot-time">Anchor set. Regenerate this chunk to inject it into the LTX input video.</p>';
+  }
   return `
-    <figure>
-      <button type="button" class="image-inspect" onclick="openImageModal(${jsArg(src)},${jsArg(label)})" title="Inspect ${esc(label)} frame">
-        <img src="${src}" alt="">
-      </button>
+    <p class="shot-time">Anchor input video ready:</p>
+    <div class="mini-path">${esc(row.anchored_prepared_path || '')}</div>
+  `;
+}
+
+function chunkStillFigure(row, path, label, position, canAnchor) {
+  const activeAnchor = row.anchor_image && row.anchor_position === position;
+  const shownPath = activeAnchor && row.anchor_exists ? row.anchor_image : path;
+  const src = media(shownPath) + (activeAnchor && row.anchor_mtime ? '&t=' + row.anchor_mtime : '');
+  const title = activeAnchor ? `${label} anchor frame` : `${label} frame`;
+  return `
+    <figure class="still-figure ${activeAnchor ? 'has-anchor' : ''}">
+      <img src="${src}" alt="" onclick="openImageModal(${jsArg(src)},${jsArg(title)})">
+      <div class="still-actions">
+        <button type="button" onclick="event.stopPropagation(); exportMedia(${jsArg(shownPath)})" title="Save this frame">&#128190;</button>
+        ${canAnchor ? `<button type="button" onclick="event.stopPropagation(); chooseOutpaintAnchor(${row.index},${jsArg(position)})" title="Upload anchor frame for this chunk">&#9875;</button>` : ''}
+        ${canAnchor ? `<button type="button" onclick="event.stopPropagation(); openAnchorPromptModal(${row.index},${jsArg(position)})" title="Generate anchor frame with Qwen">&#10022;</button>` : ''}
+      </div>
+      ${activeAnchor ? '<span class="anchor-badge">Anchor</span>' : ''}
       <figcaption>${esc(label)}</figcaption>
     </figure>
   `;
