@@ -45,6 +45,12 @@ from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, re
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 PROJECT_SCHEMA_VERSION = 1
+DEFAULT_ANCHOR_PROMPT = (
+    "Fill the black outpaint margins with a natural continuation of this black-and-white film frame. "
+    "Preserve the centre/original frame area, composition, lighting, paper, clothing, and background. "
+    "If hands or fingers extend into the new margins, make them anatomically natural with five fingers and normal joints. "
+    "Do not colorize. Do not add text, captions, logos, or unrelated new objects."
+)
 
 
 def load_settings() -> dict[str, dict[str, str]]:
@@ -647,6 +653,38 @@ class PipelineApp:
             threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
         return True, f"Started reference regeneration for shot {index + 1}."
 
+    def run_outpaint_anchor_generation(self, index: int, position: str, prompt: str) -> tuple[bool, str]:
+        ok, message = ensure_comfy_available_for_stage("Anchor Generation")
+        if not ok:
+            return False, message
+        try:
+            cmd, output = outpaint_anchor_generation_command(index, position, prompt)
+        except Exception as exc:
+            return False, str(exc)
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = f"Generating anchor for chunk {index + 1}"
+            self.running_stage_key = "outpaint"
+            self.run_started_at = time.time()
+            self.log.append(f"Generating Qwen anchor frame for chunk {index + 1}: {output}")
+            self.log.append("> " + " ".join(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            try:
+                self.process = subprocess.Popen(cmd, **kwargs)
+            except Exception as exc:
+                self.running_stage = ""
+                self.running_stage_key = ""
+                self.run_started_at = 0.0
+                self.log.append(f"Could not start anchor generation: {exc}")
+                return False, f"Could not start anchor generation: {exc}"
+            threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
+        return True, f"Started Qwen anchor generation for chunk {index + 1}."
+
     def run_all(self) -> tuple[bool, str]:
         threading.Thread(target=self._run_all_worker, daemon=True).start()
         return True, "Started whole remaster queue."
@@ -1153,6 +1191,9 @@ def outpaint_chunks_state(settings: dict) -> dict:
         start_seconds = float(row["start_seconds"])
         end_seconds = float(row["end_seconds"])
         middle_seconds = (start_seconds + end_seconds) / 2
+        anchor_path = resolve(row["anchor_image"]) if row.get("anchor_image") else None
+        anchor_exists = bool(anchor_path and anchor_path.exists())
+        anchored_prepared = anchored_outpaint_chunk_path(prepared, anchor_path, row.get("anchor_position", "")) if anchor_exists and anchor_path else None
         view_rows.append(row | {
             "index": int(row["chunk_index"]),
             "start": float(row["start_seconds"]),
@@ -1166,7 +1207,10 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "raw_exists": raw.exists(),
             "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
             "prepared_exists": prepared.exists(),
-            "anchor_exists": bool(row.get("anchor_image") and resolve(row["anchor_image"]).exists()),
+            "anchored_prepared_path": rel(anchored_prepared) if anchored_prepared else "",
+            "anchored_prepared_exists": bool(anchored_prepared and anchored_prepared.exists()),
+            "anchor_exists": anchor_exists,
+            "anchor_mtime": int(anchor_path.stat().st_mtime_ns) if anchor_exists and anchor_path else 0,
             "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
             "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
             "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
@@ -1175,6 +1219,11 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "raw_end_preview": chunk_frame_preview(raw, max(0.0, end_seconds - start_seconds - (1 / max(1.0, fps))), "raw_end") if raw.exists() else "",
         })
     return {"manifest": rel(manifest), "rows": view_rows}
+
+
+def anchored_outpaint_chunk_path(prepared: Path, anchor: Path, position: str) -> Path:
+    safe_position = position if position in {"start", "middle", "end"} else "start"
+    return prepared.with_name(f"{prepared.stem}_anchor_{safe_position}_{safe_stem(anchor.name)}{prepared.suffix}")
 
 
 def chunk_frame_preview(source: Path, seconds: float, suffix: str) -> str:
@@ -1259,6 +1308,78 @@ def install_outpaint_anchor(index: int, position: str) -> dict[str, str]:
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
     APP.log.append(f"Installed outpaint anchor for chunk {index + 1} ({safe_position}): {rel(target)}")
     return {"selected": selected, "anchor_image": rel(target), "anchor_position": safe_position}
+
+
+def outpaint_anchor_generation_command(index: int, position: str, prompt: str) -> tuple[list[str], str]:
+    state = outpaint_chunks_state(APP.settings)
+    rows = state.get("rows", [])
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+
+    safe_position = position if position in {"start", "middle", "end"} else "middle"
+    row = rows[index]
+    source_key = f"source_{safe_position}_preview"
+    source_text = row.get(source_key) or row.get("source_middle_preview") or row.get("source_start_preview")
+    if not source_text:
+        raise RuntimeError(f"No {safe_position} thumbnail exists for chunk {index + 1}.")
+    source = resolve(str(source_text))
+    if not source.exists():
+        raise FileNotFoundError(source)
+
+    manifest = resolve(str(manifest_text))
+    output_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+    output = output_dir / f"chunk_{index:04d}_{safe_position}_qwen.png"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stored = read_outpaint_chunk_rows(manifest)
+    if index not in stored:
+        raise IndexError(f"Outpaint chunk not found in manifest: {index + 1}")
+    stored[index]["anchor_image"] = rel(output)
+    stored[index]["anchor_position"] = safe_position
+    write_outpaint_chunk_rows(manifest, [stored[key] for key in sorted(stored)])
+
+    values = APP.settings.get("references", {})
+    config = current_config()
+    workflow = values.get("workflow") or default_qwen_workflow(config)
+    if not workflow:
+        raise RuntimeError("No Qwen Image Edit workflow found. Install/configure ComfyUI first.")
+    anchor_prompt = prompt.strip() or DEFAULT_ANCHOR_PROMPT
+    cmd = [
+        sys.executable,
+        "-u",
+        str(SCRIPTS / "generate_single_reference.py"),
+        "--source-image",
+        str(source),
+        "--output",
+        str(output),
+        "--workflow",
+        workflow,
+        "--comfy-url",
+        values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188"),
+        "--comfy-dir",
+        config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
+        "--comfy-output-root",
+        values.get("comfy_output_root") or str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output"),
+        "--model-backend",
+        values.get("model_backend", "gguf"),
+        "--gguf-model",
+        values.get("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf"),
+        "--prompt",
+        anchor_prompt,
+        "--prompt-suffix",
+        "",
+        "--load-image-node-id",
+        values.get("load_image_node_id", "auto"),
+        "--save-node-id",
+        values.get("save_node_id", "auto"),
+        "--force",
+    ]
+    if values.get("prompt_node_id"):
+        cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
+    return cmd, rel(output)
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -2692,6 +2813,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **result, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Outpaint anchor install failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-anchor-generate":
+            try:
+                ok, message = APP.run_outpaint_anchor_generation(
+                    int(data.get("index", 0)),
+                    str(data.get("position", "")),
+                    str(data.get("prompt", "")),
+                )
+                self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
+            except Exception as exc:
+                APP.log.append(f"Outpaint anchor generation failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:
