@@ -31,6 +31,7 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   const s = settings(key);
   const expected = (state.expected_outputs && state.expected_outputs[key]) || [];
   const sp = stageProgress(key);
+  const visibleFields = shotStageVisibleFields(st);
 
   document.getElementById('app').innerHTML = `
     <div class="shot-page">
@@ -39,7 +40,8 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
         <p>${st.description}</p>
         ${progressHtml(sp.percent, sp.label)}
         ${key === 'colour' ? colorizationMethodWarning(s) : ''}
-        ${st.fields.map(f => fieldHtml(st, f)).join('')}
+        ${key === 'shots' ? shotDetectionInputStatus(s) : ''}
+        ${visibleFields.map(f => fieldHtml(st, f)).join('')}
         ${shotOutputList(expected, outputLimit)}
         ${stageCheckboxes(s)}
         <div class="actions">
@@ -59,6 +61,26 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   bindStageFields(key);
   if (afterRender) afterRender();
   showCommand(key);
+}
+
+function shotStageVisibleFields(st) {
+  if (st.key === 'shots') return st.fields.filter(field => field[0] !== 'outpainted_video');
+  return st.fields;
+}
+
+function shotDetectionInputStatus(s) {
+  const source = s.outpainted_video || '';
+  if (!source) {
+    return '<div class="inline-warning">Complete the previous step first, or choose source material on the Overview tab.</div>';
+  }
+  return `
+    <div class="source-info">
+      <div>
+        <span>Input video</span>
+        <strong>${esc(source)}</strong>
+      </div>
+    </div>
+  `;
 }
 
 function colorizationMethodWarning(s) {

@@ -328,11 +328,14 @@ async function saveGlobal() {
   lastRenderSignature = renderSignature();
 }
 
-async function saveGlobalColorize() {
+async function saveGlobalPipelineOptions() {
   const snap = captureScrollState();
   await postJson('/api/settings', {
     stage: 'global',
-    values: { colorize: String(document.getElementById('globalColorize').checked) },
+    values: {
+      expand_outpaint: String(document.getElementById('globalExpandOutpaint').checked),
+      colorize: String(document.getElementById('globalColorize').checked),
+    },
   });
 
   state = await api('/api/state');

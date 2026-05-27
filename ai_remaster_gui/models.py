@@ -25,7 +25,7 @@ STAGES = (
         ("input", "intermediate/outpaint_prepared", "intermediate/outpainted"),
         (
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
-            ("target_height", "Output height", "select:544|576|720|768|1080", "720"),
+            ("target_height", "Output height", "select:source|480|544|576|720|768|1080", "720"),
             ("chunk_seconds", "Chunk seconds", "number", "20"),
             ("overlap_frames", "Overlap frames", "range:0|48|1", "8"),
             ("negative_prompt", "Negative prompt", "text", "cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands"),

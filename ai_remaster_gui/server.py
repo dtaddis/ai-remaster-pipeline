@@ -94,7 +94,7 @@ def default_qwen_workflow(config: dict[str, str]) -> str:
 
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": "", "colorize": "true", "section_start": "0", "section_end": "", "last_browse_dir": ""}
+    defaults["global"] = {"source": "", "expand_outpaint": "true", "colorize": "true", "section_start": "0", "section_end": "", "last_browse_dir": ""}
     if SETTINGS_FILE.exists():
         try:
             stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -178,8 +178,13 @@ class PipelineApp:
     def colorize_enabled(self) -> bool:
         return self.settings.get("global", {}).get("colorize", "true") == "true"
 
+    def outpaint_enabled(self) -> bool:
+        return self.settings.get("global", {}).get("expand_outpaint", "true") == "true"
+
     def active_stages(self) -> tuple[Stage, ...]:
         stages = tuple(stage for stage in STAGES if stage.key != "output")
+        if not self.outpaint_enabled():
+            stages = tuple(stage for stage in stages if stage.key != "outpaint")
         if self.colorize_enabled():
             return stages
         return tuple(stage for stage in stages if stage.key not in COLORIZE_STAGE_KEYS)
@@ -213,12 +218,6 @@ class PipelineApp:
         if stage_key == "outpaint" and source:
             stem = safe_stem(resolve(source).name)
             values = self.settings.get("outpaint", {})
-            aspect = aspect_slug(values.get("target_aspect", "16:9"))
-            try:
-                height = int(float(values.get("target_height", "720") or "720"))
-            except ValueError:
-                height = 720
-            size = f"{even_int(height * parse_aspect(values.get('target_aspect', '16:9')))}x{even_int(height)}"
             return (stem,)
         return ()
 
@@ -379,7 +378,7 @@ class PipelineApp:
                 self.settings.setdefault("global", {})["colorize"] = "true" if source_monochrome(str(values.get("source", ""))) else "false"
             self.clear_derived_stage_inputs()
             self.hydrate_stage_inputs("global")
-        elif stage == "global" and "colorize" in values:
+        elif stage == "global" and ({"colorize", "expand_outpaint"} & set(values)):
             self.hydrate_stage_inputs("global")
         elif stage == "colour" and "method" in values:
             if values.get("method") in {"deepexemplar", "colormnet"}:
@@ -396,7 +395,7 @@ class PipelineApp:
         self.save()
 
     def clear_overview(self) -> None:
-        self.settings.setdefault("global", {}).update({"source": "", "colorize": "true", "section_start": "0", "section_end": ""})
+        self.settings.setdefault("global", {}).update({"source": "", "expand_outpaint": "true", "colorize": "true", "section_start": "0", "section_end": ""})
         self.clear_derived_stage_inputs()
         self.log.append("Cleared source material from the Overview.")
         self.save()
@@ -446,20 +445,31 @@ class PipelineApp:
                 stage_settings[key] = ""
 
     def hydrate_stage_inputs(self, completed_stage: str = "") -> None:
-        expected_outpainted = resolve(self.expected_outputs("outpaint")[0]) if self.expected_outputs("outpaint") else None
-        if completed_stage == "global" and not (expected_outpainted and expected_outpainted.exists()):
+        if not self.outpaint_enabled():
+            outpainted_text = pipeline_source_text(self.settings)
+            if outpainted_text:
+                self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
+                self.settings.setdefault("recomp", {})["outpainted_video"] = outpainted_text
+                manifest = manifest_for_outpainted(outpainted_text)
+                self.settings.setdefault("references", {})["manifest"] = manifest
+                self.settings.setdefault("colour", {})["manifest"] = manifest
+                self.log.append(f"Updated Shot Detection input: {outpainted_text}")
             outpainted = None
         else:
-            outpainted = expected_outpainted if expected_outpainted and expected_outpainted.exists() else newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS)
-        if outpainted:
-            outpainted_text = rel(outpainted)
-            self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
-            self.settings.setdefault("recomp", {})["outpainted_video"] = outpainted_text
-            manifest = manifest_for_outpainted(outpainted_text)
-            self.settings.setdefault("references", {})["manifest"] = manifest
-            self.settings.setdefault("colour", {})["manifest"] = manifest
-            self.log.append(f"Updated Shot Detection input: {outpainted_text}")
-        elif completed_stage == "global":
+            expected_outpainted = resolve(self.expected_outputs("outpaint")[0]) if self.expected_outputs("outpaint") else None
+            if completed_stage == "global" and not (expected_outpainted and expected_outpainted.exists()):
+                outpainted = None
+            else:
+                outpainted = expected_outpainted if expected_outpainted and expected_outpainted.exists() else newest(ROOT / "intermediate" / "outpainted", VIDEO_EXTS)
+            if outpainted:
+                outpainted_text = rel(outpainted)
+                self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
+                self.settings.setdefault("recomp", {})["outpainted_video"] = outpainted_text
+                manifest = manifest_for_outpainted(outpainted_text)
+                self.settings.setdefault("references", {})["manifest"] = manifest
+                self.settings.setdefault("colour", {})["manifest"] = manifest
+                self.log.append(f"Updated Shot Detection input: {outpainted_text}")
+        if self.outpaint_enabled() and not outpainted and completed_stage == "global":
             for stage_key in ("shots", "recomp"):
                 self.settings.setdefault(stage_key, {})["outpainted_video"] = ""
             for stage_key in ("references", "colour"):
@@ -496,6 +506,8 @@ class PipelineApp:
     def expected_outputs(self, stage_key: str) -> list[str]:
         values = self.settings.get(stage_key, {})
         if stage_key == "outpaint":
+            if not self.outpaint_enabled():
+                return []
             source = pipeline_source_text(self.settings)
             return [outpaint_output_for(source, values.get("target_aspect", "16:9"), values.get("target_height", "720"))] if source else []
         if stage_key == "shots":
@@ -524,7 +536,7 @@ class PipelineApp:
             cmd.append(str(SCRIPTS / "outpaint_video.py"))
             add(["--source", pipeline_source_text(self.settings)])
             add(["--target-aspect", values.get("target_aspect", "16:9")])
-            add(["--target-height", values.get("target_height", "720")])
+            add(["--target-height", str(resolved_outpaint_height(pipeline_source_text(self.settings), values.get("target_height", "720")))])
             add(["--chunk-seconds", values.get("chunk_seconds", "20")])
             add(["--overlap-frames", values.get("overlap_frames", "8")])
             if values.get("negative_prompt"):
@@ -596,6 +608,8 @@ class PipelineApp:
         return [part for part in cmd if part != ""]
 
     def run_stage(self, stage_key: str) -> tuple[bool, str]:
+        if stage_key == "outpaint" and not self.outpaint_enabled():
+            return False, "Expand using Outpainting is disabled on the Overview tab."
         if stage_key in COLORIZE_STAGE_KEYS and not self.colorize_enabled():
             return False, "Colorize is disabled on the Global tab."
         stage = next(item for item in STAGES if item.key == stage_key)
@@ -1125,12 +1139,7 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     if not source_text:
         return ""
     source = resolve_video_source(source_text)
-    try:
-        target_height = int(float(target_height_text or "720"))
-    except ValueError:
-        target_height = 720
-    width = even_int(target_height * parse_aspect(aspect))
-    height = even_int(target_height)
+    width, height = outpaint_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     crop = "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1145,6 +1154,29 @@ def outpaint_size_for(aspect: str, target_height_text: str = "720") -> tuple[int
     return even_int(height * parse_aspect(aspect)), even_int(height)
 
 
+def source_video_height(source_text: str) -> int:
+    try:
+        source = resolve_video_source(source_text)
+        metrics = video_metrics(source)
+        return even_int(int(metrics.get("height") or 720))
+    except Exception:
+        return 720
+
+
+def resolved_outpaint_height(source_text: str, target_height_text: str = "720") -> int:
+    if str(target_height_text or "").strip().lower() in {"source", "source height", "original"}:
+        return source_video_height(source_text)
+    try:
+        return even_int(int(float(target_height_text or "720")))
+    except ValueError:
+        return 720
+
+
+def outpaint_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
+    height = resolved_outpaint_height(source_text, target_height_text)
+    return even_int(height * parse_aspect(aspect)), height
+
+
 def outpaint_crop_slug(values: dict[str, str]) -> str:
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     return "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1153,7 +1185,7 @@ def outpaint_crop_slug(values: dict[str, str]) -> str:
 def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}"
 
 
@@ -1162,14 +1194,14 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
         return ""
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
 
 
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for(aspect, values.get("target_height", "720"))
+    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
 
 
@@ -1201,7 +1233,7 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         "--crop-bottom",
         str(values.get("crop_bottom", "0") or "0"),
         "--target-height",
-        str(values.get("target_height", "720") or "720"),
+        str(resolved_outpaint_height(source_text, values.get("target_height", "720"))),
     ]
     APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
     APP.log.append("> " + " ".join(cmd))

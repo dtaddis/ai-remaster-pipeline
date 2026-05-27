@@ -72,9 +72,19 @@ function fieldHtml(st, field) {
 
 function selectFieldHtml(key, label, kind, value) {
   const options = kind.slice(7).split('|')
-    .map(option => `<option ${value === option ? 'selected' : ''}>${option}</option>`)
+    .map(option => `<option value="${esc(option)}" ${value === option ? 'selected' : ''}>${esc(selectOptionLabel(key, option))}</option>`)
     .join('');
   return `<label>${label}</label><select data-field="${key}">${options}</select>`;
+}
+
+function selectOptionLabel(key, option) {
+  if (key === 'target_height' && option === 'source') {
+    const resolution = (state.source_info && state.source_info.resolution) || '';
+    const match = String(resolution).match(/x(\d+)/i);
+    return match ? `Source height (${match[1]}p)` : 'Source height';
+  }
+  if (key === 'target_height' && /^\d+$/.test(option)) return `${option}p`;
+  return option;
 }
 
 function rangeFieldHtml(key, label, kind, value) {

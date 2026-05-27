@@ -1,6 +1,7 @@
 function drawGlobal() {
   const global = state.settings.global || {};
   const source = global.source || '';
+  const expandOutpaint = global.expand_outpaint !== 'false';
   const colorize = global.colorize !== 'false';
   const sourceTone = state.source_monochrome
     ? 'Source looks black and white'
@@ -25,6 +26,7 @@ function drawGlobal() {
       ${overviewSourcePicker(source)}
       ${overviewSectionPicker(global, source)}
       <div class="checks">
+        <label><input id="globalExpandOutpaint" type="checkbox" ${expandOutpaint ? 'checked' : ''}>Expand using Outpainting</label>
         <label><input id="globalColorize" type="checkbox" ${colorize ? 'checked' : ''}>Colorize</label>
         <span class="shot-time">${esc(sourceTone)}</span>
       </div>
@@ -38,7 +40,8 @@ function drawGlobal() {
   `;
 
   document.getElementById('globalSource').addEventListener('change', saveGlobal);
-  document.getElementById('globalColorize').addEventListener('change', saveGlobalColorize);
+  document.getElementById('globalExpandOutpaint').addEventListener('change', saveGlobalPipelineOptions);
+  document.getElementById('globalColorize').addEventListener('change', saveGlobalPipelineOptions);
   bindOverviewSectionControls();
 }
 

@@ -51,6 +51,12 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_1280x720_outpainted.mp4")
 
+    def test_source_height_outpaint_option_uses_video_height(self) -> None:
+        with mock.patch.object(server, "video_metrics", return_value={"height": 480}):
+            output = app.outpaint_output_for("input/My Source.mp4", "16:9", "source")
+
+        self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_854x480_outpainted.mp4")
+
     def test_outpaint_chunk_rows_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             manifest = Path(tmp_text) / "chunks.csv"
@@ -239,6 +245,18 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--method", command)
         self.assertIn("both", command)
         self.assertNotIn("--output", command)
+
+    def test_skip_outpainting_uses_pipeline_source_for_shot_detection(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "true", "section_start": "0", "section_end": ""})
+
+        app.APP.hydrate_stage_inputs("global")
+        stage_keys = [stage.key for stage in app.APP.active_stages()]
+        command = app.APP.command_for("shots")
+
+        self.assertNotIn("outpaint", stage_keys)
+        self.assertIn("shots", stage_keys)
+        self.assertEqual(app.APP.settings["shots"]["outpainted_video"], "input/example.mp4")
+        self.assertIn("input/example.mp4", command)
 
     def test_section_preview_times_are_relative_to_trim_start(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
