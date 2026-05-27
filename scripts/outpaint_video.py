@@ -344,7 +344,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 16,
+        "version": 19,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -544,8 +544,10 @@ def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, seconds: st
     width = int(info["width"])
     height = int(info["height"])
     filter_text = (
-        f"[1:v]scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p[anchor];"
-        f"[0:v][anchor]overlay=enable='eq(n\\,{frame_index})',"
+        f"[1:v]scale={width}:-2:flags=lanczos,setsar=1,"
+        f"crop={width}:min(ih\\,{height}):0:max(0\\,(ih-{height})/2),format=yuv420p[guide];"
+        f"[0:v][guide]overlay=x=0:y=(H-h)/2:enable='eq(n\\,{frame_index})',"
+        f"format=rgb24,lutrgb=r='if(lte(val\\,3)\\,0\\,val)':g='if(lte(val\\,3)\\,0\\,val)':b='if(lte(val\\,3)\\,0\\,val)',format=yuv420p,"
         f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[v]"
     )
     command = [

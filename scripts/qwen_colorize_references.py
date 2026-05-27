@@ -206,7 +206,7 @@ def build_prompt(args: argparse.Namespace, extra_description: str = '', row_prom
 
 def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, prompt: str) -> dict[str, Any]:
     return {
-        'version': 2,
+        'version': 4,
         'tool': 'qwen_colorize_references.py',
         'source': root_relative(source_path),
         'source_fingerprint': file_fingerprint(source_path),
@@ -219,6 +219,7 @@ def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, 
         'reference_description_provider': args.reference_description_provider,
         'continuity_reference_count': args.continuity_reference_count,
         'reference_description_max_chars': args.reference_description_max_chars,
+        'normalize_to_source_size': not args.no_normalize_to_source_size,
     }
 
 
@@ -385,6 +386,23 @@ def newest_output(files: list[Path]) -> Path:
     return max(paths, key=lambda p: p.stat().st_mtime_ns)
 
 
+def normalize_to_source_size(path: Path, source_path: Path, final_path: Path | None = None) -> None:
+    from PIL import Image, ImageOps
+
+    with Image.open(source_path) as source_image:
+        target_size = source_image.size
+    with Image.open(path) as image:
+        if image.size == target_size:
+            return
+        resampling = getattr(Image, 'Resampling', Image).LANCZOS
+        normalized = ImageOps.fit(image.convert('RGB'), target_size, method=resampling, centering=(0.5, 0.5))
+        output_suffix = (final_path or path).suffix.lower()
+        image_format = 'JPEG' if output_suffix in {'.jpg', '.jpeg'} else 'PNG'
+        save_kwargs = {'quality': 95} if image_format == 'JPEG' else {}
+        normalized.save(path, format=image_format, **save_kwargs)
+    print(f'Normalized Qwen output to source size: {path} ({target_size[0]}x{target_size[1]})', flush=True)
+
+
 def iter_workflow_nodes(workflow: dict[str, Any]):
     seen: set[int] = set()
 
@@ -460,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--reference-description', default='', help='Static palette/continuity guidance appended to the image edit prompt.')
     parser.add_argument('--reference-description-file', type=Path, help='UTF-8 text file with static palette/continuity guidance.')
     parser.add_argument('--reference', action='append', default=[], help='Manual colour reference image to describe as text; can be repeated.')
+    parser.add_argument('--no-normalize-to-source-size', action='store_true', help='Keep ComfyUI/Qwen output dimensions instead of cropping/resizing to the source image size.')
     parser.add_argument('--reference-description-provider', choices=['none', 'ollama'], default='none', help='Describe continuity/reference images as text instead of passing multiple images to Qwen.')
     parser.add_argument('--reference-description-prompt', default=REFERENCE_DESCRIPTION_PROMPT)
     parser.add_argument('--ollama-url', default=DEFAULT_OLLAMA_URL)
@@ -536,6 +555,8 @@ def main() -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(dst.suffix + '.partial')
         shutil.copy2(produced, tmp)
+        if not args.no_normalize_to_source_size:
+            normalize_to_source_size(tmp, src, dst)
         tmp.replace(dst)
         write_signature(dst, sig)
         print(f'Wrote {dst}')

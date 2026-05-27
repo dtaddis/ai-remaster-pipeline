@@ -1546,6 +1546,7 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
         values.get("load_image_node_id", "auto"),
         "--save-node-id",
         values.get("save_node_id", "auto"),
+        "--no-normalize-to-source-size",
         "--force",
     ]
     if values.get("prompt_node_id"):
@@ -2307,17 +2308,24 @@ def human_size(size: int) -> str:
 def cache_categories() -> tuple[dict, ...]:
     return (
         {
-            "key": "overview_previews",
-            "title": "Overview / UI Previews",
-            "description": "Generated thumbnails, aspect previews, and small browser video clips.",
-            "folders": (PREVIEW_DIR, FILE_PREVIEW_DIR, ASPECT_PREVIEW_DIR, MEDIA_CLIP_DIR),
+            "key": "global",
+            "title": "Overview",
+            "description": "Source thumbnails, target-aspect previews, selected source sections, and small browser preview clips.",
+            "folders": (
+                PREVIEW_DIR,
+                FILE_PREVIEW_DIR,
+                ASPECT_PREVIEW_DIR,
+                MEDIA_CLIP_DIR,
+                ROOT / "intermediate" / "source_sections",
+            ),
         },
         {
             "key": "outpaint",
             "title": "Outpainting",
-            "description": "Prepared inputs, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
+            "description": "Prepared inputs, guide frames, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
             "folders": (
                 ROOT / ".cache" / "outpaint_chunks",
+                ROOT / "intermediate" / "outpaint_anchors",
                 ROOT / "intermediate" / "outpaint_prepared",
                 ROOT / "intermediate" / "outpainted",
                 ROOT / "manifests" / "outpaint_chunks",
@@ -2326,17 +2334,17 @@ def cache_categories() -> tuple[dict, ...]:
         {
             "key": "shots",
             "title": "Shot Detection",
-            "description": "Shot manifests and black-and-white reference screenshots.",
-            "folders": (
-                ROOT / "intermediate" / "outpainted_references",
-                ROOT / "manifests" / "references",
-            ),
+            "description": "Shot manifests created by cut detection.",
+            "folders": (ROOT / "manifests" / "references",),
         },
         {
             "key": "references",
             "title": "Reference Generation",
-            "description": "Qwen color reference stills generated from the shot screenshots.",
-            "folders": (ROOT / "intermediate" / "outpainted_references_color",),
+            "description": "Black-and-white shot screenshots and Qwen color reference stills.",
+            "folders": (
+                ROOT / "intermediate" / "outpainted_references",
+                ROOT / "intermediate" / "outpainted_references_color",
+            ),
         },
         {
             "key": "colour",
@@ -2349,8 +2357,14 @@ def cache_categories() -> tuple[dict, ...]:
         },
         {
             "key": "recomp",
-            "title": "Recomposition / Output",
-            "description": "Final recomposited outputs. Clear this to force ARP to rebuild the final movie.",
+            "title": "Recomposition",
+            "description": "Final recomposited movies created by the Recomposition tab.",
+            "folders": (),
+        },
+        {
+            "key": "output",
+            "title": "Output",
+            "description": "Finished output movies shown on the Output tab.",
             "folders": (ROOT / "output" / "reassembled",),
         },
     )
