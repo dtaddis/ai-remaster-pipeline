@@ -362,6 +362,7 @@ class PipelineApp:
                     "index": self.running_reference_index,
                 } if self.running_reference_index is not None else None,
                 "log": "\n".join(self.log[-800:]),
+                "log_count": len(self.log),
             }
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
@@ -1397,6 +1398,31 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
 
 
+def remove_cached_file(path: Path) -> bool:
+    removed = False
+    for candidate in (path, path.with_suffix(path.suffix + ".sig.json"), path.with_suffix(path.suffix + ".partial")):
+        try:
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
+                removed = True
+        except PermissionError:
+            APP.log.append(f"Could not delete cached file because it is open in another process: {rel(candidate)}")
+        except OSError as exc:
+            APP.log.append(f"Could not delete cached file {rel(candidate)}: {exc}")
+    return removed
+
+
+def clear_cached_outpaint_guides(manifest: Path, index: int) -> int:
+    guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+    if not guide_dir.exists():
+        return 0
+    removed = 0
+    for path in guide_dir.glob(f"chunk_{index:04d}_*"):
+        if path.is_file() and remove_cached_file(path):
+            removed += 1
+    return removed
+
+
 def install_outpaint_anchor(index: int, seconds: str) -> dict[str, str]:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
@@ -1444,11 +1470,13 @@ def clear_outpaint_anchor(index: int) -> dict[str, str]:
     rows = read_outpaint_chunk_rows(manifest)
     if index not in rows:
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
+    removed = clear_cached_outpaint_guides(manifest, index)
     rows[index]["anchor_image"] = ""
     rows[index]["anchor_position"] = ""
     rows[index]["anchor_seconds"] = ""
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}")
+    suffix = f" and deleted {removed} cached file(s)" if removed else ""
+    APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}{suffix}")
     return {"anchor_image": "", "anchor_position": "", "anchor_seconds": ""}
 
 
@@ -1503,6 +1531,7 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
     output_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
     output = output_dir / f"chunk_{index:04d}_guide_qwen.png"
     output_dir.mkdir(parents=True, exist_ok=True)
+    remove_cached_file(output)
 
     stored = read_outpaint_chunk_rows(manifest)
     if index not in stored:
@@ -2154,6 +2183,11 @@ def extract_video_frame_at(source: Path, target_dir: Path, suffix: str, seconds:
         return ""
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{safe_preview_name(source)}_{suffix}.jpg"
+    try:
+        if target.exists() and target.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            return rel(target)
+    except OSError:
+        pass
     command = [ffmpeg, "-y", "-ss", f"{max(0.0, seconds):.3f}", "-i", str(source), "-frames:v", "1", "-q:v", "4", str(target)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:

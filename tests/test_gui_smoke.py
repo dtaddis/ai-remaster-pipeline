@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import shutil
 import tempfile
 import threading
 import urllib.request
@@ -70,6 +71,44 @@ class GuiSmokeTests(unittest.TestCase):
             app.write_outpaint_chunk_rows(manifest, rows)
 
             self.assertEqual(app.read_outpaint_chunk_rows(manifest)[0]["raw_path"], "raw.mp4")
+
+    def test_clearing_outpaint_guide_deletes_cached_chunk_guides(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "demo_chunks.csv"
+            guide_dir = app.ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+            guide_dir.mkdir(parents=True, exist_ok=True)
+            current = guide_dir / "chunk_0000_guide_qwen.png"
+            older = guide_dir / "chunk_0000_middle_qwen.png"
+            other = guide_dir / "chunk_0001_guide_qwen.png"
+            for path in (current, older, other, current.with_suffix(".png.sig.json")):
+                path.write_bytes(b"cached")
+            rows = [
+                {
+                    "chunk_index": "0",
+                    "start_frame": "0",
+                    "end_frame": "10",
+                    "start_seconds": "0",
+                    "end_seconds": "1",
+                    "seed": "42",
+                    "anchor_image": app.rel(current),
+                    "anchor_position": "guide",
+                    "anchor_seconds": "0.5",
+                }
+            ]
+            app.write_outpaint_chunk_rows(manifest, rows)
+
+            try:
+                with mock.patch.object(server, "outpaint_chunks_state", return_value={"manifest": str(manifest)}):
+                    app.clear_outpaint_anchor(0)
+
+                self.assertFalse(current.exists())
+                self.assertFalse(older.exists())
+                self.assertFalse(current.with_suffix(".png.sig.json").exists())
+                self.assertTrue(other.exists())
+                self.assertEqual(app.read_outpaint_chunk_rows(manifest)[0]["anchor_image"], "")
+            finally:
+                shutil.rmtree(guide_dir, ignore_errors=True)
 
     def test_reference_manifest_read_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -221,6 +260,21 @@ class GuiSmokeTests(unittest.TestCase):
     def test_media_clip_rejects_missing_source(self) -> None:
         with self.assertRaises(FileNotFoundError):
             app.media_clip_path(app.ROOT / "does-not-exist.mp4", 0, 1, "smoke")
+
+    def test_frame_preview_reuses_fresh_existing_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            source.write_bytes(b"video placeholder")
+            target_dir = folder / "previews"
+            target_dir.mkdir()
+            target = target_dir / f"{app.safe_preview_name(source)}_thumb.jpg"
+            target.write_bytes(b"cached thumbnail")
+
+            with mock.patch.object(server, "local_tool", return_value="ffmpeg"), mock.patch.object(server.subprocess, "run") as run:
+                self.assertEqual(app.extract_video_frame_at(source, target_dir, "thumb", 0), app.rel(target))
+
+            run.assert_not_called()
 
     def test_files_for_skips_files_deleted_during_refresh(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

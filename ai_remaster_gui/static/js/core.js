@@ -3,6 +3,7 @@ let active = 'global';
 let selected = {};
 let lastRenderSignature = '';
 let lastOutpaintVisualSignature = '';
+let lastSeenLogCount = null;
 
 const media = path => '/media?path=' + encodeURIComponent(path);
 const mediaClip = (path, start, end, key) => (
@@ -28,6 +29,7 @@ async function refresh(force = false) {
   state = await api('/api/state');
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
+  notifyNewLogErrors();
 
   document.getElementById('root').textContent = state.root + (
     state.running ? '  |  Running: ' + state.running_stage : ''
@@ -116,6 +118,68 @@ function updateRunLogs() {
     el.innerHTML = html;
     if (shouldFollow) el.scrollTop = el.scrollHeight;
   });
+}
+
+function notifyNewLogErrors() {
+  const count = Number(state && state.log_count);
+  const lines = String((state && state.log) || '').split('\n');
+  if (!Number.isFinite(count)) return;
+  if (lastSeenLogCount === null) {
+    lastSeenLogCount = count;
+    return;
+  }
+  if (count <= lastSeenLogCount) return;
+
+  const firstLineNumber = Math.max(0, count - lines.length);
+  const startOffset = Math.max(0, lastSeenLogCount - firstLineNumber);
+  const newLines = lines.slice(startOffset);
+  lastSeenLogCount = count;
+
+  const errorIndex = newLines.findIndex(isLogErrorLine);
+  if (errorIndex === -1) return;
+
+  const excerptStart = Math.max(0, errorIndex - 8);
+  const excerptEnd = Math.min(newLines.length, errorIndex + 18);
+  const excerpt = newLines.slice(excerptStart, excerptEnd).join('\n').trim();
+  showErrorPopup(excerpt || newLines[errorIndex]);
+}
+
+function isLogErrorLine(line) {
+  const lower = String(line || '').toLowerCase();
+  return /traceback|runtimeerror|exception|error|failed|refused|exit code [1-9]|filenotfound|permissionerror/.test(lower);
+}
+
+function showErrorPopup(excerpt) {
+  let modal = document.getElementById('logErrorModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'logErrorModal';
+    modal.className = 'image-modal hidden';
+    modal.innerHTML = `
+      <div class="image-modal-backdrop" onclick="closeErrorPopup()"></div>
+      <div class="prompt-modal-panel error-modal-panel">
+        <div class="image-modal-heading">
+          <strong>ARP Noticed An Error</strong>
+          <button type="button" onclick="closeErrorPopup()">Close</button>
+        </div>
+        <p class="shot-empty">A new error appeared in the run log. The stage may need attention before continuing.</p>
+        <pre id="logErrorExcerpt" class="log error-popup-log"></pre>
+        <div class="actions">
+          <button class="primary" type="button" onclick="copyRunLog()">Copy Log</button>
+          <button type="button" onclick="closeErrorPopup()">Dismiss</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+  const excerptEl = document.getElementById('logErrorExcerpt');
+  if (excerptEl) excerptEl.textContent = excerpt;
+  modal.classList.remove('hidden');
+}
+
+function closeErrorPopup() {
+  const modal = document.getElementById('logErrorModal');
+  if (modal) modal.classList.add('hidden');
 }
 
 function isNearLogBottom(el) {
