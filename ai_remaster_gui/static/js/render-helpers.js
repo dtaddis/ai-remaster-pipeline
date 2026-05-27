@@ -130,10 +130,18 @@ function aspectPreviewSlider(range) {
 }
 
 function outpaintOverlapWarning(s) {
-  const value = Number(s.overlap_frames ?? 8);
-  if (!Number.isFinite(value) || value >= 8) return '';
+  const warnings = [];
+  const overlap = Number(s.overlap_frames ?? 8);
+  const chunkSeconds = Number(s.chunk_seconds ?? 20);
+  if (Number.isFinite(overlap) && overlap < 8) {
+    warnings.push('Overlap below 8 frames can cause held-frame seams if LTX returns short chunks. 8 or 9 frames is recommended.');
+  }
+  if (Number.isFinite(chunkSeconds) && chunkSeconds > 0 && chunkSeconds < 10) {
+    warnings.push('Short chunks create many separate LTX jobs and can make outpainting dramatically slower. Use around 20 seconds unless a shot needs special handling.');
+  }
+  if (!warnings.length) return '';
 
-  return '<div class="inline-warning">Overlap below 8 frames can cause held-frame seams if LTX returns short chunks. 8 or 9 frames is recommended.</div>';
+  return `<div class="inline-warning">${warnings.map(esc).join('<br>')}</div>`;
 }
 
 function shotOutputList(paths, limit) {

@@ -82,7 +82,7 @@ def build_parser():
     parser.add_argument('--skip-restore', action='store_true', help='Only remux/re-encode. Useful for comparisons.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
-    parser.add_argument('--preset', default='slow')
+    parser.add_argument('--preset', default='medium')
     parser.add_argument('--ffmpeg')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')

@@ -7,8 +7,12 @@ import tempfile
 import threading
 import urllib.request
 import unittest
+import sys
 from unittest import mock
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import comfy_api  # noqa: E402
 
 from ai_remaster_gui import app
 from ai_remaster_gui import server
@@ -110,6 +114,21 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--source", command)
         self.assertIn("input/example.mp4", command)
         self.assertIn("--chunk-manifest", command)
+
+    def test_outpaint_stage_defaults_to_longer_chunks(self) -> None:
+        outpaint_stage = next(stage for stage in app.STAGES if stage.key == "outpaint")
+        chunk_field = next(field for field in outpaint_stage.fields if field[0] == "chunk_seconds")
+
+        self.assertEqual(chunk_field[3], "20")
+
+    def test_comfy_node_check_reports_missing_custom_nodes(self) -> None:
+        with mock.patch.object(comfy_api, "object_info", return_value={"UnetLoaderGGUF": {}}):
+            with self.assertRaisesRegex(RuntimeError, "ComfyUI-LTXVideo"):
+                comfy_api.ensure_node_types(
+                    "http://127.0.0.1:8188",
+                    {"LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo", "UnetLoaderGGUF": "ComfyUI-GGUF"},
+                    "outpainting workflow",
+                )
 
     def test_source_section_names_include_trim_points(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})

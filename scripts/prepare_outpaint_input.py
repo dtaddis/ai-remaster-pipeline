@@ -139,7 +139,7 @@ def build_parser():
     parser.add_argument('--gamma', type=float, default=1.06, help='Additional source gamma lift before padding. Values above 1 brighten shadows.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
-    parser.add_argument('--preset', default='slow')
+    parser.add_argument('--preset', default='medium')
     parser.add_argument('--ffmpeg')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')

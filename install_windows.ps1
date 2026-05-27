@@ -128,6 +128,27 @@ function Invoke-External {
     }
 }
 
+function Invoke-External-Optional {
+    param([string[]]$Command, [string]$WorkingDirectory = $Root)
+    if (-not $Command -or $Command.Count -eq 0) {
+        throw 'No command was provided.'
+    }
+    Write-Host ($Command -join ' ')
+    $executable = Resolve-CommandExecutable $Command[0] ($Command -join ' ')
+    $startArgs = @{
+        FilePath = $executable
+        WorkingDirectory = $WorkingDirectory
+        NoNewWindow = $true
+        Wait = $true
+        PassThru = $true
+    }
+    if ($Command.Count -gt 1) {
+        $startArgs.ArgumentList = @($Command[1..($Command.Count - 1)])
+    }
+    $process = Start-Process @startArgs
+    return $process.ExitCode -eq 0
+}
+
 function Resolve-CommandExecutable {
     param([string]$FilePath, [string]$DisplayCommand = $FilePath)
     if ([string]::IsNullOrWhiteSpace($FilePath)) {
@@ -480,9 +501,20 @@ function Resolve-ComfyInstallMode {
 }
 
 function Git-Clone-IfMissing {
-    param([string]$Repo, [string]$Destination)
+    param([string]$Repo, [string]$Destination, [switch]$UpdateExisting)
     if (Test-Path -LiteralPath $Destination) {
         Write-Host "Already exists: $Destination"
+        if ($UpdateExisting) {
+            if (Test-Path -LiteralPath (Join-Path $Destination '.git')) {
+                Write-Host "Updating existing checkout: $Destination"
+                $ok = Invoke-External-Optional -Command @('git', '-C', $Destination, 'pull', '--ff-only')
+                if (-not $ok) {
+                    Write-Host "Could not fast-forward update $Destination. If ARP reports missing nodes, update this custom node manually or delete the folder and rerun install." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "Cannot update because this is not a Git checkout: $Destination" -ForegroundColor Yellow
+            }
+        }
         return
     }
     Ensure-Directory (Split-Path -Parent $Destination)
@@ -624,10 +656,10 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     if (-not $SkipComfyManager) {
         Git-Clone-IfMissing 'https://github.com/ltdrdata/ComfyUI-Manager.git' (Join-Path $CustomNodes 'ComfyUI-Manager')
     }
-    Git-Clone-IfMissing 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo')
-    Git-Clone-IfMissing 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF')
+    Git-Clone-IfMissing 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting
+    Git-Clone-IfMissing 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
     if (-not $SkipDeepExemplar) {
-        Git-Clone-IfMissing 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization')
+        Git-Clone-IfMissing 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting
     }
 }
 

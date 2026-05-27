@@ -43,6 +43,25 @@ def wait_for_comfy(comfy_url: str, timeout_seconds: float = 180.0, poll_seconds:
     raise RuntimeError(f"ComfyUI did not become ready at {comfy_url} within {timeout_seconds:.0f}s. Last error: {last_error}")
 
 
+def object_info(comfy_url: str) -> dict[str, Any]:
+    return http_json('GET', f"{comfy_url.rstrip('/')}/object_info", timeout=30)
+
+
+def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "workflow") -> None:
+    available = object_info(comfy_url)
+    missing = [node_type for node_type in required if node_type not in available]
+    if not missing:
+        return
+
+    details = "; ".join(f"{node_type} ({required[node_type]})" for node_type in missing)
+    packages = ", ".join(sorted(set(required[node_type] for node_type in missing)))
+    raise RuntimeError(
+        f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing: {details}. "
+        f"Re-run install_windows.bat, choose the same ComfyUI directory, then fully close and restart ComfyUI. "
+        f"If you use your own ComfyUI checkout, install or update: {packages}."
+    )
+
+
 def wait_for_prompt(comfy_url: str, prompt_id: str, poll_seconds: float) -> dict[str, Any]:
     while True:
         history = http_json('GET', f"{comfy_url.rstrip('/')}/history/{prompt_id}", timeout=30)

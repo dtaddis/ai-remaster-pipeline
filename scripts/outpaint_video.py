@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
+from comfy_api import extract_output_files, ensure_node_types, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature, safe_stem
 from dependency_manager import ensure_outpaint_models
 from prepare_outpaint_input import default_output as default_prepared_output
@@ -21,6 +21,11 @@ from prepare_outpaint_input import even, parse_aspect, probe_video
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 RECOMMENDED_OVERLAP_FRAMES = 8
+OUTPAINT_REQUIRED_NODES = {
+    "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
+    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+    "LTXVPreprocess": "ComfyUI-LTXVideo",
+}
 
 
 def replace_with_retry(partial: Path, target: Path, label: str, attempts: int = 20, delay: float = 0.5) -> None:
@@ -724,6 +729,12 @@ def main() -> int:
 
     if not args.dry_run:
         ensure_outpaint_models(comfy_dir)
+        print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
+        wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+        required_nodes = dict(OUTPAINT_REQUIRED_NODES)
+        if args.model_backend == "gguf":
+            required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
+        ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow")
 
     prepare_command = [
         sys.executable,
@@ -772,8 +783,7 @@ def main() -> int:
         if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):
             print(f"Reuse raw Comfy render: {raw_output}", flush=True)
         else:
-            print(f"Waiting for ComfyUI at {args.comfy_url}...", flush=True)
-            wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+            print(f"ComfyUI is ready at {args.comfy_url}.", flush=True)
             print(f"Splitting prepared canvas into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {args.overlap_frames} overlap frame(s)", flush=True)
             if len(ranges) > 1 and args.overlap_frames < RECOMMENDED_OVERLAP_FRAMES:
                 print(
