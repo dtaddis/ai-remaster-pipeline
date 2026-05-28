@@ -58,7 +58,7 @@ function outpaintChunkSummary(row) {
       <input id="chunkSeed_${idx}" type="number" value="${esc(row.seed || '42')}">
       <div class="shot-tools">
         <button type="button" onclick="saveOutpaintChunk(${idx})">Save</button>
-        <button type="button" onclick="regenerateOutpaintChunk(${idx})" ${state.running ? 'disabled' : ''}>Regenerate Chunk</button>
+        <button type="button" data-outpaint-disable-running="true" onclick="regenerateOutpaintChunk(${idx})" ${state.running ? 'disabled' : ''}>Regenerate Chunk</button>
       </div>
     </div>
   `;
@@ -92,7 +92,7 @@ function outpaintChunkGuide(row) {
         <input id="chunkGuideSeconds_${idx}" type="range" min="0" max="${Math.max(0, length).toFixed(6)}" step="${(1 / Math.max(1, Number(row.fps || 24))).toFixed(6)}" value="${seconds.toFixed(6)}" oninput="updateChunkGuideLabel(${idx})" onchange="saveOutpaintGuideTime(${idx})">
         <div class="shot-tools">
           <button type="button" onclick="chooseOutpaintAnchor(${idx},'guide')">Upload Guide</button>
-          <button type="button" onclick="openAnchorPromptModal(${idx},'guide')" ${state.running ? 'disabled' : ''}>Generate Guide</button>
+          <button type="button" data-outpaint-disable-running="true" onclick="openAnchorPromptModal(${idx},'guide')" ${state.running ? 'disabled' : ''}>Generate Guide</button>
           <button type="button" onclick="clearOutpaintAnchor(${idx})" ${row.anchor_exists ? '' : 'disabled'}>Clear</button>
         </div>
       </div>
@@ -131,6 +131,28 @@ function updateOutpaintGuidePreviews() {
     const status = document.getElementById(`chunkGuideStatus_${idx}`);
     if (status) status.textContent = outpaintGuideStatus(row);
   }
+}
+
+function updateOutpaintRuntimeControls() {
+  if (active !== 'outpaint') return;
+  const sp = stageProgress('outpaint');
+  const progress = document.getElementById('outpaintProgress');
+  if (progress) {
+    const percent = Math.max(0, Math.min(100, Number(sp.percent) || 0));
+    const label = progress.querySelector('[data-progress-label]');
+    const value = progress.querySelector('[data-progress-percent]');
+    const bar = progress.querySelector('progress');
+    if (label) label.textContent = sp.label || 'Waiting';
+    if (value) value.textContent = `${percent}%`;
+    if (bar) bar.value = percent;
+  }
+
+  document.querySelectorAll('[data-outpaint-disable-running]').forEach(button => {
+    button.disabled = !!state.running;
+  });
+  document.querySelectorAll('[data-outpaint-enable-running]').forEach(button => {
+    button.disabled = !state.running;
+  });
 }
 
 function outpaintChunkPrompt(row) {
@@ -247,7 +269,7 @@ function drawOutpaint(st, s, expected, sp) {
       <section class="card">
         <h2>${st.title}</h2>
         <p>${st.description}</p>
-        ${progressHtml(sp.percent, sp.label)}
+        <div id="outpaintProgress">${progressHtml(sp.percent, sp.label)}</div>
         ${mainFields.map(f => fieldHtml(st, f)).join('')}
         ${outpaintOverlapWarning(s)}
         <h3>Source Crop</h3>
@@ -257,8 +279,8 @@ function drawOutpaint(st, s, expected, sp) {
         </div>
         ${stageCheckboxes(s)}
         <div class="actions">
-          <button class="primary" onclick="runStage('outpaint')" ${state.running ? 'disabled' : ''}>Run Outpainting</button>
-          <button class="warn" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
+          <button class="primary" data-outpaint-disable-running="true" onclick="runStage('outpaint')" ${state.running ? 'disabled' : ''}>Run Outpainting</button>
+          <button class="warn" data-outpaint-enable-running="true" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
         </div>
         <div class="command" id="cmd"></div>
       </section>

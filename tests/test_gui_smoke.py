@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import comfy_api  # noqa: E402
+import colorize_video  # noqa: E402
 
 from ai_remaster_gui import app
 from ai_remaster_gui import config
@@ -88,6 +89,17 @@ class GuiSmokeTests(unittest.TestCase):
 
             self.assertEqual(app.read_outpaint_chunk_rows(manifest)[0]["raw_path"], "raw.mp4")
 
+    def test_outpaint_chunk_rows_do_not_rewrite_identical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "chunks.csv"
+            rows = [{"chunk_index": "0", "start_frame": "0", "end_frame": "10", "seed": "42"}]
+
+            app.write_outpaint_chunk_rows(manifest, rows)
+            first_mtime = manifest.stat().st_mtime_ns
+            app.write_outpaint_chunk_rows(manifest, rows)
+
+            self.assertEqual(manifest.stat().st_mtime_ns, first_mtime)
+
     def test_clearing_outpaint_guide_deletes_cached_chunk_guides(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -148,6 +160,36 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(source, "input/example.mp4")
             self.assertIn("color_reference", fields)
             self.assertEqual(rows[0]["source_reference"], "bw.png")
+
+    def test_shot_fade_marker_round_trips_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "refs.csv"
+            with manifest.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["enabled", "end", "source_reference", "color_reference", "prompt"])
+                writer.writeheader()
+                writer.writerow({"enabled": "true", "end": "00:00:01.000", "source_reference": "a.png", "color_reference": "a_color.png", "prompt": ""})
+                writer.writerow({"enabled": "true", "end": "00:00:02.000", "source_reference": "b.png", "color_reference": "b_color.png", "prompt": ""})
+
+            app.update_shot_fade(str(manifest), 0, True, "0.5")
+            _source, fields, rows = app.read_manifest_details(manifest)
+
+            self.assertIn("fade_to_next", fields)
+            self.assertEqual(rows[0]["fade_to_next"], "true")
+            self.assertEqual(rows[0]["crossfade_seconds"], "0.5")
+
+    def test_colorize_plan_extends_fading_transition_chunks(self) -> None:
+        rows = [
+            {"end": "00:00:01.000", "fade_to_next": "true", "crossfade_seconds": "0.5"},
+            {"end": "00:00:02.000"},
+        ]
+
+        plan, transitions = colorize_video.shot_plan(rows, total_frames=48, fps=24.0)
+
+        self.assertEqual(transitions[0], 12)
+        self.assertEqual(plan[0]["start"], 0)
+        self.assertEqual(plan[0]["end"], 30)
+        self.assertEqual(plan[1]["start"], 18)
+        self.assertEqual(plan[1]["end"], 48)
 
     def test_command_construction_for_outpaint_uses_overview_source(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

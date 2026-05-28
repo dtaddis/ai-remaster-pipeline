@@ -107,12 +107,14 @@ def reference_signature(row: dict[str, str]) -> dict[str, Any]:
         "end_frame": row.get("end_frame", ""),
         "reference": root_relative(ref),
         "reference_fingerprint": file_fingerprint(ref),
+        "fade_to_next": row.get("fade_to_next", ""),
+        "crossfade_seconds": row.get("crossfade_seconds", ""),
     }
 
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 3,
+        "version": 4,
         "tool": "colorize_video.py",
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
@@ -231,12 +233,14 @@ def segment_signature(
     reference: Path,
     start_frame: int,
     end_frame: int,
+    base_start_frame: int,
+    base_end_frame: int,
     width: int,
     height: int,
     fps: float,
 ) -> dict[str, Any]:
     return {
-        "version": 3,
+        "version": 4,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "source_video": root_relative(source_video),
@@ -247,6 +251,10 @@ def segment_signature(
         "row_end": row.get("end", ""),
         "start_frame": start_frame,
         "end_frame": end_frame,
+        "base_start_frame": base_start_frame,
+        "base_end_frame": base_end_frame,
+        "fade_to_next": row.get("fade_to_next", ""),
+        "crossfade_seconds": row.get("crossfade_seconds", ""),
         "width": width,
         "height": height,
         "fps": fps,
@@ -316,10 +324,61 @@ def normalize_clip(ffmpeg: str, source: Path, output: Path, fps: float, expected
     replace_with_retry(partial, output)
 
 
+def truthy(value: str) -> bool:
+    return value.strip().lower() in {"true", "1", "yes", "on"}
+
+
+def transition_seconds(row: dict[str, str]) -> float:
+    if not truthy(row.get("fade_to_next", "")):
+        return 0.0
+    try:
+        return max(0.0, float(row.get("crossfade_seconds", "") or 0.0))
+    except ValueError:
+        return 0.0
+
+
+def shot_plan(rows: list[dict[str, str]], total_frames: int, fps: float) -> tuple[list[dict[str, int]], list[int]]:
+    base: list[tuple[int, int]] = []
+    start_frame = 0
+    for index, row in enumerate(rows):
+        end_frame = min(total_frames, max(start_frame + 1, round(parse_time(row.get("end", "")) * fps)))
+        if index == len(rows) - 1:
+            end_frame = total_frames
+        base.append((start_frame, end_frame))
+        start_frame = end_frame
+
+    transitions = [0 for _ in rows]
+    for index, row in enumerate(rows[:-1]):
+        frames = int(round(transition_seconds(row) * fps))
+        if frames <= 0:
+            continue
+        left = max(1, base[index][1] - base[index][0])
+        right = max(1, base[index + 1][1] - base[index + 1][0])
+        transitions[index] = max(1, min(frames, left, right))
+
+    plan: list[dict[str, int]] = []
+    for index, (base_start, base_end) in enumerate(base):
+        prev_frames = transitions[index - 1] if index > 0 else 0
+        next_frames = transitions[index] if index < len(transitions) else 0
+        pre = prev_frames // 2
+        post = next_frames - (next_frames // 2)
+        actual_start = max(0, base_start - pre)
+        actual_end = min(total_frames, base_end + post)
+        plan.append(
+            {
+                "base_start": base_start,
+                "base_end": base_end,
+                "start": actual_start,
+                "end": max(actual_start + 1, actual_end),
+            }
+        )
+    return plan, transitions
+
+
 def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     concat = output.with_suffix(".concat.txt")
-    concat.write_text("".join(f"file '{str(chunk).replace("'", "'\\''")}'\n" for chunk in chunks), encoding="utf-8")
+    concat.write_text("".join("file '" + str(chunk).replace("'", "'\\''") + "'\n" for chunk in chunks), encoding="utf-8")
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
     cmd = [
         ffmpeg,
@@ -351,6 +410,88 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     subprocess.run(cmd, check=True)
     replace_with_retry(partial, output)
     concat.unlink(missing_ok=True)
+
+
+def transition_groups(transitions: list[int]) -> list[tuple[int, int]]:
+    groups: list[tuple[int, int]] = []
+    start = 0
+    for index, frames in enumerate(transitions):
+        if frames > 0:
+            continue
+        groups.append((start, index))
+        start = index + 1
+    if transitions:
+        groups.append((start, len(transitions) - 1))
+    elif not groups:
+        groups.append((0, 0))
+    return [(left, right) for left, right in groups if left <= right]
+
+
+def xfade_group(ffmpeg: str, chunks: list[Path], transitions: list[int], output: Path, fps: float) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    cmd = [ffmpeg, "-y"]
+    for chunk in chunks:
+        cmd += ["-i", str(chunk)]
+
+    filters: list[str] = []
+    for index in range(len(chunks)):
+        filters.append(f"[{index}:v]fps=fps={fps:.8f},setpts=PTS-STARTPTS[v{index}]")
+
+    previous = "v0"
+    accumulated = video_info(chunks[0])["frames"] / fps
+    for index in range(1, len(chunks)):
+        duration = max(1 / fps, transitions[index - 1] / fps)
+        offset = max(0.0, accumulated - duration)
+        current = f"x{index}"
+        filters.append(f"[{previous}][v{index}]xfade=transition=fade:duration={duration:.8f}:offset={offset:.8f},setpts=PTS-STARTPTS[{current}]")
+        previous = current
+        accumulated += video_info(chunks[index])["frames"] / fps - duration
+    filters.append(f"[{previous}]format=yuv420p[vout]")
+
+    cmd += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[vout]",
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        str(partial),
+    ]
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    replace_with_retry(partial, output)
+
+
+def stitch_colorized(ffmpeg: str, chunks: list[Path], transitions: list[int], output: Path, fps: float, source_stem: str) -> None:
+    if not any(transitions):
+        stitch(ffmpeg, chunks, output, fps)
+        return
+
+    group_outputs: list[Path] = []
+    group_dir = ROOT / ".cache" / "colorized_chunks" / "crossfaded" / source_stem
+    group_dir.mkdir(parents=True, exist_ok=True)
+    for group_index, (left, right) in enumerate(transition_groups(transitions)):
+        group_chunks = chunks[left : right + 1]
+        if len(group_chunks) == 1:
+            group_outputs.append(group_chunks[0])
+            continue
+        group_transitions = transitions[left:right]
+        group_output = group_dir / f"group_{group_index:04d}_{left:04d}_{right:04d}.mp4"
+        xfade_group(ffmpeg, group_chunks, group_transitions, group_output, fps)
+        group_outputs.append(group_output)
+    stitch(ffmpeg, group_outputs, output, fps)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -421,22 +562,21 @@ def run(args: argparse.Namespace) -> int:
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
 
     chunks: list[Path] = []
-    start_frame = 0
+    plan, transitions = shot_plan(rows, total_frames, fps)
     cache_dir = ROOT / ".cache" / "colorized_chunks" / method_suffix(args.method) / safe_stem(source_video.name)
     cache_dir.mkdir(parents=True, exist_ok=True)
     for index, row in enumerate(rows):
-        end_frame = min(total_frames, max(start_frame + 1, round(parse_time(row.get("end", "")) * fps)))
-        if index == len(rows) - 1:
-            end_frame = total_frames
+        item = plan[index]
+        start_frame = item["start"]
+        end_frame = item["end"]
         frame_count = max(1, end_frame - start_frame)
         reference = row_reference(row)
         ref_name = copy_to_comfy_input(reference, comfy_dir, "arp_colorize_refs")
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, width, height, fps)
+        chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
             print(f"Reuse colorized segment {index + 1}/{len(rows)}: {chunk}", flush=True)
             chunks.append(chunk)
-            start_frame = end_frame
             continue
         prefix = f"arp_colorize/{method_suffix(args.method)}_{safe_stem(source_video.name)}_segment_{index:04d}_{start_frame:06d}_{end_frame:06d}"
         print(f"Colorize segment {index + 1}/{len(rows)} with {args.method}: frames {start_frame}-{end_frame} using {ref_name}", flush=True)
@@ -447,9 +587,8 @@ def run(args: argparse.Namespace) -> int:
         normalize_clip(ffmpeg, produced, chunk, fps, frame_count)
         write_signature(chunk, chunk_sig)
         chunks.append(chunk)
-        start_frame = end_frame
 
-    stitch(ffmpeg, chunks, output, fps)
+    stitch_colorized(ffmpeg, chunks, transitions, output, fps, safe_stem(source_video.name))
     write_signature(output, sig)
     print(f"Wrote colorized video: {output}", flush=True)
     return 0

@@ -38,11 +38,24 @@ async function refresh(force = false) {
   if (version) version.textContent = state.version || '';
 
   const sig = renderSignature();
+  const currentOutpaintVisualSignature = outpaintVisualSignature();
   const outpaintVisualChanged = active === 'outpaint'
-    && outpaintVisualSignature() !== lastOutpaintVisualSignature;
+    && currentOutpaintVisualSignature !== lastOutpaintVisualSignature;
+  if (!force && active === 'outpaint' && document.getElementById('app')?.children.length) {
+    updateOutpaintGuidePreviews();
+    updateRunLogs();
+    updateOutpaintRuntimeControls();
+    lastRenderSignature = sig;
+    lastOutpaintVisualSignature = currentOutpaintVisualSignature;
+    return;
+  }
+
   if (!force && (editing || (shouldPreserveInteractiveDom(mediaActive) && !outpaintVisualChanged) || sig === lastRenderSignature)) {
     updateOutpaintGuidePreviews();
     updateRunLogs();
+    if (active === 'outpaint') updateOutpaintRuntimeControls();
+    lastRenderSignature = sig;
+    lastOutpaintVisualSignature = currentOutpaintVisualSignature;
     return;
   }
 
@@ -50,7 +63,7 @@ async function refresh(force = false) {
   draw(false);
   wireColourShotVideos();
   lastRenderSignature = sig;
-  lastOutpaintVisualSignature = outpaintVisualSignature();
+  lastOutpaintVisualSignature = currentOutpaintVisualSignature;
   restoreScrollState(snap);
 }
 

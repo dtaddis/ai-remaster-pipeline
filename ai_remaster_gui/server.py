@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
+import io
 import json
 import mimetypes
 import os
@@ -903,7 +904,12 @@ def merge_manifest_shots(manifest_text: str, index: int) -> dict[str, str]:
     source_video, fieldnames, rows = read_manifest_details(manifest)
     if index < 0 or index >= len(rows) - 1:
         raise IndexError(f"Shot {index + 1} cannot be merged because there is no following shot.")
+    for key in ("fade_to_next", "crossfade_seconds"):
+        if key not in fieldnames:
+            fieldnames.append(key)
     rows[index]["end"] = rows[index + 1].get("end", rows[index].get("end", ""))
+    rows[index]["fade_to_next"] = rows[index + 1].get("fade_to_next", "")
+    rows[index]["crossfade_seconds"] = rows[index + 1].get("crossfade_seconds", "")
     removed = rows.pop(index + 1)
     write_manifest_details(manifest, source_video, fieldnames, rows)
     APP.log.append(f"Merged shot {index + 1} with shot {index + 2}; shared reference: {rows[index].get('source_reference', '')}")
@@ -916,7 +922,7 @@ def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = 
     if index < 0 or index >= len(rows):
         raise IndexError(f"Manifest row {index} is out of range.")
 
-    for key in ("enabled", "end", "source_reference", "color_reference", "prompt"):
+    for key in ("enabled", "end", "source_reference", "color_reference", "prompt", "fade_to_next", "crossfade_seconds"):
         if key not in fieldnames:
             fieldnames.append(key)
 
@@ -935,6 +941,8 @@ def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = 
     first["end"] = format_timecode(split_at)
     first["source_reference"] = ""
     first["color_reference"] = ""
+    first["fade_to_next"] = "false"
+    first["crossfade_seconds"] = ""
     second["end"] = rows[index].get("end", "")
     second["source_reference"] = ""
     second["color_reference"] = ""
@@ -968,6 +976,26 @@ def update_shot_boundary(manifest_text: str, index: int, edge: str, seconds: flo
     write_manifest_details(manifest, source_video, fieldnames, rows)
     APP.log.append(f"Updated shot {index + 1} {edge} boundary to {format_timecode(seconds)}")
     return {"manifest": rel(manifest), "time": format_timecode(seconds)}
+
+
+def update_shot_fade(manifest_text: str, index: int, enabled: bool, crossfade_seconds: str) -> dict[str, str]:
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows) - 1:
+        raise IndexError(f"Shot {index + 1} does not have a following transition.")
+    for key in ("fade_to_next", "crossfade_seconds"):
+        if key not in fieldnames:
+            fieldnames.append(key)
+    try:
+        seconds = max(0.0, float(crossfade_seconds or 0.0))
+    except ValueError:
+        seconds = 0.0
+    rows[index]["fade_to_next"] = "true" if enabled and seconds > 0 else "false"
+    rows[index]["crossfade_seconds"] = f"{seconds:.3f}".rstrip("0").rstrip(".") if seconds else ""
+    write_manifest_details(manifest, source_video, fieldnames, rows)
+    state = "enabled" if rows[index]["fade_to_next"] == "true" else "disabled"
+    APP.log.append(f"Fade transition after shot {index + 1} {state}; crossfade {rows[index].get('crossfade_seconds') or '0'}s")
+    return {"manifest": rel(manifest), "fade_to_next": rows[index]["fade_to_next"], "crossfade_seconds": rows[index]["crossfade_seconds"]}
 
 
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
@@ -1275,10 +1303,20 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
         "prepared_path",
         "raw_path",
     ]
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    text = buffer.getvalue()
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                if handle.read() == text:
+                    return
+        except OSError:
+            pass
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+        handle.write(text)
 
 
 def outpaint_chunks_state(settings: dict) -> dict:
@@ -1700,6 +1738,9 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 "color_reference_mtime": file_mtime(row.get("color_reference", "")),
                 "can_merge_next": index < len(rows) - 1,
                 "can_split": end - start >= 0.1,
+                "can_fade_next": index < len(rows) - 1,
+                "fade_to_next": row.get("fade_to_next", "false"),
+                "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "prompt": row.get("prompt", ""),
             }
         if include_previews:
@@ -3026,6 +3067,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **result, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Shot boundary update failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/shot-fade":
+            try:
+                result = update_shot_fade(str(data.get("manifest", "")), int(data.get("index", 0)), bool(data.get("enabled")), str(data.get("crossfade_seconds", "")))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Shot fade update failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/reference-regenerate":
             try:

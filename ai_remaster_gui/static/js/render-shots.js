@@ -111,7 +111,7 @@ function shotCards(mode) {
     return '<p class="shot-empty">No shot manifest yet. Run Shot Detection first.</p>';
   }
 
-  return `<div class="shot-list">${rows.map(row => shotCard(mode, manifest, row)).join('')}</div>`;
+  return `<div class="shot-list">${rows.map(row => shotCard(mode, manifest, row) + shotTransitionControl(mode, manifest, row)).join('')}</div>`;
 }
 
 function shotCard(mode, manifest, row) {
@@ -175,6 +175,37 @@ function shotBoundaryCard(context) {
       </div>
       ${boundaryFrameCard(context, 'end')}
     </article>
+  `;
+}
+
+function shotTransitionControl(mode, manifest, row) {
+  if (mode !== 'shots' || !row.can_fade_next) return '';
+  const checked = String(row.fade_to_next || '').toLowerCase() === 'true';
+  const value = row.crossfade_seconds || '1.0';
+  return `
+    <div class="shot-transition">
+      <span>Between shot ${row.index + 1} and ${row.index + 2}</span>
+      <label>
+        <input
+          type="checkbox"
+          id="fade_${row.index}"
+          ${checked ? 'checked' : ''}
+          onchange="saveShotFade('${esc(manifest)}',${row.index},this.checked,document.getElementById('crossfade_${row.index}').value)"
+        >
+        Fading transition
+      </label>
+      <label class="compact-field">
+        Crossfade seconds
+        <input
+          id="crossfade_${row.index}"
+          type="number"
+          min="0.041"
+          step="0.041"
+          value="${esc(value)}"
+          onchange="saveShotFade('${esc(manifest)}',${row.index},document.getElementById('fade_${row.index}')?.checked ?? ${checked},this.value)"
+        >
+      </label>
+    </div>
   `;
 }
 

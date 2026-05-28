@@ -34,6 +34,17 @@ async function saveOutpaintChunk(index) {
   const result = await postJson('/api/outpaint-chunk', payload);
   if (!result.ok) return alert(result.error || 'Could not save chunk');
 
+  if (active === 'outpaint' && result.state) {
+    state = result.state;
+    updateOutpaintGuidePreviews();
+    updateOutpaintRuntimeControls();
+    updateRunLogs();
+    lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
+    restoreScrollState(snap);
+    return;
+  }
+
   await redrawWithState(result.state, snap);
 }
 
@@ -147,6 +158,14 @@ async function setShotBoundary(manifest, index, edge, time) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function saveShotFade(manifest, index, enabled, crossfade_seconds) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-fade', { manifest, index, enabled, crossfade_seconds });
+  if (!result.ok) return alert(result.error || 'Could not update fade transition');
+
+  await redrawWithState(result.state, snap, true);
+}
+
 function nudgeShotBoundary(manifest, index, edge, frames) {
   const rows = (state.shot_views && state.shot_views.shots) || [];
   const row = rows[index];
@@ -216,6 +235,17 @@ async function chooseOutpaintAnchor(index, position) {
   if (!result.ok) return alert(result.error || 'Could not install guide frame');
   if (!result.selected) return;
 
+  if (active === 'outpaint' && result.state) {
+    state = result.state;
+    updateOutpaintGuidePreviews();
+    updateOutpaintRuntimeControls();
+    updateRunLogs();
+    lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
+    restoreScrollState(snap);
+    return;
+  }
+
   await redrawWithState(result.state, snap, true);
 }
 
@@ -223,6 +253,17 @@ async function clearOutpaintAnchor(index) {
   const snap = captureScrollState();
   const result = await postJson('/api/outpaint-anchor-clear', { index });
   if (!result.ok) return alert(result.error || 'Could not clear guide frame');
+  if (active === 'outpaint' && result.state) {
+    state = result.state;
+    updateOutpaintGuidePreviews();
+    updateOutpaintRuntimeControls();
+    updateRunLogs();
+    lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
+    restoreScrollState(snap);
+    return;
+  }
+
   await redrawWithState(result.state, snap, true);
 }
 
@@ -231,6 +272,17 @@ async function saveOutpaintGuideTime(index) {
   const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
   const result = await postJson('/api/outpaint-guide-time', { index, seconds });
   if (!result.ok) return alert(result.error || 'Could not update guide source frame');
+  if (active === 'outpaint' && result.state) {
+    state = result.state;
+    updateOutpaintGuidePreviews();
+    updateOutpaintRuntimeControls();
+    updateRunLogs();
+    lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
+    restoreScrollState(snap);
+    return;
+  }
+
   await redrawWithState(result.state, snap, true);
 }
 

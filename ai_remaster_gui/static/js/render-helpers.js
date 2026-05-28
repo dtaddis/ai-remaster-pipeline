@@ -245,7 +245,7 @@ function progressHtml(percent, label) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   return `
     <div class="phase-progress">
-      <div><span>${esc(label || 'Waiting')}</span><span>${p}%</span></div>
+      <div><span data-progress-label>${esc(label || 'Waiting')}</span><span data-progress-percent>${p}%</span></div>
       <progress value="${p}" max="100"></progress>
     </div>
   `;
