@@ -35,7 +35,19 @@ def load_config() -> dict[str, str]:
                 config.update({key: str(value) for key, value in stored.items() if value is not None})
         except json.JSONDecodeError:
             pass
+    config["comfy_dir"] = str(resolve_comfy_dir(config["comfy_dir"]))
     return config
+
+
+def resolve_comfy_dir(path_text: str) -> Path:
+    path = Path(path_text)
+    if (path / "main.py").exists():
+        return path
+    for child in ("ComfyUI", "comfyui"):
+        nested = path / child
+        if (nested / "main.py").exists():
+            return nested
+    return path
 
 
 def current_config() -> dict[str, str]:

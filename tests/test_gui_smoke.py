@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import comfy_api  # noqa: E402
 
 from ai_remaster_gui import app
+from ai_remaster_gui import config
 from ai_remaster_gui import server
 
 
@@ -56,6 +57,15 @@ class GuiSmokeTests(unittest.TestCase):
             output = app.outpaint_output_for("input/My Source.mp4", "16:9", "source")
 
         self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_854x480_outpainted.mp4")
+
+    def test_portable_comfy_parent_resolves_to_inner_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            portable = Path(tmp_text)
+            inner = portable / "ComfyUI"
+            inner.mkdir()
+            (inner / "main.py").write_text("# comfy\n", encoding="utf-8")
+
+            self.assertEqual(config.resolve_comfy_dir(str(portable)), inner)
 
     def test_outpaint_chunk_rows_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

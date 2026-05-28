@@ -423,6 +423,28 @@ function Test-ComfyDir {
     return (Test-Path -LiteralPath (Join-Path $Path 'main.py'))
 }
 
+function Resolve-ComfyDirPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (Test-ComfyDir $full) {
+        return $full
+    }
+
+    foreach ($child in @('ComfyUI', 'comfyui')) {
+        $nested = Join-Path $full $child
+        if (Test-ComfyDir $nested) {
+            Write-Host "Found ComfyUI checkout inside selected folder: $nested"
+            return $nested
+        }
+    }
+
+    return $null
+}
+
 function Read-Choice {
     param(
         [string]$Prompt,
@@ -449,9 +471,16 @@ Write-ArpBanner
 function Resolve-ComfyInstallMode {
     if ($ComfyDir) {
         $full = [System.IO.Path]::GetFullPath($ComfyDir)
+        $resolved = Resolve-ComfyDirPath $full
+        if ($resolved) {
+            return @{
+                Dir = $resolved
+                Existing = $true
+            }
+        }
         return @{
             Dir = $full
-            Existing = (Test-ComfyDir $full)
+            Existing = $false
         }
     }
 
@@ -486,13 +515,14 @@ function Resolve-ComfyInstallMode {
             continue
         }
         $full = [System.IO.Path]::GetFullPath($target)
-        if (Test-ComfyDir $full) {
+        $resolved = Resolve-ComfyDirPath $full
+        if ($resolved) {
             return @{
-                Dir = $full
+                Dir = $resolved
                 Existing = $true
             }
         }
-        Write-Host "That does not look like a ComfyUI checkout because main.py was not found: $full" -ForegroundColor Yellow
+        Write-Host "That does not look like a ComfyUI checkout because main.py was not found in $full or $full\ComfyUI." -ForegroundColor Yellow
         $retry = Read-Choice 'Try another path? (Y/N)' @('Y', 'N') 'Y'
         if ($retry -eq 'N') {
             throw 'Install cancelled.'
