@@ -131,7 +131,9 @@ Set the target aspect ratio, output height, chunk length, overlap frames, and so
 
 Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
 
-Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point. If outpainting fails immediately with a missing `LTXVImgToVideoConditionOnly` node, re-run the installer for the same ComfyUI directory and restart ComfyUI so `ComfyUI-LTXVideo` is installed and loaded.
+Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point.
+
+If outpainting fails immediately with missing `LTXVImgToVideoConditionOnly` or `LTXAddVideoICLoRAGuide` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
 
 ### Shot Detection
 

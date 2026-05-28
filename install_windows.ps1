@@ -521,9 +521,46 @@ function Git-Clone-IfMissing {
     Invoke-External -Command @('git', 'clone', $Repo, $Destination)
 }
 
+function Test-DirectoryContainsText {
+    param([string]$Directory, [string]$Needle)
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return $false
+    }
+    $match = Get-ChildItem -LiteralPath $Directory -Recurse -File -Include '*.py' -ErrorAction SilentlyContinue |
+        Select-String -SimpleMatch -Pattern $Needle -List -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    return $null -ne $match
+}
+
+function Assert-CustomNodeSymbols {
+    param(
+        [string]$Name,
+        [string]$Directory,
+        [string]$RepoUrl,
+        [string[]]$Symbols
+    )
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw "$Name was not installed. Expected folder: $Directory. Install it from $RepoUrl into ComfyUI\custom_nodes and rerun install_windows.bat."
+    }
+    $missing = @()
+    foreach ($symbol in $Symbols) {
+        if (-not (Test-DirectoryContainsText $Directory $symbol)) {
+            $missing += $symbol
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "$Name is installed at $Directory, but it does not contain required node type(s): $($missing -join ', '). Delete that folder or update it from $RepoUrl, then rerun install_windows.bat and fully restart ComfyUI."
+    }
+    Write-Host "$Name node definitions found: $($Symbols -join ', ')"
+}
+
 function Install-Pip {
     param([string[]]$Packages)
     Invoke-External -Command (@($PipelinePython, '-m', 'pip', 'install') + $Packages)
+}
+
+function Install-PythonBuildTools {
+    Install-Pip @('--upgrade', 'pip', 'wheel')
 }
 
 function Install-RequirementsIfPresent {
@@ -641,7 +678,7 @@ Invoke-Step 'Create ai-remaster-pipeline venv' {
     if (-not (Test-Path -LiteralPath $PipelinePython)) {
         Invoke-PythonLauncher -Arguments @('-m', 'venv', (Join-Path $Root '.venv'))
     }
-    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel')
+    Install-PythonBuildTools
     Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))
 }
 
@@ -661,6 +698,19 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     if (-not $SkipDeepExemplar) {
         Git-Clone-IfMissing 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting
     }
+}
+
+Invoke-Step 'Verify required ComfyUI custom nodes' {
+    Assert-CustomNodeSymbols `
+        'ComfyUI-LTXVideo' `
+        (Join-Path $CustomNodes 'ComfyUI-LTXVideo') `
+        'https://github.com/Lightricks/ComfyUI-LTXVideo' `
+        @('LTXVImgToVideoConditionOnly', 'LTXAddVideoICLoRAGuide', 'LTXVPreprocess')
+    Assert-CustomNodeSymbols `
+        'ComfyUI-GGUF' `
+        (Join-Path $CustomNodes 'ComfyUI-GGUF') `
+        'https://github.com/city96/ComfyUI-GGUF' `
+        @('UnetLoaderGGUF')
 }
 
 Invoke-Step 'Install custom-node requirements' {

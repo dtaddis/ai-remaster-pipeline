@@ -26,6 +26,20 @@ function drawColour() {
   });
 }
 
+function outputExists(stageKey, path) {
+  if (!path) return false;
+  const needle = normalizeStatePath(path);
+  const outputs = (state.existing_outputs && state.existing_outputs[stageKey]) || [];
+  return outputs.some(existing => {
+    const current = normalizeStatePath(existing);
+    return current === needle || current.endsWith('/' + needle) || needle.endsWith('/' + current);
+  });
+}
+
+function normalizeStatePath(path) {
+  return String(path || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
 function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   const st = stage(key);
   const s = settings(key);
@@ -199,10 +213,13 @@ function colourSegmentCard(context) {
   const { row, idx, enabled, colorReady, colorUrl } = context;
   const start = Math.max(0, Number(row.start) || 0).toFixed(3);
   const end = Math.max(0, Number(row.end) || 0).toFixed(3);
-  const colourVideo = row.colorized_video
-    || (state.expected_outputs && state.expected_outputs.colour && state.expected_outputs.colour[0])
-    || settings('recomp').colorized_video
-    || '';
+  const expectedVideos = (state.expected_outputs && state.expected_outputs.colour) || [];
+  const candidateVideos = [
+    row.colorized_video,
+    settings('recomp').colorized_video,
+    ...expectedVideos,
+  ].filter(Boolean);
+  const colourVideo = candidateVideos.find(path => outputExists('colour', path)) || '';
   const method = settings('colour').method || 'deepexemplar';
   const status = enabled ? (colorReady ? `Ready for ${colorizationLabel(method)}` : 'Missing color reference') : 'Disabled in manifest';
 

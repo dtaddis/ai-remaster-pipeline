@@ -55,10 +55,16 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
 
     details = "; ".join(f"{node_type} ({required[node_type]})" for node_type in missing)
     packages = ", ".join(sorted(set(required[node_type] for node_type in missing)))
+    install_hints = {
+        "ComfyUI-LTXVideo": "https://github.com/Lightricks/ComfyUI-LTXVideo -> ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+        "ComfyUI-GGUF": "https://github.com/city96/ComfyUI-GGUF -> ComfyUI/custom_nodes/ComfyUI-GGUF",
+    }
+    hints = "; ".join(install_hints.get(package, package) for package in sorted(set(required[node_type] for node_type in missing)))
     raise RuntimeError(
         f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing: {details}. "
         f"Re-run install_windows.bat, choose the same ComfyUI directory, then fully close and restart ComfyUI. "
-        f"If you use your own ComfyUI checkout, install or update: {packages}."
+        f"If you use your own ComfyUI checkout, install or update: {packages}. "
+        f"Manual install locations: {hints}."
     )
 
 

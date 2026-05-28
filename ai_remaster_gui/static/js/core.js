@@ -62,6 +62,7 @@ function renderSignature() {
     stages: state.stages,
     settings: state.settings,
     expected_outputs: state.expected_outputs,
+    existing_outputs: state.existing_outputs,
     source_previews: state.source_previews,
     source_info: state.source_info,
     source_monochrome: state.source_monochrome,

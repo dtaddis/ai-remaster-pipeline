@@ -345,6 +345,7 @@ class PipelineApp:
                 "progress": self.progress(),
                 "phase_progress": self.phase_progress(),
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
+                "existing_outputs": {stage.key: self.existing_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
                 "source_previews": previews,
                 "source_info": info,
                 "source_section": section,
@@ -2957,6 +2958,9 @@ class Handler(BaseHTTPRequestHandler):
                     start = float(query.get("clip_start", ["0"])[0])
                     end = float(query.get("clip_end", [str(start + 0.041)])[0])
                     path = media_clip_path(path, start, end, query.get("clip_key", [""])[0])
+                except FileNotFoundError:
+                    self.send_error(404)
+                    return
                 except Exception as exc:
                     APP.log.append(f"Shot video preview failed: {exc}")
                     self.send_error(404)
