@@ -557,10 +557,21 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "prepared_path",
         "raw_path",
     ]
+    import io as _io
+    buf = _io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    text = buf.getvalue()
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                if handle.read() == text:
+                    return
+        except OSError:
+            pass
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+        handle.write(text)
 
 
 def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
@@ -842,7 +853,8 @@ def main() -> int:
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
-                split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), args.force)
+                force_this_split = args.force and (args.only_chunk is None or chunk_index == args.only_chunk)
+                split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split)
                 previous_raw = raw_chunks[-1] if raw_chunks else None
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
