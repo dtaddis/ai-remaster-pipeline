@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import comfy_api  # noqa: E402
 import colorize_video  # noqa: E402
+import outpaint_video  # noqa: E402
 
 from ai_remaster_gui import app
 from ai_remaster_gui import config
@@ -190,6 +191,36 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(plan[0]["end"], 30)
         self.assertEqual(plan[1]["start"], 18)
         self.assertEqual(plan[1]["end"], 48)
+
+    def test_outpaint_overlap_context_stops_before_guide_inside_overlap(self) -> None:
+        self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "0.125", 24.0, 100), 3)
+        self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "1.0", 24.0, 100), 8)
+        self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "0", 24.0, 100), 0)
+
+    def test_outpaint_overlap_context_scales_height_and_skips_first_new_frame(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            chunk = folder / "chunk.mp4"
+            previous = folder / "previous.mp4"
+
+            with (
+                mock.patch.object(outpaint_video, "probe_video") as probe,
+                mock.patch.object(outpaint_video.subprocess, "run") as run,
+                mock.patch.object(outpaint_video, "replace_with_retry") as replace,
+            ):
+                probe.side_effect = [
+                    {"width": 1280, "height": 720, "frames": 8},
+                    {"width": 1280, "height": 704, "frames": 8},
+                ]
+                previous.write_bytes(b"placeholder")
+
+                result = outpaint_video.inject_overlap_context("ffmpeg", chunk, previous, 3, 24.0, False)
+
+            self.assertNotEqual(result, chunk)
+            filter_text = run.call_args.args[0][7]
+            self.assertIn("scale=1280:720:flags=lanczos", filter_text)
+            self.assertIn("trim=start_frame=4:end_frame=8", filter_text)
+            replace.assert_called_once()
 
     def test_command_construction_for_outpaint_uses_overview_source(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

@@ -25,12 +25,22 @@ function outpaintChunkCard(row) {
         </div>
         <div class="chunk-frame-row">
           <label>Outpainted frames</label>
-          ${row.raw_exists ? chunkStillStrip(row, 'raw', false) : missingChunkStillStrip('Outpainted chunk not present')}
+          <div id="chunkRawFrames_${idx}" data-raw-signature="${esc(outpaintRawSignature(row))}">
+            ${outpaintRawFramesHtml(row)}
+          </div>
         </div>
       </div>
       ${outpaintChunkPrompt(row)}
     </article>
   `;
+}
+
+function outpaintRawSignature(row) {
+  return `${row.raw_path || ''}|${row.raw_exists ? '1' : '0'}|${row.raw_mtime || 0}|${row.raw_start_preview || ''}|${row.raw_middle_preview || ''}|${row.raw_end_preview || ''}`;
+}
+
+function outpaintRawFramesHtml(row) {
+  return row.raw_exists ? chunkStillStrip(row, 'raw', false) : missingChunkStillStrip('Outpainted chunk not present');
 }
 
 function outpaintChunkSummary(row) {
@@ -130,6 +140,19 @@ function updateOutpaintGuidePreviews() {
     if (caption) caption.textContent = title;
     const status = document.getElementById(`chunkGuideStatus_${idx}`);
     if (status) status.textContent = outpaintGuideStatus(row);
+  }
+}
+
+function updateOutpaintRawPreviews() {
+  if (active !== 'outpaint') return;
+  const rows = (state.outpaint_chunks && state.outpaint_chunks.rows) || [];
+  for (const row of rows) {
+    const container = document.getElementById(`chunkRawFrames_${row.index}`);
+    if (!container) continue;
+    const signature = outpaintRawSignature(row);
+    if (container.dataset.rawSignature === signature) continue;
+    container.innerHTML = outpaintRawFramesHtml(row);
+    container.dataset.rawSignature = signature;
   }
 }
 
@@ -234,7 +257,8 @@ function chunkStillStrip(row, prefix, canAnchor) {
 
 function chunkStillFigure(row, path, label, position, canAnchor) {
   const shownPath = path;
-  const src = media(shownPath);
+  const cacheBust = shownPath.includes('_raw_') && row.raw_mtime ? '&t=' + row.raw_mtime : '';
+  const src = media(shownPath) + cacheBust;
   const title = `${label} frame`;
   return `
     <figure class="still-figure">

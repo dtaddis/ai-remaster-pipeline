@@ -349,7 +349,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 19,
+        "version": 20,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -376,6 +376,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "outpaint_lora": args.outpaint_lora,
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
+        "overlap_context_from_previous_chunk": True,
         "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
         "chunk_manifest_fingerprint": file_fingerprint(chunk_manifest) if chunk_manifest and chunk_manifest.exists() else None,
     }
@@ -589,6 +590,80 @@ def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, seconds: st
     return target
 
 
+def overlap_context_before_anchor(overlap_frames: int, anchor_seconds: str, fps: float, frame_count: int, fallback_position: str = "middle") -> int:
+    overlap_frames = max(0, min(int(overlap_frames), max(0, frame_count - 1)))
+    if overlap_frames <= 0:
+        return 0
+    anchor_index = guide_frame_index(anchor_seconds, fps, frame_count, fallback_position)
+    return max(0, min(overlap_frames, anchor_index)) if anchor_index < overlap_frames else overlap_frames
+
+
+def inject_overlap_context(ffmpeg: str, chunk_path: Path, previous_raw: Path | None, overlap_frames: int, fps: float, force: bool) -> Path:
+    if not previous_raw or overlap_frames <= 0 or not previous_raw.exists():
+        return chunk_path
+
+    chunk_info = probe_video(chunk_path)
+    previous_info = probe_video(previous_raw)
+    chunk_frames = int(chunk_info["frames"] or 0)
+    previous_frames = int(previous_info["frames"] or 0)
+    if chunk_frames <= 2 or previous_frames <= 0:
+        return chunk_path
+
+    context_frames = max(1, min(int(overlap_frames), previous_frames, chunk_frames - 2))
+    target = chunk_path.with_name(f"{chunk_path.stem}_ctx_{context_frames:03d}_{safe_stem(previous_raw.name)}{chunk_path.suffix}")
+    if target.exists() and not force and target.stat().st_mtime_ns >= max(chunk_path.stat().st_mtime_ns, previous_raw.stat().st_mtime_ns):
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    previous_start = max(0, previous_frames - context_frames)
+    width = int(chunk_info["width"])
+    height = int(chunk_info["height"])
+    rest_start = min(chunk_frames - 1, context_frames + 1)
+    filter_text = (
+        f"[1:v]trim=start_frame={previous_start}:end_frame={previous_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},"
+        f"scale={width}:{height}:flags=lanczos,setsar=1[ctx];"
+        f"[0:v]trim=start_frame={rest_start}:end_frame={chunk_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[rest];"
+        f"[0:v]trim=start_frame={chunk_frames - 1}:end_frame={chunk_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[tail];"
+        f"[ctx][rest][tail]concat=n=3:v=1:a=0,trim=end_frame={chunk_frames},format=yuv420p,setsar=1[v]"
+    )
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(chunk_path),
+        "-i",
+        str(previous_raw),
+        "-filter_complex",
+        filter_text,
+        "-map",
+        "[v]",
+        "-frames:v",
+        str(chunk_frames),
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "12",
+        "-preset",
+        "veryfast",
+        str(partial),
+    ]
+    print(
+        f"Feeding {context_frames} already-outpainted overlap frame(s) into next chunk "
+        f"and skipping the first new frame after overlap: {previous_raw.name} "
+        f"({int(previous_info['width'])}x{int(previous_info['height'])}) -> {chunk_path.name} ({width}x{height})",
+        flush=True,
+    )
+    subprocess.run(command, check=True)
+    replace_with_retry(partial, target, f"Context-conditioned prepared chunk {target.name}")
+    return target
+
+
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
     vf = f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
@@ -792,11 +867,14 @@ def main() -> int:
                     flush=True,
                 )
             raw_chunks: list[Path] = []
-            for chunk_index, start_frame, end_frame in ranges:
+            for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), args.force)
+                previous_end_frame = ranges[range_index - 1][2] if range_index > 0 else start_frame
+                previous_raw = raw_chunks[-1] if raw_chunks and start_frame < previous_end_frame else None
+                overlap_context_frames = max(0, previous_end_frame - start_frame) if range_index > 0 else 0
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
@@ -806,13 +884,29 @@ def main() -> int:
                 if anchor_image and not anchor_image.exists():
                     print(f"Warning: chunk {chunk_index + 1} anchor image was not found and will be ignored: {anchor_image}", flush=True)
                     anchor_image = None
-                chunk_conditioning = chunk_prepared
                 anchor_seconds = chunk_row.get("anchor_seconds", "")
+                anchor_position = chunk_row.get("anchor_position", "middle") or "middle"
+                if anchor_image and overlap_context_frames > 0:
+                    frame_count = int(probe_video(chunk_prepared)["frames"] or 1)
+                    adjusted_overlap = overlap_context_before_anchor(overlap_context_frames, anchor_seconds, float(prepared_info["fps"] or 24.0), frame_count, anchor_position)
+                    if adjusted_overlap < overlap_context_frames:
+                        print(
+                            f"Guide frame falls inside chunk {chunk_index + 1} overlap; using {adjusted_overlap} prior overlap frame(s) before the guide and leaving later overlap frames to the guide.",
+                            flush=True,
+                        )
+                    overlap_context_frames = adjusted_overlap
+                chunk_conditioning = inject_overlap_context(
+                    ffmpeg,
+                    chunk_prepared,
+                    previous_raw,
+                    overlap_context_frames,
+                    float(prepared_info["fps"] or 24.0),
+                    args.force,
+                )
                 if anchor_image:
-                    anchor_position = chunk_row.get("anchor_position", "middle") or "middle"
                     chunk_conditioning = inject_anchor_frame(
                         ffmpeg,
-                        chunk_prepared,
+                        chunk_conditioning,
                         anchor_image,
                         anchor_seconds,
                         float(prepared_info["fps"] or 24.0),

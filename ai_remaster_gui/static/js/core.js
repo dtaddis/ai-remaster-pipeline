@@ -43,6 +43,7 @@ async function refresh(force = false) {
     && currentOutpaintVisualSignature !== lastOutpaintVisualSignature;
   if (!force && active === 'outpaint' && document.getElementById('app')?.children.length) {
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateRunLogs();
     updateOutpaintRuntimeControls();
     lastRenderSignature = sig;
@@ -52,6 +53,7 @@ async function refresh(force = false) {
 
   if (!force && (editing || (shouldPreserveInteractiveDom(mediaActive) && !outpaintVisualChanged) || sig === lastRenderSignature)) {
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateRunLogs();
     if (active === 'outpaint') updateOutpaintRuntimeControls();
     lastRenderSignature = sig;

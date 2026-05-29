@@ -37,6 +37,7 @@ async function saveOutpaintChunk(index) {
   if (active === 'outpaint' && result.state) {
     state = result.state;
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateOutpaintRuntimeControls();
     updateRunLogs();
     lastRenderSignature = renderSignature();
@@ -238,6 +239,7 @@ async function chooseOutpaintAnchor(index, position) {
   if (active === 'outpaint' && result.state) {
     state = result.state;
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateOutpaintRuntimeControls();
     updateRunLogs();
     lastRenderSignature = renderSignature();
@@ -256,6 +258,7 @@ async function clearOutpaintAnchor(index) {
   if (active === 'outpaint' && result.state) {
     state = result.state;
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateOutpaintRuntimeControls();
     updateRunLogs();
     lastRenderSignature = renderSignature();
@@ -275,6 +278,7 @@ async function saveOutpaintGuideTime(index) {
   if (active === 'outpaint' && result.state) {
     state = result.state;
     updateOutpaintGuidePreviews();
+    updateOutpaintRawPreviews();
     updateOutpaintRuntimeControls();
     updateRunLogs();
     lastRenderSignature = renderSignature();
