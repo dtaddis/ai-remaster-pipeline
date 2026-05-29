@@ -142,13 +142,64 @@ def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
     return f"arp_outpaint/{target.name}"
 
 
-def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path) -> str:
-    """Copy a guide image (PNG/JPEG still) to ComfyUI's input folder."""
+def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path, canvas_width: int = 0, canvas_height: int = 0) -> str:
+    """Copy a guide image to ComfyUI's input folder, normalised to the LTX canvas size.
+
+    When canvas dimensions are provided the guide is resized to exactly (canvas_width × canvas_height)
+    before it reaches LTXVImgToVideoConditionOnly.  This avoids the zoom-out artefact that occurs
+    when ResizeImageMaskNode center-crops a mismatched image.
+
+    For small aspect-ratio differences (≤ 10%) — typical of Qwen output — the image is stretched
+    directly to canvas size, reversing Qwen's uniform patch-quantisation compression with only a
+    ~2% per-axis residual error, which is imperceptible to both humans and LTX's i2v conditioning.
+
+    For large AR differences (> 10%) — e.g. a manually-uploaded portrait or square image — the
+    image is letterboxed with black padding instead, so content is never badly distorted.
+    """
+    from PIL import Image as PILImage
+
     target_dir = comfy_dir / "input" / "arp_outpaint"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"guide_{guide.stem}{guide.suffix.lower()}"
-    if not target.exists() or guide.stat().st_mtime_ns != target.stat().st_mtime_ns or guide.stat().st_size != target.stat().st_size:
+
+    if canvas_width > 0 and canvas_height > 0:
+        target = target_dir / f"guide_{guide.stem}_{canvas_width}x{canvas_height}.png"
+    else:
+        target = target_dir / f"guide_{guide.stem}{guide.suffix.lower()}"
+
+    try:
+        if target.exists() and target.stat().st_mtime_ns >= guide.stat().st_mtime_ns and target.stat().st_size > 0:
+            return f"arp_outpaint/{target.name}"
+    except OSError:
+        pass
+
+    if canvas_width > 0 and canvas_height > 0:
+        with PILImage.open(guide) as img:
+            img_w, img_h = img.size
+            if img_w == canvas_width and img_h == canvas_height:
+                shutil.copy2(guide, target)
+            else:
+                # Letterbox: scale to fit within the canvas preserving aspect ratio,
+                # then pad the remainder with pure black.  This avoids geometric distortion
+                # in the guide content — any black bands are treated as outpainting margins
+                # by LTX and filled naturally.  Stretching to fill causes visible y-squish
+                # in the first few generated frames, so we never do that.
+                scale = min(canvas_width / img_w, canvas_height / img_h)
+                new_w = max(1, int(img_w * scale))
+                new_h = max(1, int(img_h * scale))
+                resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                resized = img.convert("RGB").resize((new_w, new_h), resampling)
+                out = PILImage.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+                out.paste(resized, ((canvas_width - new_w) // 2, (canvas_height - new_h) // 2))
+                out.save(target, format="PNG")
+                if new_w != canvas_width or new_h != canvas_height:
+                    print(
+                        f"Guide letterboxed {img_w}x{img_h} -> {new_w}x{new_h} "
+                        f"(padded {canvas_width - new_w}px h, {canvas_height - new_h}px v to {canvas_width}x{canvas_height})",
+                        flush=True,
+                    )
+    else:
         shutil.copy2(guide, target)
+
     return f"arp_outpaint/{target.name}"
 
 
@@ -307,8 +358,10 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # When a guide image is provided, enable i2v conditioning so LTX targets the guide appearance
     # at the start of the chunk.  When there is no guide, leave the bypass True so i2v has no
     # effect and LTX generates freely.
+    canvas_width = int(prepared_info["width"])
+    canvas_height = int(prepared_info["height"])
     if guide_image and guide_image.exists():
-        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir)
+        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
         # Node 5019 "bypass_i2v": False = run LTXVImgToVideoConditionOnly, True = bypass it.
         try:
             bypass_node = node_by_id(workflow, "5019")
@@ -784,6 +837,7 @@ def main() -> int:
                     flush=True,
                 )
             raw_chunks: list[Path] = []
+            effective_ranges: list[tuple[int, int, int]] = []
             for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
@@ -816,12 +870,23 @@ def main() -> int:
                 chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, auto_guide)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
-                        raise FileNotFoundError(f"Cannot regenerate only chunk {args.only_chunk}; chunk {chunk_index} is missing: {chunk_raw}")
+                        if chunk_index < args.only_chunk:
+                            # A chunk before the target is missing — we can't auto-guide or stitch correctly.
+                            raise FileNotFoundError(
+                                f"Cannot regenerate chunk {args.only_chunk + 1}; "
+                                f"earlier chunk {chunk_index + 1} is missing: {chunk_raw}"
+                            )
+                        # A chunk after the target doesn't exist yet — skip it.
+                        # Stitching will only cover frames up to the last available chunk.
+                        print(f"Chunk {chunk_index + 1} not yet generated; stitching will stop at chunk {args.only_chunk + 1}.", flush=True)
+                        continue
                     raw_chunks.append(chunk_raw)
+                    effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
                 if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_prepared):
                     print(f"Reuse raw Comfy chunk: {chunk_raw}", flush=True)
                     raw_chunks.append(chunk_raw)
+                    effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
                 workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
                 chunk_prefix = f"{output_prefix}_chunk_{chunk_index:04d}"
@@ -847,9 +912,10 @@ def main() -> int:
                 write_signature(chunk_raw, chunk_sig)
                 print(f"Wrote raw Comfy chunk: {chunk_raw}", flush=True)
                 raw_chunks.append(chunk_raw)
+                effective_ranges.append((chunk_index, start_frame, end_frame))
             restitched = True
             try:
-                stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
+                stitch_chunks(ffmpeg, raw_chunks, effective_ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
             except PermissionError as exc:
                 if args.only_chunk is None:
                     raise
