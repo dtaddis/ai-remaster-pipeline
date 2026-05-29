@@ -411,7 +411,7 @@ function Invoke-PythonLauncher {
     if (-not $script:ResolvedPythonLauncher) {
         $script:ResolvedPythonLauncher = Resolve-PythonLauncher
     }
-    Invoke-External -Command ($script:ResolvedPythonLauncher + $Arguments) -WorkingDirectory $WorkingDirectory
+    Invoke-External -Command (@($script:ResolvedPythonLauncher) + $Arguments) -WorkingDirectory $WorkingDirectory
 }
 
 function Ensure-Directory {
