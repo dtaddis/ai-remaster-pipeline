@@ -229,10 +229,9 @@ async function exportMedia(path) {
   if (result.saved) alert('Saved:\n' + result.saved);
 }
 
-async function chooseOutpaintAnchor(index, position) {
+async function chooseOutpaintAnchor(index) {
   const snap = captureScrollState();
-  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
-  const result = await postJson('/api/outpaint-anchor', { index, seconds });
+  const result = await postJson('/api/outpaint-anchor', { index });
   if (!result.ok) return alert(result.error || 'Could not install guide frame');
   if (!result.selected) return;
 
@@ -270,29 +269,9 @@ async function clearOutpaintAnchor(index) {
   await redrawWithState(result.state, snap, true);
 }
 
-async function saveOutpaintGuideTime(index) {
-  const snap = captureScrollState();
-  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
-  const result = await postJson('/api/outpaint-guide-time', { index, seconds });
-  if (!result.ok) return alert(result.error || 'Could not update guide source frame');
-  if (active === 'outpaint' && result.state) {
-    state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
-    lastRenderSignature = renderSignature();
-    lastOutpaintVisualSignature = outpaintVisualSignature();
-    restoreScrollState(snap);
-    return;
-  }
-
-  await redrawWithState(result.state, snap, true);
-}
-
 const DEFAULT_ANCHOR_PROMPT = 'Fill the black outpaint margins with a natural continuation of this black-and-white film frame. Preserve the centre/original frame area, composition, lighting, paper, clothing, and background. If hands or fingers extend into the new margins, make them anatomically natural with five fingers and normal joints. Do not colorize. Do not add text, captions, logos, or unrelated new objects.';
 
-function openAnchorPromptModal(index, position) {
+function openAnchorPromptModal(index) {
   let modal = document.getElementById('anchorPromptModal');
   if (!modal) {
     modal = document.createElement('div');
@@ -305,7 +284,7 @@ function openAnchorPromptModal(index, position) {
           <strong>Generate Guide Frame</strong>
           <button type="button" onclick="closeAnchorPromptModal()">Close</button>
         </div>
-        <p class="shot-empty">Qwen will turn this expanded still into a guide image for LTX. The default prompt asks it to replace the black outpaint margins while preserving the original centre frame.</p>
+        <p class="shot-empty">Qwen will colorize the chunk's start frame to use as a guide. The guide is applied at the start of the chunk via LTX i2v conditioning.</p>
         <label>Qwen edit prompt</label>
         <textarea id="anchorPromptText"></textarea>
         <div class="actions">
@@ -318,7 +297,6 @@ function openAnchorPromptModal(index, position) {
   }
 
   modal.dataset.index = String(index);
-  modal.dataset.position = position;
   document.getElementById('anchorPromptText').value = DEFAULT_ANCHOR_PROMPT;
   modal.classList.remove('hidden');
 }
@@ -332,11 +310,10 @@ async function submitAnchorPrompt() {
   const modal = document.getElementById('anchorPromptModal');
   if (!modal) return;
   const index = Number(modal.dataset.index || 0);
-  const seconds = document.getElementById(`chunkGuideSeconds_${index}`)?.value || '0';
   const prompt = document.getElementById('anchorPromptText')?.value || DEFAULT_ANCHOR_PROMPT;
   closeAnchorPromptModal();
 
-  const result = await postJson('/api/outpaint-anchor-generate', { index, seconds, prompt });
+  const result = await postJson('/api/outpaint-anchor-generate', { index, prompt });
   if (!result.ok) return alert(result.error || result.message || 'Could not generate guide frame');
   if (result.state) {
     state = result.state;
