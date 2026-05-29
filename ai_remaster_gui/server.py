@@ -46,6 +46,7 @@ from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, re
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 PROJECT_SCHEMA_VERSION = 1
+MODEL_SIZE_MULTIPLE = 32
 
 
 def app_version() -> str:
@@ -1210,6 +1211,18 @@ def outpaint_size_for_source(source_text: str, aspect: str, target_height_text: 
     return even_int(height * parse_aspect(aspect)), height
 
 
+def model_safe_int(value: int, multiple: int = MODEL_SIZE_MULTIPLE) -> int:
+    value = max(multiple, int(value))
+    lower = max(multiple, (value // multiple) * multiple)
+    upper = lower if lower == value else lower + multiple
+    return lower if value - lower <= upper - value else upper
+
+
+def outpaint_work_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
+    width, height = outpaint_size_for_source(source_text, aspect, target_height_text)
+    return model_safe_int(width), model_safe_int(height)
+
+
 def outpaint_crop_slug(values: dict[str, str]) -> str:
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     return "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1218,7 +1231,7 @@ def outpaint_crop_slug(values: dict[str, str]) -> str:
 def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}"
 
 
@@ -1227,14 +1240,14 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
         return ""
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
 
 
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
 
 
@@ -1265,8 +1278,10 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         str(values.get("crop_top", "0") or "0"),
         "--crop-bottom",
         str(values.get("crop_bottom", "0") or "0"),
+        "--target-width",
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
         "--target-height",
-        str(resolved_outpaint_height(source_text, values.get("target_height", "720"))),
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
     ]
     APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
     APP.log.append("> " + " ".join(cmd))

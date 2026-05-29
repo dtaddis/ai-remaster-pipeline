@@ -21,6 +21,7 @@ from prepare_outpaint_input import even, parse_aspect, probe_video
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 RECOMMENDED_OVERLAP_FRAMES = 8
+MODEL_SIZE_MULTIPLE = 32
 OUTPAINT_REQUIRED_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
@@ -62,6 +63,18 @@ def target_size(source: Path, aspect: str, target_height: int | None) -> tuple[i
     return width, height
 
 
+def model_safe(value: int, multiple: int = MODEL_SIZE_MULTIPLE) -> int:
+    value = max(multiple, int(value))
+    lower = max(multiple, (value // multiple) * multiple)
+    upper = lower if lower == value else lower + multiple
+    return lower if value - lower <= upper - value else upper
+
+
+def model_safe_size(source: Path, aspect: str, target_height: int | None) -> tuple[int, int]:
+    width, height = target_size(source, aspect, target_height)
+    return model_safe(width), model_safe(height)
+
+
 def crop_slug(args: Any) -> str:
     values = [int(getattr(args, key, 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     return "" if not any(values) else f"_crop{values[0]}-{values[1]}-{values[2]}-{values[3]}"
@@ -73,14 +86,12 @@ def default_output(source: Path, aspect: str, target_height: int | None, args: A
 
 
 def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    width, height = target_size(source, aspect, target_height)
+    width, height = model_safe_size(source, aspect, target_height)
     return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop_slug(args) if args else ''}_raw_comfy.mp4"
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    info = probe_video(source)
-    height = even(target_height or info["height"])
-    width = even(height * parse_aspect(aspect))
+    width, height = model_safe_size(source, aspect, target_height)
     prepared = default_prepared_output(source, width, height)
     return prepared.with_name(prepared.stem + (crop_slug(args) if args else "") + prepared.suffix)
 
@@ -349,13 +360,15 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 20,
+        "version": 21,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
         "workflow": root_relative(workflow_path),
         "workflow_fingerprint": file_fingerprint(workflow_path),
         "target_aspect": args.target_aspect,
+        "delivery_target_height": args.target_height,
+        "model_size_multiple": MODEL_SIZE_MULTIPLE,
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
         "negative_suffix": negative_suffix,
@@ -619,10 +632,18 @@ def inject_overlap_context(ffmpeg: str, chunk_path: Path, previous_raw: Path | N
     previous_start = max(0, previous_frames - context_frames)
     width = int(chunk_info["width"])
     height = int(chunk_info["height"])
+    previous_width = int(previous_info["width"])
+    previous_height = int(previous_info["height"])
+    if previous_width != width or previous_height != height:
+        raise RuntimeError(
+            f"Cannot feed overlap from {previous_raw.name}: previous chunk is {previous_width}x{previous_height}, "
+            f"but the next prepared chunk is {width}x{height}. The LTX working canvas should stay at one "
+            f"{MODEL_SIZE_MULTIPLE}px-safe size for the whole outpaint run."
+        )
     rest_start = min(chunk_frames - 1, context_frames + 1)
     filter_text = (
         f"[1:v]trim=start_frame={previous_start}:end_frame={previous_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},"
-        f"scale={width}:{height}:flags=lanczos,setsar=1[ctx];"
+        f"setsar=1[ctx];"
         f"[0:v]trim=start_frame={rest_start}:end_frame={chunk_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[rest];"
         f"[0:v]trim=start_frame={chunk_frames - 1}:end_frame={chunk_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[tail];"
         f"[ctx][rest][tail]concat=n=3:v=1:a=0,trim=end_frame={chunk_frames},format=yuv420p,setsar=1[v]"
@@ -656,7 +677,7 @@ def inject_overlap_context(ffmpeg: str, chunk_path: Path, previous_raw: Path | N
     print(
         f"Feeding {context_frames} already-outpainted overlap frame(s) into next chunk "
         f"and skipping the first new frame after overlap: {previous_raw.name} "
-        f"({int(previous_info['width'])}x{int(previous_info['height'])}) -> {chunk_path.name} ({width}x{height})",
+        f"({previous_width}x{previous_height}) -> {chunk_path.name} ({width}x{height})",
         flush=True,
     )
     subprocess.run(command, check=True)
@@ -800,6 +821,8 @@ def main() -> int:
 
     output = resolve_path(args.output) if args.output else default_output(source, args.target_aspect, args.target_height, args)
     raw_output = resolve_path(args.raw_output) if args.raw_output else default_raw_output(source, args.target_aspect, args.target_height, args)
+    delivery_width, delivery_height = target_size(source, args.target_aspect, args.target_height)
+    work_width, work_height = model_safe_size(source, args.target_aspect, args.target_height)
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
@@ -833,22 +856,27 @@ def main() -> int:
         "--crop-bottom",
         str(args.crop_bottom),
     ]
-    if args.target_height:
-        prepare_command += ["--target-height", str(args.target_height)]
+    prepare_command += ["--target-height", str(work_height)]
+    prepare_command += ["--target-width", str(work_width)]
     if args.force:
         prepare_command.append("--force")
     if args.dry_run:
         prepare_command.append("--dry-run")
-    width, height = target_size(source, args.target_aspect, args.target_height)
-    print(f"Preparing expanded outpaint canvas: {width}x{height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)
+    if (work_width, work_height) != (delivery_width, delivery_height):
+        print(
+            f"LTX working canvas rounded to {work_width}x{work_height} "
+            f"from requested delivery {delivery_width}x{delivery_height}.",
+            flush=True,
+        )
+    print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)
     run_command(prepare_command, False)
 
-    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}"
+    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
-        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}{crop_slug(args)}"
-        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, width, height, args)
+        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}{crop_slug(args)}"
+        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, work_width, work_height, args)
         prepared_info = probe_video(prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
         ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
@@ -975,6 +1003,10 @@ def main() -> int:
         str(args.black_lift),
         "--gamma",
         str(args.gamma),
+        "--target-width",
+        str(delivery_width),
+        "--target-height",
+        str(delivery_height),
     ]
     if args.force:
         finalize_command.append("--force")

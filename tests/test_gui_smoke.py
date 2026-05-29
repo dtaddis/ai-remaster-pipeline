@@ -54,6 +54,25 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_1280x720_outpainted.mp4")
 
+    def test_outpaint_ltx_working_paths_use_model_safe_size(self) -> None:
+        app.APP.settings.setdefault("outpaint", {}).update(
+            {
+                "target_aspect": "16:9",
+                "target_height": "720",
+                "crop_left": "0",
+                "crop_right": "0",
+                "crop_top": "0",
+                "crop_bottom": "0",
+            }
+        )
+
+        prepared = app.outpaint_prepared_for("input/My Source.mp4", app.APP.settings["outpaint"])
+        manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", app.APP.settings["outpaint"])
+
+        self.assertEqual(prepared.name, "My Source_1280x704_lifted.mp4")
+        self.assertTrue(manifest.endswith("My_Source_16x9_1280x704_chunks.csv"))
+        self.assertEqual(app.outpaint_output_for("input/My Source.mp4", "16:9", "720"), "intermediate/outpainted/My_Source_16x9_1280x720_outpainted.mp4")
+
     def test_source_height_outpaint_option_uses_video_height(self) -> None:
         with mock.patch.object(server, "video_metrics", return_value={"height": 480}):
             output = app.outpaint_output_for("input/My Source.mp4", "16:9", "source")
@@ -197,7 +216,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "1.0", 24.0, 100), 8)
         self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "0", 24.0, 100), 0)
 
-    def test_outpaint_overlap_context_scales_height_and_skips_first_new_frame(self) -> None:
+    def test_outpaint_overlap_context_rejects_mixed_geometry(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
             chunk = folder / "chunk.mp4"
@@ -214,11 +233,34 @@ class GuiSmokeTests(unittest.TestCase):
                 ]
                 previous.write_bytes(b"placeholder")
 
+                with self.assertRaisesRegex(RuntimeError, "working canvas should stay"):
+                    outpaint_video.inject_overlap_context("ffmpeg", chunk, previous, 3, 24.0, False)
+
+            run.assert_not_called()
+            replace.assert_not_called()
+
+    def test_outpaint_overlap_context_skips_first_new_frame_on_matching_geometry(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            chunk = folder / "chunk.mp4"
+            previous = folder / "previous.mp4"
+
+            with (
+                mock.patch.object(outpaint_video, "probe_video") as probe,
+                mock.patch.object(outpaint_video.subprocess, "run") as run,
+                mock.patch.object(outpaint_video, "replace_with_retry") as replace,
+            ):
+                probe.side_effect = [
+                    {"width": 1280, "height": 704, "frames": 8},
+                    {"width": 1280, "height": 704, "frames": 8},
+                ]
+                previous.write_bytes(b"placeholder")
+
                 result = outpaint_video.inject_overlap_context("ffmpeg", chunk, previous, 3, 24.0, False)
 
             self.assertNotEqual(result, chunk)
             filter_text = run.call_args.args[0][7]
-            self.assertIn("scale=1280:720:flags=lanczos", filter_text)
+            self.assertNotIn("scale=1280:720", filter_text)
             self.assertIn("trim=start_frame=4:end_frame=8", filter_text)
             replace.assert_called_once()
 

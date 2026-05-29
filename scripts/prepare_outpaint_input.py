@@ -130,6 +130,7 @@ def build_parser():
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
     parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
     parser.add_argument('--target-aspect', default='16:9')
+    parser.add_argument('--target-width', type=int, help='Output width. Defaults to target-height * target-aspect.')
     parser.add_argument('--target-height', type=int, help='Output height. Defaults to the source height.')
     parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
@@ -153,7 +154,7 @@ def main():
         raise FileNotFoundError(f'Source video not found: {source}')
     info = probe_video(source)
     target_height = even(args.target_height or info['height'])
-    target_width = even(target_height * parse_aspect(args.target_aspect))
+    target_width = even(args.target_width or (target_height * parse_aspect(args.target_aspect)))
     output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height)
     sig = signature(args, source, info, target_width, target_height)
     if not args.force and resumable_output(output, sig, video_like=source, width=target_width, height=target_height):
