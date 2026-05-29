@@ -107,6 +107,8 @@ def load_settings() -> dict[str, dict[str, str]]:
     source = newest(ROOT / "input", VIDEO_EXTS)
     if source and not defaults["global"].get("source"):
         defaults["global"]["source"] = rel(source)
+    if not defaults["global"].get("source"):
+        defaults["global"]["expand_outpaint"] = "true"
     if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
         defaults["recomp"]["colorized_video"] = ""
     defaults["colour"].setdefault("method", "deepexemplar")
@@ -1034,6 +1036,8 @@ def read_project_file(path: Path) -> dict[str, dict[str, str]]:
     for stage, values in settings.items():
         if stage in loaded and isinstance(values, dict):
             loaded[stage].update({str(key): str(value) for key, value in values.items()})
+    if not loaded.get("global", {}).get("source"):
+        loaded.setdefault("global", {})["expand_outpaint"] = "true"
     return loaded
 
 
