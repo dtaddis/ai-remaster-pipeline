@@ -236,6 +236,15 @@ function Invoke-CapturedProcess {
     }
 }
 
+function Invoke-PythonVersionProbe {
+    param([string[]]$Command)
+    $display = $Command -join ' '
+    $executable = Resolve-CommandExecutable $Command[0] $display
+    $probeScript = Join-Path $Root 'scripts\python_version_probe.py'
+    $arguments = (Get-CommandTail $Command) + @($probeScript)
+    return Invoke-CapturedProcess -FilePath $executable -Arguments $arguments
+}
+
 function Add-PythonLauncherCandidate {
     param(
         [System.Collections.ArrayList]$Candidates,
@@ -293,17 +302,14 @@ function Expand-PythonLauncherCandidates {
 function Get-PythonLauncherCheck {
     param([string[]]$Command)
     $display = $Command -join ' '
-    $executable = $null
     try {
-        $executable = Resolve-CommandExecutable $Command[0] $display
+        $probe = Invoke-PythonVersionProbe -Command $Command
     } catch {
         return [pscustomobject]@{
             Success = $false
             Reason = $_.Exception.Message
         }
     }
-    $arguments = (Get-CommandTail $Command) + @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    $probe = Invoke-CapturedProcess -FilePath $executable -Arguments $arguments
     if ($probe.ExitCode -ne 0) {
         $detail = (($probe.Stdout, $probe.Stderr) -join "`n").Trim()
         if ([string]::IsNullOrWhiteSpace($detail)) {
@@ -802,7 +808,6 @@ Invoke-Step 'Write local ARP configuration' {
 Write-Host "`nInstall complete." -ForegroundColor Green
 Write-Host "ComfyUI: $ComfyDir"
 Write-Host "Python environment: $PipelinePython"
-Write-Host "Start ComfyUI with:"
-Write-Host "  cd `"$ComfyDir`""
-Write-Host "  `"$PipelinePython`" main.py --listen 127.0.0.1 --port 8188"
+Write-Host "Start ARP with:"
+Write-Host "  launch_gui.bat"
 

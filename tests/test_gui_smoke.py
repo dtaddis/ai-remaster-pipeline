@@ -341,6 +341,23 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(app.APP.settings["shots"]["outpainted_video"], "input/example.mp4")
         self.assertIn("input/example.mp4", command)
 
+    def test_blank_project_defaults_outpainting_visible(self) -> None:
+        with mock.patch.object(app, "SETTINGS_FILE", Path("missing-settings.json")), mock.patch.object(app, "newest", return_value=None):
+            settings = app.load_settings()
+
+        self.assertEqual(settings["global"]["expand_outpaint"], "true")
+
+    def test_blank_loaded_project_defaults_outpainting_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            path = Path(tmp_text) / "blank.arpp"
+            payload = app.project_payload(app.APP.settings)
+            payload["settings"] = {"global": {"source": "", "expand_outpaint": "false", "colorize": "true"}}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded = app.read_project_file(path)
+
+        self.assertEqual(loaded["global"]["expand_outpaint"], "true")
+
     def test_section_preview_times_are_relative_to_trim_start(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
 
