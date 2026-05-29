@@ -21,6 +21,7 @@ from prepare_outpaint_input import even, parse_aspect, probe_video
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 RECOMMENDED_OVERLAP_FRAMES = 8
+MODEL_SIZE_MULTIPLE = 32
 OUTPAINT_REQUIRED_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
@@ -62,6 +63,18 @@ def target_size(source: Path, aspect: str, target_height: int | None) -> tuple[i
     return width, height
 
 
+def model_safe(value: int, multiple: int = MODEL_SIZE_MULTIPLE) -> int:
+    value = max(multiple, int(value))
+    lower = max(multiple, (value // multiple) * multiple)
+    upper = lower if lower == value else lower + multiple
+    return lower if value - lower <= upper - value else upper
+
+
+def model_safe_size(source: Path, aspect: str, target_height: int | None) -> tuple[int, int]:
+    width, height = target_size(source, aspect, target_height)
+    return model_safe(width), model_safe(height)
+
+
 def crop_slug(args: Any) -> str:
     values = [int(getattr(args, key, 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     return "" if not any(values) else f"_crop{values[0]}-{values[1]}-{values[2]}-{values[3]}"
@@ -73,14 +86,12 @@ def default_output(source: Path, aspect: str, target_height: int | None, args: A
 
 
 def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    width, height = target_size(source, aspect, target_height)
+    width, height = model_safe_size(source, aspect, target_height)
     return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop_slug(args) if args else ''}_raw_comfy.mp4"
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    info = probe_video(source)
-    height = even(target_height or info["height"])
-    width = even(height * parse_aspect(aspect))
+    width, height = model_safe_size(source, aspect, target_height)
     prepared = default_prepared_output(source, width, height)
     return prepared.with_name(prepared.stem + (crop_slug(args) if args else "") + prepared.suffix)
 
@@ -131,13 +142,84 @@ def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
     return f"arp_outpaint/{target.name}"
 
 
-def copy_anchor_frame_to_comfy_input(anchor: Path, comfy_dir: Path) -> str:
+def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path, canvas_width: int = 0, canvas_height: int = 0) -> str:
+    """Copy a guide image to ComfyUI's input folder, normalised to the LTX canvas size.
+
+    When canvas dimensions are provided the guide is resized to exactly (canvas_width × canvas_height)
+    before it reaches LTXVImgToVideoConditionOnly.  This avoids the zoom-out artefact that occurs
+    when ResizeImageMaskNode center-crops a mismatched image.
+
+    For small aspect-ratio differences (≤ 10%) — typical of Qwen output — the image is stretched
+    directly to canvas size, reversing Qwen's uniform patch-quantisation compression with only a
+    ~2% per-axis residual error, which is imperceptible to both humans and LTX's i2v conditioning.
+
+    For large AR differences (> 10%) — e.g. a manually-uploaded portrait or square image — the
+    image is letterboxed with black padding instead, so content is never badly distorted.
+    """
+    from PIL import Image as PILImage
+
     target_dir = comfy_dir / "input" / "arp_outpaint"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"anchor_{anchor.stem}{anchor.suffix.lower()}"
-    if not target.exists() or anchor.stat().st_mtime_ns != target.stat().st_mtime_ns or anchor.stat().st_size != target.stat().st_size:
-        shutil.copy2(anchor, target)
+
+    if canvas_width > 0 and canvas_height > 0:
+        target = target_dir / f"guide_{guide.stem}_{canvas_width}x{canvas_height}.png"
+    else:
+        target = target_dir / f"guide_{guide.stem}{guide.suffix.lower()}"
+
+    try:
+        if target.exists() and target.stat().st_mtime_ns >= guide.stat().st_mtime_ns and target.stat().st_size > 0:
+            return f"arp_outpaint/{target.name}"
+    except OSError:
+        pass
+
+    if canvas_width > 0 and canvas_height > 0:
+        with PILImage.open(guide) as img:
+            img_w, img_h = img.size
+            if img_w == canvas_width and img_h == canvas_height:
+                shutil.copy2(guide, target)
+            else:
+                # Letterbox: scale to fit within the canvas preserving aspect ratio,
+                # then pad the remainder with pure black.  This avoids geometric distortion
+                # in the guide content — any black bands are treated as outpainting margins
+                # by LTX and filled naturally.  Stretching to fill causes visible y-squish
+                # in the first few generated frames, so we never do that.
+                scale = min(canvas_width / img_w, canvas_height / img_h)
+                new_w = max(1, int(img_w * scale))
+                new_h = max(1, int(img_h * scale))
+                resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                resized = img.convert("RGB").resize((new_w, new_h), resampling)
+                out = PILImage.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+                out.paste(resized, ((canvas_width - new_w) // 2, (canvas_height - new_h) // 2))
+                out.save(target, format="PNG")
+                if new_w != canvas_width or new_h != canvas_height:
+                    print(
+                        f"Guide letterboxed {img_w}x{img_h} -> {new_w}x{new_h} "
+                        f"(padded {canvas_width - new_w}px h, {canvas_height - new_h}px v to {canvas_width}x{canvas_height})",
+                        flush=True,
+                    )
+    else:
+        shutil.copy2(guide, target)
+
     return f"arp_outpaint/{target.name}"
+
+
+def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
+    """Extract the last frame of a finished raw chunk as a PNG for i2v guide conditioning."""
+    import cv2
+
+    target = chunk_dir / f"guide_prev_{safe_stem(previous_raw.name)}.png"
+    if target.exists() and target.stat().st_mtime_ns >= previous_raw.stat().st_mtime_ns:
+        return target
+    cap = cv2.VideoCapture(str(previous_raw))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 1))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        raise RuntimeError(f"Could not extract last frame from previous chunk: {previous_raw}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(target), frame)
+    return target
 
 
 def set_widget_if_node(workflow: dict[str, Any], node_id: str | None, widget: str | int, value: Any) -> None:
@@ -266,17 +348,42 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, anchor_image: Path | None = None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
-    image_name = copy_anchor_frame_to_comfy_input(anchor_image, comfy_dir) if anchor_image else copy_reference_frame_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
+
+    # Guide image path: LoadImage (2004) -> ResizeImageMaskNode (5090) -> LTXVPreprocess (3336)
+    # -> LTXVImgToVideoConditionOnly (3159) -> LTXAddVideoICLoRAGuide (5012) latent input.
+    # When a guide image is provided, enable i2v conditioning so LTX targets the guide appearance
+    # at the start of the chunk.  When there is no guide, leave the bypass True so i2v has no
+    # effect and LTX generates freely.
+    canvas_width = int(prepared_info["width"])
+    canvas_height = int(prepared_info["height"])
+    if guide_image and guide_image.exists():
+        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
+        # Node 5019 "bypass_i2v": False = run LTXVImgToVideoConditionOnly, True = bypass it.
+        try:
+            bypass_node = node_by_id(workflow, "5019")
+            bypass_node["widgets_values"] = [False]
+        except KeyError:
+            pass
+    else:
+        image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
+        # Keep bypass_i2v = True (default in workflow) so i2v has no effect.
+        try:
+            bypass_node = node_by_id(workflow, "5019")
+            bypass_node["widgets_values"] = [True]
+        except KeyError:
+            pass
+
     try:
         image_node = node_by_id(workflow, "2004")
         ensure_widget_input(image_node, "image")
         set_widget(image_node, "0", image_name)
     except KeyError:
         pass
+
     set_widget_if_node(workflow, args.positive_node_id, args.prompt_widget, prompt_text)
     set_widget_if_node(workflow, args.negative_node_id, args.prompt_widget, negative_text)
     set_widget_if_node(workflow, args.save_node_id, args.save_prefix_widget, output_prefix)
@@ -308,10 +415,6 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     except KeyError:
         pass
 
-    # Preserve the workflow author's image-guide path:
-    # LoadImage -> ResizeImageMaskNode -> LTXVPreprocess -> LTXVImgToVideoConditionOnly.
-    # That path is how custom/Qwen anchor frames influence the LTX IC-LoRA render. The
-    # video input still carries ARP's prepared expanded canvas into LTXAddVideoICLoRAGuide.
     try:
         if args.save_node_id != "5076":
             set_input_link(workflow, args.save_node_id, "images", 13594)
@@ -345,25 +448,26 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", anchor_image: Path | None = None, chunk_manifest: Path | None = None) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 19,
+        "version": 22,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
         "workflow": root_relative(workflow_path),
         "workflow_fingerprint": file_fingerprint(workflow_path),
         "target_aspect": args.target_aspect,
+        "delivery_target_height": args.target_height,
+        "model_size_multiple": MODEL_SIZE_MULTIPLE,
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
         "negative_suffix": negative_suffix,
-        "anchor_image": root_relative(anchor_image) if anchor_image else "",
-        "anchor_fingerprint": file_fingerprint(anchor_image) if anchor_image and anchor_image.exists() else None,
-        "anchor_injected_into_video": bool(anchor_image),
-        "preserve_author_image_guide_path": True,
-        "bypass_optional_preview_nodes": True,
+        "guide_image": root_relative(guide_image) if guide_image else "",
+        "guide_fingerprint": file_fingerprint(guide_image) if guide_image and guide_image.exists() else None,
+        "guide_via_i2v_conditioning": bool(guide_image),
+        "auto_guide_from_previous_chunk": auto_guide,
         "seed": seed,
         "negative_prompt": negative_text,
         "load_video_node_id": args.load_video_node_id,
@@ -424,7 +528,17 @@ def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return {int(row["chunk_index"]): row for row in csv.DictReader(handle) if row.get("chunk_index", "").isdigit()}
+        rows = {}
+        for row in csv.DictReader(handle):
+            if not row.get("chunk_index", "").isdigit():
+                continue
+            # Migrate old field names written before the anchor→guide rename.
+            if "anchor_image" in row and "guide_image" not in row:
+                row["guide_image"] = row.pop("anchor_image", "")
+            row.pop("anchor_position", None)
+            row.pop("anchor_seconds", None)
+            rows[int(row["chunk_index"])] = row
+        return rows
 
 
 def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
@@ -439,14 +553,12 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "seed",
         "prompt_suffix",
         "negative_suffix",
-        "anchor_image",
-        "anchor_position",
-        "anchor_seconds",
+        "guide_image",
         "prepared_path",
         "raw_path",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -496,9 +608,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
             row["seed"] = str(default_seed + chunk_index)
         row.setdefault("prompt_suffix", "")
         row.setdefault("negative_suffix", "")
-        row.setdefault("anchor_image", "")
-        row.setdefault("anchor_position", "")
-        row.setdefault("anchor_seconds", "")
+        row.setdefault("guide_image", "")
         row.setdefault("custom_seconds", "")
         rows.append(row)
     write_chunk_manifest(path, rows)
@@ -515,78 +625,6 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     replace_with_retry(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
 
 
-def anchor_frame_index(position: str, frame_count: int) -> int:
-    last = max(0, frame_count - 1)
-    if position == "end":
-        return last
-    if position == "middle":
-        return max(0, min(last, frame_count // 2))
-    return 0
-
-
-def guide_frame_index(seconds: str, fps: float, frame_count: int, fallback_position: str = "middle") -> int:
-    try:
-        return max(0, min(max(0, frame_count - 1), int(round(float(seconds or 0) * fps))))
-    except ValueError:
-        return anchor_frame_index(fallback_position, frame_count)
-
-
-def anchored_chunk_path(chunk_path: Path, anchor: Path, position: str) -> Path:
-    return chunk_path.with_name(f"{chunk_path.stem}_anchor_{position}_{safe_stem(anchor.name)}{chunk_path.suffix}")
-
-
-def inject_anchor_frame(ffmpeg: str, chunk_path: Path, anchor: Path, seconds: str, fps: float, force: bool, position: str = "middle") -> Path:
-    info = probe_video(chunk_path)
-    frame_count = int(info["frames"] or 1)
-    frame_index = guide_frame_index(seconds, fps, frame_count, position)
-    safe_time = f"{frame_index:06d}"
-    target = chunk_path.with_name(f"{chunk_path.stem}_guide_{safe_time}_{safe_stem(anchor.name)}{chunk_path.suffix}")
-    if target.exists() and not force and target.stat().st_mtime_ns >= max(chunk_path.stat().st_mtime_ns, anchor.stat().st_mtime_ns):
-        return target
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
-    width = int(info["width"])
-    height = int(info["height"])
-    filter_text = (
-        f"[1:v]scale={width}:-2:flags=lanczos,setsar=1,"
-        f"crop={width}:min(ih\\,{height}):0:max(0\\,(ih-{height})/2),format=yuv420p[guide];"
-        f"[0:v][guide]overlay=x=0:y=(H-h)/2:enable='eq(n\\,{frame_index})',"
-        f"format=rgb24,lutrgb=r='if(lte(val\\,3)\\,0\\,val)':g='if(lte(val\\,3)\\,0\\,val)':b='if(lte(val\\,3)\\,0\\,val)',format=yuv420p,"
-        f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1[v]"
-    )
-    command = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(chunk_path),
-        "-loop",
-        "1",
-        "-i",
-        str(anchor),
-        "-filter_complex",
-        filter_text,
-        "-map",
-        "[v]",
-        "-frames:v",
-        str(frame_count),
-        "-an",
-        "-r",
-        f"{fps:.8f}",
-        "-fps_mode",
-        "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "12",
-        "-preset",
-        "veryfast",
-        str(partial),
-    ]
-    print(f"Injecting guide into prepared chunk frame {frame_index + 1}/{frame_count}: {anchor}", flush=True)
-    subprocess.run(command, check=True)
-    replace_with_retry(partial, target, f"Anchored prepared chunk {target.name}")
-    return target
 
 
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
@@ -670,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-bottom", type=int, default=0)
     parser.add_argument("--chunk-seconds", type=float, default=20.0, help="Outpaint in chunks of roughly this many seconds. Use 0 to send the full clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated between neighbouring chunks before stitching.")
-    parser.add_argument("--chunk-manifest", help="CSV storing per-chunk seed and prompt suffix overrides.")
+    parser.add_argument("--chunk-manifest", help="CSV storing per-chunk seed, prompt, and guide image overrides.")
     parser.add_argument("--only-chunk", type=int, help="Regenerate only one outpaint chunk, then restitch from existing chunks.")
     parser.add_argument("--model-backend", choices=["gguf", "checkpoint"], default="gguf")
     parser.add_argument("--gguf-model", default="LTX-2.3-distilled-Q4_K_M.gguf")
@@ -725,6 +763,8 @@ def main() -> int:
 
     output = resolve_path(args.output) if args.output else default_output(source, args.target_aspect, args.target_height, args)
     raw_output = resolve_path(args.raw_output) if args.raw_output else default_raw_output(source, args.target_aspect, args.target_height, args)
+    delivery_width, delivery_height = target_size(source, args.target_aspect, args.target_height)
+    work_width, work_height = model_safe_size(source, args.target_aspect, args.target_height)
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
@@ -758,28 +798,33 @@ def main() -> int:
         "--crop-bottom",
         str(args.crop_bottom),
     ]
-    if args.target_height:
-        prepare_command += ["--target-height", str(args.target_height)]
+    prepare_command += ["--target-height", str(work_height)]
+    prepare_command += ["--target-width", str(work_width)]
     if args.force:
         prepare_command.append("--force")
     if args.dry_run:
         prepare_command.append("--dry-run")
-    width, height = target_size(source, args.target_aspect, args.target_height)
-    print(f"Preparing expanded outpaint canvas: {width}x{height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)
+    if (work_width, work_height) != (delivery_width, delivery_height):
+        print(
+            f"LTX working canvas rounded to {work_width}x{work_height} "
+            f"from requested delivery {delivery_width}x{delivery_height}.",
+            flush=True,
+        )
+    print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)
     run_command(prepare_command, False)
 
-    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}"
+    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
-        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{width}x{height}{crop_slug(args)}"
-        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, width, height, args)
+        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}{crop_slug(args)}"
+        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, work_width, work_height, args)
         prepared_info = probe_video(prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
         ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
         chunk_overrides = sync_chunk_manifest(chunk_manifest, ranges, float(prepared_info["fps"]), chunk_dir, args.seed)
         print(f"Outpaint chunk manifest: {chunk_manifest}", flush=True)
-        raw_sig = raw_signature(args, workflow_path, prepared, chunk_manifest=chunk_manifest)
+        raw_sig = raw_signature(args, workflow_path, prepared, chunk_manifest=chunk_manifest)  # outer whole-run signature
         if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):
             print(f"Reuse raw Comfy render: {raw_output}", flush=True)
         else:
@@ -792,42 +837,56 @@ def main() -> int:
                     flush=True,
                 )
             raw_chunks: list[Path] = []
-            for chunk_index, start_frame, end_frame in ranges:
+            effective_ranges: list[tuple[int, int, int]] = []
+            for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
                 chunk_prepared = chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 chunk_raw = chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), args.force)
+                previous_raw = raw_chunks[-1] if raw_chunks else None
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
                 chunk_negative_suffix = chunk_row.get("negative_suffix", "")
-                anchor_text = chunk_row.get("anchor_image", "")
-                anchor_image = resolve_path(anchor_text) if anchor_text else None
-                if anchor_image and not anchor_image.exists():
-                    print(f"Warning: chunk {chunk_index + 1} anchor image was not found and will be ignored: {anchor_image}", flush=True)
-                    anchor_image = None
-                chunk_conditioning = chunk_prepared
-                anchor_seconds = chunk_row.get("anchor_seconds", "")
-                if anchor_image:
-                    anchor_position = chunk_row.get("anchor_position", "middle") or "middle"
-                    chunk_conditioning = inject_anchor_frame(
-                        ffmpeg,
-                        chunk_prepared,
-                        anchor_image,
-                        anchor_seconds,
-                        float(prepared_info["fps"] or 24.0),
-                        args.force,
-                        anchor_position,
-                    )
-                chunk_sig = raw_signature(args, workflow_path, chunk_conditioning, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, anchor_image)
+
+                # Determine guide image for i2v conditioning.
+                # Priority: (1) explicit guide_image set in manifest, (2) auto-extract last
+                # frame of previous raw chunk for temporal continuity, (3) no guide (first chunk).
+                guide_text = chunk_row.get("guide_image", "")
+                explicit_guide: Path | None = resolve_path(guide_text) if guide_text else None
+                if explicit_guide and not explicit_guide.exists():
+                    print(f"Warning: chunk {chunk_index + 1} guide image not found and will be ignored: {explicit_guide}", flush=True)
+                    explicit_guide = None
+                auto_guide: bool = False
+                guide_image: Path | None = explicit_guide
+                if guide_image is None and previous_raw is not None and previous_raw.exists():
+                    try:
+                        guide_image = extract_last_frame_as_guide(previous_raw, chunk_dir)
+                        auto_guide = True
+                        print(f"Chunk {chunk_index + 1}: auto-guide from last frame of chunk {chunk_index}", flush=True)
+                    except Exception as exc:
+                        print(f"Warning: could not extract auto-guide from previous chunk: {exc}", flush=True)
+
+                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, auto_guide)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
-                        raise FileNotFoundError(f"Cannot regenerate only chunk {args.only_chunk}; chunk {chunk_index} is missing: {chunk_raw}")
+                        if chunk_index < args.only_chunk:
+                            # A chunk before the target is missing — we can't auto-guide or stitch correctly.
+                            raise FileNotFoundError(
+                                f"Cannot regenerate chunk {args.only_chunk + 1}; "
+                                f"earlier chunk {chunk_index + 1} is missing: {chunk_raw}"
+                            )
+                        # A chunk after the target doesn't exist yet — skip it.
+                        # Stitching will only cover frames up to the last available chunk.
+                        print(f"Chunk {chunk_index + 1} not yet generated; stitching will stop at chunk {args.only_chunk + 1}.", flush=True)
+                        continue
                     raw_chunks.append(chunk_raw)
+                    effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
-                if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_conditioning):
+                if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_prepared):
                     print(f"Reuse raw Comfy chunk: {chunk_raw}", flush=True)
                     raw_chunks.append(chunk_raw)
+                    effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
                 workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
                 chunk_prefix = f"{output_prefix}_chunk_{chunk_index:04d}"
@@ -838,9 +897,10 @@ def main() -> int:
                     print(f"Chunk {chunk_index + 1} prompt suffix: {chunk_prompt_suffix}", flush=True)
                 if chunk_negative_suffix:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
-                if anchor_image:
-                    print(f"Chunk {chunk_index + 1} guide frame: {anchor_image}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_conditioning, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, anchor_image)
+                if guide_image:
+                    source = "explicit" if explicit_guide else "auto"
+                    print(f"Chunk {chunk_index + 1} guide frame ({source}): {guide_image}", flush=True)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
@@ -852,9 +912,10 @@ def main() -> int:
                 write_signature(chunk_raw, chunk_sig)
                 print(f"Wrote raw Comfy chunk: {chunk_raw}", flush=True)
                 raw_chunks.append(chunk_raw)
+                effective_ranges.append((chunk_index, start_frame, end_frame))
             restitched = True
             try:
-                stitch_chunks(ffmpeg, raw_chunks, ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
+                stitch_chunks(ffmpeg, raw_chunks, effective_ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
             except PermissionError as exc:
                 if args.only_chunk is None:
                     raise
@@ -881,6 +942,10 @@ def main() -> int:
         str(args.black_lift),
         "--gamma",
         str(args.gamma),
+        "--target-width",
+        str(delivery_width),
+        "--target-height",
+        str(delivery_height),
     ]
     if args.force:
         finalize_command.append("--force")

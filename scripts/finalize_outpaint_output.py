@@ -28,24 +28,31 @@ def encoder_args(args):
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
 
 
-def inverse_filter(args) -> str:
+def inverse_filter(args, info: dict) -> str:
     lift = max(0.0, min(0.25, args.black_lift))
     gamma = max(0.1, args.gamma)
+    target_width = int(args.target_width or info["width"])
+    target_height = int(args.target_height or info["height"])
+    scale = ""
+    if target_width != int(info["width"]) or target_height != int(info["height"]):
+        scale = f",scale={target_width}:{target_height}:flags=lanczos"
     if args.skip_restore:
-        return '[0:v]format=yuv420p[v]'
+        return f'[0:v]format=yuv420p{scale}[v]'
     expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
-    return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}',format=yuv420p[v]"
+    return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}',format=yuv420p{scale}[v]"
 
 
 def signature(args, source: Path) -> dict:
     return {
-        'version': 2,
+        'version': 3,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
         'black_lift': args.black_lift,
         'gamma': args.gamma,
         'skip_restore': args.skip_restore,
+        'target_width': args.target_width,
+        'target_height': args.target_height,
         'encoder': args.encoder,
         'crf': args.crf,
         'preset': args.preset,
@@ -80,6 +87,8 @@ def build_parser():
     parser.add_argument('--black-lift', type=float, default=0.018, help='Must match prepare_outpaint_input.py.')
     parser.add_argument('--gamma', type=float, default=1.06, help='Must match prepare_outpaint_input.py.')
     parser.add_argument('--skip-restore', action='store_true', help='Only remux/re-encode. Useful for comparisons.')
+    parser.add_argument('--target-width', type=int, help='Scale the restored clip to this delivery width.')
+    parser.add_argument('--target-height', type=int, help='Scale the restored clip to this delivery height.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
     parser.add_argument('--preset', default='medium')
@@ -95,12 +104,15 @@ def main():
     if not source.exists():
         raise FileNotFoundError(f'Outpainted source not found: {source}')
     output = resolve_path(args.output) if args.output else default_output(source)
+    info = video_info(source)
+    target_width = int(args.target_width or info["width"])
+    target_height = int(args.target_height or info["height"])
     sig = signature(args, source)
-    if not args.force and resumable_output(output, sig, video_like=source):
+    if not args.force and resumable_output(output, sig, width=target_width, height=target_height):
         print(f'Reuse restored outpaint: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
-    fps = float(video_info(source)["fps"] or 24.0)
+    fps = float(info["fps"] or 24.0)
     partial = output.with_suffix(output.suffix + '.partial' + output.suffix)
     command = [
         ffmpeg,
@@ -108,7 +120,7 @@ def main():
         '-i',
         str(source),
         '-filter_complex',
-        inverse_filter(args),
+        inverse_filter(args, info),
         '-map',
         '[v]',
         '-map',

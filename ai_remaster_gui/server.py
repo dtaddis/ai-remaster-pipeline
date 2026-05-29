@@ -46,6 +46,7 @@ from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, re
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 PROJECT_SCHEMA_VERSION = 1
+MODEL_SIZE_MULTIPLE = 32
 
 
 def app_version() -> str:
@@ -712,12 +713,12 @@ class PipelineApp:
             threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
         return True, f"Started reference regeneration for shot {index + 1}."
 
-    def run_outpaint_anchor_generation(self, index: int, seconds: str, prompt: str) -> tuple[bool, str]:
+    def run_outpaint_guide_generation(self, index: int, prompt: str) -> tuple[bool, str]:
         ok, message = ensure_comfy_available_for_stage("Guide Frame Generation")
         if not ok:
             return False, message
         try:
-            cmd, output = outpaint_anchor_generation_command(index, seconds, prompt)
+            cmd, output = outpaint_guide_generation_command(index, prompt)
         except Exception as exc:
             return False, str(exc)
         with self.lock:
@@ -1210,6 +1211,18 @@ def outpaint_size_for_source(source_text: str, aspect: str, target_height_text: 
     return even_int(height * parse_aspect(aspect)), height
 
 
+def model_safe_int(value: int, multiple: int = MODEL_SIZE_MULTIPLE) -> int:
+    value = max(multiple, int(value))
+    lower = max(multiple, (value // multiple) * multiple)
+    upper = lower if lower == value else lower + multiple
+    return lower if value - lower <= upper - value else upper
+
+
+def outpaint_work_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
+    width, height = outpaint_size_for_source(source_text, aspect, target_height_text)
+    return model_safe_int(width), model_safe_int(height)
+
+
 def outpaint_crop_slug(values: dict[str, str]) -> str:
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     return "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1218,7 +1231,7 @@ def outpaint_crop_slug(values: dict[str, str]) -> str:
 def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / ".cache" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}"
 
 
@@ -1227,14 +1240,14 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
         return ""
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return rel(ROOT / "manifests" / "outpaint_chunks" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{outpaint_crop_slug(values)}_chunks.csv")
 
 
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
 
 
@@ -1265,8 +1278,10 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         str(values.get("crop_top", "0") or "0"),
         "--crop-bottom",
         str(values.get("crop_bottom", "0") or "0"),
+        "--target-width",
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
         "--target-height",
-        str(resolved_outpaint_height(source_text, values.get("target_height", "720"))),
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
     ]
     APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
     APP.log.append("> " + " ".join(cmd))
@@ -1286,7 +1301,17 @@ def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return {int(row["chunk_index"]): row for row in csv.DictReader(handle) if row.get("chunk_index", "").isdigit()}
+        rows = {}
+        for row in csv.DictReader(handle):
+            if not row.get("chunk_index", "").isdigit():
+                continue
+            # Migrate old field names written before the anchor→guide rename.
+            if "anchor_image" in row and "guide_image" not in row:
+                row["guide_image"] = row.pop("anchor_image", "")
+            row.pop("anchor_position", None)
+            row.pop("anchor_seconds", None)
+            rows[int(row["chunk_index"])] = row
+        return rows
 
 
 def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
@@ -1301,9 +1326,7 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
         "seed",
         "prompt_suffix",
         "negative_suffix",
-        "anchor_image",
-        "anchor_position",
-        "anchor_seconds",
+        "guide_image",
         "prepared_path",
         "raw_path",
     ]
@@ -1376,9 +1399,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
             row["seed"] = str(42 + index)
         row.setdefault("prompt_suffix", "")
         row.setdefault("negative_suffix", "")
-        row.setdefault("anchor_image", "")
-        row.setdefault("anchor_position", "")
-        row.setdefault("anchor_seconds", "")
+        row.setdefault("guide_image", "")
         rows.append(row)
     write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
@@ -1388,14 +1409,12 @@ def outpaint_chunks_state(settings: dict) -> dict:
         start_seconds = float(row["start_seconds"])
         end_seconds = float(row["end_seconds"])
         middle_seconds = (start_seconds + end_seconds) / 2
-        anchor_path = resolve(row["anchor_image"]) if row.get("anchor_image") else None
-        anchor_exists = bool(anchor_path and anchor_path.exists())
-        try:
-            anchor_seconds = float(row.get("anchor_seconds", "") or max(0.0, middle_seconds - start_seconds))
-        except ValueError:
-            anchor_seconds = max(0.0, middle_seconds - start_seconds)
-        anchor_seconds = max(0.0, min(max(0.0, end_seconds - start_seconds), anchor_seconds))
-        anchor_source_seconds = start_seconds + anchor_seconds
+        guide_path = resolve(row["guide_image"]) if row.get("guide_image") else None
+        guide_exists = bool(guide_path and guide_path.exists())
+        # Guide is always applied at the start of the chunk.
+        # Use the second frame (start + 1/fps) as the preview source because some video containers
+        # produce a pure-black first frame at t=0 due to overlay-filter initialisation timing.
+        guide_preview_seconds = start_seconds + (1.0 / max(1.0, fps))
         view_rows.append(row | {
             "index": int(row["chunk_index"]),
             "start": float(row["start_seconds"]),
@@ -1409,11 +1428,10 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "raw_exists": raw.exists(),
             "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
             "prepared_exists": prepared.exists(),
-            "anchor_exists": anchor_exists,
-            "anchor_mtime": int(anchor_path.stat().st_mtime_ns) if anchor_exists and anchor_path else 0,
-            "anchor_seconds": f"{anchor_seconds:.6f}",
-            "anchor_frame_preview": chunk_frame_preview(range_source, anchor_source_seconds, "source_guide"),
-            "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
+            "guide_exists": guide_exists,
+            "guide_mtime": int(guide_path.stat().st_mtime_ns) if guide_exists and guide_path else 0,
+            "guide_frame_preview": chunk_frame_preview(range_source, guide_preview_seconds, "source_guide"),
+            "source_start_preview": chunk_frame_preview(range_source, guide_preview_seconds, "source_start"),
             "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
             "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
             "raw_start_preview": chunk_frame_preview(raw, 0.0, "raw_start") if raw.exists() else "",
@@ -1487,10 +1505,13 @@ def remove_cached_file(path: Path) -> bool:
     return removed
 
 
-def clear_cached_outpaint_guides(manifest: Path, index: int) -> int:
-    guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+def clear_cached_guide_frames(manifest: Path, index: int) -> int:
+    guide_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     if not guide_dir.exists():
-        return 0
+        # Also check legacy path name used before the anchor→guide rename.
+        guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+        if not guide_dir.exists():
+            return 0
     removed = 0
     for path in guide_dir.glob(f"chunk_{index:04d}_*"):
         if path.is_file() and remove_cached_file(path):
@@ -1498,7 +1519,7 @@ def clear_cached_outpaint_guides(manifest: Path, index: int) -> int:
     return removed
 
 
-def install_outpaint_anchor(index: int, seconds: str) -> dict[str, str]:
+def install_outpaint_guide(index: int) -> dict[str, str]:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -1508,35 +1529,29 @@ def install_outpaint_anchor(index: int, seconds: str) -> dict[str, str]:
     if index not in rows:
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
 
-    current = rows[index].get("anchor_image", "")
+    current = rows[index].get("guide_image", "")
     selected = browse_path("image", current)
     if not selected:
-        return {"selected": "", "anchor_image": current}
+        return {"selected": "", "guide_image": current}
 
     source = resolve(selected)
     if source.suffix.lower() not in IMAGE_EXTS:
-        raise RuntimeError("Choose a PNG or JPEG image for the outpaint anchor frame.")
+        raise RuntimeError("Choose a PNG or JPEG image for the outpaint guide frame.")
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(source)
 
-    try:
-        guide_seconds = max(0.0, float(seconds or 0))
-    except ValueError:
-        guide_seconds = 0.0
-    target_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     target = target_dir / f"chunk_{index:04d}_guide{source.suffix.lower()}"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
 
-    rows[index]["anchor_image"] = rel(target)
-    rows[index]["anchor_position"] = "guide"
-    rows[index]["anchor_seconds"] = f"{guide_seconds:.6f}"
+    rows[index]["guide_image"] = rel(target)
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
     APP.log.append(f"Installed outpaint guide frame for chunk {index + 1}: {rel(target)}")
-    return {"selected": selected, "anchor_image": rel(target), "anchor_position": "guide", "anchor_seconds": f"{guide_seconds:.6f}"}
+    return {"selected": selected, "guide_image": rel(target)}
 
 
-def clear_outpaint_anchor(index: int) -> dict[str, str]:
+def clear_outpaint_guide(index: int) -> dict[str, str]:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -1545,40 +1560,15 @@ def clear_outpaint_anchor(index: int) -> dict[str, str]:
     rows = read_outpaint_chunk_rows(manifest)
     if index not in rows:
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
-    removed = clear_cached_outpaint_guides(manifest, index)
-    rows[index]["anchor_image"] = ""
-    rows[index]["anchor_position"] = ""
-    rows[index]["anchor_seconds"] = ""
+    removed = clear_cached_guide_frames(manifest, index)
+    rows[index]["guide_image"] = ""
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
     suffix = f" and deleted {removed} cached file(s)" if removed else ""
     APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}{suffix}")
-    return {"anchor_image": "", "anchor_position": "", "anchor_seconds": ""}
+    return {"guide_image": ""}
 
 
-def update_outpaint_guide_time(index: int, seconds: str) -> dict[str, str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    manifest = resolve(str(manifest_text))
-    rows = read_outpaint_chunk_rows(manifest)
-    view_rows = state.get("rows", [])
-    if index not in rows or index < 0 or index >= len(view_rows):
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-
-    row = view_rows[index]
-    try:
-        guide_seconds = max(0.0, float(seconds or 0))
-    except ValueError:
-        guide_seconds = 0.0
-    chunk_length = max(0.0, float(row.get("end", 0.0)) - float(row.get("start", 0.0)))
-    guide_seconds = min(chunk_length, guide_seconds)
-    rows[index]["anchor_seconds"] = f"{guide_seconds:.6f}"
-    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    return {"anchor_seconds": f"{guide_seconds:.6f}"}
-
-
-def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) -> tuple[list[str], str]:
+def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str]:
     state = outpaint_chunks_state(APP.settings)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
@@ -1588,22 +1578,22 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
 
     row = rows[index]
-    try:
-        guide_seconds = max(0.0, float(seconds or row.get("anchor_seconds") or 0))
-    except ValueError:
-        guide_seconds = 0.0
-    chunk_length = max(0.0, float(row.get("end", 0.0)) - float(row.get("start", 0.0)))
-    guide_seconds = min(chunk_length, guide_seconds)
+    fps = float(row.get("fps", 24) or 24)
+    start_seconds = float(row.get("start", 0.0))
+    # Use the second frame (start + 1/fps) as the Qwen source.  Some video containers produce a
+    # pure-black first frame at t=0 due to overlay-filter initialisation timing in the prepared
+    # canvas; skipping one frame gives Qwen a frame with actual content.
+    guide_source_seconds = start_seconds + (1.0 / max(1.0, fps))
     source_text = pipeline_source_text(APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
     range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
-    source = resolve(chunk_frame_preview(range_source, float(row.get("start", 0.0)) + guide_seconds, "source_guide_qwen"))
+    source = resolve(chunk_frame_preview(range_source, guide_source_seconds, "source_guide_qwen"))
     if not source.exists():
         raise FileNotFoundError(source)
 
     manifest = resolve(str(manifest_text))
-    output_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+    output_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     output = output_dir / f"chunk_{index:04d}_guide_qwen.png"
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_cached_file(output)
@@ -1611,9 +1601,7 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
     stored = read_outpaint_chunk_rows(manifest)
     if index not in stored:
         raise IndexError(f"Outpaint chunk not found in manifest: {index + 1}")
-    stored[index]["anchor_image"] = rel(output)
-    stored[index]["anchor_position"] = "guide"
-    stored[index]["anchor_seconds"] = f"{guide_seconds:.6f}"
+    stored[index]["guide_image"] = rel(output)
     write_outpaint_chunk_rows(manifest, [stored[key] for key in sorted(stored)])
 
     values = APP.settings.get("references", {})
@@ -1621,7 +1609,7 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
     workflow = values.get("workflow") or default_qwen_workflow(config)
     if not workflow:
         raise RuntimeError("No Qwen Image Edit workflow found. Install/configure ComfyUI first.")
-    anchor_prompt = prompt.strip() or DEFAULT_ANCHOR_PROMPT
+    guide_prompt = prompt.strip() or DEFAULT_ANCHOR_PROMPT
     cmd = [
         sys.executable,
         "-u",
@@ -1643,7 +1631,7 @@ def outpaint_anchor_generation_command(index: int, seconds: str, prompt: str) ->
         "--gguf-model",
         values.get("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf"),
         "--prompt",
-        anchor_prompt,
+        guide_prompt,
         "--prompt-suffix",
         "",
         "--load-image-node-id",
@@ -2437,7 +2425,8 @@ def cache_categories() -> tuple[dict, ...]:
             "description": "Prepared inputs, guide frames, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
             "folders": (
                 ROOT / ".cache" / "outpaint_chunks",
-                ROOT / "intermediate" / "outpaint_anchors",
+                ROOT / "intermediate" / "outpaint_guides",
+                ROOT / "intermediate" / "outpaint_anchors",  # legacy name
                 ROOT / "intermediate" / "outpaint_prepared",
                 ROOT / "intermediate" / "outpainted",
                 ROOT / "manifests" / "outpaint_chunks",
@@ -3124,35 +3113,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-anchor":
             try:
-                result = install_outpaint_anchor(int(data.get("index", 0)), str(data.get("seconds", "")))
+                result = install_outpaint_guide(int(data.get("index", 0)))
                 self.send_json({"ok": True, **result, "state": APP.state()})
             except Exception as exc:
-                APP.log.append(f"Outpaint anchor install failed: {exc}")
+                APP.log.append(f"Outpaint guide install failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-anchor-clear":
             try:
-                result = clear_outpaint_anchor(int(data.get("index", 0)))
+                result = clear_outpaint_guide(int(data.get("index", 0)))
                 self.send_json({"ok": True, **result, "state": APP.state()})
             except Exception as exc:
                 APP.log.append(f"Outpaint guide clear failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
-        elif parsed.path == "/api/outpaint-guide-time":
-            try:
-                result = update_outpaint_guide_time(int(data.get("index", 0)), str(data.get("seconds", "")))
-                self.send_json({"ok": True, **result, "state": APP.state()})
-            except Exception as exc:
-                APP.log.append(f"Outpaint guide time update failed: {exc}")
-                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-anchor-generate":
             try:
-                ok, message = APP.run_outpaint_anchor_generation(
+                ok, message = APP.run_outpaint_guide_generation(
                     int(data.get("index", 0)),
-                    str(data.get("seconds", "")),
                     str(data.get("prompt", "")),
                 )
                 self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
             except Exception as exc:
-                APP.log.append(f"Outpaint anchor generation failed: {exc}")
+                APP.log.append(f"Outpaint guide generation failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:
@@ -3446,7 +3427,7 @@ def main() -> int:
     os.chdir(ROOT)
     install_shutdown_handlers()
     if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") != "1":
-        start_comfy_if_needed()
+            start_comfy_if_needed()
     host = "127.0.0.1"
     requested_port = int(os.environ.get("AI_REMASTER_GUI_PORT", "8765"))
     server = create_server(host, requested_port)
@@ -3462,3 +3443,7 @@ def main() -> int:
         server.server_close()
         stop_started_comfy()
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

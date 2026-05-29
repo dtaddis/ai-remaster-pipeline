@@ -70,7 +70,7 @@ def crop_values(args, info: dict) -> tuple[int, int, int, int, int, int]:
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 3,
+        'version': 4,
         'tool': 'prepare_outpaint_input.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -97,9 +97,14 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     left, _right, top, _bottom, crop_width, crop_height = crop_values(args, info)
     # The source image is lifted away from exact 0 before padding. The synthetic 16:9 margins stay exact black.
     lut = f"r=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):g=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):b=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma}))"
+    # trim=start_frame=0,setpts=PTS-STARTPTS normalises the source timestamps to begin at t=0.
+    # Without this, videos with a non-zero initial PTS (common with H.264, interlaced sources,
+    # and anything with an edit list) cause the overlay filter to emit a pure-black frame at t=0
+    # before the source video contributes its first frame, because the colour background is ready
+    # at t=0 but the source has not yet produced a frame.
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
-        f"[0:v]crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1,format=rgb24,lutrgb={lut}[src]",
+        f"[0:v]trim=start_frame=0,setpts=PTS-STARTPTS,crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1,format=rgb24,lutrgb={lut}[src]",
         '[bg][src]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1:format=auto,format=yuv420p[v]',
     ])
 
@@ -130,6 +135,7 @@ def build_parser():
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
     parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
     parser.add_argument('--target-aspect', default='16:9')
+    parser.add_argument('--target-width', type=int, help='Output width. Defaults to target-height * target-aspect.')
     parser.add_argument('--target-height', type=int, help='Output height. Defaults to the source height.')
     parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
@@ -153,7 +159,7 @@ def main():
         raise FileNotFoundError(f'Source video not found: {source}')
     info = probe_video(source)
     target_height = even(args.target_height or info['height'])
-    target_width = even(target_height * parse_aspect(args.target_aspect))
+    target_width = even(args.target_width or (target_height * parse_aspect(args.target_aspect)))
     output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height)
     sig = signature(args, source, info, target_width, target_height)
     if not args.force and resumable_output(output, sig, video_like=source, width=target_width, height=target_height):
