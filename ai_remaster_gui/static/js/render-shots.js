@@ -290,7 +290,7 @@ function referenceCard(context) {
       ${shotSummary(context, referenceTimeControl(manifest, row, idx, slider, label, img))}
       <div>
         <label>B&W screenshot</label>
-        ${sourceReady ? `<img id="${img}" src="${sourceUrl}" alt="">` : missingImage('Image not present')}
+        ${sourceReady ? `<div class="thumb-wrap"><img id="${img}" src="${sourceUrl}" alt=""><button class="icon-button" type="button" title="Save B&W screenshot" onclick="exportMedia('${esc(row.source_reference)}')">&#128190;</button></div>` : missingImage('Image not present')}
       </div>
       <div>
         <label>Qwen color reference</label>
