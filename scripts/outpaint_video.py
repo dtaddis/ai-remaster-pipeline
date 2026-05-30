@@ -142,7 +142,30 @@ def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
     return f"arp_outpaint/{target.name}"
 
 
-def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path, canvas_width: int = 0, canvas_height: int = 0) -> str:
+def _inpaint_black_corners(canvas_bgr: "np.ndarray", black_thresh: int = 4) -> "np.ndarray":
+    """Fill any remaining near-black pixels in *canvas_bgr* using OpenCV inpainting.
+
+    Uses a binary mask of pixels whose every channel is ≤ *black_thresh* (pure padding
+    black), then applies cv2.INPAINT_TELEA which is fast and accurate for small regions.
+    Returns the inpainted array (same shape/dtype as input).
+    """
+    import cv2
+    import numpy as np
+
+    mask = np.all(canvas_bgr <= black_thresh, axis=2).astype(np.uint8) * 255
+    if not mask.any():
+        return canvas_bgr
+    inpainted = cv2.inpaint(canvas_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    return inpainted
+
+
+def copy_guide_image_to_comfy_input(
+    guide: Path,
+    comfy_dir: Path,
+    canvas_width: int = 0,
+    canvas_height: int = 0,
+    source_frame: "np.ndarray | None" = None,
+) -> str:
     """Copy a guide image to ComfyUI's input folder, normalised to the LTX canvas size.
 
     When canvas dimensions are provided the guide is resized to exactly (canvas_width × canvas_height)
@@ -155,6 +178,15 @@ def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path, canvas_width: 
 
     For large AR differences (> 10%) — e.g. a manually-uploaded portrait or square image — the
     image is letterboxed with black padding instead, so content is never badly distorted.
+
+    When *source_frame* is provided (a BGR numpy array at the canvas size, extracted from the
+    prepared video) and the guide requires letterboxing, the black padding regions are filled in
+    two passes:
+      1. Source-fill: pixels from *source_frame* that are not pure-black padding are composited
+         into the black bands, using the exact letterbox geometry as a mask (no heuristics).
+      2. Corner inpaint: any pixels that remain near-black after the source fill (i.e. areas where
+         both the guide and the source are pure black) are inpainted with cv2.INPAINT_TELEA so LTX
+         receives a fully-populated guide frame with no large black voids.
     """
     from PIL import Image as PILImage
 
@@ -189,14 +221,59 @@ def copy_guide_image_to_comfy_input(guide: Path, comfy_dir: Path, canvas_width: 
                 resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
                 resized = img.convert("RGB").resize((new_w, new_h), resampling)
                 out = PILImage.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
-                out.paste(resized, ((canvas_width - new_w) // 2, (canvas_height - new_h) // 2))
-                out.save(target, format="PNG")
+                paste_x = (canvas_width - new_w) // 2
+                paste_y = (canvas_height - new_h) // 2
+                out.paste(resized, (paste_x, paste_y))
+
                 if new_w != canvas_width or new_h != canvas_height:
                     print(
                         f"Guide letterboxed {img_w}x{img_h} -> {new_w}x{new_h} "
                         f"(padded {canvas_width - new_w}px h, {canvas_height - new_h}px v to {canvas_width}x{canvas_height})",
                         flush=True,
                     )
+
+                    # ------------------------------------------------------------------
+                    # Source-fill + corner inpaint when a prepared source frame is available.
+                    # The guide only covers the rectangle [paste_x:paste_x+new_w, paste_y:paste_y+new_h].
+                    # Everything outside that rectangle is pure-black padding.  We fill it in two steps:
+                    #   1. Composite source_frame content into the black bands (exact geometry mask).
+                    #   2. Inpaint any remaining black corners where both guide and source are black.
+                    # ------------------------------------------------------------------
+                    if source_frame is not None:
+                        import cv2
+                        import numpy as np
+
+                        # Convert guide PIL image to BGR numpy for cv2 operations.
+                        canvas_bgr = cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
+
+                        # source_frame is already canvas-sized BGR from the prepared video.
+                        src = source_frame
+                        if src.shape[1] != canvas_width or src.shape[0] != canvas_height:
+                            src = cv2.resize(src, (canvas_width, canvas_height), interpolation=cv2.INTER_LANCZOS4)
+
+                        # Build the guide-coverage mask: True where the guide content sits.
+                        guide_mask = np.zeros((canvas_height, canvas_width), dtype=bool)
+                        guide_mask[paste_y:paste_y + new_h, paste_x:paste_x + new_w] = True
+
+                        # Source pixels that are not pure-black padding (black_lift raises
+                        # real content above 0; actual padding in the prepared video is exact 0).
+                        src_is_content = np.any(src > 4, axis=2)  # at least one channel > 4/255
+
+                        # Fill bands: pixels outside guide coverage where source has real content.
+                        fill_mask = (~guide_mask) & src_is_content
+                        canvas_bgr[fill_mask] = src[fill_mask]
+
+                        filled_pixels = int(fill_mask.sum())
+                        if filled_pixels:
+                            print(f"Guide source-filled {filled_pixels} black-band pixels from prepared frame.", flush=True)
+
+                        # Inpaint remaining black corners (outside guide and source coverage).
+                        canvas_bgr = _inpaint_black_corners(canvas_bgr)
+
+                        # Write back as PNG via PIL.
+                        out = PILImage.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+
+                out.save(target, format="PNG")
     else:
         shutil.copy2(guide, target)
 
@@ -361,7 +438,20 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
     if guide_image and guide_image.exists():
-        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
+        # Extract the first frame of the prepared video to use as source fill for guide black bands.
+        source_frame: "np.ndarray | None" = None
+        try:
+            import cv2 as _cv2
+            import numpy as _np
+            _cap = _cv2.VideoCapture(str(prepared))
+            _ok, _frame = _cap.read()
+            _cap.release()
+            if _ok and _frame is not None:
+                source_frame = _frame
+        except Exception as _e:
+            print(f"Warning: could not extract source frame for guide compositing: {_e}", flush=True)
+
+        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame)
         # Node 5019 "bypass_i2v": False = run LTXVImgToVideoConditionOnly, True = bypass it.
         try:
             bypass_node = node_by_id(workflow, "5019")

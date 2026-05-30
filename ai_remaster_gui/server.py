@@ -718,16 +718,17 @@ class PipelineApp:
         if not ok:
             return False, message
         try:
-            cmd, output = outpaint_guide_generation_command(index, prompt)
+            cmd, output_rel, prepared_canvas = outpaint_guide_generation_command(index, prompt)
         except Exception as exc:
             return False, str(exc)
+        output = resolve(output_rel)
         with self.lock:
             if self.process and self.process.poll() is None:
                 return False, "A command is already running."
             self.running_stage = f"Generating guide frame for chunk {index + 1}"
             self.running_stage_key = "outpaint"
             self.run_started_at = time.time()
-            self.log.append(f"Generating Qwen guide frame for chunk {index + 1}: {output}")
+            self.log.append(f"Generating Qwen guide frame for chunk {index + 1}: {output_rel}")
             self.log.append("> " + " ".join(cmd))
             kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
             if os.name == "nt":
@@ -742,8 +743,35 @@ class PipelineApp:
                 self.run_started_at = 0.0
                 self.log.append(f"Could not start guide frame generation: {exc}")
                 return False, f"Could not start guide frame generation: {exc}"
-            threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
+            threading.Thread(
+                target=self._collect_output_guide,
+                args=(output, prepared_canvas),
+                daemon=True,
+            ).start()
         return True, f"Started Qwen guide frame generation for chunk {index + 1}."
+
+    def _collect_output_guide(self, output: Path, prepared_canvas: Path) -> None:
+        """Like _collect_output but composites the guide in-place after a successful Qwen run."""
+        assert self.process and self.process.stdout
+        for line in self.process.stdout:
+            with self.lock:
+                self.log.append(line.rstrip())
+        code = self.process.wait()
+        with self.lock:
+            self.log.append(f"Process finished with exit code {code}.")
+            self.running_stage = ""
+            self.running_stage_key = ""
+            self.running_reference_manifest = ""
+            self.running_reference_index = None
+            self.run_started_at = 0.0
+            if code == 0 and output.exists() and prepared_canvas.exists():
+                try:
+                    _composite_guide_in_place(output, prepared_canvas)
+                    self.log.append("Guide frame composited with source fill and corner inpaint.")
+                except Exception as exc:
+                    self.log.append(f"Warning: guide compositing failed (guide used as-is): {exc}")
+            if code == 0:
+                self.hydrate_stage_inputs("outpaint")
 
     def run_all(self) -> tuple[bool, str]:
         threading.Thread(target=self._run_all_worker, daemon=True).start()
@@ -1568,7 +1596,81 @@ def clear_outpaint_guide(index: int) -> dict[str, str]:
     return {"guide_image": ""}
 
 
-def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str]:
+def _composite_guide_in_place(output: Path, prepared_canvas: Path) -> None:
+    """Composite a raw Qwen guide PNG with source content and inpaint black corners, in-place.
+
+    The Qwen guide is typically slightly shorter than the LTX canvas (e.g. 690px vs 704px),
+    leaving black strips top and bottom when letterboxed.  This function:
+      1. Determines the letterbox geometry for the guide inside the canvas.
+      2. Fills the black strips with content from the prepared canvas (the source material).
+      3. Inpaints any remaining black corner pixels (where both guide and source are black).
+    The result is saved back over *output* so the GUI thumbnail reflects the final guide.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image as PILImage
+
+    # Probe canvas dimensions and extract a usable source frame via cv2 directly.
+    cap = cv2.VideoCapture(str(prepared_canvas))
+    canvas_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    canvas_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    # Skip frame 0 — the prepared canvas overlay filter can emit a pure-black frame at t=0.
+    cap.set(cv2.CAP_PROP_POS_MSEC, (1.0 / max(1.0, fps)) * 1000)
+    ok, src_frame = cap.read()
+    if not ok or src_frame is None:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, src_frame = cap.read()
+    cap.release()
+    if not ok or src_frame is None:
+        raise RuntimeError(f"Could not read frame from prepared canvas: {prepared_canvas}")
+    if src_frame.shape[1] != canvas_w or src_frame.shape[0] != canvas_h:
+        src_frame = cv2.resize(src_frame, (canvas_w, canvas_h), interpolation=cv2.INTER_LANCZOS4)
+
+    with PILImage.open(output) as img:
+        img_w, img_h = img.size
+        guide_rgb = img.convert("RGB")
+
+    resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+
+    if img_w == canvas_w and img_h == canvas_h:
+        # Already the right size — nothing to composite.
+        return
+
+    scale = min(canvas_w / img_w, canvas_h / img_h)
+    new_w = max(1, int(img_w * scale))
+    new_h = max(1, int(img_h * scale))
+    paste_x = (canvas_w - new_w) // 2
+    paste_y = (canvas_h - new_h) // 2
+
+    if new_w == canvas_w and new_h == canvas_h:
+        # No black bands — guide already fills the canvas after scaling.
+        return
+
+    # Build the letterboxed guide as a BGR numpy array.
+    resized = guide_rgb.resize((new_w, new_h), resampling)
+    canvas_pil = PILImage.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+    canvas_pil.paste(resized, (paste_x, paste_y))
+    canvas_bgr = cv2.cvtColor(np.array(canvas_pil), cv2.COLOR_RGB2BGR)
+
+    # Source-fill: paste prepared-canvas pixels into the black bands wherever source has content.
+    guide_mask = np.zeros((canvas_h, canvas_w), dtype=bool)
+    guide_mask[paste_y:paste_y + new_h, paste_x:paste_x + new_w] = True
+    src_is_content = np.any(src_frame > 4, axis=2)
+    fill_mask = (~guide_mask) & src_is_content
+    if fill_mask.any():
+        canvas_bgr[fill_mask] = src_frame[fill_mask]
+
+    # Corner inpaint: fill any pixels that are still near-black after source fill.
+    still_black = np.all(canvas_bgr <= 4, axis=2).astype(np.uint8) * 255
+    if still_black.any():
+        canvas_bgr = cv2.inpaint(canvas_bgr, still_black, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+
+    result = PILImage.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+    result.save(output, format="PNG")
+
+
+def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path]:
     state = outpaint_chunks_state(APP.settings)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
@@ -1643,7 +1745,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     ]
     if values.get("prompt_node_id"):
         cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
-    return cmd, rel(output)
+    return cmd, rel(output), resolve(range_source)
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
