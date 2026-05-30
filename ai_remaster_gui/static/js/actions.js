@@ -34,12 +34,9 @@ async function saveOutpaintChunk(index) {
   const result = await postJson('/api/outpaint-chunk', payload);
   if (!result.ok) return alert(result.error || 'Could not save chunk');
 
-  if (active === 'outpaint' && result.state) {
+  if (result.state) {
     state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
+    draw(false);
     lastRenderSignature = renderSignature();
     lastOutpaintVisualSignature = outpaintVisualSignature();
     restoreScrollState(snap);

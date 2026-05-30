@@ -722,7 +722,7 @@ class PipelineApp:
         if not ok:
             return False, message
         try:
-            cmd, output_rel, prepared_canvas = outpaint_end_guide_generation_command(index, prompt)
+            cmd, output_rel, prepared_canvas, source_seconds = outpaint_end_guide_generation_command(index, prompt)
         except Exception as exc:
             return False, str(exc)
         output = resolve(output_rel)
@@ -750,6 +750,7 @@ class PipelineApp:
             threading.Thread(
                 target=self._collect_output_guide,
                 args=(output, prepared_canvas),
+                kwargs={"source_seconds": source_seconds},
                 daemon=True,
             ).start()
         return True, f"Started Qwen end guide frame generation for chunk {index + 1}."
@@ -791,7 +792,7 @@ class PipelineApp:
             ).start()
         return True, f"Started Qwen guide frame generation for chunk {index + 1}."
 
-    def _collect_output_guide(self, output: Path, prepared_canvas: Path) -> None:
+    def _collect_output_guide(self, output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
         """Like _collect_output but composites the guide in-place after a successful Qwen run."""
         assert self.process and self.process.stdout
         for line in self.process.stdout:
@@ -807,7 +808,7 @@ class PipelineApp:
             self.run_started_at = 0.0
             if code == 0 and output.exists() and prepared_canvas.exists():
                 try:
-                    _composite_guide_in_place(output, prepared_canvas)
+                    _composite_guide_in_place(output, prepared_canvas, source_seconds=source_seconds)
                     self.log.append("Guide frame composited with source fill and corner inpaint.")
                 except Exception as exc:
                     self.log.append(f"Warning: guide compositing failed (guide used as-is): {exc}")
@@ -1714,7 +1715,7 @@ def clear_outpaint_end_guide(index: int) -> dict[str, str]:
     return {"guide_end_image": ""}
 
 
-def _composite_guide_in_place(output: Path, prepared_canvas: Path) -> None:
+def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
     """Composite a raw Qwen guide PNG with source content and inpaint black corners, in-place.
 
     The Qwen guide is typically slightly shorter than the LTX canvas (e.g. 690px vs 704px),
@@ -1723,6 +1724,10 @@ def _composite_guide_in_place(output: Path, prepared_canvas: Path) -> None:
       2. Fills the black strips with content from the prepared canvas (the source material).
       3. Inpaints any remaining black corner pixels (where both guide and source are black).
     The result is saved back over *output* so the GUI thumbnail reflects the final guide.
+
+    source_seconds: timestamp in the prepared canvas to use as the fill frame.  Defaults to
+    1/fps (near the start).  Pass the chunk end time for end-guide compositing so the correct
+    source frame fills the letterbox bands instead of the start frame.
     """
     import cv2
     import numpy as np
@@ -1733,8 +1738,8 @@ def _composite_guide_in_place(output: Path, prepared_canvas: Path) -> None:
     canvas_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     canvas_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    # Skip frame 0 — the prepared canvas overlay filter can emit a pure-black frame at t=0.
-    cap.set(cv2.CAP_PROP_POS_MSEC, (1.0 / max(1.0, fps)) * 1000)
+    seek_ms = source_seconds * 1000.0 if source_seconds is not None else (1.0 / max(1.0, fps)) * 1000.0
+    cap.set(cv2.CAP_PROP_POS_MSEC, seek_ms)
     ok, src_frame = cap.read()
     if not ok or src_frame is None:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -1866,7 +1871,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     return cmd, rel(output), resolve(range_source)
 
 
-def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path]:
+def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path, float]:
     state = outpaint_chunks_state(APP.settings)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
@@ -1939,7 +1944,7 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
     ]
     if values.get("prompt_node_id"):
         cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
-    return cmd, rel(output), resolve(range_source)
+    return cmd, rel(output), resolve(range_source), guide_source_seconds
 
 
 def recomposition_output_for(outpainted_text: str) -> str:

@@ -425,6 +425,103 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
+def _patch_end_guide(
+    workflow: dict[str, Any],
+    args,
+    guide_end_image: "Path",
+    canvas_width: int,
+    canvas_height: int,
+    source_frame: "Any",
+) -> None:
+    """Inject LTXVAddGuideAdvanced with frame_idx=-1 for last-frame (FLF2V) conditioning.
+
+    Chain: LTXAddVideoICLoRAGuide (5012) → LTXVAddGuideAdvanced (9051)
+    All downstream consumers of 5012's positive/negative/latent outputs are redirected
+    to 9051's outputs so the end-frame conditioning is included in generation.
+    """
+    from pathlib import Path as _Path
+    comfy_dir = _Path(args.comfy_dir)
+    end_image_name = copy_guide_image_to_comfy_input(
+        guide_end_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame
+    )
+
+    # --- Find the VAE source that already feeds node 5012's vae input ---
+    links_map = {lnk[0]: lnk for lnk in workflow.get("links", [])}
+    vae_src_node: int = 3940
+    vae_src_slot: int = 2
+    try:
+        ic_node = node_by_id(workflow, "5012")
+        for inp in ic_node.get("inputs", []):
+            if inp.get("name") == "vae" and inp.get("link") is not None:
+                lnk = links_map[inp["link"]]
+                vae_src_node, vae_src_slot = int(lnk[1]), int(lnk[2])
+                break
+    except KeyError:
+        pass
+
+    guide_end_strength = float(getattr(args, "guide_end_strength", 1.0))
+
+    # --- Add LoadImage node 9050 for the end guide image ---
+    add_or_replace_node(workflow, {
+        "id": 9050,
+        "type": "LoadImage",
+        "title": "End Guide Frame",
+        "mode": 0,
+        "inputs": [],
+        "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [19050]}],
+        "widgets_values": [end_image_name, "image"],
+    })
+
+    # --- Add LTXVAddGuideAdvanced node 9051 ---
+    # Input order must match INPUT_TYPES: positive, negative, vae, latent, image (links),
+    # then frame_idx, strength, crf, blur_radius, interpolation, crop (widgets).
+    add_or_replace_node(workflow, {
+        "id": 9051,
+        "type": "LTXVAddGuideAdvanced",
+        "title": "End Frame Guide",
+        "mode": 0,
+        "inputs": [
+            {"name": "positive",  "type": "CONDITIONING", "link": 19052},
+            {"name": "negative",  "type": "CONDITIONING", "link": 19053},
+            {"name": "vae",       "type": "VAE",          "link": 19051},
+            {"name": "latent",    "type": "LATENT",        "link": 19054},
+            {"name": "image",     "type": "IMAGE",         "link": 19050},
+        ],
+        "outputs": [
+            {"name": "positive", "type": "CONDITIONING", "links": []},
+            {"name": "negative", "type": "CONDITIONING", "links": []},
+            {"name": "latent",   "type": "LATENT",        "links": []},
+        ],
+        "widgets_values": {
+            "frame_idx": -1,
+            "strength": guide_end_strength,
+            "crf": 18,
+            "blur_radius": 0,
+            "interpolation": "lanczos",
+            "crop": "disabled",
+        },
+    })
+
+    # --- Add new links into 9051 ---
+    NEW_LINKS = [
+        [19050, 9050, 0, 9051, 4, "IMAGE"],        # LoadImage → 9051 image
+        [19051, vae_src_node, vae_src_slot, 9051, 2, "VAE"],  # VAE → 9051 vae
+        [19052, 5012, 0, 9051, 0, "CONDITIONING"],  # 5012 positive → 9051
+        [19053, 5012, 1, 9051, 1, "CONDITIONING"],  # 5012 negative → 9051
+        [19054, 5012, 2, 9051, 3, "LATENT"],        # 5012 latent   → 9051
+    ]
+    existing = [lnk for lnk in workflow.get("links", []) if lnk[0] not in {l[0] for l in NEW_LINKS}]
+    workflow["links"] = existing + NEW_LINKS
+
+    # --- Redirect 5012's downstream consumers to 9051 ---
+    # These are the links that currently carry 5012's positive/negative/latent outputs.
+    # Changing their source node to 9051 makes workflow_to_prompt traverse through 9051.
+    REDIRECT_FROM_5012 = {13409, 13410, 13413, 13414, 13444}
+    for lnk in workflow["links"]:
+        if lnk[0] in REDIRECT_FROM_5012 and int(lnk[1]) == 5012:
+            lnk[1] = 9051  # source node: 5012 → 9051 (slot stays the same)
+
+
 def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, guide_end_image: Path | None = None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
@@ -475,47 +572,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
         except KeyError:
             pass
 
-    # End-frame guide: use LTXAddVideoICLoRAGuide (node 5012) with mode="last".
-    # This node already receives the start guide image via the switch chain (5087→5012).
-    # When an end guide is set, we inject a new LoadImage node for it and rewire 5012's
-    # image input, then set its mode widget to "last" and the strength widget.
-    if guide_end_image and guide_end_image.exists():
-        end_image_name = copy_guide_image_to_comfy_input(guide_end_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame if guide_image and guide_image.exists() else None)
-        # Add a new LoadImage node (id 9050) for the end guide.
-        end_load_node_id = "9050"
-        add_or_replace_node(workflow, {
-            "id": int(end_load_node_id),
-            "type": "LoadImage",
-            "title": "End Guide Frame",
-            "mode": 0,
-            "inputs": [],
-            "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [19050]}],
-            "widgets_values": [end_image_name, "image"],
-        })
-        # Add a link from the new LoadImage to LTXAddVideoICLoRAGuide's image input.
-        links = workflow.setdefault("links", [])
-        # Remove any existing link with id 19050 to avoid duplicates.
-        workflow["links"] = [lnk for lnk in links if lnk[0] != 19050]
-        workflow["links"].append([19050, int(end_load_node_id), 0, 5012, 4, "IMAGE"])
-        # Update LTXAddVideoICLoRAGuide's image input link reference.
-        try:
-            ic_node = node_by_id(workflow, "5012")
-            for inp in ic_node.get("inputs", []):
-                if inp.get("name") == "image":
-                    inp["link"] = 19050
-                    break
-        except KeyError:
-            pass
-        # Set mode to "last" (widget index 3) and end-guide strength (widget index 2).
-        guide_end_strength = getattr(args, "guide_end_strength", 1.0)
-        try:
-            ic_node = node_by_id(workflow, "5012")
-            wv = ic_node.get("widgets_values")
-            if isinstance(wv, list) and len(wv) >= 4:
-                wv[2] = float(guide_end_strength)
-                wv[3] = "last"
-        except KeyError:
-            pass
+    # End-frame guide: injected after all other patching so the VAE source is already resolved.
 
     try:
         image_node = node_by_id(workflow, "2004")
@@ -584,6 +641,11 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             pad_node["widgets_values"][0:4] = [0, 0, 0, 0]
     except KeyError:
         pass
+
+    # End-frame guide via LTXVAddGuideAdvanced (frame_idx=-1 = last frame).
+    # Inserted here so GGUF patching has already resolved the correct VAE source node.
+    if guide_end_image and guide_end_image.exists():
+        _patch_end_guide(workflow, args, guide_end_image, canvas_width, canvas_height, source_frame)
 
     return workflow_to_prompt(workflow, args.output_node_id)
 
@@ -1029,8 +1091,8 @@ def main() -> int:
                     except Exception as exc:
                         print(f"Warning: could not extract auto-guide from previous chunk: {exc}", flush=True)
 
-                # End-frame guide: explicit only (no auto-derive). Requires start guide.
-                guide_end_text = chunk_row.get("guide_end_image", "") if guide_image else ""
+                # End-frame guide: explicit only (no auto-derive). Independent of start guide.
+                guide_end_text = chunk_row.get("guide_end_image", "")
                 guide_end_image: Path | None = resolve_path(guide_end_text) if guide_end_text else None
                 if guide_end_image and not guide_end_image.exists():
                     print(f"Warning: chunk {chunk_index + 1} end guide image not found and will be ignored: {guide_end_image}", flush=True)

@@ -78,7 +78,6 @@ function outpaintChunkGuide(row) {
   const idx = row.index;
   const hasStart = !!row.guide_exists;
   const hasEnd = !!row.guide_end_exists;
-  const endDisabled = !hasStart;
 
   // Start guide
   const startPath = row.guide_exists ? row.guide_image : row.guide_frame_preview;
@@ -119,28 +118,27 @@ function outpaintChunkGuide(row) {
         </div>
       </div>
 
-      <div class="chunk-guide ${endDisabled ? 'chunk-guide-disabled' : ''}">
+      <div class="chunk-guide">
         <div>
-          <label>End guide <span class="shot-time">(optional${endDisabled ? ' — set start guide first' : ''})</span></label>
-          ${endPath && !endDisabled ? `
+          <label>End guide <span class="shot-time">(optional)</span></label>
+          ${endPath ? `
             <figure id="chunkEndGuideFigure_${idx}" class="still-figure ${row.guide_end_exists ? 'has-anchor' : ''}">
               <img id="chunkEndGuideImg_${idx}" src="${endSrc}" alt="" onclick="openImageModal(this.src,${jsArg(endTitle)})">
               <span id="chunkEndGuideBadge_${idx}" class="anchor-badge ${row.guide_end_exists ? '' : 'hidden'}">End Guide</span>
               <figcaption id="chunkEndGuideCaption_${idx}">${esc(endTitle)}</figcaption>
             </figure>
-          ` : missingImage(endDisabled ? 'Set a start guide to unlock end guide' : 'Chunk end frame not present')}
+          ` : missingImage('Chunk end frame not present')}
         </div>
         <div>
           <p id="chunkEndGuideStatus_${idx}" class="shot-time">${esc(outpaintEndGuideStatus(row))}</p>
-          <p class="shot-time">Applied at the last frame of the chunk via IC-LoRA conditioning (FLF2V). Requires a start guide.</p>
+          <p class="shot-time">Applied at the last frame of the chunk via LTXVAddGuideAdvanced (frame_idx=-1). Works independently of the start guide.</p>
           <label>Strength: <span id="chunkEndGuideStrengthLabel_${idx}">${endStrength.toFixed(2)}</span></label>
           <input id="chunkEndGuideStrength_${idx}" type="range" min="0" max="1" step="0.01" value="${endStrength}"
-            ${endDisabled ? 'disabled' : ''}
             oninput="document.getElementById('chunkEndGuideStrengthLabel_${idx}').textContent=parseFloat(this.value).toFixed(2)">
           <div class="shot-tools">
-            <button type="button" data-outpaint-disable-running="true" onclick="chooseOutpaintEndAnchor(${idx})" ${endDisabled || state.running ? 'disabled' : ''}>Upload End Guide</button>
-            <button type="button" data-outpaint-disable-running="true" onclick="openEndAnchorPromptModal(${idx})" ${endDisabled || state.running ? 'disabled' : ''}>Generate End Guide</button>
-            <button type="button" onclick="clearOutpaintEndAnchor(${idx})" ${!row.guide_end_image || endDisabled ? 'disabled' : ''}>Clear</button>
+            <button type="button" data-outpaint-disable-running="true" onclick="chooseOutpaintEndAnchor(${idx})" ${state.running ? 'disabled' : ''}>Upload End Guide</button>
+            <button type="button" data-outpaint-disable-running="true" onclick="openEndAnchorPromptModal(${idx})" ${state.running ? 'disabled' : ''}>Generate End Guide</button>
+            <button type="button" onclick="clearOutpaintEndAnchor(${idx})" ${!row.guide_end_image ? 'disabled' : ''}>Clear</button>
           </div>
         </div>
       </div>
@@ -157,9 +155,8 @@ function outpaintGuideStatus(row) {
 }
 
 function outpaintEndGuideStatus(row) {
-  if (!row.guide_exists) return 'Set a start guide to enable end-frame guidance.';
   return row.guide_end_exists
-    ? 'End guide set. LTX will target this appearance at the last frame of the chunk (FLF2V).'
+    ? 'End guide set. LTX will target this appearance at the last frame of the chunk.'
     : 'No end guide set. LTX will generate the last frame freely.';
 }
 
