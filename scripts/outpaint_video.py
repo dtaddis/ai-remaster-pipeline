@@ -425,7 +425,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "1", args.text_encoder_checkpoint)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, guide_end_image: Path | None = None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir)
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
@@ -437,9 +437,9 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # effect and LTX generates freely.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
+    source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
         # Extract the first frame of the prepared video to use as source fill for guide black bands.
-        source_frame: "np.ndarray | None" = None
         try:
             import cv2 as _cv2
             import numpy as _np
@@ -458,12 +458,62 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             bypass_node["widgets_values"] = [False]
         except KeyError:
             pass
+        # Apply start-guide strength to LTXVImgToVideoConditionOnly (node 3159) widget 0.
+        guide_strength = getattr(args, "guide_strength", 0.7)
+        try:
+            i2v_node = node_by_id(workflow, "3159")
+            if isinstance(i2v_node.get("widgets_values"), list) and i2v_node["widgets_values"]:
+                i2v_node["widgets_values"][0] = float(guide_strength)
+        except KeyError:
+            pass
     else:
         image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
         # Keep bypass_i2v = True (default in workflow) so i2v has no effect.
         try:
             bypass_node = node_by_id(workflow, "5019")
             bypass_node["widgets_values"] = [True]
+        except KeyError:
+            pass
+
+    # End-frame guide: use LTXAddVideoICLoRAGuide (node 5012) with mode="last".
+    # This node already receives the start guide image via the switch chain (5087→5012).
+    # When an end guide is set, we inject a new LoadImage node for it and rewire 5012's
+    # image input, then set its mode widget to "last" and the strength widget.
+    if guide_end_image and guide_end_image.exists():
+        end_image_name = copy_guide_image_to_comfy_input(guide_end_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame if guide_image and guide_image.exists() else None)
+        # Add a new LoadImage node (id 9050) for the end guide.
+        end_load_node_id = "9050"
+        add_or_replace_node(workflow, {
+            "id": int(end_load_node_id),
+            "type": "LoadImage",
+            "title": "End Guide Frame",
+            "mode": 0,
+            "inputs": [],
+            "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [19050]}],
+            "widgets_values": [end_image_name, "image"],
+        })
+        # Add a link from the new LoadImage to LTXAddVideoICLoRAGuide's image input.
+        links = workflow.setdefault("links", [])
+        # Remove any existing link with id 19050 to avoid duplicates.
+        workflow["links"] = [lnk for lnk in links if lnk[0] != 19050]
+        workflow["links"].append([19050, int(end_load_node_id), 0, 5012, 4, "IMAGE"])
+        # Update LTXAddVideoICLoRAGuide's image input link reference.
+        try:
+            ic_node = node_by_id(workflow, "5012")
+            for inp in ic_node.get("inputs", []):
+                if inp.get("name") == "image":
+                    inp["link"] = 19050
+                    break
+        except KeyError:
+            pass
+        # Set mode to "last" (widget index 3) and end-guide strength (widget index 2).
+        guide_end_strength = getattr(args, "guide_end_strength", 1.0)
+        try:
+            ic_node = node_by_id(workflow, "5012")
+            wv = ic_node.get("widgets_values")
+            if isinstance(wv, list) and len(wv) >= 4:
+                wv[2] = float(guide_end_strength)
+                wv[3] = "last"
         except KeyError:
             pass
 
@@ -538,7 +588,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, guide_end_image: Path | None = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
@@ -556,7 +606,12 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "negative_suffix": negative_suffix,
         "guide_image": root_relative(guide_image) if guide_image else "",
         "guide_fingerprint": file_fingerprint(guide_image) if guide_image and guide_image.exists() else None,
+        "guide_strength": getattr(args, "guide_strength", 0.7),
+        "guide_end_image": root_relative(guide_end_image) if guide_end_image else "",
+        "guide_end_fingerprint": file_fingerprint(guide_end_image) if guide_end_image and guide_end_image.exists() else None,
+        "guide_end_strength": getattr(args, "guide_end_strength", 1.0),
         "guide_via_i2v_conditioning": bool(guide_image),
+        "guide_end_via_ic_lora": bool(guide_end_image),
         "auto_guide_from_previous_chunk": auto_guide,
         "seed": seed,
         "negative_prompt": negative_text,
@@ -644,6 +699,9 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "prompt_suffix",
         "negative_suffix",
         "guide_image",
+        "guide_strength",
+        "guide_end_image",
+        "guide_end_strength",
         "prepared_path",
         "raw_path",
     ]
@@ -838,6 +896,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-widget", default="0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--negative-prompt", default="cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands")
+    parser.add_argument("--guide-strength", type=float, default=0.7, help="Conditioning strength for the start-frame guide (LTX i2v, 0–1). Default: 0.7.")
+    parser.add_argument("--guide-end-strength", type=float, default=1.0, help="Conditioning strength for the end-frame guide (IC-LoRA, 0–1). Default: 1.0.")
     parser.add_argument("--black-lift", type=float, default=0.018)
     parser.add_argument("--gamma", type=float, default=1.06)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
@@ -957,7 +1017,7 @@ def main() -> int:
                 guide_text = chunk_row.get("guide_image", "")
                 explicit_guide: Path | None = resolve_path(guide_text) if guide_text else None
                 if explicit_guide and not explicit_guide.exists():
-                    print(f"Warning: chunk {chunk_index + 1} guide image not found and will be ignored: {explicit_guide}", flush=True)
+                    print(f"Warning: chunk {chunk_index + 1} start guide image not found and will be ignored: {explicit_guide}", flush=True)
                     explicit_guide = None
                 auto_guide: bool = False
                 guide_image: Path | None = explicit_guide
@@ -969,7 +1029,28 @@ def main() -> int:
                     except Exception as exc:
                         print(f"Warning: could not extract auto-guide from previous chunk: {exc}", flush=True)
 
-                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, auto_guide)
+                # End-frame guide: explicit only (no auto-derive). Requires start guide.
+                guide_end_text = chunk_row.get("guide_end_image", "") if guide_image else ""
+                guide_end_image: Path | None = resolve_path(guide_end_text) if guide_end_text else None
+                if guide_end_image and not guide_end_image.exists():
+                    print(f"Warning: chunk {chunk_index + 1} end guide image not found and will be ignored: {guide_end_image}", flush=True)
+                    guide_end_image = None
+
+                # Per-chunk strength overrides (fall back to CLI defaults).
+                strength_text = chunk_row.get("guide_strength", "")
+                if strength_text:
+                    try:
+                        args.guide_strength = float(strength_text)
+                    except ValueError:
+                        pass
+                end_strength_text = chunk_row.get("guide_end_strength", "")
+                if end_strength_text:
+                    try:
+                        args.guide_end_strength = float(end_strength_text)
+                    except ValueError:
+                        pass
+
+                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, guide_end_image, auto_guide)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
                         if chunk_index < args.only_chunk:
@@ -1001,8 +1082,10 @@ def main() -> int:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
                 if guide_image:
                     source = "explicit" if explicit_guide else "auto"
-                    print(f"Chunk {chunk_index + 1} guide frame ({source}): {guide_image}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image)
+                    print(f"Chunk {chunk_index + 1} start guide ({source}): {guide_image}", flush=True)
+                if guide_end_image:
+                    print(f"Chunk {chunk_index + 1} end guide: {guide_end_image}", flush=True)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, guide_end_image)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
