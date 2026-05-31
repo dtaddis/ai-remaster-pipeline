@@ -106,19 +106,30 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     # at t=0 but the source has not yet produced a frame.
     #
     # Two-step scaling when delivery dimensions differ from target (model-safe) dimensions:
-    #   Step 1 – scale to fit DELIVERY dimensions (e.g. 1280×720), preserving source AR.
+    #   Step 1 – scale to fit DELIVERY dimensions, preserving source AR.
     #            This gives the same pillar/letter-bar geometry as the delivery frame.
-    #   Step 2 – squish height from delivery to model-safe (e.g. 720→704), non-AR-preserving.
-    #            Width is unchanged (e.g. 960 stays 960), vertical is compressed slightly.
+    #   Step 2 – squish the axis that changed from delivery → model-safe, non-AR-preserving.
+    #            Landscape: squish height (e.g. 720→704), width unchanged.
+    #            Portrait:  squish width  (e.g. 720→704), height unchanged.
     # When delivery == target the second scale is a no-op.
     delivery_w = int(args.delivery_width or target_width)
     delivery_h = int(args.delivery_height or target_height)
     if delivery_w == target_width and delivery_h == target_height:
         scale_steps = f"scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos"
     else:
+        # Step 2 squishes from delivery to model-safe along whichever axis changed.
+        # Landscape: delivery 1280×720 → target 1280×704 — squish height, keep width.
+        # Portrait:  delivery 720×1280 → target 704×1280 — squish width, keep height.
+        # Both differ: squish both (rare, but handled without extra AR distortion).
+        if delivery_w == target_width:
+            squish = f"scale=w=iw:h={target_height}:flags=lanczos"
+        elif delivery_h == target_height:
+            squish = f"scale=w={target_width}:h=ih:flags=lanczos"
+        else:
+            squish = f"scale=w={target_width}:h={target_height}:flags=lanczos"
         scale_steps = (
             f"scale=w={delivery_w}:h={delivery_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-            f"scale=w=iw:h={target_height}:flags=lanczos"
+            f"{squish}"
         )
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
@@ -156,8 +167,8 @@ def build_parser():
     parser.add_argument('--target-aspect', default='16:9')
     parser.add_argument('--target-width', type=int, help='Output width (model-safe, e.g. 1280). Defaults to target-height * target-aspect.')
     parser.add_argument('--target-height', type=int, help='Output height (model-safe, e.g. 704). Defaults to the source height.')
-    parser.add_argument('--delivery-width', type=int, default=0, help='Delivery width (e.g. 1280). Source is scaled to fit this AR first, then squished to --target-height. Defaults to --target-width.')
-    parser.add_argument('--delivery-height', type=int, default=0, help='Delivery height (e.g. 720). Source is scaled to fit this AR first, then squished to --target-height. Defaults to --target-height.')
+    parser.add_argument('--delivery-width', type=int, default=0, help='Delivery width for AR-correct scaling (step 1). Source is scaled to fit delivery dims first, then the changed axis is squished to model-safe. Defaults to --target-width.')
+    parser.add_argument('--delivery-height', type=int, default=0, help='Delivery height for AR-correct scaling (step 1). Defaults to --target-height.')
     parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-top', type=int, default=0, help='Pixels to crop from the source before padding.')

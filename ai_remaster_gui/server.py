@@ -1785,12 +1785,14 @@ def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_second
 
     resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
 
-    # Step 1: scale Qwen output to match canvas width, preserving AR.
-    # This gives e.g. 1280×691 for a typical Qwen output, centred vertically in the 1280×704
-    # canvas with ~6–7 px spare top and bottom.
+    # Step 1: scale Qwen output to fit within the canvas, preserving AR.
+    # Use the tighter dimension (min) so the image never exceeds either canvas axis.
+    # For landscape (e.g. 1280×704): Qwen is typically slightly wider in AR, so width is the
+    # tighter constraint and the result is e.g. 1280×691 with spare pixels top/bottom.
+    # For portrait (e.g. 704×1280): height is typically the tighter constraint.
     # A calibrated 1px-left / 1px-down nudge is applied for pixel-perfect alignment.
-    scale = canvas_w / img_w
-    new_w = canvas_w
+    scale = min(canvas_w / img_w, canvas_h / img_h)
+    new_w = max(1, int(round(img_w * scale)))
     new_h = max(1, int(round(img_h * scale)))
     resized = guide_rgb.resize((new_w, new_h), resampling)
 

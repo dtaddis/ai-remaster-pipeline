@@ -171,12 +171,11 @@ def copy_guide_image_to_comfy_input(
     canvas_height: int = 0,
     source_frame: "np.ndarray | None" = None,
 ) -> str:
-    """Copy a guide image to ComfyUI's input folder, normalised to the LTX canvas size.
+    """Copy a guide image to ComfyUI's input folder, stretched to exactly the LTX canvas size.
 
-    When canvas dimensions are provided the guide is always stretched to exactly
-    (canvas_width × canvas_height) before it reaches LTXVImgToVideoConditionOnly.
-    This avoids the zoom-out artefact that occurs when ResizeImageMaskNode center-crops
-    a mismatched image, and ensures the guide is pixel-aligned with the prepared canvas.
+    Always stretches to (canvas_width × canvas_height) — no letterboxing, no cropping.
+    This ensures the guide is pixel-aligned with the prepared canvas so LTXVImgToVideoConditionOnly
+    receives a properly-sized image.
 
     A warning is printed when the aspect-ratio difference exceeds 10%, which typically
     indicates a mismatched source (e.g. a portrait image used as a landscape guide).
@@ -228,21 +227,16 @@ def copy_guide_image_to_comfy_input(
     return f"arp_outpaint/{target.name}"
 
 
-def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path, target_width: int = 0, target_height: int = 0) -> Path:
+def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
     """Extract the last frame of a finished raw chunk as a PNG for i2v guide conditioning.
 
-    When *target_width* / *target_height* are provided the frame is rescaled to exactly those
-    dimensions before saving.  This is intentionally non-AR-preserving: raw chunks come back from
-    LTX at model-safe dimensions (e.g. 1280×704) while the prepared canvas — and therefore the
-    next chunk's expected guide — is at delivery dimensions (e.g. 1280×720).  A direct stretch
-    reverses LTX's quantisation crop so the guide content aligns pixel-for-pixel with the next
-    chunk's prepared canvas.  Letterboxing is explicitly *not* used here because it would
-    introduce black bands that LTX would treat as outpainting margins on the wrong edges.
+    Raw chunks are at model-safe dimensions (e.g. 1280×704), which matches the canvas
+    used for the next chunk.  No resize is performed; copy_guide_image_to_comfy_input
+    handles any final stretching to canvas size.
     """
     import cv2
 
-    size_tag = f"_{target_width}x{target_height}" if (target_width and target_height) else ""
-    target = chunk_dir / f"guide_prev_{safe_stem(previous_raw.name)}{size_tag}.png"
+    target = chunk_dir / f"guide_prev_{safe_stem(previous_raw.name)}.png"
     if target.exists() and target.stat().st_mtime_ns >= previous_raw.stat().st_mtime_ns:
         return target
     cap = cv2.VideoCapture(str(previous_raw))
@@ -252,9 +246,6 @@ def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path, target_widt
     cap.release()
     if not ok or frame is None:
         raise RuntimeError(f"Could not extract last frame from previous chunk: {previous_raw}")
-    if target_width and target_height and (frame.shape[1] != target_width or frame.shape[0] != target_height):
-        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
-        print(f"Auto-guide rescaled {frame.shape[1]}x{frame.shape[0]} → {target_width}x{target_height} (delivery un-squash)", flush=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(target), frame)
     return target
