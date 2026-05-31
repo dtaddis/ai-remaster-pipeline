@@ -70,7 +70,7 @@ def crop_values(args, info: dict) -> tuple[int, int, int, int, int, int]:
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 4,
+        'version': 5,
         'tool': 'prepare_outpaint_input.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -78,6 +78,8 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
         'source_height': info['height'],
         'target_width': target_width,
         'target_height': target_height,
+        'delivery_width': int(args.delivery_width or target_width),
+        'delivery_height': int(args.delivery_height or target_height),
         'target_aspect': args.target_aspect,
         'crop_left': max(0, int(args.crop_left)),
         'crop_right': max(0, int(args.crop_right)),
@@ -102,15 +104,32 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     # and anything with an edit list) cause the overlay filter to emit a pure-black frame at t=0
     # before the source video contributes its first frame, because the colour background is ready
     # at t=0 but the source has not yet produced a frame.
+    #
+    # Two-step scaling when delivery dimensions differ from target (model-safe) dimensions:
+    #   Step 1 – scale to fit DELIVERY dimensions (e.g. 1280×720), preserving source AR.
+    #            This gives the same pillar/letter-bar geometry as the delivery frame.
+    #   Step 2 – squish height from delivery to model-safe (e.g. 720→704), non-AR-preserving.
+    #            Width is unchanged (e.g. 960 stays 960), vertical is compressed slightly.
+    # When delivery == target the second scale is a no-op.
+    delivery_w = int(args.delivery_width or target_width)
+    delivery_h = int(args.delivery_height or target_height)
+    if delivery_w == target_width and delivery_h == target_height:
+        scale_steps = f"scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos"
+    else:
+        scale_steps = (
+            f"scale=w={delivery_w}:h={delivery_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"scale=w=iw:h={target_height}:flags=lanczos"
+        )
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
-        f"[0:v]trim=start_frame=0,setpts=PTS-STARTPTS,crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1,format=rgb24,lutrgb={lut}[src]",
+        f"[0:v]trim=start_frame=0,setpts=PTS-STARTPTS,crop=w={crop_width}:h={crop_height}:x={left}:y={top},{scale_steps},setsar=1,format=rgb24,lutrgb={lut}[src]",
         '[bg][src]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1:format=auto,format=yuv420p[v]',
     ])
 
 
-def default_output(source: Path, target_width: int, target_height: int) -> Path:
-    return resolve_path(Path('intermediate') / 'outpaint_prepared' / f'{source.stem}_{target_width}x{target_height}_lifted.mp4')
+def default_output(source: Path, target_width: int, target_height: int, delivery_width: int = 0, delivery_height: int = 0) -> Path:
+    delivery_tag = f'_from{delivery_width}x{delivery_height}' if (delivery_width and delivery_height and (delivery_width != target_width or delivery_height != target_height)) else ''
+    return resolve_path(Path('intermediate') / 'outpaint_prepared' / f'{source.stem}_{target_width}x{target_height}{delivery_tag}_lifted.mp4')
 
 
 def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: float = 0.5) -> None:
@@ -135,8 +154,10 @@ def build_parser():
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
     parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
     parser.add_argument('--target-aspect', default='16:9')
-    parser.add_argument('--target-width', type=int, help='Output width. Defaults to target-height * target-aspect.')
-    parser.add_argument('--target-height', type=int, help='Output height. Defaults to the source height.')
+    parser.add_argument('--target-width', type=int, help='Output width (model-safe, e.g. 1280). Defaults to target-height * target-aspect.')
+    parser.add_argument('--target-height', type=int, help='Output height (model-safe, e.g. 704). Defaults to the source height.')
+    parser.add_argument('--delivery-width', type=int, default=0, help='Delivery width (e.g. 1280). Source is scaled to fit this AR first, then squished to --target-height. Defaults to --target-width.')
+    parser.add_argument('--delivery-height', type=int, default=0, help='Delivery height (e.g. 720). Source is scaled to fit this AR first, then squished to --target-height. Defaults to --target-height.')
     parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-top', type=int, default=0, help='Pixels to crop from the source before padding.')
@@ -160,7 +181,7 @@ def main():
     info = probe_video(source)
     target_height = even(args.target_height or info['height'])
     target_width = even(args.target_width or (target_height * parse_aspect(args.target_aspect)))
-    output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height)
+    output = resolve_path(args.output) if args.output else default_output(source, target_width, target_height, int(args.delivery_width or 0), int(args.delivery_height or 0))
     sig = signature(args, source, info, target_width, target_height)
     if not args.force and resumable_output(output, sig, video_like=source, width=target_width, height=target_height):
         print(f'Reuse prepared outpaint input: {output}', flush=True)

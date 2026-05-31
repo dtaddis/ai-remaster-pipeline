@@ -308,8 +308,10 @@ def write_manifest(path,source_path,rows,info):
         h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
         for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
     tmp.replace(path)
-def source_signature(source_path,row): return {'version':1,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'generator':'generate_references.py'}
+def source_signature(source_path,row,out_w=0,out_h=0): return {'version':2,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'generator':'generate_references.py'}
 def extract_frames(args,source_path,info,rows):
+    out_w=int(args.frame_width or 0); out_h=int(args.frame_height or 0)
+    write_w=out_w or info.width; write_h=out_h or info.height
     expected={row.source_reference for row in rows}
     if args.prune_source_frames:
         for folder in {p.parent for p in expected}:
@@ -317,10 +319,13 @@ def extract_frames(args,source_path,info,rows):
                 for png in folder.glob('cut_*.png'):
                     if png not in expected: png.unlink(missing_ok=True); png.with_suffix(png.suffix+'.sig.json').unlink(missing_ok=True); print(f'Removed orphan source frame: {png}')
     for row in rows:
-        sig=source_signature(source_path,row)
-        if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=info.width,height=info.height): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
-        if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=info.width,height=info.height): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
-        write_png(row.source_reference,read_frame(source_path,row.selected_frame)); write_signature(row.source_reference,sig); print(f'Wrote source frame {row.index:04d}: {row.source_reference}')
+        sig=source_signature(source_path,row,out_w,out_h)
+        if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
+        if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
+        frame=read_frame(source_path,row.selected_frame)
+        if out_w and out_h and (frame.shape[1]!=out_w or frame.shape[0]!=out_h):
+            frame=cv2.resize(frame,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
+        write_png(row.source_reference,frame); write_signature(row.source_reference,sig); print(f'Wrote source frame {row.index:04d} ({write_w}x{write_h}): {row.source_reference}')
 def default_manifest_path(source_path): return DEFAULT_MANIFEST_ROOT/f'colorize_manifest_{safe_stem(source_path.name)}_shots_auto.csv'
 
 
@@ -351,6 +356,8 @@ def build_parser():
     parser.add_argument('--regenerate-source-frames',dest='regenerate_source_frames',action='store_true',default=True,help='Rewrite source screenshots by default so stale cut data is flushed out.')
     parser.add_argument('--keep-existing-source-frames',dest='regenerate_source_frames',action='store_false')
     parser.add_argument('--no-prune-source-frames',dest='prune_source_frames',action='store_false',default=True)
+    parser.add_argument('--frame-width',type=int,default=0,help='Resize extracted reference frames to this width (e.g. delivery width to correct model-safe LTX output).')
+    parser.add_argument('--frame-height',type=int,default=0,help='Resize extracted reference frames to this height (e.g. delivery height to correct model-safe LTX output).')
     parser.add_argument('--limit',type=int,help='Limit rows for smoke tests.')
     parser.add_argument('--dry-run',action='store_true')
     parser.add_argument('--force',action='store_true')

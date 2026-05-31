@@ -66,17 +66,28 @@ function overviewSectionPicker(global, source) {
   const start = Number(global.section_start || 0);
   const duration = parseDuration((state.source_info && state.source_info.duration) || '0');
   const end = Number(global.section_end || duration || 0);
+  const fps = Math.max(1, Number((state.source_info && state.source_info.fps) || 24));
+  const sliderMax = Math.max(duration, end, 1);
+  const frameStep = (1 / fps).toFixed(6);
   return `
     <div class="section-picker">
       ${source ? `<video id="sourceSectionVideo" class="section-video" src="${media(source)}" controls preload="metadata"></video>` : ''}
       <div class="editor-controls">
         <div>
           <label>Start: <span id="sectionStartLabel">${formatSeconds(start)}</span></label>
-          <input id="sectionStart" type="range" min="0" max="${Math.max(duration, end, 1)}" step="0.041" value="${start}">
+          <div class="frame-nudge-row">
+            <input id="sectionStart" type="range" min="0" max="${sliderMax}" step="${frameStep}" value="${start}" data-fps="${fps}">
+            <button type="button" class="frame-nudge" onclick="nudgeSectionBoundary('start',-1)">−1</button>
+            <button type="button" class="frame-nudge" onclick="nudgeSectionBoundary('start',1)">+1</button>
+          </div>
         </div>
         <div>
           <label>End: <span id="sectionEndLabel">${end ? formatSeconds(end) : 'End'}</span></label>
-          <input id="sectionEnd" type="range" min="0" max="${Math.max(duration, end, 1)}" step="0.041" value="${end || duration || 0}">
+          <div class="frame-nudge-row">
+            <input id="sectionEnd" type="range" min="0" max="${sliderMax}" step="${frameStep}" value="${end || duration || 0}" data-fps="${fps}">
+            <button type="button" class="frame-nudge" onclick="nudgeSectionBoundary('end',-1)">−1</button>
+            <button type="button" class="frame-nudge" onclick="nudgeSectionBoundary('end',1)">+1</button>
+          </div>
         </div>
       </div>
       <div class="shot-tools">

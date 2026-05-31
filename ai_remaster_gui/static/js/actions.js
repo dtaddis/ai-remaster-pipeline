@@ -488,6 +488,22 @@ async function saveGlobalSection() {
   lastRenderSignature = renderSignature();
 }
 
+async function nudgeSectionBoundary(edge, frames) {
+  const id = edge === 'start' ? 'sectionStart' : 'sectionEnd';
+  const labelId = edge === 'start' ? 'sectionStartLabel' : 'sectionEndLabel';
+  const slider = document.getElementById(id);
+  if (!slider) return;
+  const fps = Math.max(1, Number(slider.dataset.fps || 24));
+  const step = 1 / fps;
+  const min = Number(slider.min || 0);
+  const max = Number(slider.max || 0);
+  const current = Number(slider.value || 0);
+  slider.value = Math.min(max, Math.max(min, current + frames * step)).toFixed(6);
+  const label = document.getElementById(labelId);
+  if (label) label.textContent = formatSeconds(slider.value);
+  await saveGlobalSection();
+}
+
 async function markSourceSection(edge) {
   const video = document.getElementById('sourceSectionVideo');
   const target = document.getElementById(edge === 'start' ? 'sectionStart' : 'sectionEnd');

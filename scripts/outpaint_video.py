@@ -91,8 +91,13 @@ def default_raw_output(source: Path, aspect: str, target_height: int | None, arg
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    width, height = model_safe_size(source, aspect, target_height)
-    prepared = default_prepared_output(source, width, height)
+    # Prepare at model-safe dimensions so the canvas fed to LTX exactly matches the latent node
+    # dimensions.  LTXVPreprocess crops (not scales) to fit the latent, so any mismatch would
+    # silently remove rows/columns of pixels.  The finalize step upscales the raw LTX output back
+    # to delivery resolution (e.g. 704 → 720) after the black/gamma lift is restored.
+    work_w, work_h = model_safe_size(source, aspect, target_height)
+    del_w, del_h = target_size(source, aspect, target_height)
+    prepared = default_prepared_output(source, work_w, work_h, del_w, del_h)
     return prepared.with_name(prepared.stem + (crop_slug(args) if args else "") + prepared.suffix)
 
 
@@ -168,25 +173,14 @@ def copy_guide_image_to_comfy_input(
 ) -> str:
     """Copy a guide image to ComfyUI's input folder, normalised to the LTX canvas size.
 
-    When canvas dimensions are provided the guide is resized to exactly (canvas_width × canvas_height)
-    before it reaches LTXVImgToVideoConditionOnly.  This avoids the zoom-out artefact that occurs
-    when ResizeImageMaskNode center-crops a mismatched image.
+    When canvas dimensions are provided the guide is always stretched to exactly
+    (canvas_width × canvas_height) before it reaches LTXVImgToVideoConditionOnly.
+    This avoids the zoom-out artefact that occurs when ResizeImageMaskNode center-crops
+    a mismatched image, and ensures the guide is pixel-aligned with the prepared canvas.
 
-    For small aspect-ratio differences (≤ 10%) — typical of Qwen output — the image is stretched
-    directly to canvas size, reversing Qwen's uniform patch-quantisation compression with only a
-    ~2% per-axis residual error, which is imperceptible to both humans and LTX's i2v conditioning.
-
-    For large AR differences (> 10%) — e.g. a manually-uploaded portrait or square image — the
-    image is letterboxed with black padding instead, so content is never badly distorted.
-
-    When *source_frame* is provided (a BGR numpy array at the canvas size, extracted from the
-    prepared video) and the guide requires letterboxing, the black padding regions are filled in
-    two passes:
-      1. Source-fill: pixels from *source_frame* that are not pure-black padding are composited
-         into the black bands, using the exact letterbox geometry as a mask (no heuristics).
-      2. Corner inpaint: any pixels that remain near-black after the source fill (i.e. areas where
-         both the guide and the source are pure black) are inpainted with cv2.INPAINT_TELEA so LTX
-         receives a fully-populated guide frame with no large black voids.
+    A warning is printed when the aspect-ratio difference exceeds 10%, which typically
+    indicates a mismatched source (e.g. a portrait image used as a landscape guide).
+    The stretch still proceeds — the caller is responsible for supplying a sensible guide.
     """
     from PIL import Image as PILImage
 
@@ -210,81 +204,45 @@ def copy_guide_image_to_comfy_input(
             if img_w == canvas_width and img_h == canvas_height:
                 shutil.copy2(guide, target)
             else:
-                # Letterbox: scale to fit within the canvas preserving aspect ratio,
-                # then pad the remainder with pure black.  This avoids geometric distortion
-                # in the guide content — any black bands are treated as outpainting margins
-                # by LTX and filled naturally.  Stretching to fill causes visible y-squish
-                # in the first few generated frames, so we never do that.
-                scale = min(canvas_width / img_w, canvas_height / img_h)
-                new_w = max(1, int(img_w * scale))
-                new_h = max(1, int(img_h * scale))
                 resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
-                resized = img.convert("RGB").resize((new_w, new_h), resampling)
-                out = PILImage.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
-                paste_x = (canvas_width - new_w) // 2
-                paste_y = (canvas_height - new_h) // 2
-                out.paste(resized, (paste_x, paste_y))
-
-                if new_w != canvas_width or new_h != canvas_height:
+                img_ar = img_w / img_h
+                canvas_ar = canvas_width / canvas_height
+                ar_diff = abs(img_ar - canvas_ar) / canvas_ar
+                if ar_diff > 0.10:
                     print(
-                        f"Guide letterboxed {img_w}x{img_h} -> {new_w}x{new_h} "
-                        f"(padded {canvas_width - new_w}px h, {canvas_height - new_h}px v to {canvas_width}x{canvas_height})",
+                        f"Warning: guide AR {img_ar:.3f} ({img_w}x{img_h}) differs from canvas AR "
+                        f"{canvas_ar:.3f} ({canvas_width}x{canvas_height}) by {ar_diff * 100:.1f}%. "
+                        f"Stretching anyway — check that the correct guide image is being used.",
                         flush=True,
                     )
-
-                    # ------------------------------------------------------------------
-                    # Source-fill + corner inpaint when a prepared source frame is available.
-                    # The guide only covers the rectangle [paste_x:paste_x+new_w, paste_y:paste_y+new_h].
-                    # Everything outside that rectangle is pure-black padding.  We fill it in two steps:
-                    #   1. Composite source_frame content into the black bands (exact geometry mask).
-                    #   2. Inpaint any remaining black corners where both guide and source are black.
-                    # ------------------------------------------------------------------
-                    if source_frame is not None:
-                        import cv2
-                        import numpy as np
-
-                        # Convert guide PIL image to BGR numpy for cv2 operations.
-                        canvas_bgr = cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
-
-                        # source_frame is already canvas-sized BGR from the prepared video.
-                        src = source_frame
-                        if src.shape[1] != canvas_width or src.shape[0] != canvas_height:
-                            src = cv2.resize(src, (canvas_width, canvas_height), interpolation=cv2.INTER_LANCZOS4)
-
-                        # Build the guide-coverage mask: True where the guide content sits.
-                        guide_mask = np.zeros((canvas_height, canvas_width), dtype=bool)
-                        guide_mask[paste_y:paste_y + new_h, paste_x:paste_x + new_w] = True
-
-                        # Source pixels that are not pure-black padding (black_lift raises
-                        # real content above 0; actual padding in the prepared video is exact 0).
-                        src_is_content = np.any(src > 4, axis=2)  # at least one channel > 4/255
-
-                        # Fill bands: pixels outside guide coverage where source has real content.
-                        fill_mask = (~guide_mask) & src_is_content
-                        canvas_bgr[fill_mask] = src[fill_mask]
-
-                        filled_pixels = int(fill_mask.sum())
-                        if filled_pixels:
-                            print(f"Guide source-filled {filled_pixels} black-band pixels from prepared frame.", flush=True)
-
-                        # Inpaint remaining black corners (outside guide and source coverage).
-                        canvas_bgr = _inpaint_black_corners(canvas_bgr)
-
-                        # Write back as PNG via PIL.
-                        out = PILImage.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
-
-                out.save(target, format="PNG")
+                else:
+                    print(
+                        f"Guide stretched {img_w}x{img_h} -> {canvas_width}x{canvas_height}",
+                        flush=True,
+                    )
+                resized = img.convert("RGB").resize((canvas_width, canvas_height), resampling)
+                resized.save(target, format="PNG")
     else:
         shutil.copy2(guide, target)
 
     return f"arp_outpaint/{target.name}"
 
 
-def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
-    """Extract the last frame of a finished raw chunk as a PNG for i2v guide conditioning."""
+def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path, target_width: int = 0, target_height: int = 0) -> Path:
+    """Extract the last frame of a finished raw chunk as a PNG for i2v guide conditioning.
+
+    When *target_width* / *target_height* are provided the frame is rescaled to exactly those
+    dimensions before saving.  This is intentionally non-AR-preserving: raw chunks come back from
+    LTX at model-safe dimensions (e.g. 1280×704) while the prepared canvas — and therefore the
+    next chunk's expected guide — is at delivery dimensions (e.g. 1280×720).  A direct stretch
+    reverses LTX's quantisation crop so the guide content aligns pixel-for-pixel with the next
+    chunk's prepared canvas.  Letterboxing is explicitly *not* used here because it would
+    introduce black bands that LTX would treat as outpainting margins on the wrong edges.
+    """
     import cv2
 
-    target = chunk_dir / f"guide_prev_{safe_stem(previous_raw.name)}.png"
+    size_tag = f"_{target_width}x{target_height}" if (target_width and target_height) else ""
+    target = chunk_dir / f"guide_prev_{safe_stem(previous_raw.name)}{size_tag}.png"
     if target.exists() and target.stat().st_mtime_ns >= previous_raw.stat().st_mtime_ns:
         return target
     cap = cv2.VideoCapture(str(previous_raw))
@@ -294,6 +252,9 @@ def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
     cap.release()
     if not ok or frame is None:
         raise RuntimeError(f"Could not extract last frame from previous chunk: {previous_raw}")
+    if target_width and target_height and (frame.shape[1] != target_width or frame.shape[0] != target_height):
+        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+        print(f"Auto-guide rescaled {frame.shape[1]}x{frame.shape[0]} → {target_width}x{target_height} (delivery un-squash)", flush=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(target), frame)
     return target
@@ -532,6 +493,9 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # When a guide image is provided, enable i2v conditioning so LTX targets the guide appearance
     # at the start of the chunk.  When there is no guide, leave the bypass True so i2v has no
     # effect and LTX generates freely.
+    #
+    # The prepared video is at model-safe dimensions (e.g. 1280×704), so canvas, latent node,
+    # and guide images all use the same dimensions — no mismatch, no crop.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
     source_frame: "np.ndarray | None" = None
@@ -605,8 +569,8 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
         latent_video_node = node_by_id(workflow, "3059")
         for input_name in ("width", "height", "length"):
             clear_input_link(workflow, "3059", input_name)
-        set_widget(latent_video_node, "0", int(prepared_info["width"]))
-        set_widget(latent_video_node, "1", int(prepared_info["height"]))
+        set_widget(latent_video_node, "0", canvas_width)
+        set_widget(latent_video_node, "1", canvas_height)
         set_widget(latent_video_node, "2", int(prepared_info["frames"]))
         set_widget(latent_video_node, "3", 1)
     except KeyError:
@@ -654,7 +618,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 22,
+        "version": 23,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1023,14 +987,16 @@ def main() -> int:
     ]
     prepare_command += ["--target-height", str(work_height)]
     prepare_command += ["--target-width", str(work_width)]
+    prepare_command += ["--delivery-width", str(delivery_width)]
+    prepare_command += ["--delivery-height", str(delivery_height)]
     if args.force:
         prepare_command.append("--force")
     if args.dry_run:
         prepare_command.append("--dry-run")
     if (work_width, work_height) != (delivery_width, delivery_height):
         print(
-            f"LTX working canvas rounded to {work_width}x{work_height} "
-            f"from requested delivery {delivery_width}x{delivery_height}.",
+            f"LTX working canvas: {work_width}x{work_height} (rounded to multiples of {MODEL_SIZE_MULTIPLE} "
+            f"from delivery {delivery_width}x{delivery_height}). Finalize will upscale back to delivery.",
             flush=True,
         )
     print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)

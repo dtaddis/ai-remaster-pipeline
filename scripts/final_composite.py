@@ -37,7 +37,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 3
+    values['version'] = 4
     return values
 
 
@@ -102,8 +102,14 @@ def build_filter(args, has_color, fps: float):
     color_opacity = max(0.0, min(1.0, args.color_opacity))
     fps_text = f"{fps:.8f}"
     crop = source_crop_filter(args)
+    # Optionally scale the outpainted video to the delivery output dimensions.
+    # This corrects for LTX's model-safe quantisation (e.g. 704p → 720p) so the
+    # final composite is at the user's intended resolution.
+    out_w = int(args.output_width) if args.output_width else 0
+    out_h = int(args.output_height) if args.output_height else 0
+    scale_base = f",scale={out_w}:{out_h}:flags=lanczos" if (out_w and out_h) else ""
     filters = [
-        f'[0:v]fps=fps={fps_text},setpts=N/({fps_text}*TB)[base0]',
+        f'[0:v]fps=fps={fps_text},setpts=N/({fps_text}*TB){scale_base}[base0]',
         f'[1:v]fps=fps={fps_text},{crop}setpts=N/({fps_text}*TB)[src0]',
         '[src0][base0]scale2ref=w=oh*mdar:h=ih[src][base]',
         f"[src]format=rgba,split[src_rgb][src_a]",
@@ -179,6 +185,8 @@ def build_parser():
     parser.add_argument('--saturation', type=float, default=0.82)
     parser.add_argument('--temperature', type=float, default=-0.015, help='Negative cools the color overlay; positive warms it.')
     parser.add_argument('--color-opacity', type=float, default=1.0)
+    parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
+    parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)

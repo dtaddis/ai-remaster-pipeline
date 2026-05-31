@@ -387,7 +387,8 @@ def newest_output(files: list[Path]) -> Path:
 
 
 def normalize_to_source_size(path: Path, source_path: Path, final_path: Path | None = None) -> None:
-    from PIL import Image, ImageOps
+    """Scale (never crop) the Qwen output to exactly match the source image dimensions."""
+    from PIL import Image
 
     with Image.open(source_path) as source_image:
         target_size = source_image.size
@@ -395,7 +396,8 @@ def normalize_to_source_size(path: Path, source_path: Path, final_path: Path | N
         if image.size == target_size:
             return
         resampling = getattr(Image, 'Resampling', Image).LANCZOS
-        normalized = ImageOps.fit(image.convert('RGB'), target_size, method=resampling, centering=(0.5, 0.5))
+        # Use resize (scale), not ImageOps.fit (centre-crop), so no pixels are ever discarded.
+        normalized = image.convert('RGB').resize(target_size, resampling)
         output_suffix = (final_path or path).suffix.lower()
         image_format = 'JPEG' if output_suffix in {'.jpg', '.jpeg'} else 'PNG'
         save_kwargs = {'quality': 95} if image_format == 'JPEG' else {}

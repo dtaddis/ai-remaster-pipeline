@@ -567,6 +567,14 @@ class PipelineApp:
                 add([f"--{key.replace('_', '-')}", values.get(key, "")])
             if values.get("limit"):
                 add(["--limit", values["limit"]])
+            # Extract reference frames at model-safe dimensions (matching the prepared canvas)
+            # so thumbnails are consistent with what LTX works with.
+            outpaint_values = self.settings.get("outpaint", {})
+            source_text = pipeline_source_text(self.settings)
+            aspect = outpaint_values.get("target_aspect", "16:9")
+            height_text = outpaint_values.get("target_height", "720")
+            ref_w, ref_h = outpaint_work_size_for_source(source_text, aspect, height_text)
+            add(["--frame-width", str(ref_w), "--frame-height", str(ref_h)])
         elif stage_key == "references":
             cmd.append(str(SCRIPTS / "qwen_colorize_references.py"))
             workflow = values.get("workflow") or default_qwen_workflow(config)
@@ -610,6 +618,13 @@ class PipelineApp:
             outpaint_values = self.settings.get("outpaint", {})
             for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
                 add([f"--{key.replace('_', '-')}", outpaint_values.get(key, "0")])
+            # Pass delivery dimensions so final_composite upscales from the model-safe LTX output
+            # (e.g. 704p) back to the user's intended resolution (e.g. 720p).
+            source_text = pipeline_source_text(self.settings)
+            aspect = outpaint_values.get("target_aspect", "16:9")
+            height_text = outpaint_values.get("target_height", "720")
+            delivery_w, delivery_h = outpaint_size_for_source(source_text, aspect, height_text)
+            add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
         if values.get("force") == "true":
             cmd.append("--force")
         if values.get("dry_run") == "true":
@@ -760,7 +775,7 @@ class PipelineApp:
         if not ok:
             return False, message
         try:
-            cmd, output_rel, prepared_canvas = outpaint_guide_generation_command(index, prompt)
+            cmd, output_rel, prepared_canvas, source_seconds = outpaint_guide_generation_command(index, prompt)
         except Exception as exc:
             return False, str(exc)
         output = resolve(output_rel)
@@ -788,6 +803,7 @@ class PipelineApp:
             threading.Thread(
                 target=self._collect_output_guide,
                 args=(output, prepared_canvas),
+                kwargs={"source_seconds": source_seconds},
                 daemon=True,
             ).start()
         return True, f"Started Qwen guide frame generation for chunk {index + 1}."
@@ -1317,8 +1333,11 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
-    return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{width}x{height}_lifted.mp4"
+    height_text = values.get("target_height", "720")
+    work_w, work_h = outpaint_work_size_for_source(source_text, aspect, height_text)
+    del_w, del_h = outpaint_size_for_source(source_text, aspect, height_text)
+    delivery_tag = f"_from{del_w}x{del_h}" if (del_w != work_w or del_h != work_h) else ""
+    return ROOT / "intermediate" / "outpaint_prepared" / f"{source.stem}_{work_w}x{work_h}{delivery_tag}_lifted.mp4"
 
 
 def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
@@ -1352,6 +1371,10 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
         "--target-height",
         str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
+        "--delivery-width",
+        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
+        "--delivery-height",
+        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
     ]
     APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
     APP.log.append("> " + " ".join(cmd))
@@ -1432,8 +1455,11 @@ def outpaint_chunks_state(settings: dict) -> dict:
     if not source.exists():
         return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
     values = settings.get("outpaint", {})
-    prepared = outpaint_prepared_for(source_text, values)
-    range_source = prepared if prepared.exists() else source
+    try:
+        range_source = ensure_outpaint_prepared_canvas(source_text, values)
+    except Exception as exc:
+        APP.log.append(f"Could not prepare outpaint canvas for thumbnails: {exc}")
+        range_source = resolve_video_source(source_text)
     metrics = video_metrics(range_source)
     fps = metrics.get("fps") or 24.0
     total_frames = int(metrics.get("frames") or 0)
@@ -1489,10 +1515,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         guide_exists = bool(guide_path and guide_path.exists())
         guide_end_path = resolve(row["guide_end_image"]) if row.get("guide_end_image") else None
         guide_end_exists = bool(guide_end_path and guide_end_path.exists())
-        # Guide is always applied at the start of the chunk.
-        # Use the second frame (start + 1/fps) as the preview source because some video containers
-        # produce a pure-black first frame at t=0 due to overlay-filter initialisation timing.
-        guide_preview_seconds = start_seconds + (1.0 / max(1.0, fps))
+        guide_preview_seconds = start_seconds
         guide_end_preview_seconds = max(start_seconds, end_seconds - (1.0 / max(1.0, fps)))
         view_rows.append(row | {
             "index": int(row["chunk_index"]),
@@ -1516,7 +1539,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "guide_end_strength": row.get("guide_end_strength", "1.0"),
             "guide_frame_preview": chunk_frame_preview(range_source, guide_preview_seconds, "source_guide"),
             "guide_end_frame_preview": chunk_frame_preview(range_source, guide_end_preview_seconds, "source_guide_end"),
-            "source_start_preview": chunk_frame_preview(range_source, guide_preview_seconds, "source_start"),
+            "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
             "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
             "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
             "raw_start_preview": chunk_frame_preview(raw, 0.0, "raw_start") if raw.exists() else "",
@@ -1716,29 +1739,29 @@ def clear_outpaint_end_guide(index: int) -> dict[str, str]:
 
 
 def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
-    """Composite a raw Qwen guide PNG with source content and inpaint black corners, in-place.
+    """Composite a Qwen guide PNG with actual source content, then inpaint black corners, in-place.
 
-    The Qwen guide is typically slightly shorter than the LTX canvas (e.g. 690px vs 704px),
-    leaving black strips top and bottom when letterboxed.  This function:
-      1. Determines the letterbox geometry for the guide inside the canvas.
-      2. Fills the black strips with content from the prepared canvas (the source material).
-      3. Inpaints any remaining black corner pixels (where both guide and source are black).
-    The result is saved back over *output* so the GUI thumbnail reflects the final guide.
+    Steps:
+      1. Scale the Qwen guide to exactly match the LTX canvas size (stretch, not crop).
+      2. Overlay actual source pixels from the prepared canvas wherever they are non-black
+         (i.e. the source content area — e.g. 960×704 centred in 1280×704).  This ensures
+         pixel-accurate alignment between the guide and the prepared canvas regardless of any
+         sub-pixel shifts introduced by Qwen's internal patch processing.
+      3. Inpaint any remaining near-black pixels (corners where both guide and source are black).
+    Saves the result back over *output*.
 
-    source_seconds: timestamp in the prepared canvas to use as the fill frame.  Defaults to
-    1/fps (near the start).  Pass the chunk end time for end-guide compositing so the correct
-    source frame fills the letterbox bands instead of the start frame.
+    source_seconds: timestamp in the prepared canvas to use as the source frame.
+    Defaults to t=0 (actual first frame).
     """
     import cv2
     import numpy as np
     from PIL import Image as PILImage
 
-    # Probe canvas dimensions and extract a usable source frame via cv2 directly.
+    # Read prepared canvas dimensions and extract the source frame.
     cap = cv2.VideoCapture(str(prepared_canvas))
     canvas_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     canvas_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    seek_ms = source_seconds * 1000.0 if source_seconds is not None else (1.0 / max(1.0, fps)) * 1000.0
+    seek_ms = (source_seconds * 1000.0) if source_seconds is not None else 0.0
     cap.set(cv2.CAP_PROP_POS_MSEC, seek_ms)
     ok, src_frame = cap.read()
     if not ok or src_frame is None:
@@ -1754,43 +1777,56 @@ def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_second
         img_w, img_h = img.size
         guide_rgb = img.convert("RGB")
 
+    # Preserve the raw Qwen output alongside the composited result for inspection.
+    raw_copy = output.with_name(output.stem + "_raw" + output.suffix)
+    if not raw_copy.exists():
+        import shutil as _shutil
+        _shutil.copy2(output, raw_copy)
+
     resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
 
-    if img_w == canvas_w and img_h == canvas_h:
-        # Already the right size — nothing to composite.
-        return
-
-    scale = min(canvas_w / img_w, canvas_h / img_h)
-    new_w = max(1, int(img_w * scale))
-    new_h = max(1, int(img_h * scale))
-    paste_x = (canvas_w - new_w) // 2
-    paste_y = (canvas_h - new_h) // 2
-
-    if new_w == canvas_w and new_h == canvas_h:
-        # No black bands — guide already fills the canvas after scaling.
-        return
-
-    # Build the letterboxed guide as a BGR numpy array.
+    # Step 1: scale Qwen output to match canvas width, preserving AR.
+    # This gives e.g. 1280×691 for a typical Qwen output, centred vertically in the 1280×704
+    # canvas with ~6–7 px spare top and bottom.
+    # A calibrated 1px-left / 1px-down nudge is applied for pixel-perfect alignment.
+    scale = canvas_w / img_w
+    new_w = canvas_w
+    new_h = max(1, int(round(img_h * scale)))
     resized = guide_rgb.resize((new_w, new_h), resampling)
+
+    nominal_x = (canvas_w - new_w) // 2
+    nominal_y = (canvas_h - new_h) // 2
+    paste_x = nominal_x - 1   # 1 px left
+    paste_y = nominal_y + 1   # 1 px down
+
     canvas_pil = PILImage.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
-    canvas_pil.paste(resized, (paste_x, paste_y))
+    # Clip to canvas bounds, cropping the source image if the offset is negative.
+    src_x0 = max(0, -paste_x)
+    src_y0 = max(0, -paste_y)
+    dst_x0 = max(0, paste_x)
+    dst_y0 = max(0, paste_y)
+    blit_w = min(new_w - src_x0, canvas_w - dst_x0)
+    blit_h = min(new_h - src_y0, canvas_h - dst_y0)
+    if blit_w > 0 and blit_h > 0:
+        region = resized.crop((src_x0, src_y0, src_x0 + blit_w, src_y0 + blit_h))
+        canvas_pil.paste(region, (dst_x0, dst_y0))
+
     canvas_bgr = cv2.cvtColor(np.array(canvas_pil), cv2.COLOR_RGB2BGR)
 
-    # Source-fill: paste prepared-canvas pixels into the black bands wherever source has content.
-    guide_mask = np.zeros((canvas_h, canvas_w), dtype=bool)
-    guide_mask[paste_y:paste_y + new_h, paste_x:paste_x + new_w] = True
+    # Step 2: paste the source frame's content pixels over the centre.
+    # black_lift raises all source pixels above 0; the padding margins are exact black (0,0,0).
+    # Pasting source over Qwen ensures the centre matches the prepared canvas pixel-perfectly.
     src_is_content = np.any(src_frame > 4, axis=2)
-    fill_mask = (~guide_mask) & src_is_content
-    if fill_mask.any():
-        canvas_bgr[fill_mask] = src_frame[fill_mask]
+    if src_is_content.any():
+        canvas_bgr[src_is_content] = src_frame[src_is_content]
 
-    # Corner inpaint: fill any pixels that are still near-black after source fill.
+    # Step 3: inpaint the small corner triangles that remain black
+    # (top/bottom strips outside both the Qwen letterbox and the source content area).
     still_black = np.all(canvas_bgr <= 4, axis=2).astype(np.uint8) * 255
     if still_black.any():
         canvas_bgr = cv2.inpaint(canvas_bgr, still_black, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
-    result = PILImage.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
-    result.save(output, format="PNG")
+    PILImage.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)).save(output, format="PNG")
 
 
 def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path]:
@@ -1805,10 +1841,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     row = rows[index]
     fps = float(row.get("fps", 24) or 24)
     start_seconds = float(row.get("start", 0.0))
-    # Use the second frame (start + 1/fps) as the Qwen source.  Some video containers produce a
-    # pure-black first frame at t=0 due to overlay-filter initialisation timing in the prepared
-    # canvas; skipping one frame gives Qwen a frame with actual content.
-    guide_source_seconds = start_seconds + (1.0 / max(1.0, fps))
+    guide_source_seconds = start_seconds
     source_text = pipeline_source_text(APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
@@ -1868,7 +1901,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     ]
     if values.get("prompt_node_id"):
         cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
-    return cmd, rel(output), resolve(range_source)
+    return cmd, rel(output), resolve(range_source), guide_source_seconds
 
 
 def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path, float]:
