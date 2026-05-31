@@ -539,17 +539,42 @@ function Resolve-ComfyInstallMode {
 function Git-Clone-IfMissing {
     param([string]$Repo, [string]$Destination, [switch]$UpdateExisting)
     if (Test-Path -LiteralPath $Destination) {
-        Write-Host "Already exists: $Destination"
         if ($UpdateExisting) {
             if (Test-Path -LiteralPath (Join-Path $Destination '.git')) {
                 Write-Host "Updating existing checkout: $Destination"
                 $ok = Invoke-External-Optional -Command @('git', '-C', $Destination, 'pull', '--ff-only')
                 if (-not $ok) {
-                    Write-Host "Could not fast-forward update $Destination. If ARP reports missing nodes, update this custom node manually or delete the folder and rerun install." -ForegroundColor Yellow
+                    Write-Host "WARNING: Could not fast-forward update '$Destination'." -ForegroundColor Yellow
+                    Write-Host "  This can happen if local files were changed or the history diverged." -ForegroundColor Yellow
+                    Write-Host "  To fix: delete the folder below and rerun install_windows.bat." -ForegroundColor Yellow
+                    Write-Host "  Folder: $Destination" -ForegroundColor Yellow
                 }
             } else {
-                Write-Host "Cannot update because this is not a Git checkout: $Destination" -ForegroundColor Yellow
+                # Folder exists but is not a git repo — likely a manual zip-download install.
+                # We can't 'git pull' it, so newer node types may be missing.
+                Write-Host ""
+                Write-Host "WARNING: '$Destination' exists but is not a Git checkout." -ForegroundColor Yellow
+                Write-Host "  It was probably installed by extracting a zip download, which cannot be updated automatically." -ForegroundColor Yellow
+                Write-Host "  Some required node types may be missing or outdated." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Option: rename the existing folder to '$Destination.bak' and clone a fresh" -ForegroundColor Cyan
+                Write-Host "  copy from: $Repo" -ForegroundColor Cyan
+                Write-Host ""
+                $answer = Read-Host "  Replace it with a fresh Git clone? [Y/N]"
+                if ($answer -match '^[Yy]') {
+                    $backup = "$Destination.bak"
+                    if (Test-Path -LiteralPath $backup) {
+                        Write-Host "  Removing previous backup: $backup" -ForegroundColor Yellow
+                        Remove-Item -LiteralPath $backup -Recurse -Force
+                    }
+                    Rename-Item -LiteralPath $Destination -NewName ([System.IO.Path]::GetFileName($backup))
+                    Invoke-External -Command @('git', 'clone', $Repo, $Destination)
+                } else {
+                    Write-Host "  Skipping. If you see missing-node errors, delete '$Destination' and rerun install_windows.bat." -ForegroundColor Yellow
+                }
             }
+        } else {
+            Write-Host "Already exists: $Destination"
         }
         return
     }
@@ -578,6 +603,7 @@ function Assert-CustomNodeSymbols {
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
         throw "$Name was not installed. Expected folder: $Directory. Install it from $RepoUrl into ComfyUI\custom_nodes and rerun install_windows.bat."
     }
+    $isGitCheckout = Test-Path -LiteralPath (Join-Path $Directory '.git')
     $missing = @()
     foreach ($symbol in $Symbols) {
         if (-not (Test-DirectoryContainsText $Directory $symbol)) {
@@ -585,7 +611,15 @@ function Assert-CustomNodeSymbols {
         }
     }
     if ($missing.Count -gt 0) {
-        throw "$Name is installed at $Directory, but it does not contain required node type(s): $($missing -join ', '). Delete that folder or update it from $RepoUrl, then rerun install_windows.bat and fully restart ComfyUI."
+        $msg = "$Name is installed at $Directory, but required node type(s) are missing: $($missing -join ', '). "
+        if (-not $isGitCheckout) {
+            $msg += "The folder is not a Git checkout (it was likely installed by extracting a zip). "
+            $msg += "Delete '$Directory' and rerun install_windows.bat so it can clone the latest version. "
+        } else {
+            $msg += "Delete '$Directory' and rerun install_windows.bat to get a fresh clone, then fully restart ComfyUI. "
+        }
+        $msg += "Repo: $RepoUrl"
+        throw $msg
     }
     Write-Host "$Name node definitions found: $($Symbols -join ', ')"
 }

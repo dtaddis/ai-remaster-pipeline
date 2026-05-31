@@ -62,9 +62,12 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
     hints = "; ".join(install_hints.get(package, package) for package in sorted(set(required[node_type] for node_type in missing)))
     raise RuntimeError(
         f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing: {details}. "
-        f"Re-run install_windows.bat, choose the same ComfyUI directory, then fully close and restart ComfyUI. "
-        f"If you use your own ComfyUI checkout, install or update: {packages}. "
-        f"Manual install locations: {hints}."
+        f"To fix: re-run install_windows.bat and choose the same ComfyUI directory when prompted. "
+        f"If the folder was installed by extracting a zip download (rather than via install_windows.bat), "
+        f"the install script cannot update it automatically — delete the folder(s) under ComfyUI/custom_nodes "
+        f"for the missing package(s) ({packages}) and re-run install_windows.bat so it can clone the latest version. "
+        f"After install, fully close and restart ComfyUI before retrying. "
+        f"Repo(s): {hints}."
     )
 
 
