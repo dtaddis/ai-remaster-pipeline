@@ -130,15 +130,16 @@ function guideFrameCard(chunkIdx, guideIdx, g, lengthFrames, fps, dupIdxs) {
     ? media(g.image) + (g.image_mtime ? '&t=' + g.image_mtime : '')
     : (g.source_preview ? media(g.source_preview) : '');
   const thumbTitle = hasImage ? 'Current guide image' : 'Source frame at this position';
+  const thumbHtml = thumbSrc
+    ? `<img id="gfThumb_${chunkIdx}_${guideIdx}" src="${esc(thumbSrc)}" alt="" onclick="openImageModal(this.src,${jsArg(thumbTitle)})">`
+    : `<img id="gfThumb_${chunkIdx}_${guideIdx}" class="pending-thumb" alt="" title="Source preview not ready">`;
 
   return `
     <div class="chunk-guide guide-frame-card${isDup ? ' guide-frame-dup' : ''}">
       <div>
         <label>Guide ${guideIdx + 1}${isDup ? ' ⚠ duplicate position' : ''}</label>
         <figure class="still-figure ${hasImage ? 'has-anchor' : ''}">
-          <img id="gfThumb_${chunkIdx}_${guideIdx}"
-            src="${esc(thumbSrc)}" alt=""
-            onclick="openImageModal(this.src,${jsArg(thumbTitle)})">
+          ${thumbHtml}
           ${hasImage ? `<span class="anchor-badge">Guide</span>` : ''}
           <figcaption id="gfThumbCaption_${chunkIdx}_${guideIdx}">${esc(hasImage ? 'Guide image set' : 'Source preview')}</figcaption>
         </figure>
@@ -205,6 +206,7 @@ async function fetchGuideFramePreview(chunkIdx, guideIdx, fi) {
   if (img.closest('.has-anchor')) return;
   const result = await api(`/api/outpaint-guide-preview?chunk_index=${chunkIdx}&frame_idx=${fi}`);
   if (result && result.preview) {
+    img.classList.remove('pending-thumb');
     img.src = media(result.preview) + '&t=' + Date.now();
     if (cap) cap.textContent = 'Source preview';
   }
@@ -371,7 +373,10 @@ function drawOutpaint(st, s, expected, sp) {
         ${mainFields.map(f => fieldHtml(st, f)).join('')}
         ${outpaintOverlapWarning(s)}
         <h3>Source Crop</h3>
-        <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>
+        <div class="crop-head">
+          <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>
+          <button type="button" onclick="autoCropOutpaint()">Auto Crop</button>
+        </div>
         <div class="editor-controls">
           ${cropFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
         </div>

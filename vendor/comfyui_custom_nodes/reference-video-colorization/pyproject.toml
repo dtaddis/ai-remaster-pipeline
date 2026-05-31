@@ -1,0 +1,26 @@
+[project]
+name = "reference-video-colorization"
+description = "Dual implementation of reference-based video colorization featuring ColorMNet (2024) with DINOv2 and Deep Exemplar (2019). Includes 4 nodes (2 video, 2 image), multiple feature encoders (VGG19, DINOv2, CLIP), advanced post-processing (color-matcher, WLS, guided, bilateral), and auto-installer for dependencies."
+version = "2.0.0"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "Pillow>=9.5.0",
+    "scikit-image>=0.21.0",
+    "opencv-python>=4.8.0",
+    "einops>=0.7.0",
+    "tqdm>=4.65.0",
+    "progressbar2>=4.2.0",
+    "gdown"
+]
+
+[project.urls]
+Repository = "https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "jonstreeter"
+DisplayName = "Reference-Based Video Colorization"
+Icon = "Workflows/Reference-Based-Colorization-Workflow.png"

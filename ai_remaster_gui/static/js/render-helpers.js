@@ -113,7 +113,9 @@ function aspectPreviewHtml(st) {
 
   return `
     <h3>Target Preview</h3>
-    ${img ? `<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">` : '<p>Choose source material on the Overview tab to preview the target frame.</p>'}
+    <div class="aspect-preview-frame">
+      ${img ? `<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">` : '<p>Choose source material on the Overview tab to preview the target frame.</p>'}
+    </div>
     ${range.duration ? aspectPreviewSlider(range) : ''}
     ${shotOutputList(outputs, null)}
   `;
@@ -135,7 +137,7 @@ function aspectPreviewRange() {
 function aspectPreviewSlider(range) {
   return `
     <label>Preview time: <span id="aspectPreviewLabel">${formatSeconds(range.value)}</span></label>
-    <input type="range" min="${range.start}" max="${range.end}" step="0.041" value="${range.value}" oninput="updateAspectPreview(this.value)">
+    <input id="aspectPreviewTime" type="range" min="${range.start}" max="${range.end}" step="0.041" value="${range.value}" oninput="updateAspectPreview(this.value)">
   `;
 }
 

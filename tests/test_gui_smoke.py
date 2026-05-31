@@ -9,13 +9,16 @@ import threading
 import urllib.request
 import unittest
 import sys
+import argparse
 from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import comfy_api  # noqa: E402
 import colorize_video  # noqa: E402
+import generate_single_reference  # noqa: E402
 import outpaint_video  # noqa: E402
+import qwen_colorize_references  # noqa: E402
 
 from ai_remaster_gui import app
 from ai_remaster_gui import config
@@ -87,6 +90,73 @@ class GuiSmokeTests(unittest.TestCase):
             (inner / "main.py").write_text("# comfy\n", encoding="utf-8")
 
             self.assertEqual(config.resolve_comfy_dir(str(portable)), inner)
+
+    def test_required_comfy_workflows_are_bundled(self) -> None:
+        outpaint = app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
+        qwen = app.ROOT / "workflows" / "qwen_image_edit" / "Image Edit (Qwen 2509).json"
+
+        for workflow in (outpaint, qwen):
+            with self.subTest(workflow=workflow.name):
+                self.assertTrue(workflow.exists(), f"Missing bundled workflow: {workflow}")
+                json.loads(workflow.read_text(encoding="utf-8-sig"))
+
+        self.assertEqual(server.default_qwen_workflow({}), app.rel(qwen))
+        self.assertEqual(server.qwen_workflow_for({"workflow": "D:/missing/blueprints/Qwen 2511.json"}, {}), app.rel(qwen))
+
+    def test_required_custom_nodes_are_bundled(self) -> None:
+        required = {
+            "ComfyUI-LTXVideo": ("LTXVImgToVideoConditionOnly", "LTXAddVideoICLoRAGuide", "LTXVPreprocess"),
+            "ComfyUI-GGUF": ("UnetLoaderGGUF",),
+            "ComfyUI-VideoHelperSuite": ("VHS_LoadVideo", "VHS_VideoCombine"),
+            "reference-video-colorization": ("DeepExColorVideoNode", "ColorMNetVideo"),
+        }
+        vendor_root = app.ROOT / "vendor" / "comfyui_custom_nodes"
+        for folder, symbols in required.items():
+            with self.subTest(folder=folder):
+                package = vendor_root / folder
+                self.assertTrue(package.is_dir(), f"Missing bundled custom node package: {package}")
+                self.assertTrue((package / "LICENSE").exists(), f"Missing bundled custom node license: {package}")
+                texts = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in package.rglob("*.py"))
+                for symbol in symbols:
+                    self.assertIn(symbol, texts)
+
+    def test_single_reference_rejects_missing_source_before_qwen_startup(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            missing = Path(tmp_text) / "missing.png"
+            output = Path(tmp_text) / "output.png"
+            argv = [
+                "generate_single_reference.py",
+                "--source-image",
+                str(missing),
+                "--output",
+                str(output),
+                "--workflow",
+                str(app.ROOT / "workflows" / "qwen_image_edit" / "Image Edit (Qwen 2509).json"),
+                "--dry-run",
+            ]
+
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(generate_single_reference.qwen, "main_with_args") as qwen_main:
+                with self.assertRaisesRegex(FileNotFoundError, "Reference source image not found"):
+                    generate_single_reference.main()
+
+            qwen_main.assert_not_called()
+
+    def test_bundled_qwen_2509_subgraph_patches_inputs_by_name(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.png"
+            source.write_bytes(b"placeholder")
+            comfy_dir = folder / "comfy"
+            (comfy_dir / "input").mkdir(parents=True)
+            workflow = qwen_colorize_references.load_workflow(app.ROOT / "workflows" / "qwen_image_edit" / "Image Edit (Qwen 2509).json")
+            args = argparse.Namespace(comfy_dir=comfy_dir, model_backend="gguf", gguf_model="qwen-image-edit-2511-Q4_K_M.gguf")
+
+            qwen_colorize_references.patch_qwen_model_backend(args, workflow)
+            prompt = qwen_colorize_references.patch_workflow(args, workflow, source, folder / "output.png", "Colorize this image.")
+
+            self.assertEqual(prompt["3"]["inputs"]["seed"], 1)
+            self.assertEqual(prompt["37"]["class_type"], "UnetLoaderGGUF")
+            self.assertEqual(prompt["37"]["inputs"]["unet_name"], "qwen-image-edit-2511-Q4_K_M.gguf")
 
     def test_outpaint_chunk_rows_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

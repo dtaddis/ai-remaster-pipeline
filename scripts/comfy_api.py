@@ -17,12 +17,17 @@ def http_json(method: str, url: str, payload: dict[str, Any] | None = None, time
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode('utf-8', errors='replace')
+        print(f'ComfyUI HTTP {exc.code} error body: {body}', flush=True)
         raise RuntimeError(f'HTTP {exc.code} from {url}: {body}') from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f'Could not connect to ComfyUI at {url}: {exc.reason}') from exc
 
 
 def queue_prompt(comfy_url: str, prompt: dict[str, Any], client_id: str | None = None) -> str:
+    print('Sending prompt nodes:', {k: v['class_type'] for k, v in prompt.items()}, flush=True)
+    for node_id, node in sorted(prompt.items(), key=lambda x: int(x[0])):
+        if node['class_type'] in ('KSampler', 'UnetLoaderGGUF', 'CLIPLoader', 'VAELoader'):
+            print(f'  Node {node_id} ({node["class_type"]}): {node["inputs"]}', flush=True)
     response = http_json('POST', f"{comfy_url.rstrip('/')}/prompt", {'prompt': prompt, 'client_id': client_id or str(uuid.uuid4())})
     prompt_id = response.get('prompt_id')
     if not prompt_id:
@@ -58,6 +63,8 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
     install_hints = {
         "ComfyUI-LTXVideo": "https://github.com/Lightricks/ComfyUI-LTXVideo -> ComfyUI/custom_nodes/ComfyUI-LTXVideo",
         "ComfyUI-GGUF": "https://github.com/city96/ComfyUI-GGUF -> ComfyUI/custom_nodes/ComfyUI-GGUF",
+        "ComfyUI-VideoHelperSuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite -> ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
+        "ComfyUI-Reference-Based-Video-Colorization": "https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization -> ComfyUI/custom_nodes/reference-video-colorization",
     }
     hints = "; ".join(install_hints.get(package, package) for package in sorted(set(required[node_type] for node_type in missing)))
     raise RuntimeError(
@@ -165,9 +172,16 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
             raise ValueError(f'Output path references disabled/missing node {node_id}')
         needed.add(node_id)
         for item in nodes[node_id].get('inputs', []):
+            if not isinstance(item, dict):
+                continue
             link_id = item.get('link')
-            if link_id is not None:
-                visit(str(links[int(link_id)][1]))
+            if link_id is None:
+                continue
+            link_key = int(link_id)
+            if link_key not in links:
+                raise ValueError(f'Node {node_id} input "{item.get("name")}" references missing link {link_id}')
+            origin = str(links[link_key][1])
+            visit(origin)
 
     visit(str(output_node_id))
     prompt: dict[str, Any] = {}

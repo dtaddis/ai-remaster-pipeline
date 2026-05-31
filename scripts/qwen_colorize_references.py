@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt, http_json
+from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, widget_fallback_inputs, workflow_to_prompt, http_json
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
 
@@ -256,10 +256,16 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
     subgraph = copy.deepcopy(subgraphs[0])
     nodes = subgraph.get('nodes') or []
     links = subgraph.get('links') or []
+    subgraph_inputs = subgraph.get('inputs') or []
     load_id = 90001
     save_id = 90002
     comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir))
     link_lookup = {int(link.get('id')): link for link in links if isinstance(link, dict) and 'id' in link}
+
+    def subgraph_input_name(slot: int) -> str:
+        if 0 <= slot < len(subgraph_inputs) and isinstance(subgraph_inputs[slot], dict):
+            return str(subgraph_inputs[slot].get('name') or subgraph_inputs[slot].get('label') or '').lower()
+        return ''
 
     for node in nodes:
         if not isinstance(node, dict):
@@ -272,34 +278,49 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
             if not link or int(link.get('origin_id', 0)) != -10:
                 continue
             slot = int(link.get('origin_slot', -1))
-            if slot == 0:
+            input_name = subgraph_input_name(slot)
+            if input_name in {'image', 'image1'}:
                 item['link'] = 900001
-            elif slot in {1, 2}:
+            elif input_name in {'image2', 'image3'}:
                 item['link'] = None
-            elif slot == 3:
+            elif input_name == 'prompt':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'prompt')}
                 set_workflow_widget(node, item.get('name', 'prompt'), prompt)
-            elif slot == 4:
+            elif input_name == 'seed':
+                item['link'] = None
+                item['widget'] = {'name': item.get('name', 'seed')}
+                set_workflow_widget(node, item.get('name', 'seed'), 1)
+            elif input_name in {'value', 'enable_turbo_mode'}:
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'value')}
                 set_workflow_widget(node, item.get('name', 'value'), True)
-            elif slot == 5:
+            elif input_name == 'unet_name':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'unet_name')}
                 set_workflow_widget(node, item.get('name', 'unet_name'), args.gguf_model if args.model_backend == 'gguf' else 'qwen_image_edit_2511_bf16.safetensors')
-            elif slot == 6:
+            elif input_name == 'clip_name':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'clip_name')}
                 set_workflow_widget(node, item.get('name', 'clip_name'), 'qwen_2.5_vl_7b_fp8_scaled.safetensors')
-            elif slot == 7:
+            elif input_name == 'vae_name':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'vae_name')}
                 set_workflow_widget(node, item.get('name', 'vae_name'), 'qwen_image_vae.safetensors')
-            elif slot == 8:
+
+    # Defensively clear any remaining links from the subgraph input node (-10) that
+    # weren't explicitly handled above (e.g. inputs replaced by patch_qwen_model_backend).
+    input_link_ids = {
+        int(l.get('id'))
+        for l in links
+        if isinstance(l, dict) and int(l.get('origin_id', 0)) == -10
+    }
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for item in node.get('inputs') or []:
+            if isinstance(item, dict) and item.get('link') is not None and int(item['link']) in input_link_ids:
                 item['link'] = None
-                item['widget'] = {'name': item.get('name', 'lora_name')}
-                set_workflow_widget(node, item.get('name', 'lora_name'), 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
 
     nodes.append(
         {
@@ -310,7 +331,7 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
             'widgets_values': [comfy_image],
         }
     )
-    links.append({'id': 900001, 'origin_id': load_id, 'origin_slot': 0, 'target_id': 160, 'target_slot': 0, 'type': 'IMAGE'})
+    links.append({'id': 900001, 'origin_id': load_id, 'origin_slot': 0, 'target_id': 16, 'target_slot': 0, 'type': 'IMAGE'})
 
     output_link = next((link for link in links if isinstance(link, dict) and int(link.get('target_id', 0)) == -20), None)
     if not output_link:
@@ -326,6 +347,21 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
             'widgets_values': [prefix],
         }
     )
+    # Convert positional widgets_values lists to named dicts for nodes with known widget
+    # layouts. This prevents misalignment caused by hidden widgets (e.g. KSampler's
+    # control_after_generate) that occupy a slot in widgets_values but have no entry in
+    # the inputs list, which would shift all subsequent widget indices by one.
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        wv = node.get('widgets_values')
+        if not isinstance(wv, list):
+            continue
+        class_type = node.get('type') or node.get('class_type', '')
+        named = widget_fallback_inputs(class_type, wv)
+        if named:
+            node['widgets_values'] = named
+
     flat = {'nodes': nodes, 'links': [link_to_list(link) for link in links]}
     return workflow_to_prompt(flat, save_id)
 
@@ -504,8 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main_with_args(args: argparse.Namespace) -> int:
     if args.continuity_reference_count < 0:
         raise RuntimeError('--continuity-reference-count must be zero or greater')
     manifest = resolve_path(args.manifest)
@@ -517,6 +552,11 @@ def main() -> int:
     print(f'Manifest: {manifest}')
     print(f'Rows: {len(rows)}')
     print(f'Qwen mode: {args.model_backend}; one source image only; extra references are converted to text guidance when enabled.')
+    missing_sources = [resolve_path(row_source(row)) for row in rows if not resolve_path(row_source(row)).is_file()]
+    if missing_sources:
+        sample = ', '.join(str(path) for path in missing_sources[:3])
+        more = f' and {len(missing_sources) - 3} more' if len(missing_sources) > 3 else ''
+        raise FileNotFoundError(f'Reference source image not found: {sample}{more}')
     if not args.dry_run and rows:
         if args.model_backend == 'gguf' and not (comfy_dir / 'custom_nodes' / 'ComfyUI-GGUF').exists():
             raise FileNotFoundError(f'ComfyUI-GGUF is required for Qwen GGUF. Re-run install_windows.bat, then restart ComfyUI: {comfy_dir / "custom_nodes" / "ComfyUI-GGUF"}')
@@ -545,7 +585,7 @@ def main() -> int:
             if args.print_api_prompt:
                 print(json.dumps(prompt_payload, indent=2))
             continue
-        if not src.exists():
+        if not src.is_file():
             raise FileNotFoundError(f'Reference source not found: {src}')
         prompt_payload = patch_workflow(args, workflow, src, dst, prompt)
         if args.print_api_prompt:
@@ -563,6 +603,10 @@ def main() -> int:
         write_signature(dst, sig)
         print(f'Wrote {dst}')
     return 0
+
+
+def main() -> int:
+    return main_with_args(build_parser().parse_args())
 
 
 if __name__ == '__main__':

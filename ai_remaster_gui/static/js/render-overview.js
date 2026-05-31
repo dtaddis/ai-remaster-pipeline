@@ -3,9 +3,10 @@ function drawGlobal() {
   const source = global.source || '';
   const expandOutpaint = global.expand_outpaint !== 'false';
   const colorize = global.colorize !== 'false';
-  const sourceTone = state.source_monochrome
-    ? 'Source looks black and white'
-    : 'Source appears to contain colour';
+  const analysis = state.source_analysis || {};
+  const sourceTone = source && !analysis.ready
+    ? (analysis.message || 'Analyzing source material')
+    : (state.source_monochrome ? 'Source looks black and white' : 'Source appears to contain colour');
   const progress = (state.phase_progress && state.phase_progress.global) || { percent: 0, label: 'Waiting' };
 
   document.getElementById('app').innerHTML = `
@@ -24,17 +25,18 @@ function drawGlobal() {
       </div>
       <img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline">
       ${overviewSourcePicker(source)}
+      ${sourceAnalysisHtml(analysis)}
       ${overviewSectionPicker(global, source)}
       <div class="checks">
         <label><input id="globalExpandOutpaint" type="checkbox" ${expandOutpaint ? 'checked' : ''}>Expand using Outpainting</label>
         <label><input id="globalColorize" type="checkbox" ${colorize ? 'checked' : ''}>Colorize</label>
-        <span class="shot-time">${esc(sourceTone)}</span>
+        <span id="overviewSourceTone" class="shot-time">${esc(sourceTone)}</span>
       </div>
-      ${overviewFilmstrip()}
-      ${sourceInfoHtml(state.source_info || {})}
-      ${progressHtml(progress.percent, progress.label)}
+      <div id="overviewFilmstrip">${overviewFilmstripInner()}</div>
+      <div id="overviewSourceInfo">${sourceInfoHtml(state.source_info || {})}</div>
+      <div id="overviewPipelineProgress">${progressHtml(progress.percent, progress.label)}</div>
       ${overviewActions()}
-      ${overviewProgressTable()}
+      <div id="overviewProgressTable">${overviewProgressTable()}</div>
       ${runLogHtml()}
     </section>
   `;
@@ -43,6 +45,17 @@ function drawGlobal() {
   document.getElementById('globalExpandOutpaint').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalColorize').addEventListener('change', saveGlobalPipelineOptions);
   bindOverviewSectionControls();
+}
+
+function sourceAnalysisHtml(analysis) {
+  if (!analysis || !analysis.message || analysis.ready) return '<div id="overviewSourceAnalysis"></div>';
+  const percent = Math.max(1, Math.min(100, Number(analysis.percent || 1)));
+  return `
+    <div id="overviewSourceAnalysis" class="inline-warning">
+      <strong>${esc(analysis.message)}</strong>
+      ${progressHtml(percent, percent + '%')}
+    </div>
+  `;
 }
 
 function overviewSourcePicker(source) {
@@ -56,6 +69,11 @@ function overviewSourcePicker(source) {
 }
 
 function overviewFilmstrip() {
+  const inner = overviewFilmstripInner();
+  return inner ? `<div class="filmstrip">${inner}</div>` : '';
+}
+
+function overviewFilmstripInner() {
   const thumbs = (state.source_previews || [])
     .map(path => `<img src="${media(path)}" alt="">`)
     .join('');

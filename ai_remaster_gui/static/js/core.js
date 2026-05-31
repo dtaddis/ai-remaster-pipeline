@@ -12,6 +12,7 @@ const mediaClip = (path, start, end, key) => (
   + '&clip_end=' + encodeURIComponent(end)
   + '&clip_key=' + encodeURIComponent(key || '')
 );
+const stateUrl = () => '/api/state?active=' + encodeURIComponent(active || '');
 
 async function api(path, opts = {}) {
   const response = await fetch(path, {
@@ -26,7 +27,7 @@ async function refresh(force = false) {
   const editing = isEditingField();
   const mediaActive = hasMediaOnPage();
 
-  state = await api('/api/state');
+  state = await api(stateUrl());
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   notifyNewLogErrors();
@@ -41,6 +42,14 @@ async function refresh(force = false) {
   const currentOutpaintVisualSignature = outpaintVisualSignature();
   const outpaintVisualChanged = active === 'outpaint'
     && currentOutpaintVisualSignature !== lastOutpaintVisualSignature;
+  if (!force && active === 'global' && document.getElementById('app')?.children.length) {
+    updateOverviewDynamicStatus();
+    updateRunLogs();
+    lastRenderSignature = sig;
+    lastOutpaintVisualSignature = currentOutpaintVisualSignature;
+    return;
+  }
+
   if (!force && !outpaintVisualChanged && active === 'outpaint' && document.getElementById('app')?.children.length) {
     updateOutpaintGuidePreviews();
     updateOutpaintRawPreviews();
@@ -52,6 +61,7 @@ async function refresh(force = false) {
   }
 
   if (!force && (editing || (shouldPreserveInteractiveDom(mediaActive) && !outpaintVisualChanged) || sig === lastRenderSignature)) {
+    if (active === 'global') updateOverviewDynamicStatus();
     updateOutpaintGuidePreviews();
     updateOutpaintRawPreviews();
     updateRunLogs();
@@ -93,6 +103,37 @@ function renderSignature() {
   });
 }
 
+function updateOverviewDynamicStatus() {
+  const analysis = state.source_analysis || {};
+  const analysisEl = document.getElementById('overviewSourceAnalysis');
+  if (analysisEl) {
+    analysisEl.outerHTML = sourceAnalysisHtml(analysis);
+  }
+
+  const toneEl = document.getElementById('overviewSourceTone');
+  if (toneEl) {
+    const source = (state.settings.global || {}).source || '';
+    toneEl.textContent = source && !analysis.ready
+      ? (analysis.message || 'Analyzing source material')
+      : (state.source_monochrome ? 'Source looks black and white' : 'Source appears to contain colour');
+  }
+
+  const filmstripEl = document.getElementById('overviewFilmstrip');
+  if (filmstripEl) filmstripEl.innerHTML = overviewFilmstripInner();
+
+  const infoEl = document.getElementById('overviewSourceInfo');
+  if (infoEl) infoEl.innerHTML = sourceInfoHtml(state.source_info || {});
+
+  const progressEl = document.getElementById('overviewPipelineProgress');
+  if (progressEl) {
+    const progress = (state.phase_progress && state.phase_progress.global) || { percent: 0, label: 'Waiting' };
+    progressEl.innerHTML = progressHtml(progress.percent, progress.label);
+  }
+
+  const tableEl = document.getElementById('overviewProgressTable');
+  if (tableEl) tableEl.innerHTML = overviewProgressTable();
+}
+
 function hasMediaOnPage() {
   return ['outpaint', 'colour', 'recomp', 'output'].includes(active)
     ? document.querySelectorAll('video').length > 0
@@ -102,7 +143,7 @@ function hasMediaOnPage() {
 function shouldPreserveInteractiveDom(mediaActive) {
   const app = document.getElementById('app');
   if (!app || !app.children.length) return false;
-  if (['global', 'outpaint'].includes(active)) return true;
+  if (active === 'outpaint') return true;
   if (!mediaActive) return false;
 
   // Normal polling must not recreate video elements while the user is inspecting
@@ -230,8 +271,10 @@ function drawTabs() {
   }
 }
 
-function selectTab(tab) {
+async function selectTab(tab) {
   active = tab;
+  state = await api(stateUrl());
+  pruneSelected();
   drawTabs();
   draw(false);
   wireColourShotVideos();

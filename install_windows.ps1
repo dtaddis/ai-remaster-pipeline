@@ -15,6 +15,7 @@ $Root = $PSScriptRoot
 $DownloadCache = Join-Path $Root '.cache\huggingface'
 $DefaultComfyDir = Join-Path $Root 'tools\comfyui'
 $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
+$BundledCustomNodes = Join-Path $Root 'vendor\comfyui_custom_nodes'
 $UseExistingComfy = $false
 $ResolvedPythonLauncher = $null
 
@@ -582,6 +583,38 @@ function Git-Clone-IfMissing {
     Invoke-External -Command @('git', 'clone', $Repo, $Destination)
 }
 
+function Copy-BundledCustomNode-IfMissing {
+    param([string]$Name, [string]$Destination)
+    $source = Join-Path $BundledCustomNodes $Name
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+        return $false
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        return $true
+    }
+    Ensure-Directory (Split-Path -Parent $Destination)
+    Write-Host "Installing bundled custom node: $Name"
+    Copy-Item -LiteralPath $source -Destination $Destination -Recurse
+    return $true
+}
+
+function Install-CustomNodePackage {
+    param(
+        [string]$Name,
+        [string]$Repo,
+        [string]$Destination,
+        [switch]$UpdateExisting
+    )
+    if (Copy-BundledCustomNode-IfMissing $Name $Destination) {
+        return
+    }
+    if ($UpdateExisting) {
+        Git-Clone-IfMissing $Repo $Destination -UpdateExisting
+    } else {
+        Git-Clone-IfMissing $Repo $Destination
+    }
+}
+
 function Test-DirectoryContainsText {
     param([string]$Directory, [string]$Needle)
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -763,10 +796,11 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     if (-not $SkipComfyManager) {
         Git-Clone-IfMissing 'https://github.com/ltdrdata/ComfyUI-Manager.git' (Join-Path $CustomNodes 'ComfyUI-Manager')
     }
-    Git-Clone-IfMissing 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting
-    Git-Clone-IfMissing 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-LTXVideo' 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-GGUF' 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
     if (-not $SkipDeepExemplar) {
-        Git-Clone-IfMissing 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting
+        Install-CustomNodePackage 'reference-video-colorization' 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting
     }
 }
 
@@ -781,11 +815,24 @@ Invoke-Step 'Verify required ComfyUI custom nodes' {
         (Join-Path $CustomNodes 'ComfyUI-GGUF') `
         'https://github.com/city96/ComfyUI-GGUF' `
         @('UnetLoaderGGUF')
+    Assert-CustomNodeSymbols `
+        'ComfyUI-VideoHelperSuite' `
+        (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') `
+        'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite' `
+        @('VHS_LoadVideo', 'VHS_VideoCombine')
+    if (-not $SkipDeepExemplar) {
+        Assert-CustomNodeSymbols `
+            'ComfyUI-Reference-Based-Video-Colorization' `
+            (Join-Path $CustomNodes 'reference-video-colorization') `
+            'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization' `
+            @('DeepExColorVideoNode', 'ColorMNetVideo')
+    }
 }
 
 Invoke-Step 'Install custom-node requirements' {
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-LTXVideo\requirements.txt')
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-GGUF\requirements.txt')
+    Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite\requirements.txt')
     if (-not $SkipDeepExemplar) {
         Install-RequirementsIfPresent (Join-Path $CustomNodes 'reference-video-colorization\requirements.txt')
         Install-Pip @('scikit-image', 'einops', 'tqdm', 'matplotlib')

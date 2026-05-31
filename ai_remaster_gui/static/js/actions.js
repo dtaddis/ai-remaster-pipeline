@@ -6,7 +6,7 @@ async function postJson(path, payload) {
 }
 
 async function redrawWithState(nextState, snap, forceSignature = false) {
-  state = nextState || await api('/api/state');
+  state = nextState || await api(stateUrl());
   pruneSelected();
   draw(false);
   if (forceSignature) lastRenderSignature = renderSignature();
@@ -25,7 +25,7 @@ async function saveShotPrompt(manifest, index, prompt) {
   const result = await postJson('/api/shot-prompt', { manifest, index, prompt });
   if (!result.ok) return alert(result.error || 'Could not save prompt');
 
-  state = await api('/api/state');
+  state = await api(stateUrl());
 }
 
 async function saveOutpaintChunk(index) {
@@ -356,7 +356,7 @@ async function saveStage(key, redraw = false) {
   const snap = captureScrollState();
   await postJson('/api/settings', { stage: key, values: formValues() });
 
-  state = await api('/api/state');
+  state = await api(stateUrl());
   pruneSelected();
 
   if (redraw) {
@@ -382,7 +382,7 @@ async function saveGlobal() {
   });
 
   selected = {};
-  state = await api('/api/state');
+  state = await api(stateUrl());
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   drawTabs();
@@ -400,7 +400,7 @@ async function saveGlobalPipelineOptions() {
     },
   });
 
-  state = await api('/api/state');
+  state = await api(stateUrl());
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   drawTabs();
@@ -409,7 +409,6 @@ async function saveGlobalPipelineOptions() {
 }
 
 async function saveGlobalSection() {
-  const snap = captureScrollState();
   await postJson('/api/settings', {
     stage: 'global',
     values: {
@@ -417,11 +416,34 @@ async function saveGlobalSection() {
       section_end: document.getElementById('sectionEnd')?.value || '',
     },
   });
-  state = await api('/api/state');
+  state = await api(stateUrl());
   pruneSelected();
-  draw(false);
-  restoreScrollState(snap);
+  updateOverviewDynamicStatus();
   lastRenderSignature = renderSignature();
+}
+
+async function autoCropOutpaint() {
+  const slider = document.getElementById('aspectPreviewTime');
+  const time = slider ? slider.value : '0';
+  const result = await api('/api/outpaint-auto-crop?time=' + encodeURIComponent(time));
+  if (!result.ok) return alert(result.error || 'Auto Crop failed');
+
+  state = result.state || state;
+  ['crop_left', 'crop_right', 'crop_top', 'crop_bottom'].forEach(key => {
+    const el = document.querySelector(`[data-field="${key}"]`);
+    const value = result[key] ?? settings('outpaint')[key] ?? '0';
+    if (el) {
+      el.value = value;
+      const label = document.getElementById(`${key}Value`);
+      if (label) label.textContent = value;
+    }
+  });
+
+  const img = document.getElementById('aspectPreviewImg');
+  if (result.preview && img) img.src = media(result.preview) + '&t=' + Date.now();
+  showCommand('outpaint');
+  lastRenderSignature = renderSignature();
+  lastOutpaintVisualSignature = outpaintVisualSignature();
 }
 
 async function nudgeSectionBoundary(edge, frames) {

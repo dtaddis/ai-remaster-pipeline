@@ -1,0 +1,30 @@
+# ColorMNet ComfyUI Integration Requirements
+# Modern dependencies compatible with ComfyUI
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=9.5.0
+
+# Image processing
+scikit-image>=0.21.0
+opencv-python>=4.8.0
+einops>=0.7.0
+
+# ColorMNet specific dependencies
+# Note: These need to be installed separately via git
+# py-thin-plate-spline: https://github.com/cheind/py-thin-plate-spline
+# Pytorch-Correlation-extension: https://github.com/ClementPinard/Pytorch-Correlation-extension
+
+# Progress bars
+tqdm>=4.65.0
+progressbar2>=4.2.0
+
+# Utilities (optional but recommended)
+gdown  # For downloading model checkpoints from Google Drive
+
+# Development dependencies (optional)
+# pytest>=7.4.0
+# black>=23.0.0
+# mypy>=1.5.0

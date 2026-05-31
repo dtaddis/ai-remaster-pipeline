@@ -29,8 +29,8 @@ The app is still alpha software, but the goal is simple: you should be able to r
 
 - Windows with an NVIDIA GPU is the currently supported installer path. The installer defaults to CUDA 12.8 PyTorch wheels.
 - Python 3.13 is required. On Windows, install it from [python.org](https://www.python.org/downloads/) with the Python Launcher option enabled, or make sure `python.exe` is on `PATH`.
-- Git is required so the installer can clone ComfyUI and the ComfyUI custom nodes.
-- Internet access is required during installation for Python packages, ComfyUI/custom-node repositories, FFmpeg, and optional model downloads.
+- Git is required so the installer can clone ComfyUI, and as a fallback if bundled custom nodes need to be refreshed from upstream.
+- Internet access is required during installation for Python packages, ComfyUI, FFmpeg, and optional model downloads.
 - ComfyUI is required as the AI backend. The installer can clone it for you, or you can point ARP at an existing ComfyUI checkout.
 
 ### Windows
@@ -183,6 +183,13 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 
 The repo stores orchestration code, GUI code, workflows, wrappers, docs, and small assets. Runtime media, model caches, ComfyUI installs, and generated outputs are ignored by Git.
 
+ARP bundles the ComfyUI workflow JSONs it needs to queue jobs:
+
+- `workflows/outpaint_ltx/outpaint_LTX-IC.json` for LTX IC outpainting.
+- `workflows/qwen_image_edit/Image Edit (Qwen 2509).json` for Qwen Image Edit reference frames and outpaint guide frames.
+
+Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON files; ARP builds those ComfyUI API prompts directly from the selected source, manifest, and method. ComfyUI itself and model weights remain external dependencies. ARP bundles the required custom-node packages where their licenses allow redistribution; see `vendor/comfyui_custom_nodes/README.md`.
+
 ## Folder Layout
 
 ```text
@@ -194,7 +201,8 @@ intermediate/outpainted_references_color/ Qwen colorized reference stills
 intermediate/outpainted_colorized/       Reference-guided colorized video
 manifests/references/                    Shot/reference manifests
 output/reassembled/                      Final composited masters
-workflows/                               ComfyUI workflow templates
+workflows/                               Bundled ComfyUI workflows used by ARP
+vendor/comfyui_custom_nodes/             Bundled ComfyUI custom nodes used by ARP
 wrappers/                                Batch/shell entry points
 assets/branding/                         Logo, icons, and GitHub artwork
 assets/screenshots/                      README screenshots

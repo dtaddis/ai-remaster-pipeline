@@ -1,0 +1,55 @@
+[
+    {
+        "name": "Custom"
+    },
+    {
+        "name": "13b Dynamic",
+        "skip_steps_sigma_threshold": 0.997,
+        "cfg_star_rescale": true,
+        "sigmas": [1.0, 0.9933, 0.9850, 0.9767, 0.9008, 0.6180],
+        "cfg_values": [1, 6, 8, 6, 1, 1],
+        "stg_scale_values": [0, 4, 4, 4, 2, 1],
+        "stg_rescale_values": [1, 0.5, 0.5, 1, 1, 1],
+        "stg_layers_indices": [[11, 25, 35, 39], [22, 35, 39], [28], [28], [28], [28]]
+    },
+    {
+        "name": "13b Balanced",
+        "skip_steps_sigma_threshold": 0.998,
+        "cfg_star_rescale": true,
+        "sigmas": [1.0, 0.9933, 0.9850, 0.9767, 0.9008, 0.6180],
+        "cfg_values": [1, 6, 8, 6, 1, 1],
+        "stg_scale_values": [0, 4, 4, 4, 2, 1],
+        "stg_rescale_values": [1, 0.5, 0.5, 1, 1, 1],
+        "stg_layers_indices": [[12], [12], [5], [5], [28], [29]]
+    },
+    {
+        "name": "13b Upscale",
+        "skip_steps_sigma_threshold": 0.997,
+        "cfg_star_rescale": true,
+        "sigmas": [1.0, 0.9933, 0.9850, 0.9767, 0.9008, 0.6180],
+        "cfg_values": [1, 1, 1, 1, 1, 1],
+        "stg_scale_values": [1, 1, 1, 1, 1, 1],
+        "stg_rescale_values": [1, 1, 1, 1, 1, 1],
+        "stg_layers_indices": [[42], [42], [42], [42], [42], [42]]
+    },
+    {
+        "name": "13b Distilled",
+        "skip_steps_sigma_threshold": 0.997,
+        "cfg_star_rescale": true,
+        "sigmas": [1.0],
+        "cfg_values": [1],
+        "stg_scale_values": [0],
+        "stg_rescale_values": [1],
+        "stg_layers_indices": [[25]]
+    },
+    {
+        "name": "2b",
+        "skip_steps_sigma_threshold": 0.997,
+        "cfg_star_rescale": true,
+        "sigmas": [1.0, 0.9933, 0.9850, 0.9767, 0.9008, 0.6180],
+        "cfg_values": [4, 4, 4, 4, 1, 1],
+        "stg_scale_values": [2, 2, 2, 2, 1, 0],
+        "stg_rescale_values": [1, 1, 1, 1, 1, 1],
+        "stg_layers_indices": [[14], [14], [14], [14], [14], [14]]
+    }
+]

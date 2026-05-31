@@ -1,0 +1,54 @@
+# Backup files
+*_old_backup.py
+*_new.py
+*_backup.txt
+requirements_old_backup.txt
+requirements_new.txt
+README_NEW.md
+
+# Development files
+.claude/
+nul
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Checkpoints (too large for git)
+checkpoints/*.pth
+checkpoints/
+data/*.pth
+*.zip
+
+# Examples (too large for git - host externally)
+examples/*.mp4
+examples/*.avi
+examples/*.mov
+
+# Test and helper scripts
+test_*.py
+install_*.py
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+**/.vscode/
+.idea/
+*.swp
+*.swo
+.style.yapf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log

@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
+from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import ROOT, file_fingerprint, resolve_path, root_relative, safe_stem, resumable_output, video_info, write_signature
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -560,6 +560,15 @@ def run(args: argparse.Namespace) -> int:
     width, height, fps, total_frames = int(info["width"]), int(info["height"]), float(info["fps"]), int(info["frames"])
     video_name = copy_to_comfy_input(source_video, comfy_dir, "arp_colorize")
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+    required_nodes = {
+        "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+        "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+    }
+    if args.method == "colormnet":
+        required_nodes["ColorMNetVideo"] = "ComfyUI-Reference-Based-Video-Colorization"
+    else:
+        required_nodes["DeepExColorVideoNode"] = "ComfyUI-Reference-Based-Video-Colorization"
+    ensure_node_types(args.comfy_url, required_nodes, f"{args.method} colourisation")
 
     chunks: list[Path] = []
     plan, transitions = shot_plan(rows, total_frames, fps)

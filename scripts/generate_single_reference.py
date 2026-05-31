@@ -38,6 +38,8 @@ def main() -> int:
     args = parser.parse_args()
     source = resolve_path(args.source_image)
     output = resolve_path(args.output)
+    if not source.is_file():
+        raise FileNotFoundError(f"Reference source image not found: {source}")
     manifest = write_temp_manifest(source, output)
     args.manifest = manifest
     args.limit = 1

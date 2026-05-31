@@ -26,6 +26,8 @@ OUTPAINT_REQUIRED_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
+    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
 }
 
 
