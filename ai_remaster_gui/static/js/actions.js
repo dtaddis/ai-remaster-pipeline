@@ -47,9 +47,11 @@ async function saveOutpaintChunk(index) {
 }
 
 function outpaintChunkForm(index) {
+  const customCheckbox = document.getElementById(`chunkCustom_${index}`);
   return {
     index,
     seed: document.getElementById(`chunkSeed_${index}`).value,
+    custom_length: !!(customCheckbox && customCheckbox.checked),
     custom_seconds: outpaintChunkCustomSeconds(index),
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
     negative_suffix: document.getElementById(`chunkNegative_${index}`).value,

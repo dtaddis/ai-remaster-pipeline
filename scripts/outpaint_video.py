@@ -83,7 +83,7 @@ def crop_slug(args: Any) -> str:
 
 
 def default_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
-    width, height = target_size(source, aspect, target_height)
+    width, height = model_safe_size(source, aspect, target_height)
     return ROOT / "intermediate" / "outpainted" / f"{safe_stem(source.name)}_{aspect_slug(aspect)}_{width}x{height}{crop_slug(args) if args else ''}_outpainted.mp4"
 
 
@@ -95,8 +95,8 @@ def default_raw_output(source: Path, aspect: str, target_height: int | None, arg
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     # Prepare at model-safe dimensions so the canvas fed to LTX exactly matches the latent node
     # dimensions.  LTXVPreprocess crops (not scales) to fit the latent, so any mismatch would
-    # silently remove rows/columns of pixels.  The finalize step upscales the raw LTX output back
-    # to delivery resolution (e.g. 704 → 720) after the black/gamma lift is restored.
+    # silently remove rows/columns of pixels.  Recomposition later upscales from model-safe
+    # dimensions (e.g. 704) to delivery resolution (e.g. 720) when producing the final master.
     work_w, work_h = model_safe_size(source, aspect, target_height)
     del_w, del_h = target_size(source, aspect, target_height)
     prepared = default_prepared_output(source, work_w, work_h, del_w, del_h)
@@ -1011,7 +1011,7 @@ def main() -> int:
     if (work_width, work_height) != (delivery_width, delivery_height):
         print(
             f"LTX working canvas: {work_width}x{work_height} (rounded to multiples of {MODEL_SIZE_MULTIPLE} "
-            f"from delivery {delivery_width}x{delivery_height}). Finalize will upscale back to delivery.",
+            f"from delivery {delivery_width}x{delivery_height}). Recomposition will upscale back to delivery.",
             flush=True,
         )
     print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}", flush=True)

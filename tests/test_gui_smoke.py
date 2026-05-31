@@ -55,7 +55,7 @@ class GuiSmokeTests(unittest.TestCase):
 
         output = app.outpaint_output_for("input/My Source.mp4", "16:9", "720")
 
-        self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_1280x720_outpainted.mp4")
+        self.assertEqual(output, "intermediate/outpainted/My_Source_16x9_1280x704_outpainted.mp4")
 
     def test_outpaint_ltx_working_paths_use_model_safe_size(self) -> None:
         app.APP.settings.setdefault("outpaint", {}).update(
@@ -72,9 +72,9 @@ class GuiSmokeTests(unittest.TestCase):
         prepared = app.outpaint_prepared_for("input/My Source.mp4", app.APP.settings["outpaint"])
         manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", app.APP.settings["outpaint"])
 
-        self.assertEqual(prepared.name, "My Source_1280x704_lifted.mp4")
+        self.assertEqual(prepared.name, "My Source_1280x704_from1280x720_lifted.mp4")
         self.assertTrue(manifest.endswith("My_Source_16x9_1280x704_chunks.csv"))
-        self.assertEqual(app.outpaint_output_for("input/My Source.mp4", "16:9", "720"), "intermediate/outpainted/My_Source_16x9_1280x720_outpainted.mp4")
+        self.assertEqual(app.outpaint_output_for("input/My Source.mp4", "16:9", "720"), "intermediate/outpainted/My_Source_16x9_1280x704_outpainted.mp4")
 
     def test_source_height_outpaint_option_uses_video_height(self) -> None:
         with mock.patch.object(server, "video_metrics", return_value={"height": 480}):
@@ -189,6 +189,35 @@ class GuiSmokeTests(unittest.TestCase):
             app.write_outpaint_chunk_rows(manifest, rows)
 
             self.assertEqual(manifest.stat().st_mtime_ns, first_mtime)
+
+    def test_outpaint_chunk_save_can_clear_custom_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "chunks.csv"
+            rows = [
+                {
+                    "chunk_index": "0",
+                    "start_frame": "0",
+                    "end_frame": "120",
+                    "start_seconds": "0.000000",
+                    "end_seconds": "5.000000",
+                    "custom_seconds": "5.000",
+                    "seed": "42",
+                }
+            ]
+            app.write_outpaint_chunk_rows(manifest, rows)
+
+            with mock.patch.object(server, "outpaint_chunks_state", return_value={"manifest": str(manifest)}):
+                app.update_outpaint_chunk(
+                    0,
+                    seed="43",
+                    prompt_suffix="",
+                    custom_seconds="5.000",
+                    custom_length=False,
+                )
+
+            stored = app.read_outpaint_chunk_rows(manifest)[0]
+            self.assertEqual(stored["seed"], "43")
+            self.assertEqual(stored["custom_seconds"], "")
 
     def test_clearing_outpaint_guide_deletes_cached_chunk_guides(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

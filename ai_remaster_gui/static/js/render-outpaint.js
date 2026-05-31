@@ -48,6 +48,7 @@ function outpaintChunkSummary(row) {
   const fps = Math.max(1, Number(row.fps || 24));
   const projectFrames = Math.max(1, Math.round(Number(settings('outpaint').chunk_seconds || 20) * fps));
   const frameCount = Math.max(1, Number(row.custom_seconds ? Math.round(Number(row.custom_seconds) * fps) : row.length_frames || projectFrames));
+  const defaultFrames = Math.max(1, Math.min(Number(row.max_length_frames || projectFrames), projectFrames));
   const maxFrames = Math.max(frameCount, Number(row.max_length_frames || frameCount));
   const custom = !!row.custom_seconds;
 
@@ -58,7 +59,7 @@ function outpaintChunkSummary(row) {
       <p class="shot-time">Frames ${esc(row.start_frame)}-${esc(row.end_frame)}</p>
       <label><input id="chunkCustom_${idx}" type="checkbox" ${custom ? 'checked' : ''} onchange="toggleChunkLength(${idx})"> Custom length</label>
       <label>Length: <span id="chunkFramesLabel_${idx}">${chunkLengthLabel(frameCount, fps)}</span></label>
-      <input id="chunkFrames_${idx}" data-fps="${fps}" type="range" min="1" max="${maxFrames}" step="1" value="${frameCount}" ${custom ? '' : 'disabled'} oninput="updateChunkLengthLabel(${idx})">
+      <input id="chunkFrames_${idx}" data-fps="${fps}" data-default-frames="${defaultFrames}" type="range" min="1" max="${maxFrames}" step="1" value="${frameCount}" ${custom ? '' : 'disabled'} oninput="updateChunkLengthLabel(${idx})">
       <div class="shot-tools">
         <button type="button" onclick="nudgeChunkLength(${idx},-1)" ${custom ? '' : 'disabled'}>-1 frame</button>
         <input id="chunkFramesInput_${idx}" class="frame-input" type="number" min="1" max="${maxFrames}" step="1" value="${frameCount}" ${custom ? '' : 'disabled'} onchange="setChunkLengthFrames(${idx},this.value)">
@@ -283,9 +284,14 @@ function toggleChunkLength(index) {
   const slider = document.getElementById(`chunkFrames_${index}`);
   const input = document.getElementById(`chunkFramesInput_${index}`);
   const buttons = slider ? slider.parentElement.querySelectorAll('.shot-tools button') : [];
-  if (slider) slider.disabled = !(checkbox && checkbox.checked);
-  if (input) input.disabled = !(checkbox && checkbox.checked);
-  buttons.forEach(button => { button.disabled = !(checkbox && checkbox.checked); });
+  const enabled = !!(checkbox && checkbox.checked);
+  if (slider && !enabled) {
+    slider.value = Math.max(Number(slider.min || 1), Math.min(Number(slider.max || 1), Math.round(Number(slider.dataset.defaultFrames || slider.value) || 1)));
+    updateChunkLengthLabel(index);
+  }
+  if (slider) slider.disabled = !enabled;
+  if (input) input.disabled = !enabled;
+  buttons.forEach(button => { button.disabled = !enabled; });
 }
 
 function updateChunkLengthLabel(index) {

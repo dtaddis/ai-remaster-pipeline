@@ -1436,7 +1436,7 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     if not source_text:
         return ""
     source = resolve_video_source(source_text)
-    width, height = outpaint_size_for_source(source_text, aspect, target_height_text)
+    width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     crop = "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1825,7 +1825,13 @@ def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float,
     return ranges
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "") -> None:
+def _truthy_payload_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None) -> None:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -1837,7 +1843,8 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
     row["prompt_suffix"] = prompt_suffix
     row["negative_suffix"] = negative_suffix
-    if custom_seconds:
+    use_custom_length = _truthy_payload_value(custom_length) if custom_length is not None else bool(custom_seconds)
+    if use_custom_length and custom_seconds:
         row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
     else:
         row["custom_seconds"] = ""
@@ -4047,14 +4054,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None))
                 self.send_json({"ok": True, "state": APP.state("outpaint")})
             except Exception as exc:
                 APP.log.append(f"Outpaint chunk save failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             try:
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")))
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None))
                 ok, message = APP.run_outpaint_chunk(int(data.get("index", 0)))
                 self.send_json({"ok": ok, "message": message, "state": APP.state("outpaint") if ok else None, "error": "" if ok else message})
             except Exception as exc:
