@@ -1135,6 +1135,9 @@ def main() -> int:
             elif args.only_chunk is not None:
                 return 0
 
+    # Finalize restores the black/gamma lift but does NOT upscale to delivery resolution.
+    # The outpainted and colorised layers stay at model-safe dimensions (e.g. 1280×704)
+    # all the way through to recomposition, where final_composite.py scales up to delivery.
     finalize_command = [
         sys.executable,
         str(ROOT / "scripts" / "finalize_outpaint_output.py"),
@@ -1146,10 +1149,6 @@ def main() -> int:
         str(args.black_lift),
         "--gamma",
         str(args.gamma),
-        "--target-width",
-        str(delivery_width),
-        "--target-height",
-        str(delivery_height),
     ]
     if args.force:
         finalize_command.append("--force")

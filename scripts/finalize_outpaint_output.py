@@ -44,7 +44,7 @@ def inverse_filter(args, info: dict) -> str:
 
 def signature(args, source: Path) -> dict:
     return {
-        'version': 4,
+        'version': 5,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),

@@ -111,7 +111,7 @@ def build_filter(args, has_color, fps: float):
     filters = [
         f'[0:v]fps=fps={fps_text},setpts=N/({fps_text}*TB){scale_base}[base0]',
         f'[1:v]fps=fps={fps_text},{crop}setpts=N/({fps_text}*TB)[src0]',
-        '[src0][base0]scale2ref=w=oh*mdar:h=ih[src][base]',
+        '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
         f"[src]format=rgba,split[src_rgb][src_a]",
         f"[src_a]alphaextract,geq=lum='if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))'[mask]",
         '[src_rgb][mask]alphamerge[srcm]',
