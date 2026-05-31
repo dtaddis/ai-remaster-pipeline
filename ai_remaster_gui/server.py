@@ -1815,12 +1815,25 @@ def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_second
 
     canvas_bgr = cv2.cvtColor(np.array(canvas_pil), cv2.COLOR_RGB2BGR)
 
-    # Step 2: paste the source frame's content pixels over the centre.
+    # Step 2: blend the source frame's content pixels over the centre with a soft edge.
     # black_lift raises all source pixels above 0; the padding margins are exact black (0,0,0).
-    # Pasting source over Qwen ensures the centre matches the prepared canvas pixel-perfectly.
+    # A ~10px Gaussian feather at the content boundary avoids a hard seam where Qwen's
+    # outpainting meets the composited source pixels.
     src_is_content = np.any(src_frame > 4, axis=2)
     if src_is_content.any():
-        canvas_bgr[src_is_content] = src_frame[src_is_content]
+        feather_px = 10
+        alpha = cv2.GaussianBlur(
+            src_is_content.astype(np.float32),
+            (feather_px * 2 + 1, feather_px * 2 + 1),
+            feather_px / 2,
+        )
+        # Mask the alpha back to zero outside the content area so the blur never
+        # bleeds black pillar pixels into Qwen's outpainting — feather is inward only.
+        alpha = (alpha * src_is_content.astype(np.float32))[:, :, np.newaxis]
+        canvas_bgr = (
+            src_frame.astype(np.float32) * alpha
+            + canvas_bgr.astype(np.float32) * (1.0 - alpha)
+        ).clip(0, 255).astype(np.uint8)
 
     # Step 3: inpaint the small corner triangles that remain black
     # (top/bottom strips outside both the Qwen letterbox and the source content area).
