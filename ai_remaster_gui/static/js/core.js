@@ -41,7 +41,7 @@ async function refresh(force = false) {
   const currentOutpaintVisualSignature = outpaintVisualSignature();
   const outpaintVisualChanged = active === 'outpaint'
     && currentOutpaintVisualSignature !== lastOutpaintVisualSignature;
-  if (!force && active === 'outpaint' && document.getElementById('app')?.children.length) {
+  if (!force && !outpaintVisualChanged && active === 'outpaint' && document.getElementById('app')?.children.length) {
     updateOutpaintGuidePreviews();
     updateOutpaintRawPreviews();
     updateRunLogs();
@@ -123,6 +123,7 @@ function outpaintVisualSignature() {
     raw_start_preview: row.raw_start_preview,
     raw_middle_preview: row.raw_middle_preview,
     raw_end_preview: row.raw_end_preview,
+    guides_sig: (row.guides || []).map(g => `${g.frame_idx}:${g.image_mtime}`).join(','),
   })));
 }
 

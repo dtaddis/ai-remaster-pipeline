@@ -808,6 +808,44 @@ class PipelineApp:
             ).start()
         return True, f"Started Qwen guide frame generation for chunk {index + 1}."
 
+    def run_guide_frame_generation(self, chunk_index: int, guide_index: int, frame_idx: int, prompt: str) -> tuple[bool, str]:
+        ok, message = ensure_comfy_available_for_stage("Guide Frame Generation")
+        if not ok:
+            return False, message
+        try:
+            cmd, output_rel, prepared_canvas, source_seconds = guide_frame_generation_command(chunk_index, guide_index, frame_idx, prompt)
+        except Exception as exc:
+            return False, str(exc)
+        output = resolve(output_rel)
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = f"Generating guide frame {guide_index} for chunk {chunk_index + 1}"
+            self.running_stage_key = "outpaint"
+            self.run_started_at = time.time()
+            self.log.append(f"Generating Qwen guide (chunk {chunk_index + 1}, guide {guide_index}, frame_idx={frame_idx}): {output_rel}")
+            self.log.append("> " + " ".join(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            try:
+                self.process = subprocess.Popen(cmd, **kwargs)
+            except Exception as exc:
+                self.running_stage = ""
+                self.running_stage_key = ""
+                self.run_started_at = 0.0
+                self.log.append(f"Could not start guide frame generation: {exc}")
+                return False, f"Could not start guide frame generation: {exc}"
+            threading.Thread(
+                target=self._collect_output_guide,
+                args=(output, prepared_canvas),
+                kwargs={"source_seconds": source_seconds},
+                daemon=True,
+            ).start()
+        return True, f"Started Qwen guide frame generation for chunk {chunk_index + 1}, guide {guide_index}."
+
     def _collect_output_guide(self, output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
         """Like _collect_output but composites the guide in-place after a successful Qwen run."""
         assert self.process and self.process.stdout
@@ -1423,6 +1461,7 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
         "guide_strength",
         "guide_end_image",
         "guide_end_strength",
+        "guide_frames",
         "prepared_path",
         "raw_path",
     ]
@@ -1502,6 +1541,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         row.setdefault("guide_strength", "0.7")
         row.setdefault("guide_end_image", "")
         row.setdefault("guide_end_strength", "1.0")
+        row.setdefault("guide_frames", "")
         rows.append(row)
     write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
@@ -1511,34 +1551,22 @@ def outpaint_chunks_state(settings: dict) -> dict:
         start_seconds = float(row["start_seconds"])
         end_seconds = float(row["end_seconds"])
         middle_seconds = (start_seconds + end_seconds) / 2
-        guide_path = resolve(row["guide_image"]) if row.get("guide_image") else None
-        guide_exists = bool(guide_path and guide_path.exists())
-        guide_end_path = resolve(row["guide_end_image"]) if row.get("guide_end_image") else None
-        guide_end_exists = bool(guide_end_path and guide_end_path.exists())
-        guide_preview_seconds = start_seconds
-        guide_end_preview_seconds = max(start_seconds, end_seconds - (1.0 / max(1.0, fps)))
+        length_frames = int(row["end_frame"]) - int(row["start_frame"])
+        guides = _build_guide_frames_view(row, range_source, start_seconds, end_seconds, fps, length_frames)
         view_rows.append(row | {
             "index": int(row["chunk_index"]),
             "start": float(row["start_seconds"]),
             "end": float(row["end_seconds"]),
             "fps": fps,
             "total_frames": total_frames,
-            "length_frames": int(row["end_frame"]) - int(row["start_frame"]),
+            "length_frames": length_frames,
             "max_length_frames": max(1, total_frames - int(row["start_frame"])),
             "start_label": format_timecode(float(row["start_seconds"])),
             "end_label": format_timecode(float(row["end_seconds"])),
             "raw_exists": raw.exists(),
             "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
             "prepared_exists": prepared.exists(),
-            "guide_exists": guide_exists,
-            "guide_mtime": int(guide_path.stat().st_mtime_ns) if guide_exists and guide_path else 0,
-            "guide_strength": row.get("guide_strength", "0.7"),
-            "guide_end_exists": guide_end_exists,
-            "guide_end_image": row.get("guide_end_image", ""),
-            "guide_end_mtime": int(guide_end_path.stat().st_mtime_ns) if guide_end_exists and guide_end_path else 0,
-            "guide_end_strength": row.get("guide_end_strength", "1.0"),
-            "guide_frame_preview": chunk_frame_preview(range_source, guide_preview_seconds, "source_guide"),
-            "guide_end_frame_preview": chunk_frame_preview(range_source, guide_end_preview_seconds, "source_guide_end"),
+            "guides": guides,
             "source_start_preview": chunk_frame_preview(range_source, start_seconds, "source_start"),
             "source_middle_preview": chunk_frame_preview(range_source, middle_seconds, "source_middle"),
             "source_end_preview": chunk_frame_preview(range_source, max(start_seconds, end_seconds - (1 / max(1.0, fps))), "source_end"),
@@ -1553,6 +1581,89 @@ def chunk_frame_preview(source: Path, seconds: float, suffix: str) -> str:
     if not source.exists():
         return ""
     return extract_video_frame_at(source, FILE_PREVIEW_DIR / "chunks", f"{suffix}_{int(seconds * 1000):010d}", seconds)
+
+
+def _parse_guide_frames(row: dict[str, str]) -> list[dict]:
+    """Return the guide_frames list for a manifest row, migrating from old fields if needed."""
+    raw = row.get("guide_frames", "").strip()
+    if raw:
+        try:
+            frames = json.loads(raw)
+            if isinstance(frames, list):
+                return frames
+        except json.JSONDecodeError:
+            pass
+    # Migrate from legacy guide_image / guide_end_image fields.
+    frames: list[dict] = []
+    if row.get("guide_image"):
+        try:
+            strength = float(row.get("guide_strength", "0.7") or "0.7")
+        except ValueError:
+            strength = 0.7
+        frames.append({"frame_idx": 0, "strength": round(strength, 3), "image": row["guide_image"]})
+    if row.get("guide_end_image"):
+        try:
+            strength = float(row.get("guide_end_strength", "1.0") or "1.0")
+        except ValueError:
+            strength = 1.0
+        frames.append({"frame_idx": -1, "strength": round(strength, 3), "image": row["guide_end_image"]})
+    return frames
+
+
+def _save_guide_frames(manifest: Path, chunk_index: int, frames: list[dict]) -> None:
+    """Persist guide_frames JSON back to the manifest row."""
+    rows = read_outpaint_chunk_rows(manifest)
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    rows[chunk_index]["guide_frames"] = json.dumps(frames)
+    write_outpaint_chunk_rows(manifest, [rows[k] for k in sorted(rows)])
+
+
+def _guide_source_seconds(row: dict, frame_idx: int, fps: float) -> float:
+    """Convert a frame_idx (possibly negative) to absolute seconds in the prepared canvas."""
+    start = float(row.get("start", 0.0))
+    end = float(row.get("end", 0.0))
+    length_frames = int(row.get("end_frame", 0)) - int(row.get("start_frame", 0))
+    if frame_idx < 0:
+        actual = max(0, length_frames + frame_idx)
+    else:
+        actual = frame_idx
+    return max(start, min(end - (1.0 / max(1.0, fps)), start + actual / max(1.0, fps)))
+
+
+def _build_guide_frames_view(
+    row: dict,
+    range_source: "Path",
+    start_seconds: float,
+    end_seconds: float,
+    fps: float,
+    length_frames: int,
+) -> list[dict]:
+    """Build the view list for guide frames, including thumbnail previews."""
+    frames = _parse_guide_frames(row)
+    view = []
+    for i, gf in enumerate(frames):
+        frame_idx = int(gf.get("frame_idx", 0))
+        strength = float(gf.get("strength", 0.7))
+        image_rel = gf.get("image", "")
+        image_path = resolve(image_rel) if image_rel else None
+        image_exists = bool(image_path and image_path.exists())
+        source_secs = _guide_source_seconds(
+            {"start": start_seconds, "end": end_seconds,
+             "start_frame": str(int(start_seconds * fps)),
+             "end_frame": str(int(end_seconds * fps))},
+            frame_idx, fps,
+        )
+        view.append({
+            "guide_index": i,
+            "frame_idx": frame_idx,
+            "strength": strength,
+            "image": image_rel,
+            "image_exists": image_exists,
+            "image_mtime": int(image_path.stat().st_mtime_ns) if image_exists and image_path else 0,
+            "source_preview": chunk_frame_preview(range_source, source_secs, f"gf_{int(source_secs * 1000):010d}"),
+        })
+    return view
 
 
 def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
@@ -1736,6 +1847,165 @@ def clear_outpaint_end_guide(index: int) -> dict[str, str]:
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
     APP.log.append(f"Cleared outpaint end guide frame for chunk {index + 1}")
     return {"guide_end_image": ""}
+
+
+def _get_guide_manifest() -> tuple[Path, dict[int, dict[str, str]], str]:
+    state = outpaint_chunks_state(APP.settings)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    return manifest, rows, manifest_text
+
+
+def add_guide_frame(chunk_index: int) -> dict:
+    manifest, rows, _ = _get_guide_manifest()
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    frames = _parse_guide_frames(rows[chunk_index])
+    frames.append({"frame_idx": 0, "strength": 0.7, "image": ""})
+    _save_guide_frames(manifest, chunk_index, frames)
+    APP.log.append(f"Added guide frame to chunk {chunk_index + 1} (total: {len(frames)})")
+    return {"guide_index": len(frames) - 1}
+
+
+def remove_guide_frame(chunk_index: int, guide_index: int) -> dict:
+    manifest, rows, _ = _get_guide_manifest()
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    frames = _parse_guide_frames(rows[chunk_index])
+    if guide_index < 0 or guide_index >= len(frames):
+        raise IndexError(f"Guide frame {guide_index} not found in chunk {chunk_index + 1}")
+    removed = frames.pop(guide_index)
+    if removed.get("image"):
+        remove_cached_file(resolve(removed["image"]))
+    _save_guide_frames(manifest, chunk_index, frames)
+    APP.log.append(f"Removed guide frame {guide_index} from chunk {chunk_index + 1}")
+    return {"removed": guide_index}
+
+
+def save_guide_frame(chunk_index: int, guide_index: int, frame_idx: int, strength: float) -> dict:
+    manifest, rows, _ = _get_guide_manifest()
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    frames = _parse_guide_frames(rows[chunk_index])
+    if guide_index < 0 or guide_index >= len(frames):
+        raise IndexError(f"Guide frame {guide_index} not found in chunk {chunk_index + 1}")
+    frames[guide_index]["frame_idx"] = int(frame_idx)
+    frames[guide_index]["strength"] = round(max(0.0, min(1.0, float(strength))), 3)
+    _save_guide_frames(manifest, chunk_index, frames)
+    APP.log.append(f"Saved guide frame {guide_index} for chunk {chunk_index + 1}: frame_idx={frame_idx}, strength={strength:.2f}")
+    return {"frame_idx": frame_idx, "strength": frames[guide_index]["strength"]}
+
+
+def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
+    manifest, rows, _ = _get_guide_manifest()
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    frames = _parse_guide_frames(rows[chunk_index])
+    if guide_index < 0 or guide_index >= len(frames):
+        raise IndexError(f"Guide frame {guide_index} not found in chunk {chunk_index + 1}")
+    current = frames[guide_index].get("image", "")
+    selected = browse_path("image", current)
+    if not selected:
+        return {"selected": "", "image": current}
+    source = resolve(selected)
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise RuntimeError("Choose a PNG or JPEG image for the guide frame.")
+    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target = target_dir / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}{source.suffix.lower()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    frames[guide_index]["image"] = rel(target)
+    _save_guide_frames(manifest, chunk_index, frames)
+    APP.log.append(f"Uploaded guide frame {guide_index} for chunk {chunk_index + 1}: {rel(target)}")
+    return {"selected": selected, "image": rel(target)}
+
+
+def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
+    manifest, rows, _ = _get_guide_manifest()
+    if chunk_index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+    frames = _parse_guide_frames(rows[chunk_index])
+    if guide_index < 0 or guide_index >= len(frames):
+        raise IndexError(f"Guide frame {guide_index} not found in chunk {chunk_index + 1}")
+    current = frames[guide_index].get("image", "")
+    if current:
+        remove_cached_file(resolve(current))
+    frames[guide_index]["image"] = ""
+    _save_guide_frames(manifest, chunk_index, frames)
+    APP.log.append(f"Cleared guide frame {guide_index} image for chunk {chunk_index + 1}")
+    return {"image": ""}
+
+
+def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx: int, prompt: str) -> tuple[list[str], str, Path, float]:
+    """Build the Qwen generation command for any guide frame position."""
+    state = outpaint_chunks_state(APP.settings)
+    rows = state.get("rows", [])
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    if chunk_index < 0 or chunk_index >= len(rows):
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+
+    row = rows[chunk_index]
+    fps = float(row.get("fps", 24) or 24)
+    source_seconds = _guide_source_seconds(row, frame_idx, fps)
+
+    source_text = pipeline_source_text(APP.settings)
+    if not source_text:
+        raise RuntimeError("No source material is selected.")
+    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    cache_key = f"gf_qwen_{int(source_seconds * 1000):010d}"
+    source_img = resolve(chunk_frame_preview(range_source, source_seconds, cache_key))
+    if not source_img.exists():
+        raise FileNotFoundError(source_img)
+
+    manifest = resolve(str(manifest_text))
+    output_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    output = output_dir / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}_qwen.png"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    remove_cached_file(output)
+
+    # Pre-write the output path into guide_frames so the thumbnail updates immediately.
+    stored = read_outpaint_chunk_rows(manifest)
+    if chunk_index in stored:
+        frames = _parse_guide_frames(stored[chunk_index])
+        if 0 <= guide_index < len(frames):
+            frames[guide_index]["image"] = rel(output)
+        else:
+            frames.append({"frame_idx": frame_idx, "strength": 0.7, "image": rel(output)})
+        stored[chunk_index]["guide_frames"] = json.dumps(frames)
+        write_outpaint_chunk_rows(manifest, [stored[k] for k in sorted(stored)])
+
+    values = APP.settings.get("references", {})
+    config = current_config()
+    workflow = values.get("workflow") or default_qwen_workflow(config)
+    if not workflow:
+        raise RuntimeError("No Qwen Image Edit workflow found. Install/configure ComfyUI first.")
+    guide_prompt = prompt.strip() or DEFAULT_ANCHOR_PROMPT
+    cmd = [
+        sys.executable, "-u",
+        str(SCRIPTS / "generate_single_reference.py"),
+        "--source-image", str(source_img),
+        "--output", str(output),
+        "--workflow", workflow,
+        "--comfy-url", values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188"),
+        "--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
+        "--comfy-output-root", values.get("comfy_output_root") or str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output"),
+        "--model-backend", values.get("model_backend", "gguf"),
+        "--gguf-model", values.get("gguf_model", "qwen-image-edit-2511-Q4_K_M.gguf"),
+        "--prompt", guide_prompt,
+        "--prompt-suffix", "",
+        "--load-image-node-id", values.get("load_image_node_id", "auto"),
+        "--save-node-id", values.get("save_node_id", "auto"),
+        "--no-normalize-to-source-size",
+        "--force",
+    ]
+    if values.get("prompt_node_id"):
+        cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
+    return cmd, rel(output), resolve(range_source), source_seconds
 
 
 def _composite_guide_in_place(output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
@@ -3333,6 +3603,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "path": path})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-guide-preview":
+            query = parse_qs(parsed.query)
+            try:
+                chunk_index = int(query.get("chunk_index", ["0"])[0])
+                frame_idx = int(query.get("frame_idx", ["0"])[0])
+                source_text = pipeline_source_text(APP.settings)
+                if not source_text:
+                    self.send_json({"ok": False, "error": "No source material"})
+                else:
+                    values = APP.settings.get("outpaint", {})
+                    range_source = ensure_outpaint_prepared_canvas(source_text, values)
+                    chunks_state = outpaint_chunks_state(APP.settings)
+                    rows = chunks_state.get("rows", [])
+                    row = next((r for r in rows if r.get("index") == chunk_index), None)
+                    if row is None:
+                        self.send_json({"ok": False, "error": "Chunk not found"})
+                    else:
+                        fps = float(row.get("fps", 24) or 24)
+                        secs = _guide_source_seconds(row, frame_idx, fps)
+                        cache_key = f"gfprev_{chunk_index}_{frame_idx}"
+                        preview = chunk_frame_preview(range_source, secs, cache_key)
+                        self.send_json({"ok": True, "preview": preview})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/media":
             query = parse_qs(parsed.query)
             path = resolve(unquote(query.get("path", [""])[0]))
@@ -3507,6 +3801,53 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
             except Exception as exc:
                 APP.log.append(f"Outpaint end guide generation failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-add":
+            try:
+                result = add_guide_frame(int(data.get("chunk_index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Guide frame add failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-remove":
+            try:
+                result = remove_guide_frame(int(data.get("chunk_index", 0)), int(data.get("guide_index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Guide frame remove failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-save":
+            try:
+                result = save_guide_frame(int(data.get("chunk_index", 0)), int(data.get("guide_index", 0)), int(data.get("frame_idx", 0)), float(data.get("strength", 0.7)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Guide frame save failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-upload":
+            try:
+                result = upload_guide_frame_image(int(data.get("chunk_index", 0)), int(data.get("guide_index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Guide frame upload failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-clear":
+            try:
+                result = clear_guide_frame_image(int(data.get("chunk_index", 0)), int(data.get("guide_index", 0)))
+                self.send_json({"ok": True, **result, "state": APP.state()})
+            except Exception as exc:
+                APP.log.append(f"Guide frame clear failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/guide-frame-generate":
+            try:
+                ok, message = APP.run_guide_frame_generation(
+                    int(data.get("chunk_index", 0)),
+                    int(data.get("guide_index", 0)),
+                    int(data.get("frame_idx", 0)),
+                    str(data.get("prompt", "")),
+                )
+                self.send_json({"ok": ok, "message": message, "state": APP.state() if ok else None, "error": "" if ok else message})
+            except Exception as exc:
+                APP.log.append(f"Guide frame generation failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/browse":
             try:

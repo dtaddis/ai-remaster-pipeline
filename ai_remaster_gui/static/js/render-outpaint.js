@@ -76,136 +76,155 @@ function outpaintChunkSummary(row) {
 
 function outpaintChunkGuide(row) {
   const idx = row.index;
-  const hasStart = !!row.guide_exists;
-  const hasEnd = !!row.guide_end_exists;
+  const guides = row.guides || [];
+  const lengthFrames = Math.max(1, Number(row.length_frames || 1));
+  const fps = Math.max(1, Number(row.fps || 24));
 
-  // Start guide
-  const startPath = row.guide_exists ? row.guide_image : row.guide_frame_preview;
-  const startTitle = row.guide_exists ? 'Current start guide' : 'Chunk start frame (no guide set)';
-  const startSrc = startPath ? media(startPath) + (row.guide_exists && row.guide_mtime ? '&t=' + row.guide_mtime : '') : '';
-  const startStrength = parseFloat(row.guide_strength || '0.7');
+  // Warn about duplicate frame positions (after LTX rounding to multiples of 8)
+  const roundedIdxs = guides.map(g => {
+    const fi = Number(g.frame_idx);
+    return fi < 0 ? fi : (Math.floor(fi / 8) * 8);
+  });
+  const dupIdxs = new Set(roundedIdxs.filter((v, i, a) => a.indexOf(v) !== i));
 
-  // End guide
-  const endPath = row.guide_end_exists ? row.guide_end_image : row.guide_end_frame_preview;
-  const endTitle = row.guide_end_exists ? 'Current end guide' : 'Chunk end frame (no guide set)';
-  const endSrc = endPath ? media(endPath) + (row.guide_end_exists && row.guide_end_mtime ? '&t=' + row.guide_end_mtime : '') : '';
-  const endStrength = parseFloat(row.guide_end_strength || '1.0');
+  const guideCards = guides.map((g, gi) => guideFrameCard(idx, gi, g, lengthFrames, fps, dupIdxs)).join('');
+
+  const empty = guides.length === 0
+    ? `<p class="shot-empty guide-empty">No guide frames set. Add one below to steer LTX at specific points in the chunk.</p>`
+    : '';
+
+  const tooMany = guides.length > Math.floor(lengthFrames / 8) + 1
+    ? `<p class="shot-time guide-warn">⚠ More guides than valid LTX frame positions — some will overlap after rounding to multiples of 8.</p>`
+    : '';
 
   return `
     <div class="chunk-guide-section">
-      <div class="chunk-guide">
-        <div>
-          <label>Start guide <span class="shot-time">(optional)</span></label>
-          ${startPath ? `
-            <figure id="chunkGuideFigure_${idx}" class="still-figure ${row.guide_exists ? 'has-anchor' : ''}">
-              <img id="chunkGuideImg_${idx}" src="${startSrc}" alt="" onclick="openImageModal(this.src,${jsArg(startTitle)})">
-              <span id="chunkGuideBadge_${idx}" class="anchor-badge ${row.guide_exists ? '' : 'hidden'}">Guide</span>
-              <figcaption id="chunkGuideCaption_${idx}">${esc(startTitle)}</figcaption>
-            </figure>
-          ` : missingImage('Chunk start frame not present')}
-        </div>
-        <div>
-          <p id="chunkGuideStatus_${idx}" class="shot-time">${esc(outpaintGuideStatus(row))}</p>
-          <p class="shot-time">Applied at the start of the chunk via LTX i2v conditioning. If no guide is set, the last frame of the previous chunk is used automatically for continuity.</p>
-          <label>Strength: <span id="chunkGuideStrengthLabel_${idx}">${startStrength.toFixed(2)}</span></label>
-          <input id="chunkGuideStrength_${idx}" type="range" min="0" max="1" step="0.01" value="${startStrength}"
-            oninput="document.getElementById('chunkGuideStrengthLabel_${idx}').textContent=parseFloat(this.value).toFixed(2)">
-          <div class="shot-tools">
-            <button type="button" data-outpaint-disable-running="true" onclick="chooseOutpaintAnchor(${idx})" ${state.running ? 'disabled' : ''}>Upload Guide</button>
-            <button type="button" data-outpaint-disable-running="true" onclick="openAnchorPromptModal(${idx})" ${state.running ? 'disabled' : ''}>Generate Guide</button>
-            <button type="button" onclick="clearOutpaintAnchor(${idx})" ${row.guide_image ? '' : 'disabled'}>Clear</button>
-          </div>
-        </div>
+      ${empty}${tooMany}
+      <div id="guideFrameList_${idx}">${guideCards}</div>
+      <div class="shot-tools guide-add-row">
+        <button type="button" data-outpaint-disable-running="true"
+          onclick="addGuideFrame(${idx})" ${state.running ? 'disabled' : ''}>+ Add Guide Frame</button>
       </div>
-
-      <div class="chunk-guide">
-        <div>
-          <label>End guide <span class="shot-time">(optional)</span></label>
-          ${endPath ? `
-            <figure id="chunkEndGuideFigure_${idx}" class="still-figure ${row.guide_end_exists ? 'has-anchor' : ''}">
-              <img id="chunkEndGuideImg_${idx}" src="${endSrc}" alt="" onclick="openImageModal(this.src,${jsArg(endTitle)})">
-              <span id="chunkEndGuideBadge_${idx}" class="anchor-badge ${row.guide_end_exists ? '' : 'hidden'}">End Guide</span>
-              <figcaption id="chunkEndGuideCaption_${idx}">${esc(endTitle)}</figcaption>
-            </figure>
-          ` : missingImage('Chunk end frame not present')}
-        </div>
-        <div>
-          <p id="chunkEndGuideStatus_${idx}" class="shot-time">${esc(outpaintEndGuideStatus(row))}</p>
-          <p class="shot-time">Applied at the last frame of the chunk via LTXVAddGuideAdvanced (frame_idx=-1). Works independently of the start guide.</p>
-          <label>Strength: <span id="chunkEndGuideStrengthLabel_${idx}">${endStrength.toFixed(2)}</span></label>
-          <input id="chunkEndGuideStrength_${idx}" type="range" min="0" max="1" step="0.01" value="${endStrength}"
-            oninput="document.getElementById('chunkEndGuideStrengthLabel_${idx}').textContent=parseFloat(this.value).toFixed(2)">
-          <div class="shot-tools">
-            <button type="button" data-outpaint-disable-running="true" onclick="chooseOutpaintEndAnchor(${idx})" ${state.running ? 'disabled' : ''}>Upload End Guide</button>
-            <button type="button" data-outpaint-disable-running="true" onclick="openEndAnchorPromptModal(${idx})" ${state.running ? 'disabled' : ''}>Generate End Guide</button>
-            <button type="button" onclick="clearOutpaintEndAnchor(${idx})" ${!row.guide_end_image ? 'disabled' : ''}>Clear</button>
-          </div>
-        </div>
-      </div>
-
-      <p class="shot-time chunk-guide-hint">💡 To steer the outpaint mid-chunk, shorten the chunk so the desired frame lands at the end — the last frame steers the start of the next chunk automatically.</p>
+      <p class="shot-time chunk-guide-hint">💡 frame_idx 0 = chunk start (i2v), −1 = last frame (FLF2V), any multiple of 8 in between. Non-multiples are rounded down by LTX.</p>
     </div>
   `;
 }
 
-function outpaintGuideStatus(row) {
-  return row.guide_exists
-    ? 'Start guide set. LTX will target this appearance at the start of the chunk.'
-    : 'No start guide set. The previous chunk\'s last frame will be used automatically, or LTX will generate freely for the first chunk.';
+function guideFrameLabel(fi, maxFrame) {
+  if (fi === 0) return '0 — chunk start (i2v)';
+  if (fi >= maxFrame) return `${fi} — last frame (FLF2V)`;
+  return `${fi}${fi % 8 !== 0 ? ' → rounds to ' + Math.floor(fi / 8) * 8 : ''}`;
 }
 
-function outpaintEndGuideStatus(row) {
-  return row.guide_end_exists
-    ? 'End guide set. LTX will target this appearance at the last frame of the chunk.'
-    : 'No end guide set. LTX will generate the last frame freely.';
+function guideFrameCard(chunkIdx, guideIdx, g, lengthFrames, fps, dupIdxs) {
+  const maxFrame = Math.max(0, lengthFrames - 1);
+  // Normalise stored frame_idx: negative values → equivalent positive index
+  const rawFi = Number(g.frame_idx);
+  const fi = rawFi < 0 ? Math.max(0, maxFrame + rawFi + 1) : Math.min(rawFi, maxFrame);
+  const strength = Number(g.strength || 0.7);
+  const hasImage = !!g.image_exists;
+  const rounded = Math.floor(fi / 8) * 8;
+  const isDup = dupIdxs.has(rounded);
+
+  const thumbSrc = hasImage
+    ? media(g.image) + (g.image_mtime ? '&t=' + g.image_mtime : '')
+    : (g.source_preview ? media(g.source_preview) : '');
+  const thumbTitle = hasImage ? 'Current guide image' : 'Source frame at this position';
+
+  return `
+    <div class="chunk-guide guide-frame-card${isDup ? ' guide-frame-dup' : ''}">
+      <div>
+        <label>Guide ${guideIdx + 1}${isDup ? ' ⚠ duplicate position' : ''}</label>
+        <figure class="still-figure ${hasImage ? 'has-anchor' : ''}">
+          <img id="gfThumb_${chunkIdx}_${guideIdx}"
+            src="${esc(thumbSrc)}" alt=""
+            onclick="openImageModal(this.src,${jsArg(thumbTitle)})">
+          ${hasImage ? `<span class="anchor-badge">Guide</span>` : ''}
+          <figcaption id="gfThumbCaption_${chunkIdx}_${guideIdx}">${esc(hasImage ? 'Guide image set' : 'Source preview')}</figcaption>
+        </figure>
+      </div>
+      <div>
+        <label>Frame: <span id="gfLabel_${chunkIdx}_${guideIdx}">${esc(guideFrameLabel(fi, maxFrame))}</span></label>
+        <input id="gfSlider_${chunkIdx}_${guideIdx}" type="range"
+          min="0" max="${maxFrame}" step="1" value="${fi}"
+          oninput="onGuideFrameSlide(${chunkIdx},${guideIdx},this.value,${maxFrame})">
+        <div class="shot-tools">
+          <button type="button" onclick="nudgeGuideFrame(${chunkIdx},${guideIdx},-8)">−8</button>
+          <input id="gfInput_${chunkIdx}_${guideIdx}" class="frame-input" type="number"
+            min="0" max="${maxFrame}" step="1" value="${fi}"
+            onchange="setGuideFrameIdx(${chunkIdx},${guideIdx},this.value,${maxFrame})">
+          <button type="button" onclick="nudgeGuideFrame(${chunkIdx},${guideIdx},8)">+8</button>
+        </div>
+        <label>Strength: <span id="gfStrLabel_${chunkIdx}_${guideIdx}">${strength.toFixed(2)}</span></label>
+        <input id="gfStrength_${chunkIdx}_${guideIdx}" type="range" min="0" max="1" step="0.01" value="${strength}"
+          oninput="document.getElementById('gfStrLabel_${chunkIdx}_${guideIdx}').textContent=parseFloat(this.value).toFixed(2)">
+        <div class="shot-tools">
+          <button type="button" data-outpaint-disable-running="true"
+            onclick="saveGuideFrameSettings(${chunkIdx},${guideIdx})" ${state.running ? 'disabled' : ''}>Save</button>
+          <button type="button" data-outpaint-disable-running="true"
+            onclick="uploadGuideFrameImage(${chunkIdx},${guideIdx})" ${state.running ? 'disabled' : ''}>Upload Image</button>
+          <button type="button" data-outpaint-disable-running="true"
+            onclick="openGuideFrameGenerateModal(${chunkIdx},${guideIdx},${fi})" ${state.running ? 'disabled' : ''}>Generate</button>
+          <button type="button"
+            onclick="clearGuideFrameImage(${chunkIdx},${guideIdx})" ${!hasImage ? 'disabled' : ''}>Clear Image</button>
+          <button type="button" class="warn"
+            onclick="removeGuideFrame(${chunkIdx},${guideIdx})">Remove</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+const _gfPreviewTimers = {};
+
+function onGuideFrameSlide(chunkIdx, guideIdx, value, maxFrame) {
+  const fi = Math.max(0, Math.min(maxFrame, Math.round(Number(value))));
+  const label = document.getElementById(`gfLabel_${chunkIdx}_${guideIdx}`);
+  const input = document.getElementById(`gfInput_${chunkIdx}_${guideIdx}`);
+  if (label) label.textContent = guideFrameLabel(fi, maxFrame);
+  if (input) input.value = fi;
+  // Update generate modal frame_idx live
+  const modal = document.getElementById('guideFrameGenerateModal');
+  if (modal && Number(modal.dataset.chunkIndex) === chunkIdx && Number(modal.dataset.guideIndex) === guideIdx) {
+    modal.dataset.frameIdx = fi;
+  }
+  // Debounce the source preview fetch and auto-save
+  const key = `${chunkIdx}_${guideIdx}`;
+  clearTimeout(_gfPreviewTimers[key]);
+  _gfPreviewTimers[key] = setTimeout(() => {
+    fetchGuideFramePreview(chunkIdx, guideIdx, fi);
+    autoSaveGuideFrame(chunkIdx, guideIdx);
+  }, 400);
+}
+
+async function fetchGuideFramePreview(chunkIdx, guideIdx, fi) {
+  const img = document.getElementById(`gfThumb_${chunkIdx}_${guideIdx}`);
+  const cap = document.getElementById(`gfThumbCaption_${chunkIdx}_${guideIdx}`);
+  if (!img) return;
+  // Only update if no guide image is set (it would be the authoritative thumbnail)
+  if (img.closest('.has-anchor')) return;
+  const result = await api(`/api/outpaint-guide-preview?chunk_index=${chunkIdx}&frame_idx=${fi}`);
+  if (result && result.preview) {
+    img.src = media(result.preview) + '&t=' + Date.now();
+    if (cap) cap.textContent = 'Source preview';
+  }
+}
+
+function setGuideFrameIdx(chunkIdx, guideIdx, value, maxFrame) {
+  const fi = Math.max(0, Math.min(maxFrame, Math.round(Number(value))));
+  const slider = document.getElementById(`gfSlider_${chunkIdx}_${guideIdx}`);
+  if (slider) slider.value = fi;
+  onGuideFrameSlide(chunkIdx, guideIdx, fi, maxFrame);
+}
+
+function nudgeGuideFrame(chunkIdx, guideIdx, delta) {
+  const slider = document.getElementById(`gfSlider_${chunkIdx}_${guideIdx}`);
+  if (!slider) return;
+  setGuideFrameIdx(chunkIdx, guideIdx, Number(slider.value) + delta, Number(slider.max));
 }
 
 function updateOutpaintGuidePreviews() {
-  if (active !== 'outpaint') return;
-  const rows = (state.outpaint_chunks && state.outpaint_chunks.rows) || [];
-  for (const row of rows) {
-    const idx = row.index;
-
-    // Update start guide
-    const img = document.getElementById(`chunkGuideImg_${idx}`);
-    if (img) {
-      const guidePath = row.guide_exists ? row.guide_image : row.guide_frame_preview;
-      if (guidePath) {
-        const title = row.guide_exists ? 'Current start guide' : 'Chunk start frame (no guide set)';
-        const src = media(guidePath) + (row.guide_exists && row.guide_mtime ? '&t=' + row.guide_mtime : '');
-        if (img.getAttribute('src') !== src) img.setAttribute('src', src);
-        img.onclick = () => openImageModal(img.src, title);
-        const figure = document.getElementById(`chunkGuideFigure_${idx}`);
-        if (figure) figure.classList.toggle('has-anchor', !!row.guide_exists);
-        const badge = document.getElementById(`chunkGuideBadge_${idx}`);
-        if (badge) badge.classList.toggle('hidden', !row.guide_exists);
-        const caption = document.getElementById(`chunkGuideCaption_${idx}`);
-        if (caption) caption.textContent = title;
-      }
-      const status = document.getElementById(`chunkGuideStatus_${idx}`);
-      if (status) status.textContent = outpaintGuideStatus(row);
-    }
-
-    // Update end guide
-    const endImg = document.getElementById(`chunkEndGuideImg_${idx}`);
-    if (endImg) {
-      const endPath = row.guide_end_exists ? row.guide_end_image : row.guide_end_frame_preview;
-      if (endPath) {
-        const title = row.guide_end_exists ? 'Current end guide' : 'Chunk end frame (no guide set)';
-        const src = media(endPath) + (row.guide_end_exists && row.guide_end_mtime ? '&t=' + row.guide_end_mtime : '');
-        if (endImg.getAttribute('src') !== src) endImg.setAttribute('src', src);
-        endImg.onclick = () => openImageModal(endImg.src, title);
-        const figure = document.getElementById(`chunkEndGuideFigure_${idx}`);
-        if (figure) figure.classList.toggle('has-anchor', !!row.guide_end_exists);
-        const badge = document.getElementById(`chunkEndGuideBadge_${idx}`);
-        if (badge) badge.classList.toggle('hidden', !row.guide_end_exists);
-        const caption = document.getElementById(`chunkEndGuideCaption_${idx}`);
-        if (caption) caption.textContent = title;
-      }
-      const status = document.getElementById(`chunkEndGuideStatus_${idx}`);
-      if (status) status.textContent = outpaintEndGuideStatus(row);
-    }
-  }
+  // Guide list re-renders via draw() on state change — nothing incremental needed.
 }
 
 function updateOutpaintRawPreviews() {

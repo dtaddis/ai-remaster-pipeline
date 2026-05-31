@@ -47,16 +47,12 @@ async function saveOutpaintChunk(index) {
 }
 
 function outpaintChunkForm(index) {
-  const guideStrengthEl = document.getElementById(`chunkGuideStrength_${index}`);
-  const endStrengthEl = document.getElementById(`chunkEndGuideStrength_${index}`);
   return {
     index,
     seed: document.getElementById(`chunkSeed_${index}`).value,
     custom_seconds: outpaintChunkCustomSeconds(index),
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
     negative_suffix: document.getElementById(`chunkNegative_${index}`).value,
-    guide_strength: guideStrengthEl ? guideStrengthEl.value : '',
-    guide_end_strength: endStrengthEl ? endStrengthEl.value : '',
   };
 }
 
@@ -230,190 +226,130 @@ async function exportMedia(path) {
   if (result.saved) alert('Saved:\n' + result.saved);
 }
 
-async function chooseOutpaintAnchor(index) {
-  const snap = captureScrollState();
-  const result = await postJson('/api/outpaint-anchor', { index });
-  if (!result.ok) return alert(result.error || 'Could not install guide frame');
-  if (!result.selected) return;
-
-  if (active === 'outpaint' && result.state) {
-    state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
-    lastRenderSignature = renderSignature();
-    lastOutpaintVisualSignature = outpaintVisualSignature();
-    restoreScrollState(snap);
-    return;
-  }
-
-  await redrawWithState(result.state, snap, true);
-}
-
-async function clearOutpaintAnchor(index) {
-  const snap = captureScrollState();
-  const result = await postJson('/api/outpaint-anchor-clear', { index });
-  if (!result.ok) return alert(result.error || 'Could not clear guide frame');
-  if (active === 'outpaint' && result.state) {
-    state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
-    lastRenderSignature = renderSignature();
-    lastOutpaintVisualSignature = outpaintVisualSignature();
-    restoreScrollState(snap);
-    return;
-  }
-
-  await redrawWithState(result.state, snap, true);
-}
-
-async function chooseOutpaintEndAnchor(index) {
-  const snap = captureScrollState();
-  const result = await postJson('/api/outpaint-end-anchor', { index });
-  if (!result.ok) return alert(result.error || 'Could not install end guide frame');
-  if (!result.selected) return;
-
-  if (active === 'outpaint' && result.state) {
-    state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
-    lastRenderSignature = renderSignature();
-    lastOutpaintVisualSignature = outpaintVisualSignature();
-    restoreScrollState(snap);
-    return;
-  }
-
-  await redrawWithState(result.state, snap, true);
-}
-
-async function clearOutpaintEndAnchor(index) {
-  const snap = captureScrollState();
-  const result = await postJson('/api/outpaint-end-anchor-clear', { index });
-  if (!result.ok) return alert(result.error || 'Could not clear end guide frame');
-  if (active === 'outpaint' && result.state) {
-    state = result.state;
-    updateOutpaintGuidePreviews();
-    updateOutpaintRawPreviews();
-    updateOutpaintRuntimeControls();
-    updateRunLogs();
-    lastRenderSignature = renderSignature();
-    lastOutpaintVisualSignature = outpaintVisualSignature();
-    restoreScrollState(snap);
-    return;
-  }
-
-  await redrawWithState(result.state, snap, true);
-}
-
 const DEFAULT_ANCHOR_PROMPT = 'Fill the black outpaint margins with a natural continuation of this black-and-white film frame. Preserve the centre/original frame area, composition, lighting, paper, clothing, and background. If hands or fingers extend into the new margins, make them anatomically natural with five fingers and normal joints. Do not colorize. Do not add text, captions, logos, or unrelated new objects.';
 
-function openAnchorPromptModal(index) {
-  let modal = document.getElementById('anchorPromptModal');
+// ── Guide frame list actions ─────────────────────────────────────────────────
+
+async function autoSaveGuideFrame(chunkIndex, guideIndex) {
+  const slider = document.getElementById(`gfSlider_${chunkIndex}_${guideIndex}`);
+  const strEl = document.getElementById(`gfStrength_${chunkIndex}_${guideIndex}`);
+  if (!slider) return;
+  const frame_idx = Number(slider.value);
+  const strength = strEl ? Number(strEl.value) : 0.7;
+  await postJson('/api/guide-frame-save', { chunk_index: chunkIndex, guide_index: guideIndex, frame_idx, strength });
+}
+
+async function guideFrameRedraw(result, snap) {
+  if (!result.ok) return;
+  if (result.state) {
+    state = result.state;
+    draw(false);
+    lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
+    restoreScrollState(snap);
+  }
+}
+
+async function addGuideFrame(chunkIndex) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/guide-frame-add', { chunk_index: chunkIndex });
+  if (!result.ok) return alert(result.error || 'Could not add guide frame');
+  await guideFrameRedraw(result, snap);
+}
+
+async function removeGuideFrame(chunkIndex, guideIndex) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/guide-frame-remove', { chunk_index: chunkIndex, guide_index: guideIndex });
+  if (!result.ok) return alert(result.error || 'Could not remove guide frame');
+  await guideFrameRedraw(result, snap);
+}
+
+async function saveGuideFrameSettings(chunkIndex, guideIndex) {
+  const snap = captureScrollState();
+  const slider = document.getElementById(`gfSlider_${chunkIndex}_${guideIndex}`);
+  const strEl = document.getElementById(`gfStrength_${chunkIndex}_${guideIndex}`);
+  const frame_idx = slider ? Number(slider.value) : 0;
+  const strength = strEl ? Number(strEl.value) : 0.7;
+  const result = await postJson('/api/guide-frame-save', { chunk_index: chunkIndex, guide_index: guideIndex, frame_idx, strength });
+  if (!result.ok) return alert(result.error || 'Could not save guide frame');
+  await guideFrameRedraw(result, snap);
+}
+
+async function uploadGuideFrameImage(chunkIndex, guideIndex) {
+  await autoSaveGuideFrame(chunkIndex, guideIndex);
+  const snap = captureScrollState();
+  const result = await postJson('/api/guide-frame-upload', { chunk_index: chunkIndex, guide_index: guideIndex });
+  if (!result.ok) return alert(result.error || 'Could not upload guide frame image');
+  if (!result.selected) return;
+  await guideFrameRedraw(result, snap);
+}
+
+async function clearGuideFrameImage(chunkIndex, guideIndex) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/guide-frame-clear', { chunk_index: chunkIndex, guide_index: guideIndex });
+  if (!result.ok) return alert(result.error || 'Could not clear guide frame image');
+  await guideFrameRedraw(result, snap);
+}
+
+function openGuideFrameGenerateModal(chunkIndex, guideIndex, frameIdx) {
+  let modal = document.getElementById('guideFrameGenerateModal');
   if (!modal) {
     modal = document.createElement('div');
-    modal.id = 'anchorPromptModal';
+    modal.id = 'guideFrameGenerateModal';
     modal.className = 'image-modal hidden';
     modal.innerHTML = `
-      <div class="image-modal-backdrop" onclick="closeAnchorPromptModal()"></div>
+      <div class="image-modal-backdrop" onclick="closeGuideFrameGenerateModal()"></div>
       <div class="prompt-modal-panel">
         <div class="image-modal-heading">
-          <strong>Generate Guide Frame</strong>
-          <button type="button" onclick="closeAnchorPromptModal()">Close</button>
+          <strong>Generate Guide Frame Image</strong>
+          <button type="button" onclick="closeGuideFrameGenerateModal()">Close</button>
         </div>
-        <p class="shot-empty">Qwen will colorize the chunk's start frame to use as a guide. The guide is applied at the start of the chunk via LTX i2v conditioning.</p>
+        <p class="shot-empty">Qwen will colorize the source frame at the selected position.</p>
         <label>Qwen edit prompt</label>
-        <textarea id="anchorPromptText"></textarea>
+        <textarea id="guideFrameGeneratePrompt"></textarea>
         <div class="actions">
-          <button class="primary" type="button" onclick="submitAnchorPrompt()">Generate Guide</button>
-          <button type="button" onclick="closeAnchorPromptModal()">Cancel</button>
+          <button class="primary" type="button" onclick="submitGuideFrameGenerate()">Generate</button>
+          <button type="button" onclick="closeGuideFrameGenerateModal()">Cancel</button>
         </div>
       </div>
     `;
     document.body.appendChild(modal);
   }
-
-  modal.dataset.index = String(index);
-  document.getElementById('anchorPromptText').value = DEFAULT_ANCHOR_PROMPT;
+  modal.dataset.chunkIndex = String(chunkIndex);
+  modal.dataset.guideIndex = String(guideIndex);
+  modal.dataset.frameIdx = String(frameIdx);
+  // Pick up current slider value in case the user changed it without saving
+  const slider = document.getElementById(`gfSlider_${chunkIndex}_${guideIndex}`);
+  if (slider) modal.dataset.frameIdx = slider.value;
+  document.getElementById('guideFrameGeneratePrompt').value = DEFAULT_ANCHOR_PROMPT;
   modal.classList.remove('hidden');
 }
 
-function closeAnchorPromptModal() {
-  const modal = document.getElementById('anchorPromptModal');
+function closeGuideFrameGenerateModal() {
+  const modal = document.getElementById('guideFrameGenerateModal');
   if (modal) modal.classList.add('hidden');
 }
 
-async function submitAnchorPrompt() {
-  const modal = document.getElementById('anchorPromptModal');
+async function submitGuideFrameGenerate() {
+  const modal = document.getElementById('guideFrameGenerateModal');
   if (!modal) return;
-  const index = Number(modal.dataset.index || 0);
-  const prompt = document.getElementById('anchorPromptText')?.value || DEFAULT_ANCHOR_PROMPT;
-  closeAnchorPromptModal();
+  const chunkIndex = Number(modal.dataset.chunkIndex || 0);
+  const guideIndex = Number(modal.dataset.guideIndex || 0);
+  const frameIdx = Number(modal.dataset.frameIdx || 0);
+  const prompt = document.getElementById('guideFrameGeneratePrompt')?.value || DEFAULT_ANCHOR_PROMPT;
+  closeGuideFrameGenerateModal();
 
-  const result = await postJson('/api/outpaint-anchor-generate', { index, prompt });
-  if (!result.ok) return alert(result.error || result.message || 'Could not generate guide frame');
+  // Save current frame_idx and strength before generating.
+  await postJson('/api/guide-frame-save', { chunk_index: chunkIndex, guide_index: guideIndex, frame_idx: frameIdx, strength: Number(document.getElementById(`gfStrength_${chunkIndex}_${guideIndex}`)?.value || 0.7) });
+
+  const result = await postJson('/api/guide-frame-generate', { chunk_index: chunkIndex, guide_index: guideIndex, frame_idx: frameIdx, prompt });
+  if (!result.ok) return alert(result.error || result.message || 'Could not generate guide frame image');
   if (result.state) {
     state = result.state;
     draw(false);
     lastRenderSignature = renderSignature();
+    lastOutpaintVisualSignature = outpaintVisualSignature();
   }
-  setTimeout(() => refresh(true), 1000);
-}
-
-function openEndAnchorPromptModal(index) {
-  let modal = document.getElementById('endAnchorPromptModal');
-  if (!modal) {
-    modal = document.createElement('div');
-    modal.id = 'endAnchorPromptModal';
-    modal.className = 'image-modal hidden';
-    modal.innerHTML = `
-      <div class="image-modal-backdrop" onclick="closeEndAnchorPromptModal()"></div>
-      <div class="prompt-modal-panel">
-        <div class="image-modal-heading">
-          <strong>Generate End Guide Frame</strong>
-          <button type="button" onclick="closeEndAnchorPromptModal()">Close</button>
-        </div>
-        <p class="shot-empty">Qwen will colorize the chunk's last frame to use as an end guide. Applied at the last frame of the chunk via IC-LoRA conditioning (FLF2V).</p>
-        <label>Qwen edit prompt</label>
-        <textarea id="endAnchorPromptText"></textarea>
-        <div class="actions">
-          <button class="primary" type="button" onclick="submitEndAnchorPrompt()">Generate End Guide</button>
-          <button type="button" onclick="closeEndAnchorPromptModal()">Cancel</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(modal);
-  }
-
-  modal.dataset.index = String(index);
-  document.getElementById('endAnchorPromptText').value = DEFAULT_ANCHOR_PROMPT;
-  modal.classList.remove('hidden');
-}
-
-function closeEndAnchorPromptModal() {
-  const modal = document.getElementById('endAnchorPromptModal');
-  if (modal) modal.classList.add('hidden');
-}
-
-async function submitEndAnchorPrompt() {
-  const modal = document.getElementById('endAnchorPromptModal');
-  if (!modal) return;
-  const index = Number(modal.dataset.index || 0);
-  const prompt = document.getElementById('endAnchorPromptText')?.value || DEFAULT_ANCHOR_PROMPT;
-  closeEndAnchorPromptModal();
-
-  const result = await postJson('/api/outpaint-end-anchor-generate', { index, prompt });
-  if (!result.ok) return alert(result.error || result.message || 'Could not generate end guide frame');
-  if (result.state) {
-    state = result.state;
-    draw(false);
-    lastRenderSignature = renderSignature();
-  }
-  setTimeout(() => refresh(true), 1000);
 }
 
 async function saveStage(key, redraw = false) {
