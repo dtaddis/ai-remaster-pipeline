@@ -3,6 +3,10 @@
 import hashlib
 import math
 import json
+import os
+import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +16,17 @@ ROOT = Path(__file__).resolve().parents[1]
 def resolve_path(path_text: str | Path) -> Path:
     path = Path(path_text)
     return path if path.is_absolute() else ROOT / path
+
+
+def load_local_config() -> dict[str, str]:
+    path = ROOT / ".ai_remaster_config.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return {}
+    return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
 def root_relative(path: Path) -> str:
@@ -122,6 +137,62 @@ def resumable_output(path: Path, signature: dict[str, Any], *, video_like: Path 
 
 def write_signature(path: Path, signature: dict[str, Any]) -> None:
     signature_path(path).write_text(json.dumps(signature, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def find_ffmpeg(explicit: str | None = None) -> str:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    exe = "ffmpeg.exe" if is_windows() else "ffmpeg"
+    candidates.extend([ROOT / ".cache" / "tools" / "ffmpeg" / exe, Path("ffmpeg")])
+    if is_windows():
+        candidates.append(Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"))
+    for candidate in candidates:
+        try:
+            subprocess.run([str(candidate), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return str(candidate)
+        except Exception:
+            continue
+    raise FileNotFoundError("ffmpeg was not found. Run install_windows.bat/install script again or pass --ffmpeg.")
+
+
+def copy_to_comfy_input(path: Path, comfy_dir: Path, subfolder: str) -> str:
+    target_dir = comfy_dir / "input" / subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    if not target.exists() or target.stat().st_size != path.stat().st_size:
+        shutil.copy2(path, target)
+    return str(Path(subfolder) / target.name).replace("\\", "/")
+
+
+def newest_output(files: list[Path], suffixes: set[str] | None = None, label: str = "output file") -> Path:
+    candidates = files
+    if suffixes:
+        wanted = {suffix.lower() for suffix in suffixes}
+        candidates = [path for path in files if path.suffix.lower() in wanted]
+    if not candidates:
+        raise RuntimeError(f"ComfyUI completed but did not report a {label}.")
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        raise RuntimeError(f"ComfyUI reported {label}s, but none exist on disk: {candidates}")
+    return max(existing, key=lambda path: path.stat().st_mtime_ns)
+
+
+def replace_with_retry(source: Path, target: Path, label: str | None = None, attempts: int = 20, delay: float = 0.5) -> None:
+    for attempt in range(attempts):
+        try:
+            source.replace(target)
+            return
+        except PermissionError:
+            if attempt >= attempts - 1:
+                raise
+            if label:
+                print(f"{label} is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
+            time.sleep(delay)
 
 
 def format_time(seconds: float) -> str:

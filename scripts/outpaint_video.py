@@ -7,12 +7,24 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
 from comfy_api import extract_output_files, ensure_node_types, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
-from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature, safe_stem
+from common import (
+    ROOT,
+    copy_to_comfy_input,
+    file_fingerprint,
+    find_ffmpeg,
+    load_local_config,
+    newest_output as newest_comfy_output,
+    replace_with_retry,
+    resolve_path,
+    root_relative,
+    resumable_output,
+    safe_stem,
+    write_signature,
+)
 from dependency_manager import ensure_outpaint_models
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
@@ -31,31 +43,8 @@ OUTPAINT_REQUIRED_NODES = {
 }
 
 
-def replace_with_retry(partial: Path, target: Path, label: str, attempts: int = 20, delay: float = 0.5) -> None:
-    for attempt in range(attempts):
-        try:
-            partial.replace(target)
-            return
-        except PermissionError:
-            if attempt >= attempts - 1:
-                raise
-            print(f"{label} is locked by another process; retrying in {delay:g}s ({attempt + 1}/{attempts})...", flush=True)
-            time.sleep(delay)
-
-
 def aspect_slug(value: str) -> str:
     return value.replace(":", "x").replace(".", "_")
-
-
-def load_local_config() -> dict[str, str]:
-    path = ROOT / ".ai_remaster_config.json"
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except json.JSONDecodeError:
-        return {}
-    return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
 def target_size(source: Path, aspect: str, target_height: int | None) -> tuple[int, int]:
@@ -107,30 +96,6 @@ def run_command(command: list[str], dry_run: bool) -> None:
     print(" ".join(command), flush=True)
     if not dry_run:
         subprocess.run(command, check=True)
-
-
-def find_ffmpeg() -> str:
-    candidates = [
-        ROOT / ".cache" / "tools" / "ffmpeg" / "ffmpeg.exe",
-        Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"),
-        Path("ffmpeg"),
-    ]
-    for candidate in candidates:
-        try:
-            subprocess.run([str(candidate), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return str(candidate)
-        except Exception:
-            continue
-    raise FileNotFoundError("ffmpeg was not found. Re-run install_windows.bat to install ARP's local FFmpeg copy.")
-
-
-def copy_to_comfy_input(source: Path, comfy_dir: Path) -> str:
-    target_dir = comfy_dir / "input" / "arp_outpaint"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / source.name
-    if not target.exists() or source.stat().st_mtime_ns != target.stat().st_mtime_ns or source.stat().st_size != target.stat().st_size:
-        shutil.copy2(source, target)
-    return f"arp_outpaint/{target.name}"
 
 
 def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
@@ -503,7 +468,7 @@ def _patch_extra_guides(
 
 
 def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None) -> dict[str, Any]:
-    video_name = copy_to_comfy_input(prepared, comfy_dir)
+    video_name = copy_to_comfy_input(prepared, comfy_dir, "arp_outpaint")
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
 
@@ -671,11 +636,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
 
 
 def newest_output(files: list[Path]) -> Path:
-    videos = [path for path in files if path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}]
-    candidates = videos or files
-    if not candidates:
-        raise RuntimeError("ComfyUI completed but did not report an output file.")
-    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    videos = {".mp4", ".mov", ".mkv", ".webm"}
+    return newest_comfy_output(files, videos if any(path.suffix.lower() in videos for path in files) else None, "output file")
 
 
 def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> list[tuple[int, int, int]]:
@@ -719,9 +681,7 @@ def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
                 continue
             # Migrate old field names written before the anchor→guide rename.
             if "anchor_image" in row and "guide_image" not in row:
-                row["guide_image"] = row.pop("anchor_image", "")
-            row.pop("anchor_position", None)
-            row.pop("anchor_seconds", None)
+                row["guide_image"] = row.get("anchor_image", "")
             rows[int(row["chunk_index"])] = row
         return rows
 
@@ -743,6 +703,9 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "guide_end_image",
         "guide_end_strength",
         "guide_frames",
+        "anchor_image",
+        "anchor_position",
+        "anchor_seconds",
         "prepared_path",
         "raw_path",
     ]
@@ -823,6 +786,70 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
     replace_with_retry(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
+
+
+def overlap_context_before_anchor(overlap_frames: int, anchor_seconds: str, fps: float, total_frames: int) -> int:
+    try:
+        anchor_frame = int(float(anchor_seconds or 0.0) * fps)
+    except ValueError:
+        anchor_frame = overlap_frames
+    return max(0, min(int(overlap_frames), int(total_frames), anchor_frame))
+
+
+def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context_frames: int, fps: float, force: bool) -> Path:
+    if context_frames <= 0 or not previous_raw.exists():
+        return chunk
+    output = chunk.with_name(f"{chunk.stem}_with_context{chunk.suffix}")
+    if output.exists() and not force:
+        return output
+
+    chunk_info = probe_video(chunk)
+    previous_info = probe_video(previous_raw)
+    chunk_size = (int(chunk_info["width"]), int(chunk_info["height"]))
+    previous_size = (int(previous_info["width"]), int(previous_info["height"]))
+    if chunk_size != previous_size:
+        raise RuntimeError(
+            f"Outpaint chunk overlap geometry changed from {previous_size[0]}x{previous_size[1]} "
+            f"to {chunk_size[0]}x{chunk_size[1]}; the working canvas should stay constant."
+        )
+
+    previous_frames = int(previous_info["frames"])
+    start = max(0, previous_frames - int(context_frames) - 1)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    vf = (
+        f"[0:v]trim=start_frame={start}:end_frame={previous_frames},setpts=N/({fps:.8f}*TB)[ctx];"
+        f"[1:v]trim=start_frame=1,setpts=N/({fps:.8f}*TB)[new];"
+        f"[ctx][new]concat=n=2:v=1:a=0,fps={fps:.8f},setsar=1[v]"
+    )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(previous_raw),
+            "-i",
+            str(chunk),
+            "-filter_complex",
+            vf,
+            "-map",
+            "[v]",
+            "-an",
+            "-r",
+            f"{fps:.8f}",
+            "-fps_mode",
+            "cfr",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "12",
+            "-preset",
+            "veryfast",
+            str(partial),
+        ],
+        check=True,
+    )
+    replace_with_retry(partial, output, f"Overlap context chunk {output.name}")
+    return output
 
 
 

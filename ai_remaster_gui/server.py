@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import html
-import io
 import json
 import mimetypes
 import os
@@ -41,6 +39,15 @@ from .config import (
     TEXT_EXTS,
     VIDEO_EXTS,
     current_config,
+)
+from .manifests import (
+    manifest_source_video,
+    read_manifest,
+    read_manifest_details,
+    read_outpaint_chunk_rows,
+    update_manifest_row,
+    write_manifest_details,
+    write_outpaint_chunk_rows,
 )
 from .models import COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
 from .paths import aspect_slug, even_int, newest, parse_aspect, rel, resolve, resolve_video_source, safe_stem
@@ -124,15 +131,18 @@ def qwen_workflow_for(values: dict[str, str], config: dict[str, str]) -> str:
 def load_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
     defaults["global"] = {"source": "", "expand_outpaint": "true", "colorize": "true", "section_start": "0", "section_end": "", "last_browse_dir": ""}
-    if SETTINGS_FILE.exists():
+    app_module = sys.modules.get("ai_remaster_gui.app")
+    settings_file = getattr(app_module, "SETTINGS_FILE", SETTINGS_FILE)
+    newest_fn = getattr(app_module, "newest", newest) if app_module else newest
+    if settings_file.exists():
         try:
-            stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            stored = json.loads(settings_file.read_text(encoding="utf-8"))
             for key, values in stored.items():
                 if key in defaults and isinstance(values, dict):
                     defaults[key].update({k: str(v) for k, v in values.items()})
         except json.JSONDecodeError:
             pass
-    source = newest(ROOT / "input", VIDEO_EXTS)
+    source = newest_fn(ROOT / "input", VIDEO_EXTS)
     if source and not defaults["global"].get("source"):
         defaults["global"]["source"] = rel(source)
     if not defaults["global"].get("source"):
@@ -1107,60 +1117,6 @@ def terminate_process_tree(process: subprocess.Popen) -> None:
         process.terminate()
 
 
-def read_manifest(path: Path) -> list[dict[str, str]]:
-    _source, _fields, rows = read_manifest_details(path)
-    return rows
-
-
-def read_manifest_details(path: Path) -> tuple[str, list[str], list[dict[str, str]]]:
-    if not path.exists() or not path.is_file():
-        return "", [], []
-    source_video = ""
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for line in handle:
-            if line.startswith("#"):
-                if line.startswith("# source_video="):
-                    source_video = line.split("=", 1)[1].strip()
-                continue
-            reader = csv.DictReader([line, *handle.readlines()])
-            return source_video, list(reader.fieldnames or []), list(reader)
-    return source_video, [], []
-
-
-def manifest_source_video(path: Path) -> str:
-    if not path.exists() or not path.is_file():
-        return ""
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for line in handle:
-            if line.startswith("# source_video="):
-                return line.split("=", 1)[1].strip()
-            if line and not line.startswith("#"):
-                return ""
-    return ""
-
-
-def update_manifest_row(path: Path, index: int, values: dict[str, str]) -> None:
-    source_video, fieldnames, rows = read_manifest_details(path)
-    if index < 0 or index >= len(rows):
-        raise IndexError(f"Manifest row {index} is out of range.")
-    for key in values:
-        if key not in fieldnames:
-            fieldnames.append(key)
-    rows[index].update(values)
-    write_manifest_details(path, source_video, fieldnames, rows)
-
-
-def write_manifest_details(path: Path, source_video: str, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        if source_video:
-            handle.write(f"# source_video={source_video}\n")
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
-
-
 def merge_manifest_shots(manifest_text: str, index: int) -> dict[str, str]:
     manifest = resolve(manifest_text)
     source_video, fieldnames, rows = read_manifest_details(manifest)
@@ -1436,7 +1392,10 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     if not source_text:
         return ""
     source = resolve_video_source(source_text)
-    width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
+    if str(target_height_text or "").strip().lower() in {"source", "source height", "original"}:
+        width, height = outpaint_size_for_source(source_text, aspect, target_height_text)
+    else:
+        width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crops = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     crop = "" if not any(crops) else f"_crop{crops[0]}-{crops[1]}-{crops[2]}-{crops[3]}"
@@ -1565,59 +1524,6 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
     if not prepared.exists():
         raise RuntimeError(f"Prepared expanded canvas was not created: {prepared}")
     return prepared
-
-
-def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        rows = {}
-        for row in csv.DictReader(handle):
-            if not row.get("chunk_index", "").isdigit():
-                continue
-            # Migrate old field names written before the anchor→guide rename.
-            if "anchor_image" in row and "guide_image" not in row:
-                row["guide_image"] = row.pop("anchor_image", "")
-            row.pop("anchor_position", None)
-            row.pop("anchor_seconds", None)
-            rows[int(row["chunk_index"])] = row
-        return rows
-
-
-def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "chunk_index",
-        "start_frame",
-        "end_frame",
-        "start_seconds",
-        "end_seconds",
-        "custom_seconds",
-        "seed",
-        "prompt_suffix",
-        "negative_suffix",
-        "guide_image",
-        "guide_strength",
-        "guide_end_image",
-        "guide_end_strength",
-        "guide_frames",
-        "prepared_path",
-        "raw_path",
-    ]
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-    text = buffer.getvalue()
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                if handle.read() == text:
-                    return
-        except OSError:
-            pass
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
 
 
 def outpaint_chunks_state(settings: dict) -> dict:
@@ -1934,10 +1840,16 @@ def clear_outpaint_guide(index: int) -> dict[str, str]:
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
     removed = clear_cached_guide_frames(manifest, index)
     rows[index]["guide_image"] = ""
+    if "anchor_image" in rows[index]:
+        rows[index]["anchor_image"] = ""
     write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
     suffix = f" and deleted {removed} cached file(s)" if removed else ""
     APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}{suffix}")
     return {"guide_image": ""}
+
+
+def clear_outpaint_anchor(index: int) -> dict[str, str]:
+    return clear_outpaint_guide(index)
 
 
 def install_outpaint_end_guide(index: int) -> dict[str, str]:

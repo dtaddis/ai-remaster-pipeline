@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import base64
@@ -6,12 +6,11 @@ import copy
 import csv
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
 from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, widget_fallback_inputs, workflow_to_prompt, http_json
-from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
+from common import ROOT, copy_to_comfy_input, file_fingerprint, load_local_config, newest_output, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
 
 DEFAULT_PROMPT = (
@@ -29,17 +28,6 @@ REFERENCE_DESCRIPTION_PROMPT = (
     'Mention skin, clothing, walls/wood/fabric/metal, and lighting only if clearly visible. '
     'No markdown, no headings, no bullets, no film-history commentary, no composition summary. Maximum 35 words.'
 )
-
-
-def load_local_config() -> dict[str, str]:
-    path = ROOT / '.ai_remaster_config.json'
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding='utf-8-sig'))
-    except json.JSONDecodeError:
-        return {}
-    return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
 def read_manifest(path: Path):
@@ -87,15 +75,6 @@ def output_for_row(args: argparse.Namespace, row: dict[str, str]) -> Path:
         source_path = Path(row_source(row))
         target_path = resolve_path(args.output_root) / source_path.name
     return target_path
-
-
-def copy_to_comfy_input(path: Path, comfy_dir: Path, subfolder: str = 'arp_qwen_refs') -> str:
-    target_dir = comfy_dir / 'input' / subfolder
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / path.name
-    if not target.exists() or target.stat().st_size != path.stat().st_size:
-        shutil.copy2(path, target)
-    return str(Path(subfolder) / target.name).replace('\\', '/')
 
 
 def read_text_file(path: Path | None) -> str:
@@ -226,7 +205,7 @@ def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, 
 def patch_workflow(args: argparse.Namespace, workflow: dict[str, Any], source_path: Path, output_path: Path, prompt: str) -> dict[str, Any]:
     if has_frontend_subgraphs(workflow):
         return subgraph_workflow_to_prompt(args, workflow, source_path, output_path, prompt)
-    comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir))
+    comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir), 'arp_qwen_refs')
     load_id = resolve_node_id(workflow, args.load_image_node_id, {'LoadImage'})
     save_id = resolve_node_id(workflow, args.save_node_id, {'SaveImage'})
     prompt_id = resolve_node_id(workflow, args.prompt_node_id, {'TextEncodeQwenImageEditPlus', 'CLIPTextEncode'}, prefer_title='positive') if args.prompt_node_id else ''
@@ -259,7 +238,7 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
     subgraph_inputs = subgraph.get('inputs') or []
     load_id = 90001
     save_id = 90002
-    comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir))
+    comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir), 'arp_qwen_refs')
     link_lookup = {int(link.get('id')): link for link in links if isinstance(link, dict) and 'id' in link}
 
     def subgraph_input_name(slot: int) -> str:
@@ -411,15 +390,6 @@ def resolve_node_id(workflow: dict[str, Any], value: str | None, class_types: se
     if not matches:
         raise RuntimeError(f"Could not auto-detect workflow node for: {', '.join(sorted(class_types))}")
     return str(matches[0].get('id'))
-
-
-def newest_output(files: list[Path]) -> Path:
-    if not files:
-        raise RuntimeError('Comfy completed but no image output was found.')
-    paths = [p for p in files if p.exists()]
-    if not paths:
-        raise RuntimeError(f'Comfy reported outputs, but none exist on disk: {files}')
-    return max(paths, key=lambda p: p.stat().st_mtime_ns)
 
 
 def normalize_to_source_size(path: Path, source_path: Path, final_path: Path | None = None) -> None:
@@ -611,5 +581,6 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
 
 

@@ -37,3 +37,7 @@ venv/
 *.tmp
 *.log
 /tools/comfyui/
+/tmp*/
+
+# Accidental mirrored absolute paths from local Windows runs
+/d/

@@ -2,28 +2,28 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import shutil
 import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
 from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
-from common import ROOT, file_fingerprint, resolve_path, root_relative, safe_stem, resumable_output, video_info, write_signature
+from common import (
+    ROOT,
+    copy_to_comfy_input,
+    file_fingerprint,
+    find_ffmpeg,
+    load_local_config,
+    newest_output as newest_comfy_output,
+    replace_with_retry,
+    resolve_path,
+    root_relative,
+    safe_stem,
+    resumable_output,
+    video_info,
+    write_signature,
+)
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
-
-
-def load_local_config() -> dict[str, str]:
-    path = ROOT / ".ai_remaster_config.json"
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except json.JSONDecodeError:
-        return {}
-    return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
 def read_manifest(path: Path) -> tuple[str | None, list[dict[str, str]]]:
@@ -58,36 +58,6 @@ def parse_time(text: str) -> float:
     minutes = int(parts[-2])
     hours = int(parts[-3]) if len(parts) > 2 else 0
     return hours * 3600 + minutes * 60 + seconds
-
-
-def find_ffmpeg(explicit: str | None) -> str:
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit))
-    exe = "ffmpeg.exe" if is_windows() else "ffmpeg"
-    candidates.extend([ROOT / ".cache" / "tools" / "ffmpeg" / exe, Path("ffmpeg")])
-    for candidate in candidates:
-        try:
-            subprocess.run([str(candidate), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return str(candidate)
-        except Exception:
-            continue
-    raise FileNotFoundError("ffmpeg was not found. Run install_windows.bat/install script again or pass --ffmpeg.")
-
-
-def is_windows() -> bool:
-    import os
-
-    return os.name == "nt"
-
-
-def copy_to_comfy_input(path: Path, comfy_dir: Path, subfolder: str) -> str:
-    target_dir = comfy_dir / "input" / subfolder
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / path.name
-    if not target.exists() or target.stat().st_size != path.stat().st_size:
-        shutil.copy2(path, target)
-    return str(Path(subfolder) / target.name).replace("\\", "/")
 
 
 def method_suffix(method: str) -> str:
@@ -220,10 +190,7 @@ def colorization_node(args: argparse.Namespace, width: int, height: int) -> dict
 
 
 def newest_output(files: list[Path]) -> Path:
-    paths = [path for path in files if path.exists() and path.suffix.lower() in VIDEO_EXTS]
-    if not paths:
-        raise RuntimeError(f"Comfy completed but did not report a video output: {files}")
-    return max(paths, key=lambda path: path.stat().st_mtime_ns)
+    return newest_comfy_output(files, VIDEO_EXTS, "video output")
 
 
 def segment_signature(
@@ -278,19 +245,6 @@ def segment_resumable(chunk: Path, chunk_sig: dict[str, Any], width: int, height
     except Exception:
         return False
     return abs(int(info["frames"]) - expected_frames) <= 3
-
-
-def replace_with_retry(source: Path, target: Path, attempts: int = 12, delay: float = 0.5) -> None:
-    last_exc: PermissionError | None = None
-    for _attempt in range(attempts):
-        try:
-            source.replace(target)
-            return
-        except PermissionError as exc:
-            last_exc = exc
-            time.sleep(delay)
-    assert last_exc is not None
-    raise last_exc
 
 
 def normalize_clip(ffmpeg: str, source: Path, output: Path, fps: float, expected_frames: int) -> None:
