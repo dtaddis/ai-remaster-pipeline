@@ -55,6 +55,8 @@ const FIELD_DESCRIPTIONS = {
     'tiny-long = tiny with lower VRAM use on long clips.',
   'upscale.flashvsr_scale':
     'How far the model upscales before the final resize to the target size. 2 stays closest to the source; 3-4 invent more detail (and hallucinate more).',
+  'upscale.flashvsr_pre_downscale':
+    'Downscale the input to target size divided by FlashVSR scale before processing. Much faster, but asks FlashVSR to reconstruct more detail.',
   'upscale.flashvsr_tiled_dit':
     'Processes the frame as small tiles to save VRAM. Tiles only see their own patch, so small faces can lose identity ' +
     '(the model invents a plausible face). Untick for full-frame context if VRAM allows - the biggest lever against changed faces.',
@@ -62,6 +64,8 @@ const FIELD_DESCRIPTIONS = {
     'Tile edge in pixels when tiled diffusion is on (multiples of 32, max 1024). Larger tiles give faces more surrounding context at the cost of VRAM. Try 512 if full-frame does not fit.',
   'upscale.flashvsr_tile_overlap':
     'Feathered overlap between tiles that hides seams. Raise it if you can see tile borders.',
+  'upscale.flashvsr_vae_tile_multiplier':
+    'Multiplies full-model VAE decode tile size. Higher is faster if VRAM allows; try 2 before disabling tiled decode.',
   'upscale.flashvsr_local_range':
     'Temporal attention window. 11 = more stable but can freeze small motion such as mouths; 9 = sharper, livelier detail with slightly more shimmer.',
   'upscale.flashvsr_sparse_ratio':

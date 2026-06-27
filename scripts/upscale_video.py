@@ -26,6 +26,7 @@ ADVANCED_DEFAULTS = {
     "flashvsr_color_fix": True,
     "flashvsr_tile_size": 256,
     "flashvsr_tile_overlap": 24,
+    "flashvsr_vae_tile_multiplier": 1,
     "flashvsr_sparse_ratio": 2.0,
     "flashvsr_kv_ratio": 3.0,
     "flashvsr_local_range": 11,
@@ -34,13 +35,14 @@ ADVANCED_DEFAULTS = {
 
 def signature(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> dict[str, Any]:
     sig = {
-        "version": 5,
+        "version": 6,
         "tool": "upscale_video.py",
         "method": "flashvsr_ultra_fast",
         "source": root_relative(source),
         "source_fingerprint": file_fingerprint(source),
         "target_width": output_width,
         "target_height": output_height,
+        "flashvsr_pre_downscale": args.flashvsr_pre_downscale,
         "comfy_dir": root_relative(resolve_path(args.comfy_dir)),
         "comfy_url": args.comfy_url,
         "flashvsr_model": args.flashvsr_model,
@@ -76,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flashvsr-model", choices=["FlashVSR", "FlashVSR-v1.1"], default="FlashVSR-v1.1")
     parser.add_argument("--flashvsr-mode", choices=["tiny", "tiny-long", "full"], default="tiny")
     parser.add_argument("--flashvsr-scale", type=int, default=2)
+    parser.add_argument("--flashvsr-pre-downscale", dest="flashvsr_pre_downscale", action="store_true", default=False, help="Downscale input before FlashVSR to the smallest model-compatible size that upscales cleanly to the requested target aspect.")
+    parser.add_argument("--no-flashvsr-pre-downscale", dest="flashvsr_pre_downscale", action="store_false")
     parser.add_argument("--flashvsr-tiled-vae", dest="flashvsr_tiled_vae", action="store_true", default=True)
     parser.add_argument("--no-flashvsr-tiled-vae", dest="flashvsr_tiled_vae", action="store_false")
     parser.add_argument("--flashvsr-tiled-dit", dest="flashvsr_tiled_dit", action="store_true", default=True)
@@ -86,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-flashvsr-color-fix", dest="flashvsr_color_fix", action="store_false")
     parser.add_argument("--flashvsr-tile-size", type=int, default=256, help="DiT tile edge in pixels when tiled DiT is on (multiple of 32, max 1024). Larger tiles give faces more surrounding context at the cost of VRAM.")
     parser.add_argument("--flashvsr-tile-overlap", type=int, default=24, help="Feathered overlap between DiT tiles in pixels; raise it if tile seams are visible.")
+    parser.add_argument("--flashvsr-vae-tile-multiplier", type=int, default=1, help="Multiplies the full-model tiled VAE decode tile size. Larger values can greatly speed decode if VRAM allows.")
     parser.add_argument("--flashvsr-sparse-ratio", type=float, default=2.0, help="Sparse attention density, 1.5-2.0: 2.0 is most stable, 1.5 is faster.")
     parser.add_argument("--flashvsr-kv-ratio", type=float, default=3.0, help="Attention memory budget, 1.0-3.0: 3.0 is highest quality, lower saves VRAM.")
     parser.add_argument("--flashvsr-local-range", type=int, choices=[9, 11], default=11, help="Temporal attention window: 11 is more stable, 9 keeps more fine motion (lips) and detail.")
@@ -133,6 +138,7 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
     init_values = {
         "model": args.flashvsr_model,
         "mode": args.flashvsr_mode,
+        "force_offload": False,
         # The basic FlashVSRNode ran fp16; keep it so existing renders stay reproducible.
         "precision": "fp16",
     }
@@ -143,6 +149,7 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
         "tiled_dit": bool(args.flashvsr_tiled_dit),
         "tile_size": args.flashvsr_tile_size,
         "tile_overlap": args.flashvsr_tile_overlap,
+        "vae_tile_multiplier": args.flashvsr_vae_tile_multiplier,
         "unload_dit": bool(args.flashvsr_unload_dit),
         "sparse_ratio": args.flashvsr_sparse_ratio,
         "kv_ratio": args.flashvsr_kv_ratio,
@@ -305,25 +312,16 @@ def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height:
     replace_with_retry(partial, target, f"Upscale normalized chunk {target.name}")
 
 
-def stitch_chunks(ffmpeg: str, chunks: list[Path], source: Path, output: Path) -> None:
-    if not chunks:
-        raise RuntimeError("No upscale chunks were produced.")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    video_partial = output.with_suffix(output.suffix + ".video.partial" + output.suffix)
-    final_partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-    with tempfile.TemporaryDirectory(prefix="arp_upscale_concat_") as tmp_text:
-        list_file = Path(tmp_text) / "chunks.txt"
-        list_file.write_text("".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks), encoding="utf-8")
-        print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(video_partial)], check=True)
+def mux_audio(ffmpeg: str, video_source: Path, audio_source: Path, output: Path) -> None:
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
     print("Muxing original audio into upscaled video", flush=True)
-    mux_command = [
+    command = [
         ffmpeg,
         "-y",
         "-i",
-        str(video_partial),
+        str(video_source),
         "-i",
-        str(source),
+        str(audio_source),
         "-map",
         "0:v:0",
         "-map",
@@ -335,15 +333,29 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], source: Path, output: Path) -
         "-shortest",
         "-movflags",
         "+faststart",
-        str(final_partial),
+        str(partial),
     ]
-    subprocess.run(mux_command, check=True)
+    subprocess.run(command, check=True)
+    replace_with_retry(partial, output, "Upscaled output")
+
+
+def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: Path) -> None:
+    if not chunks:
+        raise RuntimeError("No upscale chunks were produced.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    video_partial = output.with_suffix(output.suffix + ".video.partial" + output.suffix)
+    with tempfile.TemporaryDirectory(prefix="arp_upscale_concat_") as tmp_text:
+        list_file = Path(tmp_text) / "chunks.txt"
+        list_file.write_text("".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks), encoding="utf-8")
+        print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(video_partial)], check=True)
+    mux_audio(ffmpeg, video_partial, audio_source, output)
     video_partial.unlink(missing_ok=True)
-    replace_with_retry(final_partial, output, "Upscaled output")
 
 
-def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, output_width: int, output_height: int, info: dict[str, Any], source_fingerprint: dict[str, Any]) -> None:
+def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, output_width: int, output_height: int, info: dict[str, Any], source_fingerprint: dict[str, Any], audio_source: Path | None = None) -> None:
     ffmpeg = find_ffmpeg(args.ffmpeg)
+    audio_source = audio_source or source
     fps = args.fps or float(info["fps"])
     ranges = chunk_ranges(int(info["frames"]), fps, args.chunk_seconds, args.overlap_frames)
     if len(ranges) <= 1:
@@ -364,7 +376,8 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
             raw_partial.unlink(missing_ok=True)
         if output.exists():
             output.unlink()
-        replace_with_retry(final_partial, output, "Upscaled output")
+        mux_audio(ffmpeg, final_partial, audio_source, output)
+        final_partial.unlink(missing_ok=True)
         return
 
     chunk_dir = ROOT / ".cache" / "upscale_chunks" / f"{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
@@ -391,7 +404,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         normalized_chunks.append(chunk_final)
     if output.exists():
         output.unlink()
-    stitch_chunks(ffmpeg, normalized_chunks, source, output)
+    stitch_chunks(ffmpeg, normalized_chunks, audio_source, output)
 
 
 def fit_dimensions(source_width: int, source_height: int, target_width: int, target_height: int) -> tuple[int, int]:
@@ -427,6 +440,81 @@ def scale_video(ffmpeg: str, source: Path, output: Path, width: int, height: int
     subprocess.run(command, check=True)
 
 
+def pre_downscale_dimensions(output_width: int, output_height: int, flashvsr_scale: int) -> tuple[int, int]:
+    scale = max(1, int(flashvsr_scale or 1))
+    multiple = 128
+    aspect = output_width / max(1, output_height)
+    min_h_units = max(1, math.ceil(output_height / multiple))
+    candidates: list[tuple[float, int, int, int]] = []
+    for h_units in range(min_h_units, min_h_units + 32):
+        raw_height = h_units * multiple
+        raw_width = math.ceil((raw_height * aspect) / multiple) * multiple
+        if raw_width < output_width:
+            raw_width = math.ceil(output_width / multiple) * multiple
+        aspect_error = abs((raw_width / raw_height) - aspect) / aspect
+        candidates.append((aspect_error, raw_width * raw_height, raw_width, raw_height))
+    _error, _area, raw_width, raw_height = min(candidates, key=lambda item: (item[0], item[1]))
+    width = max(2, math.ceil(raw_width / scale))
+    height = max(2, math.ceil(raw_height / scale))
+    width = width + (width % 2)
+    height = height + (height % 2)
+    return width, height
+
+
+def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, output_width: int, output_height: int, source_info: dict[str, Any]) -> Path:
+    width, height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
+    target = ROOT / ".cache" / "upscale_sources" / f"{safe_stem(source.name)}_flashvsr_input_{width}x{height}_s{args.flashvsr_scale}.mp4"
+    sig = {
+        "version": 1,
+        "tool": "upscale_video.py",
+        "method": "flashvsr_pre_downscale",
+        "source": root_relative(source),
+        "source_fingerprint": file_fingerprint(source),
+        "target_width": output_width,
+        "target_height": output_height,
+        "flashvsr_scale": args.flashvsr_scale,
+        "processing_width": width,
+        "processing_height": height,
+        "fps": args.fps,
+    }
+    if not args.force and resumable_output(target, sig, video_like=source, width=width, height=height):
+        print(f"Reuse FlashVSR pre-downscaled input: {target}", flush=True)
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    fps = args.fps or float(source_info["fps"])
+    print(f"Pre-downscaling FlashVSR input to {width}x{height}: {source}", flush=True)
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"scale={width}:{height}:flags=lanczos,setsar=1,fps={fps:.8f}",
+        "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(partial),
+    ]
+    subprocess.run(command, check=True)
+    replace_with_retry(partial, target, "FlashVSR pre-downscaled input")
+    write_signature(target, sig)
+    return target
+
+
 def run(args: argparse.Namespace) -> int:
     source = resolve_path(args.input)
     if not source.exists():
@@ -441,11 +529,22 @@ def run(args: argparse.Namespace) -> int:
         print(f"Reuse upscaled video: {output}", flush=True)
         return 0
     if args.dry_run:
+        if args.flashvsr_pre_downscale:
+            processing_width, processing_height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
+            print(f"Would pre-downscale FlashVSR input to {processing_width}x{processing_height}", flush=True)
         print(f"Would upscale {source} -> {output} using FlashVSR in ComfyUI at {args.comfy_url} ({args.comfy_dir})", flush=True)
         return 0
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    chunked_flashvsr_run(args, source, output, output_width, output_height, info, sig["source_fingerprint"])
+    processing_source = source
+    processing_info = info
+    processing_fingerprint = sig["source_fingerprint"]
+    if args.flashvsr_pre_downscale:
+        ffmpeg = find_ffmpeg(args.ffmpeg)
+        processing_source = pre_downscale_source(ffmpeg, args, source, output_width, output_height, info)
+        processing_info = video_info(processing_source)
+        processing_fingerprint = file_fingerprint(processing_source)
+    chunked_flashvsr_run(args, processing_source, output, output_width, output_height, processing_info, processing_fingerprint, audio_source=source)
     write_signature(output, sig)
     print(f"Wrote upscaled video: {output}", flush=True)
     return 0

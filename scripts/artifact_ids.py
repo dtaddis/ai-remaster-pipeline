@@ -181,12 +181,15 @@ def recomp_identity(outpaint_stem: str) -> dict:
     return {"v": 1, "kind": "recomp", "outpaint": safe_stem(outpaint_stem)}
 
 
-def upscale_identity(input_stem: str, target_w: int, target_h: int, model: str) -> dict:
-    return {"v": 1, "kind": "upscale", "input": safe_stem(input_stem), "w": int(target_w), "h": int(target_h), "model": str(model)}
+def upscale_identity(input_stem: str, target_w: int, target_h: int, model: str, pre_downscale: bool = False, scale: int | str = 0) -> dict:
+    ident = {"v": 1, "kind": "upscale", "input": safe_stem(input_stem), "w": int(target_w), "h": int(target_h), "model": str(model)}
+    if pre_downscale:
+        ident.update({"pre_downscale": True, "scale": int(scale or 0)})
+    return ident
 
 
-def upscale_preview_identity(input_stem: str, target_w: int, target_h: int, model: str, seconds: str) -> dict:
-    ident = upscale_identity(input_stem, target_w, target_h, model)
+def upscale_preview_identity(input_stem: str, target_w: int, target_h: int, model: str, seconds: str, pre_downscale: bool = False, scale: int | str = 0) -> dict:
+    ident = upscale_identity(input_stem, target_w, target_h, model, pre_downscale, scale)
     ident.update({"kind": "upscalepreview", "seconds": str(seconds)})
     return ident
 

@@ -44,6 +44,7 @@ from .manifests import (
 )
 from .models import COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
 from .paths import even_int, format_timecode, newest, rel, resolve, resolve_served, resolve_video_source, safe_stem
+from .power import keep_awake, release_keep_awake
 from .naming import manifest_for_outpainted
 from .project_io import (
     bind_context as bind_project_io_context,
@@ -1304,6 +1305,7 @@ class PipelineApp:
             else:
                 kwargs["start_new_session"] = True
             self.process = subprocess.Popen(cmd, **kwargs)
+            keep_awake(stage.title)
             threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
         return True, "Started " + stage.title
 
@@ -1332,6 +1334,7 @@ class PipelineApp:
             else:
                 kwargs["start_new_session"] = True
             self.process = subprocess.Popen(cmd, **kwargs)
+            keep_awake(f"Outpainting chunk {index + 1}")
             threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
         return True, f"Started outpaint chunk {index + 1}"
 
@@ -1366,6 +1369,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Reference Generation")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1403,6 +1407,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Reference Editing")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1438,6 +1443,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Guide Frame Editing")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1476,6 +1482,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Guide Frame Generation")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1514,6 +1521,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("End Guide Generation")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1554,6 +1562,7 @@ class PipelineApp:
         add(["--flashvsr-scale", values.get("flashvsr_scale", "2")])
         add(["--flashvsr-tile-size", values.get("flashvsr_tile_size") or "256"])
         add(["--flashvsr-tile-overlap", values.get("flashvsr_tile_overlap") or "24"])
+        add(["--flashvsr-vae-tile-multiplier", values.get("flashvsr_vae_tile_multiplier") or "1"])
         add(["--flashvsr-local-range", values.get("flashvsr_local_range") or "11"])
         add(["--flashvsr-sparse-ratio", values.get("flashvsr_sparse_ratio") or "2.0"])
         add(["--flashvsr-kv-ratio", values.get("flashvsr_kv_ratio") or "3.0"])
@@ -1561,6 +1570,7 @@ class PipelineApp:
         add(["--chunk-seconds", values.get("chunk_seconds", "6")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add_bool_flags(cmd, values, ("flashvsr_tiled_vae", "flashvsr_tiled_dit", "flashvsr_color_fix"), "true")
+        add_bool_flags(cmd, values, ("flashvsr_pre_downscale",))
         if is_true(values, "flashvsr_unload_dit"):
             add(["--flashvsr-unload-dit"])
         return [part for part in cmd if part != ""]
@@ -1635,6 +1645,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Upscale Preview")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1683,6 +1694,7 @@ class PipelineApp:
                 kwargs["start_new_session"] = True
             try:
                 self.process = subprocess.Popen(cmd, **kwargs)
+                keep_awake("Guide Edit Preview")
             except Exception as exc:
                 self.running_stage = ""
                 self.running_stage_key = ""
@@ -1708,6 +1720,7 @@ class PipelineApp:
         code = self.process.wait()
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
+            release_keep_awake()
             self.running_stage = ""
             self.running_stage_key = ""
             self.running_reference_manifest = ""
@@ -1731,6 +1744,7 @@ class PipelineApp:
         code = self.process.wait()
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
+            release_keep_awake()
             self.running_stage = ""
             self.running_stage_key = ""
             self.running_reference_manifest = ""
@@ -1774,6 +1788,7 @@ class PipelineApp:
         code = self.process.wait()
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
+            release_keep_awake()
             self.running_stage = ""
             self.running_stage_key = ""
             self.running_reference_manifest = ""
@@ -1788,6 +1803,7 @@ class PipelineApp:
         with self.lock:
             if self.process and self.process.poll() is None:
                 terminate_process_tree(self.process)
+                release_keep_awake()
                 self.log.append("Stop requested.")
 
     def stop_for_quit(self) -> None:
@@ -1837,7 +1853,7 @@ def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
         return ""
     source = resolve(source_text)
     width, height = upscale_target_size(values)
-    ident = aid.upscale_identity(source.stem, width, height, "flashvsr")
+    ident = aid.upscale_identity(source.stem, width, height, "flashvsr", is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2"))
     return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
 
 
@@ -1857,7 +1873,7 @@ def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
     source = resolve(source_text)
     width, height = upscale_target_size(values)
     seconds = str(values.get("preview_seconds", "6") or "6")
-    ident = aid.upscale_preview_identity(source.stem, width, height, "flashvsr", seconds)
+    ident = aid.upscale_preview_identity(source.stem, width, height, "flashvsr", seconds, is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2"))
     return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
 
 

@@ -164,7 +164,9 @@ function drawUpscale() {
 function upscaleMainFields(st) {
   const fieldKeys = [
     'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
+    'flashvsr_pre_downscale',
     'flashvsr_tiled_dit', 'flashvsr_tile_size', 'flashvsr_tile_overlap',
+    'flashvsr_vae_tile_multiplier',
     'flashvsr_local_range', 'flashvsr_sparse_ratio', 'flashvsr_kv_ratio',
     'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
     'flashvsr_seed',

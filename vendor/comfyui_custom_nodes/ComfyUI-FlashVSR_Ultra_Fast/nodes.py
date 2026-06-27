@@ -59,45 +59,37 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
     tH = max(multiple, (sH // multiple) * multiple)
     return sW, sH, tW, tH
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int) -> torch.Tensor:
-    h0, w0, c = frame_tensor.shape
-    tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
-    
-    sW, sH = w0 * scale, h0 * scale
-    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
-    
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
-    cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
-
-    return cropped_tensor.squeeze(0)
-
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
     N0, h0, w0, _ = image_tensor.shape
     
     multiple = 128
     sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
-    F = largest_8n1_leq(num_frames_with_padding)
+    frame_count = largest_8n1_leq(num_frames_with_padding)
     
-    if F == 0:
+    if frame_count == 0:
         raise RuntimeError(f"Not enough frames after padding. Got {num_frames_with_padding}.")
     
-    frames = []
-    for i in range(F):
-        frame_idx = min(i, N0 - 1)
-        frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH).to('cpu').to(dtype) * 2.0 - 1.0
-        frames.append(tensor_chw)
-        del frame_slice
+    l = max(0, (sW - tW) // 2)
+    t = max(0, (sH - tH) // 2)
+    frame_indices = torch.arange(frame_count).clamp_max(N0 - 1)
+    max_batch_frames = max(1, min(64, 96_000_000 // max(1, sH * sW)))
+    frame_chunks = []
+    for start in range(0, frame_count, max_batch_frames):
+        batch_indices = frame_indices[start:start + max_batch_frames]
+        batch = image_tensor[batch_indices].permute(0, 3, 1, 2).to(device)
+        upscaled = F.interpolate(batch, size=(sH, sW), mode='bicubic', align_corners=False)
+        cropped = upscaled[:, :, t:t + tH, l:l + tW].to('cpu').to(dtype) * 2.0 - 1.0
+        frame_chunks.append(cropped)
+        del batch, upscaled, cropped
 
-    vid_stacked = torch.stack(frames, 0)
+    vid_stacked = torch.cat(frame_chunks, 0)
     vid_final = vid_stacked.permute(1, 0, 2, 3).unsqueeze(0)
     
-    del vid_stacked
+    del vid_stacked, frame_chunks
     clean_vram()
     
-    return vid_final, tH, tW, F
+    return vid_final, tH, tW, frame_count
 
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
@@ -188,7 +180,6 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])
-    pipe.offload_model()
 
     return pipe
 
@@ -242,7 +233,15 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload):
+def vae_tiler_kwargs(vae_tile_multiplier):
+    multiplier = max(1, int(vae_tile_multiplier or 1))
+    return {
+        "tile_size": (60 * multiplier, 104 * multiplier),
+        "tile_stride": (30 * multiplier, 52 * multiplier),
+    }
+
+
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, vae_tile_multiplier, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload):
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
@@ -259,9 +258,13 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             dtype=torch.float16, 
             device="cpu"
         )
-        weight_sum_canvas = torch.zeros_like(final_output_canvas)
+        weight_sum_canvas = torch.zeros(
+            (1, H * scale, W * scale, 1),
+            dtype=torch.float16,
+            device="cpu"
+        )
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
-        latent_tiles_cpu = []
+        mask_cache = {}
         
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles")):
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})", message_type='info')
@@ -274,17 +277,21 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                **vae_tiler_kwargs(vae_tile_multiplier),
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload
             )
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
             
-            mask_nchw = create_feather_mask(
-                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-                tile_overlap * scale
-            ).to("cpu")
-            mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
+            mask_key = (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2], tile_overlap * scale)
+            if mask_key not in mask_cache:
+                mask_nchw = create_feather_mask(
+                    (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
+                    tile_overlap * scale
+                ).to("cpu")
+                mask_cache[mask_key] = mask_nchw.permute(0, 2, 3, 1)
+            mask_nhwc = mask_cache[mask_key]
             out_x1, out_y1 = x1 * scale, y1 * scale
             
             tile_H_scaled = processed_tile_cpu.shape[1]
@@ -308,6 +315,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             progress_bar_cmd=cqdm, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+            **vae_tiler_kwargs(vae_tile_multiplier),
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
             color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload
         )
@@ -437,6 +445,13 @@ class FlashVSRNodeAdv:
                     "max": 512,
                     "step": 8,
                 }),
+                "vae_tile_multiplier": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 4,
+                    "step": 1,
+                    "tooltip": "Multiplies full-model tiled VAE decode tile size. Higher can be much faster if VRAM allows."
+                }),
                 "unload_dit": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Unload DiT before decoding to reduce VRAM peak at the cost of speed."
@@ -478,9 +493,9 @@ class FlashVSRNodeAdv:
     CATEGORY = "FlashVSR"
     #DESCRIPTION = ""
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed):
+    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, vae_tile_multiplier, unload_dit, sparse_ratio, kv_ratio, local_range, seed):
         _pipe, force_offload = pipe
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
+        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, vae_tile_multiplier, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
         return(output,)
 
 class FlashVSRNode:
@@ -537,7 +552,7 @@ class FlashVSRNode:
             raise RuntimeError("No devices found to run FlashVSR!")
             
         pipe = init_pipeline(model, mode, _device, torch.float16)
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, True)
+        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, 1, unload_dit, 2.0, 3.0, 11, seed, True)
         return(output,)
 
 NODE_CLASS_MAPPINGS = {
