@@ -13,7 +13,11 @@ const mediaClip = (path, start, end, key) => (
   + '&clip_end=' + encodeURIComponent(end)
   + '&clip_key=' + encodeURIComponent(key || '')
 );
-const stateUrl = () => '/api/state?active=' + encodeURIComponent(active || '');
+const stateUrl = (options = {}) => {
+  const params = new URLSearchParams({ active: active || '' });
+  if (options.shotPreviews) params.set('shot_previews', options.shotPreviews);
+  return '/api/state?' + params.toString();
+};
 
 async function api(path, opts = {}) {
   const response = await fetch(path, {
@@ -29,7 +33,9 @@ async function refresh(force = false) {
   const editing = isEditingField();
   const mediaActive = hasMediaOnPage();
 
-  state = await api(stateUrl());
+  const appHasContent = !!document.getElementById('app')?.children.length;
+  const useCachedShotPreviews = !force && active === 'shots' && appHasContent;
+  state = await api(stateUrl({ shotPreviews: useCachedShotPreviews ? 'cached' : 'generate' }));
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   notifyNewLogErrors();

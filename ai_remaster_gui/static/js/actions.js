@@ -934,22 +934,43 @@ async function saveShotEnabled(manifest, index, enabled) {
   await redrawWithState(null, snap);
 }
 
-async function mergeShot(manifest, index) {
+function markShotActionBusy(button, label) {
+  if (!button) return;
+  button.disabled = true;
+  button.dataset.originalText = button.textContent;
+  button.textContent = label;
+}
+
+function restoreShotActionButton(button) {
+  if (!button) return;
+  button.disabled = false;
+  if (button.dataset.originalText) button.textContent = button.dataset.originalText;
+}
+
+async function mergeShot(manifest, index, button = null) {
   if (!confirm('Merge this shot with the next one and use the same reference?')) return;
 
   const snap = captureScrollState();
+  markShotActionBusy(button, 'Merging...');
   const result = await postJson('/api/shot-merge', { manifest, index });
-  if (!result.ok) return alert(result.error || 'Could not merge shots');
+  if (!result.ok) {
+    restoreShotActionButton(button);
+    return alert(result.error || 'Could not merge shots');
+  }
 
   await redrawWithState(result.state, snap, true);
 }
 
-async function splitShot(manifest, index) {
+async function splitShot(manifest, index, button = null) {
   if (!confirm('Split this shot at its midpoint? Existing generated references for the two halves will be cleared.')) return;
 
   const snap = captureScrollState();
+  markShotActionBusy(button, 'Splitting...');
   const result = await postJson('/api/shot-split', { manifest, index });
-  if (!result.ok) return alert(result.error || 'Could not split shot');
+  if (!result.ok) {
+    restoreShotActionButton(button);
+    return alert(result.error || 'Could not split shot');
+  }
 
   await redrawWithState(result.state, snap, true);
 }
@@ -962,11 +983,32 @@ async function setShotBoundary(manifest, index, edge, frame) {
   const result = await postJson('/api/shot-boundary', { manifest, index, edge, frame: numericFrame, time: numericFrame / fps });
   if (!result.ok) return alert(result.error || 'Could not update shot boundary');
 
-  state = result.state || await api(stateUrl());
+  if (result.state) {
+    state = result.state;
+  } else if (Array.isArray(result.rows)) {
+    mergeShotRows('shots', result.rows);
+    if (typeof result.log === 'string') state.log = result.log;
+    if (Number.isFinite(Number(result.log_count))) state.log_count = Number(result.log_count);
+  } else {
+    state = await api(stateUrl());
+  }
   pruneSelected();
-  refreshShotRows('shots', [index, edge === 'start' ? index - 1 : index + 1]);
+  const refreshed = Array.isArray(result.rows)
+    ? result.rows.map(row => Number(row.index)).filter(Number.isInteger)
+    : [index, edge === 'start' ? index - 1 : index + 1];
+  refreshShotRows('shots', refreshed);
   updateRunLogs();
   lastRenderSignature = renderSignature();
+}
+
+function mergeShotRows(mode, rows) {
+  if (!state.shot_views) state.shot_views = {};
+  const existing = state.shot_views[mode] || [];
+  const byIndex = new Map(existing.map(row => [Number(row.index), row]));
+  rows.forEach(row => byIndex.set(Number(row.index), row));
+  state.shot_views[mode] = [...byIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, row]) => row);
 }
 
 async function saveShotFade(manifest, index, enabled, crossfade_seconds) {
@@ -987,20 +1029,43 @@ function nudgeShotBoundary(manifest, index, edge, frames) {
 }
 
 const previewTimers = {};
+const previewQueued = {};
+const previewInFlight = {};
+
+function queueShotPreview(imgId, buildQuery, delay = 250) {
+  clearTimeout(previewTimers[imgId]);
+  previewQueued[imgId] = buildQuery;
+  previewTimers[imgId] = setTimeout(() => runQueuedShotPreview(imgId), delay);
+}
+
+async function runQueuedShotPreview(imgId) {
+  if (previewInFlight[imgId]) return;
+  const buildQuery = previewQueued[imgId];
+  previewQueued[imgId] = null;
+  if (!buildQuery) return;
+
+  previewInFlight[imgId] = true;
+  try {
+    const result = await api('/api/shot-preview' + buildQuery());
+    const img = document.getElementById(imgId);
+    if (result.ok && result.path && img) img.src = media(result.path);
+  } finally {
+    previewInFlight[imgId] = false;
+    if (previewQueued[imgId]) {
+      clearTimeout(previewTimers[imgId]);
+      previewTimers[imgId] = setTimeout(() => runQueuedShotPreview(imgId), 80);
+    }
+  }
+}
 
 function updateShotPreview(manifest, index, time, imgId, labelId, frame = null) {
   document.getElementById(labelId).textContent = formatSeconds(time);
-  clearTimeout(previewTimers[imgId]);
-
-  previewTimers[imgId] = setTimeout(async () => {
-    const query = '?manifest=' + encodeURIComponent(manifest)
+  queueShotPreview(imgId, () => (
+    '?manifest=' + encodeURIComponent(manifest)
       + '&index=' + index
       + '&time=' + encodeURIComponent(time)
-      + (frame !== null && frame !== undefined && Number.isFinite(Number(frame)) ? '&frame=' + encodeURIComponent(Math.max(0, Math.round(Number(frame)))) : '');
-    const result = await api('/api/shot-preview' + query);
-    const img = document.getElementById(imgId);
-    if (result.ok && result.path && img) img.src = media(result.path);
-  }, 180);
+      + (frame !== null && frame !== undefined && Number.isFinite(Number(frame)) ? '&frame=' + encodeURIComponent(Math.max(0, Math.round(Number(frame)))) : '')
+  ), 250);
 }
 
 function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, dataset) {
@@ -1011,18 +1076,14 @@ function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, datas
   const displayFrame = edge === 'End' ? Math.max(0, boundaryFrame - 1) : boundaryFrame;
   if (label) label.textContent = `${edge} frame ${displayFrame}`;
 
-  clearTimeout(previewTimers[imgId]);
-  previewTimers[imgId] = setTimeout(async () => {
+  queueShotPreview(imgId, () => {
     const previewFrame = Math.max(0, boundaryFrame + Number((dataset && dataset.previewOffsetFrames) || 0));
     const previewTime = previewFrame / fps;
-    const query = '?manifest=' + encodeURIComponent(manifest)
+    return '?manifest=' + encodeURIComponent(manifest)
       + '&index=' + index
       + '&time=' + encodeURIComponent(previewTime)
       + '&frame=' + encodeURIComponent(previewFrame);
-    const result = await api('/api/shot-preview' + query);
-    const img = document.getElementById(imgId);
-    if (result.ok && result.path && img) img.src = media(result.path);
-  }, 120);
+  }, 250);
 }
 
 async function regenerateReference(manifest, index) {

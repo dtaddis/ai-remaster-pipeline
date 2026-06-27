@@ -677,21 +677,21 @@ class PipelineApp:
                     label = f"Upscale chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done){eta}"
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
-    def state(self, view: str = "") -> dict:
+    def state(self, view: str = "", generate_shot_previews: bool = True) -> dict:
         with self.lock:
             running = self.process is not None and self.process.poll() is None
-            source_text = self.settings.get("global", {}).get("source", "")
+            settings_snapshot = json.loads(json.dumps(self.settings))
+            source_text = settings_snapshot.get("global", {}).get("source", "")
             source_media = self.source_media_state(source_text)
-            section = source_section_state(self.settings)
-            aspect_preview = aspect_preview_for_settings(self.settings) if view == "outpaint" else source_media["aspect_preview"]
-            outpaint_chunks = outpaint_chunks_state(self.settings) if view == "outpaint" else {"manifest": "", "rows": []}
-            shots = shot_views(self.settings) if view in {"shots", "references", "colour"} else {"manifest": "", "rows": []}
+            section = source_section_state(settings_snapshot)
+            aspect_preview = aspect_preview_for_settings(settings_snapshot) if view == "outpaint" else source_media["aspect_preview"]
+            outpaint_chunks = outpaint_chunks_state(settings_snapshot) if view == "outpaint" else {"manifest": "", "rows": []}
             cache = cache_state() if view == "cache" else {}
-            return {
+            payload = {
                 "root": str(ROOT),
                 "version": APP_VERSION,
                 "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in (*self.active_stages(), output_stage())],
-                "settings": self.settings,
+                "settings": settings_snapshot,
                 "progress": self.progress(),
                 "phase_progress": self.phase_progress(),
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
@@ -706,7 +706,7 @@ class PipelineApp:
                 "source_analysis": source_media["analysis"],
                 "aspect_preview": aspect_preview,
                 "outpaint_chunks": outpaint_chunks,
-                "shot_views": shots,
+                "shot_views": {"manifest": "", "rows": []},
                 "audio_stems": self.audio_stems_state() if view == "audio" else [],
                 "cache": cache,
                 "system_status": system_status(),
@@ -719,6 +719,9 @@ class PipelineApp:
                 "log": "\n".join(self.log[-800:]),
                 "log_count": len(self.log),
             }
+        if view in {"shots", "references", "colour"}:
+            payload["shot_views"] = shot_views(settings_snapshot, generate_previews=generate_shot_previews)
+        return payload
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
         previous_source = self.settings.get("global", {}).get("source", "") if stage == "global" else ""

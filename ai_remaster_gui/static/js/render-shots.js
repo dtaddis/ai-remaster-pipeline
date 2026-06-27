@@ -177,10 +177,10 @@ function shotSummary({ manifest, row, idx, enabled }, extra = '') {
 function shotBoundaryCard(context) {
   const { manifest, row, idx } = context;
   const mergeButton = row.can_merge_next
-    ? `<button type="button" onclick="mergeShot('${esc(manifest)}',${idx})">Merge Next</button>`
+    ? `<button type="button" onclick="mergeShot(${jsArg(manifest)},${idx},this)">Merge Next</button>`
     : '';
   const splitButton = row.can_split
-    ? `<button type="button" onclick="splitShot('${esc(manifest)}',${idx})">Split</button>`
+    ? `<button type="button" onclick="splitShot(${jsArg(manifest)},${idx},this)">Split</button>`
     : '';
 
   return `

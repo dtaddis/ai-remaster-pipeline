@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from . import state
@@ -55,26 +57,35 @@ def color_reference_outputs(manifest_text: str) -> list[str]:
     rows = read_manifest(manifest)
     return [row.get("color_reference", "") for row in rows if row.get("color_reference")]
 
-def shot_views(settings: dict[str, dict[str, str]]) -> dict[str, object]:
+def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = True) -> dict[str, object]:
     shots_manifest = manifest_for_outpainted(settings.get("shots", {}).get("outpainted_video", ""))
     references_manifest = settings.get("references", {}).get("manifest", "")
     colour_manifest = settings.get("colour", {}).get("manifest", "") or references_manifest
     return {
         "shots_manifest": shots_manifest,
-        "shots": shot_rows(shots_manifest, include_previews=True),
+        "shots": shot_rows(shots_manifest, include_previews=True, generate_previews=generate_previews),
         "references_manifest": references_manifest,
         "references": shot_rows(references_manifest),
         "colour_manifest": colour_manifest,
         "colour": shot_rows(colour_manifest),
     }
 
-def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[str, object]]:
+def shot_rows(
+    manifest_text: str,
+    include_previews: bool = False,
+    preview_indices: Iterable[int] | None = None,
+    generate_previews: bool = True,
+) -> list[dict[str, object]]:
     if not manifest_text:
         return []
     path = resolve(manifest_text)
     rows = read_manifest(path)
     fps = manifest_fps(path)
     out: list[dict[str, object]] = []
+    preview_index_set = set(preview_indices) if preview_indices is not None else None
+    cached_preview_source_text = manifest_source_video(path) if include_previews and not generate_previews else ""
+    cached_preview_source = resolve(cached_preview_source_text) if cached_preview_source_text else None
+    cached_preview_dir = PREVIEW_DIR / "shot_scrub" / safe_preview_name(path) if cached_preview_source else None
     start = 0.0
     start_frame = 0
     for index, row in enumerate(rows):
@@ -126,7 +137,7 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "prompt": row.get("prompt", ""),
             }
-        if include_previews:
+        if include_previews and (preview_index_set is None or index in preview_index_set):
             last_frame = max(start_frame, end_frame_exclusive - 1)
             mid_frame = start_frame + max(0, (end_frame_exclusive - start_frame - 1) // 2)
             mid = mid_frame / fps
@@ -137,13 +148,20 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 ("end_preview", end_preview, last_frame),
             ):
                 try:
-                    item[key] = preview_reference_frame(manifest_text, index, value, frame=frame)
+                    item[key] = preview_reference_frame(manifest_text, index, value, frame=frame) if generate_previews else cached_preview_reference_frame_path(cached_preview_source, cached_preview_dir, index, frame)
                 except Exception:
                     item[key] = ""
         out.append(item)
         start_frame = end_frame_exclusive
         start = end
     return out
+
+def shot_rows_for_indices(manifest_text: str, indices: Iterable[int], include_previews: bool = True) -> list[dict[str, object]]:
+    wanted = {index for index in indices if index >= 0}
+    if not wanted:
+        return []
+    rows = shot_rows(manifest_text, include_previews=include_previews, preview_indices=wanted)
+    return [row for row in rows if int(row.get("index", -1)) in wanted]
 
 def recent_color_references(rows: list[dict[str, str]], row_index: int, limit: int = 8) -> list[str]:
     previous: list[tuple[int, str]] = []
@@ -546,6 +564,28 @@ def preview_reference_frame(manifest_text: str, index: int, seconds: float, fram
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
     return rel(target)
+
+def cached_preview_reference_frame(manifest_text: str, index: int, frame: int) -> str:
+    manifest = resolve(manifest_text)
+    source_video, _fields, rows = read_manifest_details(manifest)
+    if not source_video or index < 0 or index >= len(rows):
+        return ""
+    return cached_preview_reference_frame_path(resolve(source_video), PREVIEW_DIR / "shot_scrub" / safe_preview_name(manifest), index, frame)
+
+def cached_preview_reference_frame_path(source: Path | None, target_dir: Path | None, index: int, frame: int) -> str:
+    if source is None or target_dir is None:
+        return ""
+    suffix = f"shot_{index:04d}_frame_{max(0, int(frame)):010d}"
+    candidate = target_dir / f"{safe_preview_name(source)}_{suffix}.jpg"
+    if len(str(candidate)) > 240:
+        key = hashlib.sha256(f"{source}\0{suffix}\0{max(0, int(frame))}".encode()).hexdigest()[:24]
+        candidate = target_dir / f"{key}.jpg"
+    try:
+        if candidate.exists() and candidate.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            return rel(candidate)
+    except OSError:
+        return ""
+    return ""
 
 def reference_row_io(manifest_text: str, index: int) -> tuple[Path, dict[str, str], str, str]:
     manifest = resolve(manifest_text)

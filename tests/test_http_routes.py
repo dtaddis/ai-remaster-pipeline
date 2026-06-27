@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import inspect
 import re
+import threading
 import unittest
+from types import MethodType
 from unittest import mock
 
 from ai_remaster_gui import http_handler, state
@@ -119,6 +121,29 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertEqual(handler.responses["json"], {"ok": True})
         row.assert_called_once()
 
+    def test_shot_boundary_returns_row_patch_instead_of_full_state(self) -> None:
+        with (
+            mock.patch.object(http_handler, "update_shot_boundary", return_value={"frame": "12"}) as boundary,
+            mock.patch.object(http_handler, "shot_rows_for_indices", return_value=[{"index": 0}, {"index": 1}]) as rows,
+        ):
+            handler = _Handler("/api/shot-boundary", {"manifest": "m.csv", "index": 0, "edge": "end", "frame": 12})
+            handler.do_POST()
+
+        payload = handler.responses["json"]
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["rows"], [{"index": 0}, {"index": 1}])
+        self.assertNotIn("state", payload)
+        boundary.assert_called_once_with("m.csv", 0, "end", 0.0, 12)
+        rows.assert_called_once_with("m.csv", (-2, -1, 0, 1))
+
+    def test_state_route_can_request_cached_shot_previews(self) -> None:
+        state.APP.state = mock.Mock(return_value={"ok": True})
+        handler = _Handler("/api/state?active=shots&shot_previews=cached")
+        handler.do_GET()
+
+        self.assertEqual(handler.responses["json"], {"ok": True})
+        state.APP.state.assert_called_once_with("shots", generate_shot_previews=False)
+
     def test_send_action_returns_ok_message_state(self) -> None:
         state.APP.run_reference_regeneration = lambda *a: (True, "done")
         handler = _Handler("/api/reference-regenerate", {"manifest": "m.csv", "index": 0})
@@ -142,6 +167,51 @@ class HelperBehaviourTests(unittest.TestCase):
         handler = _Handler("/api/guide-frame-edit-preview", {"chunk_index": 0, "guide_index": 0})
         handler.do_POST()
         self.assertEqual(handler.responses["json"]["preview"], "preview.png")
+
+
+class StateLockTests(unittest.TestCase):
+    def test_shot_view_builds_after_app_lock_is_released(self) -> None:
+        app = server.PipelineApp.__new__(server.PipelineApp)
+        app.settings = {"global": {"colorize": "true"}}
+        app.project_path = None
+        app.log = []
+        app.process = None
+        app.running_stage = ""
+        app.running_stage_key = ""
+        app.running_reference_manifest = ""
+        app.running_reference_index = None
+        app.run_started_at = 0.0
+        app.lock = threading.Lock()
+
+        app.source_media_state = MethodType(lambda self, source: {
+            "previews": [],
+            "info": {},
+            "monochrome": True,
+            "analysis": {},
+            "aspect_preview": "",
+        }, app)
+        app.files_for = MethodType(lambda self, stage: [], app)
+        app.active_stages = MethodType(lambda self: (), app)
+        app.progress = MethodType(lambda self: [], app)
+        app.phase_progress = MethodType(lambda self: {"global": {"percent": 0, "label": "Waiting"}, "stages": []}, app)
+        app.expected_outputs = MethodType(lambda self, key: [], app)
+        app.existing_outputs = MethodType(lambda self, key: [], app)
+        app.upscale_preview_state = MethodType(lambda self: {}, app)
+        app.output_selection_state = MethodType(lambda self: {}, app)
+
+        def fake_shot_views(settings, generate_previews=True):
+            self.assertTrue(app.lock.acquire(blocking=False))
+            app.lock.release()
+            return {"shots": [{"index": 0}], "shots_manifest": "m.csv"}
+
+        with (
+            mock.patch.object(server, "shot_views", side_effect=fake_shot_views),
+            mock.patch.object(server, "source_section_state", return_value={}),
+            mock.patch.object(server, "system_status", return_value={}),
+        ):
+            payload = app.state("shots")
+
+        self.assertEqual(payload["shot_views"]["shots"], [{"index": 0}])
 
 
 if __name__ == "__main__":

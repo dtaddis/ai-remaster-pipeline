@@ -45,6 +45,7 @@ from .references import (
     sam_reference_mask,
     save_reference_paint,
     split_manifest_shot,
+    shot_rows_for_indices,
     update_shot_boundary,
     update_shot_fade,
 )
@@ -142,8 +143,10 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
         elif parsed.path == "/api/state":
-            view = parse_qs(parsed.query).get("active", [""])[0]
-            self.send_json(state.APP.state(view))
+            query = parse_qs(parsed.query)
+            view = query.get("active", [""])[0]
+            generate_shot_previews = query.get("shot_previews", ["generate"])[0] != "cached"
+            self.send_json(state.APP.state(view, generate_shot_previews=generate_shot_previews))
         elif parsed.path == "/api/command":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"command": state.APP.command_for(stage) if stage else []})
@@ -351,13 +354,24 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/shot-split":
             self._send_result("Shot split", lambda: {**split_manifest_shot(str(data.get("manifest", "")), int(data.get("index", 0))), "state": state.APP.state("shots")})
         elif parsed.path == "/api/shot-boundary":
-            self._send_result("Shot boundary update", lambda: {**update_shot_boundary(
-                str(data.get("manifest", "")),
-                int(data.get("index", 0)),
-                str(data.get("edge", "")),
-                float(data.get("time", 0)),
-                int(data.get("frame")) if data.get("frame") is not None and str(data.get("frame")).strip() != "" else None,
-            ), "state": state.APP.state("shots")})
+            def update_boundary_result():
+                manifest = str(data.get("manifest", ""))
+                index = int(data.get("index", 0))
+                edge = str(data.get("edge", ""))
+                result = update_shot_boundary(
+                    manifest,
+                    index,
+                    edge,
+                    float(data.get("time", 0)),
+                    int(data.get("frame")) if data.get("frame") is not None and str(data.get("frame")).strip() != "" else None,
+                )
+                return {
+                    **result,
+                    "rows": shot_rows_for_indices(manifest, (index - 2, index - 1, index, index + 1)),
+                    "log": "\n".join(state.APP.log[-800:]),
+                    "log_count": len(state.APP.log),
+                }
+            self._send_result("Shot boundary update", update_boundary_result)
         elif parsed.path == "/api/shot-fade":
             self._send_result("Shot fade update", lambda: {**update_shot_fade(str(data.get("manifest", "")), int(data.get("index", 0)), bool(data.get("enabled")), str(data.get("crossfade_seconds", ""))), "state": state.APP.state("shots")})
         elif parsed.path == "/api/reference-regenerate":

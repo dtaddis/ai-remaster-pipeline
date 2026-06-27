@@ -101,6 +101,45 @@ class ReferenceScrubTests(unittest.TestCase):
         self.assertEqual(path, "preview.jpg")
         self.assertEqual(exact.call_args.args[3], 30)
 
+    def test_shot_rows_can_limit_preview_generation_to_selected_indices(self) -> None:
+        previous_app = state.APP
+        state.APP = SimpleNamespace(settings={"references": {}})
+        try:
+            with tempfile.TemporaryDirectory(dir=references.ROOT) as tmp_text:
+                folder = Path(tmp_text)
+                source = folder / "source.mp4"
+                source.write_bytes(b"video placeholder")
+                manifest = folder / "shots.csv"
+                write_manifest_details(
+                    manifest,
+                    references.rel(source),
+                    ["start_frame", "end_frame", "end", "source_reference", "color_reference"],
+                    [
+                        {"start_frame": "0", "end_frame": "24", "end": "00:00:01.000", "source_reference": "", "color_reference": ""},
+                        {"start_frame": "24", "end_frame": "48", "end": "00:00:02.000", "source_reference": "", "color_reference": ""},
+                        {"start_frame": "48", "end_frame": "72", "end": "00:00:03.000", "source_reference": "", "color_reference": ""},
+                    ],
+                )
+
+                calls = []
+
+                def fake_preview(_manifest, index, _seconds, frame=None):
+                    calls.append((index, frame))
+                    return f"preview-{index}-{frame}.jpg"
+
+                with (
+                    mock.patch.object(references, "manifest_fps", return_value=24.0),
+                    mock.patch.object(references, "preview_reference_frame", side_effect=fake_preview),
+                ):
+                    rows = references.shot_rows(references.rel(manifest), include_previews=True, preview_indices={1})
+
+            self.assertNotIn("start_preview", rows[0])
+            self.assertEqual(rows[1]["start_preview"], "preview-1-24.jpg")
+            self.assertNotIn("start_preview", rows[2])
+            self.assertEqual([index for index, _frame in calls], [1, 1, 1])
+        finally:
+            state.APP = previous_app
+
 
 if __name__ == "__main__":
     unittest.main()
