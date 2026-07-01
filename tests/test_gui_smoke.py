@@ -2332,6 +2332,14 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("outpainted_references_color_edits", unmasked_output)
         self.assertIn("outpainted_references_color_edits", masked_output)
 
+    def test_reference_edit_prompt_preserves_lighter_sampled_values(self) -> None:
+        prompt = app.reference_edit_prompt("make the selected suit light grey", "#c8c8c8")
+
+        self.assertIn("#c8c8c8", prompt)
+        self.assertIn("brightness/value", prompt)
+        self.assertIn("raise the masked area's luminance", prompt)
+        self.assertIn("do not merely darken", prompt)
+
     def test_reference_edit_accept_and_revert_updates_manifest(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -3059,6 +3067,35 @@ class GuiSmokeTests(unittest.TestCase):
 
     def test_upscale_chunk_ranges_use_single_prompt_when_clip_fits(self) -> None:
         self.assertEqual(upscale_video.chunk_ranges(total_frames=100, fps=25.0, chunk_seconds=6.0, overlap_frames=8), [(0, 0, 100)])
+
+    def test_upscale_chunk_cache_key_keeps_same_section_start_when_end_extends(self) -> None:
+        first = Path("intermediate/source_sections/example_0000012000_0000024000.mp4")
+        extended = Path("intermediate/source_sections/example_0000012000_0000060000.mp4")
+        moved_start = Path("intermediate/source_sections/example_0000045000_0000060000.mp4")
+
+        self.assertEqual(upscale_video.upscale_chunk_source_key(first), upscale_video.upscale_chunk_source_key(extended))
+        self.assertNotEqual(upscale_video.upscale_chunk_source_key(first), upscale_video.upscale_chunk_source_key(moved_start))
+
+    def test_upscale_chunk_signature_compatibility_ignores_cache_path_and_mtime_only(self) -> None:
+        parser = upscale_video.build_parser()
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            old_chunk = folder / "old" / "input_0000.mp4"
+            new_chunk = folder / "new" / "input_0000.mp4"
+            old_chunk.parent.mkdir()
+            new_chunk.parent.mkdir()
+            old_chunk.write_bytes(b"same")
+            new_chunk.write_bytes(b"same")
+            args = parser.parse_args(["--input", str(new_chunk)])
+            old_sig = upscale_video.signature(args, old_chunk, 1920, 1080)
+            new_sig = upscale_video.signature(args, new_chunk, 1920, 1080)
+            old_sig["source_fingerprint"]["mtime_ns"] = 1
+            new_sig["source_fingerprint"]["mtime_ns"] = 2
+
+        self.assertTrue(upscale_video.compatible_upscale_chunk_signature(old_sig, new_sig))
+        changed = copy.deepcopy(new_sig)
+        changed["source_fingerprint"]["sha256"] = "different"
+        self.assertFalse(upscale_video.compatible_upscale_chunk_signature(old_sig, changed))
 
     def test_upscale_runs_after_recomposition_when_processing_is_enabled(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "true", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})

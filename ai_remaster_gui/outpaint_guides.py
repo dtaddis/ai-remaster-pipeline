@@ -502,9 +502,17 @@ def _save_guide_edit_mask(manifest: Path, chunk_index: int, guide_index: int, ma
     return rel(path)
 
 def _guide_edit_prompt(instruction: str, sampled_color: str = "") -> str:
-    parts = [instruction.strip()]
-    if sampled_color.strip():
-        parts.append(f"Use the sampled colour/value exactly where relevant: {sampled_color.strip()}.")
+    text = instruction.strip()
+    color = sampled_color.strip()
+    parts = [text]
+    if color:
+        parts.append(f"Use the sampled colour/value exactly where relevant: {color}, including its brightness.")
+    if text or color:
+        parts.append(
+            "If the requested material colour is lighter than the current one, raise the masked area's "
+            "luminance to the target value while preserving texture, shadows, edges, composition, and identity; "
+            "do not merely darken or tint the existing colour."
+        )
     return " ".join(part for part in parts if part).strip() or DEFAULT_ANCHOR_PROMPT
 
 def normalize_guide_preview_to_source(output: Path, source: Path) -> None:

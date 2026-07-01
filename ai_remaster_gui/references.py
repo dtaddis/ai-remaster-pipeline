@@ -224,10 +224,17 @@ def save_reference_edit_mask(manifest_text: str, index: int, mask_data: str) -> 
     return rel(path)
 
 def reference_edit_prompt(instruction: str, sampled_color: str = "") -> str:
-    parts = [instruction.strip()]
+    text = instruction.strip()
+    parts = [text]
     color = sampled_color.strip()
     if color:
-        parts.append(f"Use the sampled colour exactly where relevant: {color}.")
+        parts.append(f"Use the sampled colour exactly where relevant: {color}, including its brightness/value.")
+    if text or color:
+        parts.append(
+            "If the requested material colour is lighter than the current one, raise the masked area's "
+            "luminance to the target colour while preserving texture, shadows, edges, composition, and identity; "
+            "do not merely darken or tint the existing colour."
+        )
     prompt = " ".join(part for part in parts if part).strip()
     return prompt or "Refine this colour reference while preserving the original composition and identity."
 

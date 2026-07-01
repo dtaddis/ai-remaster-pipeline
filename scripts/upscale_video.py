@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,10 +15,77 @@ from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, loa
 
 config = load_local_config()
 
+SOURCE_SECTION_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<start>\d{10})_(?P<end>\d{10})$")
+ARP_ARTIFACT_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<tag>outpaint|recomp|color|audio)_[0-9a-f]{8}$")
+
 
 def default_output(source: Path, width: int, height: int) -> Path:
     suffix = f"flashvsr_{width}x{height}" if width and height else "flashvsr"
     return ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{suffix}.mp4"
+
+
+def upscale_chunk_source_key(source: Path) -> str:
+    stem = safe_stem(source.name)
+    section = SOURCE_SECTION_STEM_RE.match(Path(source.name).stem)
+    if section:
+        return safe_stem(f"{section.group('prefix')}_{section.group('start')}")
+    artifact = ARP_ARTIFACT_STEM_RE.match(Path(source.name).stem)
+    if artifact:
+        return safe_stem(f"{artifact.group('prefix')}_{artifact.group('tag')}")
+    return stem
+
+
+def upscale_chunk_dir(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> Path:
+    source_key = upscale_chunk_source_key(source)
+    return ROOT / ".cache" / "upscale_chunks" / f"{source_key}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
+
+
+def chunk_signature_match_view(signature: dict[str, Any]) -> dict[str, Any]:
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items() if key != "mtime_ns"}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(signature)
+
+
+def compatible_upscale_chunk_signature(stored: dict[str, Any], expected: dict[str, Any]) -> bool:
+    stored_view = chunk_signature_match_view(stored)
+    expected_view = chunk_signature_match_view(expected)
+    if stored_view == expected_view:
+        return True
+    stored_without_path = dict(stored_view)
+    expected_without_path = dict(expected_view)
+    stored_without_path.pop("source", None)
+    expected_without_path.pop("source", None)
+    return stored_without_path == expected_without_path
+
+
+def resumable_upscale_chunk(path: Path, expected_signature: dict[str, Any], width: int, height: int) -> bool:
+    from common import signature_path
+
+    if not path.exists() or not signature_path(path).exists():
+        return False
+    try:
+        import json
+
+        stored = json.loads(signature_path(path).read_text(encoding="utf-8-sig"))
+    except Exception:
+        return False
+    if not compatible_upscale_chunk_signature(stored, expected_signature):
+        return False
+    return resumable_output(path, stored, width=width, height=height)
+
+
+def find_reusable_upscale_chunk(chunk_dir: Path, chunk_name: str, chunk_sig: dict[str, Any], output_width: int, output_height: int) -> Path | None:
+    for candidate in (ROOT / ".cache" / "upscale_chunks").glob(f"*/{chunk_name}"):
+        if candidate.parent == chunk_dir:
+            continue
+        if resumable_upscale_chunk(candidate, chunk_sig, output_width, output_height):
+            return candidate
+    return None
 
 
 # The legacy single-node workflow hardcoded these values, so leaving a knob at its
@@ -380,7 +448,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         final_partial.unlink(missing_ok=True)
         return
 
-    chunk_dir = ROOT / ".cache" / "upscale_chunks" / f"{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
+    chunk_dir = upscale_chunk_dir(args, source, output_width, output_height)
     chunk_dir.mkdir(parents=True, exist_ok=True)
     print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s)", flush=True)
     normalized_chunks: list[Path] = []
@@ -392,8 +460,15 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         print(f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
         split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, source_fingerprint)
         chunk_sig = signature(args, chunk_input, output_width, output_height)
-        if not args.force and resumable_output(chunk_final, chunk_sig, width=output_width, height=output_height):
+        if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, output_width, output_height):
             print(f"Reuse upscaled chunk: {chunk_final}", flush=True)
+            normalized_chunks.append(chunk_final)
+            continue
+        reusable = None if args.force else find_reusable_upscale_chunk(chunk_dir, chunk_final.name, chunk_sig, output_width, output_height)
+        if reusable:
+            shutil.copy2(reusable, chunk_final)
+            shutil.copy2(reusable.with_suffix(reusable.suffix + ".sig.json"), chunk_final.with_suffix(chunk_final.suffix + ".sig.json"))
+            print(f"Reuse upscaled chunk from compatible cache: {reusable}", flush=True)
             normalized_chunks.append(chunk_final)
             continue
         flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height)

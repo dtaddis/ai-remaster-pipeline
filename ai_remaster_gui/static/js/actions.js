@@ -166,6 +166,7 @@ const referenceEditor = {
   tool: 'brush-add',
   brushSize: 28,
   sampledColor: '',
+  sampledColorSource: '',
   samPoints: [],
   drawing: false,
   preview: '',
@@ -177,6 +178,9 @@ const referenceEditor = {
   paintStrokes: 0,
   paintUndo: [],
   lastPaintPoint: null,
+  recolourSourceRgb: null,
+  recolourSourceRgbFull: null,
+  recolourStroke: null,
 };
 
 function openReferenceEditor(manifest, index) {
@@ -196,7 +200,7 @@ function openReferenceEditor(manifest, index) {
   ensureReferenceEditorModal();
   document.getElementById('referenceEditTitle').textContent = `Shot ${index + 1} Reference Editor`;
   document.getElementById('referenceEditInstruction').value = row.prompt || '';
-  document.getElementById('referenceEditSample').textContent = 'No colour sampled';
+  clearReferenceSample();
   document.getElementById('referenceEditPreview').innerHTML = missingImage('No preview yet');
   document.getElementById('referenceEditRecent').innerHTML = referenceRecentHtml(row);
   document.getElementById('referenceEditModal').classList.remove('hidden');
@@ -230,7 +234,7 @@ async function openGuideEditor(chunkIndex, guideIndex, fallbackPath = '') {
   ensureReferenceEditorModal();
   document.getElementById('referenceEditTitle').textContent = `Chunk ${chunkIndex + 1} Guide ${guideIndex + 1} Editor`;
   document.getElementById('referenceEditInstruction').value = DEFAULT_ANCHOR_PROMPT;
-  document.getElementById('referenceEditSample').textContent = 'No colour sampled';
+  clearReferenceSample();
   document.getElementById('referenceEditPreview').innerHTML = missingImage('No preview yet');
   document.getElementById('referenceEditRecent').innerHTML = guideRecentHtml(row, guideIndex);
   document.getElementById('referenceEditModal').classList.remove('hidden');
@@ -249,6 +253,7 @@ function referenceIcon(name) {
     'brush-subtract': `<svg ${common}><path d="M14 4l6 6-8.5 8.5c-1.2 1.2-3.1 1.2-4.2 0l-1.8-1.8c-1.2-1.2-1.2-3.1 0-4.2L14 4z"/><path d="M13 5l6 6"/><path d="M4 20c1.7.2 3-.2 4-1.2"/>${minus}</svg>`,
     wand: `<svg ${common}><path d="M4 20l10-10"/><path d="M13 5l1 3 3 1-3 1-1 3-1-3-3-1 3-1 1-3z"/><path d="M18 3v3M20 5h-4M6 5v2M7 6H5"/></svg>`,
     dropper: `<svg ${common}><path d="M14 5l5 5"/><path d="M11 8l5 5-7.5 7.5H4v-4.5L11 8z"/><path d="M13 6l2-2c.8-.8 2.2-.8 3 0l2 2c.8.8.8 2.2 0 3l-2 2"/></svg>`,
+    rehue: `<svg ${common}><path d="M12 4l5 5-7 7c-1 1-2.6 1-3.6 0l-1.4-1.4c-1-1-1-2.6 0-3.6L12 4z"/><path d="M11 5l5 5"/><path d="M17.5 14a3.5 3.5 0 1 1-2.5 1"/><path d="M15 13.5h3v3"/></svg>`,
     recolour: `<svg ${common}><path d="M12 4l5 5-7 7c-1 1-2.6 1-3.6 0l-1.4-1.4c-1-1-1-2.6 0-3.6L12 4z"/><path d="M11 5l5 5"/><path d="M19 13.5c1.1 1.5 1.8 2.6 1.8 3.5a1.8 1.8 0 0 1-3.6 0c0-.9.7-2 1.8-3.5z"/></svg>`,
     clear: `<svg ${common}><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M7 7l1 13h8l1-13"/><path d="M10 11v5M14 11v5"/></svg>`,
     invert: `<svg ${common}><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z"/></svg>`,
@@ -290,8 +295,8 @@ function ensureReferenceEditorModal() {
             ${referenceToolButton('wand', 'Magic wand selection')}
             ${referenceToolButton('sam-subtract', 'SAM2 subtract from mask')}
             ${referenceToolButton('brush-subtract', 'Brush subtract from mask')}
-            ${referenceToolButton('dropper', 'Sample colour')}
-            ${referenceToolButton('recolour', 'Recolour brush (paints the sampled colour, keeps texture)')}
+            ${referenceToolButton('rehue', 'ReHue brush (change hue, keep brightness)')}
+            ${referenceToolButton('recolour', 'ReColor brush (replace sampled colour and value)')}
           </div>
           <label>Brush size</label>
           <input id="referenceBrushSize" type="range" min="4" max="120" value="28" oninput="referenceEditor.brushSize=Number(this.value)">
@@ -299,7 +304,14 @@ function ensureReferenceEditorModal() {
             ${referenceMaskActionButton('clearReferenceMask()', 'clear', 'Clear mask')}
             ${referenceMaskActionButton('invertReferenceMask()', 'invert', 'Invert mask')}
           </div>
-          <div class="sample-row"><span id="referenceSampleSwatch"></span><span id="referenceEditSample">No colour sampled</span></div>
+          <div class="sample-row">
+            <label id="referenceColorButton" class="reference-color-button">
+              <span id="referenceSampleSwatch"></span>
+              <span id="referenceEditSample">Current color: none</span>
+              <input id="referenceColorPicker" class="reference-color-picker" type="color" value="#808080" aria-label="Choose colour" oninput="chooseReferenceColor(this.value,false)" onchange="chooseReferenceColor(this.value,true)">
+            </label>
+            ${referenceToolButton('dropper', 'Sample colour')}
+          </div>
           <div class="actions">
             <button type="button" onclick="undoReferencePaint()">Undo stroke</button>
             <button type="button" onclick="discardReferencePaint()">Discard paint</button>
@@ -379,6 +391,9 @@ function loadReferenceEditorImage(src) {
     referenceEditor.paintStrokes = 0;
     referenceEditor.paintUndo = [];
     referenceEditor.lastPaintPoint = null;
+    referenceEditor.recolourStroke = null;
+    referenceEditor.recolourSourceRgb = null;
+    referenceEditor.recolourSourceRgbFull = null;
     clearReferenceMask();
   };
   img.src = src;
@@ -388,7 +403,12 @@ function wireReferenceEditorCanvas() {
   const wrap = document.querySelector('.reference-canvas-wrap');
   wrap.addEventListener('pointerdown', event => {
     if (event.button !== 0) return;
-    if (referenceEditor.tool === 'recolour' && referenceEditor.sampledColor) pushReferencePaintUndo();
+    if (referencePaintToolNeedsColour(referenceEditor.tool) && referenceEditor.sampledColor) {
+      pushReferencePaintUndo();
+      if (referenceEditor.tool === 'recolour') beginReferenceRecolourStroke();
+    }
+    referenceEditor.recolourSourceRgb = null;
+    referenceEditor.recolourSourceRgbFull = null;
     referenceEditor.lastPaintPoint = null;
     referenceEditor.drawing = true;
     handleReferenceCanvasPoint(event);
@@ -396,12 +416,15 @@ function wireReferenceEditorCanvas() {
   wrap.addEventListener('pointermove', event => {
     if (!referenceEditor.drawing) return;
     if ((event.buttons & 1) === 0) return;
-    if (!referenceEditor.tool.startsWith('brush') && referenceEditor.tool !== 'recolour') return;
+    if (!referenceEditor.tool.startsWith('brush') && !referencePaintToolNeedsColour(referenceEditor.tool)) return;
     handleReferenceCanvasPoint(event);
   });
   window.addEventListener('pointerup', () => {
     referenceEditor.drawing = false;
     referenceEditor.lastPaintPoint = null;
+    referenceEditor.recolourSourceRgb = null;
+    referenceEditor.recolourSourceRgbFull = null;
+    referenceEditor.recolourStroke = null;
   });
 }
 
@@ -417,11 +440,12 @@ function setReferenceTool(tool) {
     'brush-subtract': 'Brush subtract from mask',
     wand: 'Magic wand selection',
     dropper: 'Sample colour',
-    recolour: 'Recolour brush',
+    rehue: 'ReHue brush',
+    recolour: 'ReColor brush',
   };
-  if (tool === 'recolour' && !referenceEditor.sampledColor) {
+  if (referencePaintToolNeedsColour(tool) && !referenceEditor.sampledColor) {
     const status = document.getElementById('referenceEditStatus');
-    if (status) status.textContent = 'Recolour brush: sample a colour first with the dropper or a recent image.';
+    if (status) status.textContent = `${labels[tool] || 'Colour brush'}: choose a colour first with the picker, dropper, or a recent image.`;
     return;
   }
   const status = document.getElementById('referenceEditStatus');
@@ -442,8 +466,13 @@ function handleReferenceCanvasPoint(event) {
   if (referenceEditor.tool === 'dropper') return sampleActiveReferenceColor(point.x, point.y);
   if (referenceEditor.tool === 'wand') return wandReferenceMask(point.x, point.y, 34);
   if (referenceEditor.tool === 'sam-add' || referenceEditor.tool === 'sam-subtract') return requestReferenceSamMask(point);
+  if (referenceEditor.tool === 'rehue') return paintReferenceRehue(point.x, point.y);
   if (referenceEditor.tool === 'recolour') return paintReferenceRecolour(point.x, point.y);
   drawReferenceBrush(point.x, point.y, referenceEditor.tool === 'brush-subtract');
+}
+
+function referencePaintToolNeedsColour(tool) {
+  return tool === 'rehue' || tool === 'recolour';
 }
 
 function drawReferenceBrush(x, y, subtract) {
@@ -480,7 +509,7 @@ function invertReferenceMask() {
 function sampleActiveReferenceColor(x, y) {
   const canvas = document.getElementById('referenceImageCanvas');
   const data = canvas.getContext('2d').getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
-  setReferenceSample(rgbToHex(data[0], data[1], data[2]));
+  setReferenceSample(rgbToHex(data[0], data[1], data[2]), true, 'sampled');
 }
 
 function sampleReferenceImageColor(event, img) {
@@ -494,20 +523,41 @@ function sampleReferenceImageColor(event, img) {
     const x = Math.floor((event.clientX - rect.left) * canvas.width / rect.width);
     const y = Math.floor((event.clientY - rect.top) * canvas.height / rect.height);
     const data = ctx.getImageData(x, y, 1, 1).data;
-    setReferenceSample(rgbToHex(data[0], data[1], data[2]));
+    setReferenceSample(rgbToHex(data[0], data[1], data[2]), true, 'sampled');
   } catch {
     document.getElementById('referenceEditStatus').textContent = 'Could not sample that image.';
   }
 }
 
-function setReferenceSample(hex) {
-  referenceEditor.sampledColor = hex;
-  document.getElementById('referenceEditSample').textContent = hex;
-  document.getElementById('referenceSampleSwatch').style.background = hex;
+function clearReferenceSample() {
+  referenceEditor.sampledColor = '';
+  referenceEditor.sampledColorSource = '';
+  const sample = document.getElementById('referenceEditSample');
+  const swatch = document.getElementById('referenceSampleSwatch');
+  const picker = document.getElementById('referenceColorPicker');
+  if (sample) sample.textContent = 'Current color: none';
+  if (swatch) swatch.style.background = '#0b0e10';
+  if (picker) picker.value = '#808080';
+}
+
+function setReferenceSample(hex, appendInstruction = true, source = 'chosen') {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return;
+  const normalized = rgbToHex(rgb[0], rgb[1], rgb[2]);
+  referenceEditor.sampledColor = normalized;
+  referenceEditor.sampledColorSource = source;
+  document.getElementById('referenceEditSample').textContent = `Current color: ${normalized} (${source})`;
+  document.getElementById('referenceSampleSwatch').style.background = normalized;
+  const picker = document.getElementById('referenceColorPicker');
+  if (picker && picker.value.toLowerCase() !== normalized) picker.value = normalized;
   const instruction = document.getElementById('referenceEditInstruction');
-  if (instruction && !instruction.value.includes(hex)) {
-    instruction.value = `${instruction.value.trim()} use ${hex}`.trim();
+  if (appendInstruction && instruction && !instruction.value.toLowerCase().includes(normalized)) {
+    instruction.value = `${instruction.value.trim()} use ${normalized}`.trim();
   }
+}
+
+function chooseReferenceColor(hex, commit = true) {
+  setReferenceSample(hex, commit, 'chosen');
 }
 
 function rgbToHex(r, g, b) {
@@ -538,25 +588,70 @@ function setColourLuminance(rgb, lum) {
   return out.map(v => Math.round(Math.max(0, Math.min(255, v))));
 }
 
-let referenceRecolourLut = { hex: '', lut: null };
+let referenceRecolourSpec = { hex: '', spec: null };
+let referenceRehueLut = { hex: '', lut: null };
 
-function recolourLutFor(hex) {
-  if (referenceRecolourLut.hex === hex && referenceRecolourLut.lut) return referenceRecolourLut.lut;
+function recolourSpecFor(hex) {
+  if (referenceRecolourSpec.hex === hex && referenceRecolourSpec.spec) return referenceRecolourSpec.spec;
+  const rgb = hexToRgb(hex);
+  if (!rgb) return null;
+  const spec = { rgb, luminance: colourLuminance(rgb[0], rgb[1], rgb[2]) };
+  referenceRecolourSpec = { hex, spec };
+  return spec;
+}
+
+function rehueLutFor(hex) {
+  if (referenceRehueLut.hex === hex && referenceRehueLut.lut) return referenceRehueLut.lut;
   const rgb = hexToRgb(hex);
   if (!rgb) return null;
   const lut = new Array(256);
   for (let lum = 0; lum < 256; lum++) lut[lum] = setColourLuminance(rgb, lum);
-  referenceRecolourLut = { hex, lut };
+  referenceRehueLut = { hex, lut };
   return lut;
 }
 
-function paintReferenceRecolour(x, y) {
+function beginReferenceRecolourStroke() {
+  const snapshot = referenceEditor.paintUndo[referenceEditor.paintUndo.length - 1] || {};
+  referenceEditor.recolourStroke = {
+    states: new WeakMap(),
+    displayOriginal: snapshot.display || null,
+    fullOriginal: snapshot.full || null,
+  };
+}
+
+function imageDataPixel(imageData, x, y) {
+  if (!imageData) return null;
+  const px = Math.max(0, Math.min(imageData.width - 1, Math.floor(x)));
+  const py = Math.max(0, Math.min(imageData.height - 1, Math.floor(y)));
+  const i = (py * imageData.width + px) * 4;
+  return [imageData.data[i], imageData.data[i + 1], imageData.data[i + 2]];
+}
+
+function recolourCanvasState(ctx, originalImageData) {
+  if (!referenceEditor.recolourStroke) beginReferenceRecolourStroke();
+  const stroke = referenceEditor.recolourStroke;
+  let state = stroke.states.get(ctx.canvas);
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+  if (!state || state.width !== width || state.height !== height) {
+    state = {
+      width,
+      height,
+      original: originalImageData || ctx.getImageData(0, 0, width, height),
+      alpha: new Float32Array(width * height),
+    };
+    stroke.states.set(ctx.canvas, state);
+  }
+  return state;
+}
+
+function paintReferenceRehue(x, y) {
   const status = document.getElementById('referenceEditStatus');
   if (!referenceEditor.sampledColor) {
-    if (status) status.textContent = 'Recolour brush: sample a colour first with the dropper or a recent image.';
+    if (status) status.textContent = 'ReHue brush: choose a colour first with the picker, dropper, or a recent image.';
     return;
   }
-  const lut = recolourLutFor(referenceEditor.sampledColor);
+  const lut = rehueLutFor(referenceEditor.sampledColor);
   if (!lut) return;
   const radius = referenceEditor.brushSize / 2;
   const last = referenceEditor.lastPaintPoint;
@@ -573,16 +668,16 @@ function paintReferenceRecolour(x, y) {
   const full = referenceEditor.fullCanvas;
   const scale = referenceEditor.imageScale || 1;
   for (const point of points) {
-    applyRecolourStamp(display, point.x, point.y, radius, lut);
-    if (full && scale !== 1) applyRecolourStamp(full.getContext('2d'), point.x / scale, point.y / scale, radius / scale, lut);
+    applyRehueStamp(display, point.x, point.y, radius, lut);
+    if (full && scale !== 1) applyRehueStamp(full.getContext('2d'), point.x / scale, point.y / scale, radius / scale, lut);
   }
   referenceEditor.lastPaintPoint = { x, y };
-  if (status) status.textContent = `Recolouring with ${referenceEditor.sampledColor}. Save paint keeps it, Undo removes the last stroke.`;
+  if (status) status.textContent = `ReHue painting with ${referenceEditor.sampledColor}. Save paint keeps it, Undo removes the last stroke.`;
 }
 
-// Replaces hue/saturation with the sampled colour but keeps each pixel's
-// luminance, so shading and texture survive (like Paint.NET's Recolor tool).
-function applyRecolourStamp(ctx, cx, cy, radius, lut) {
+// Original hue-only behaviour: replace hue/saturation with the chosen colour
+// while preserving each pixel's luminance.
+function applyRehueStamp(ctx, cx, cy, radius, lut) {
   const x0 = Math.max(0, Math.floor(cx - radius - 1));
   const y0 = Math.max(0, Math.floor(cy - radius - 1));
   const x1 = Math.min(ctx.canvas.width, Math.ceil(cx + radius + 1));
@@ -602,6 +697,101 @@ function applyRecolourStamp(ctx, cx, cy, radius, lut) {
       data[i] += (tinted[0] - data[i]) * coverage;
       data[i + 1] += (tinted[1] - data[i + 1]) * coverage;
       data[i + 2] += (tinted[2] - data[i + 2]) * coverage;
+    }
+  }
+  ctx.putImageData(img, x0, y0);
+}
+
+function paintReferenceRecolour(x, y) {
+  const status = document.getElementById('referenceEditStatus');
+  if (!referenceEditor.sampledColor) {
+    if (status) status.textContent = 'ReColor brush: choose a colour first with the picker, dropper, or a recent image.';
+    return;
+  }
+  const spec = recolourSpecFor(referenceEditor.sampledColor);
+  if (!spec) return;
+  const radius = referenceEditor.brushSize / 2;
+  const display = document.getElementById('referenceImageCanvas').getContext('2d');
+  if (!referenceEditor.recolourStroke) beginReferenceRecolourStroke();
+  const stroke = referenceEditor.recolourStroke || {};
+  if (!referenceEditor.recolourSourceRgb) {
+    const sx = Math.max(0, Math.min(display.canvas.width - 1, Math.floor(x)));
+    const sy = Math.max(0, Math.min(display.canvas.height - 1, Math.floor(y)));
+    const sampled = imageDataPixel(stroke.displayOriginal, sx, sy) || Array.from(display.getImageData(sx, sy, 1, 1).data).slice(0, 3);
+    referenceEditor.recolourSourceRgb = sampled;
+  }
+  const sourceRgb = referenceEditor.recolourSourceRgb;
+  const last = referenceEditor.lastPaintPoint;
+  const points = [];
+  if (last) {
+    const dist = Math.hypot(x - last.x, y - last.y);
+    const step = Math.max(1, radius * 0.45);
+    for (let d = step; d < dist; d += step) {
+      points.push({ x: last.x + (x - last.x) * d / dist, y: last.y + (y - last.y) * d / dist });
+    }
+  }
+  points.push({ x, y });
+  const full = referenceEditor.fullCanvas;
+  const scale = referenceEditor.imageScale || 1;
+  if (full && scale !== 1 && !referenceEditor.recolourSourceRgbFull) {
+    const sampled = imageDataPixel(stroke.fullOriginal, x / scale, y / scale);
+    referenceEditor.recolourSourceRgbFull = sampled || sourceRgb;
+  }
+  const sourceRgbFull = referenceEditor.recolourSourceRgbFull || sourceRgb;
+  for (const point of points) {
+    applyRecolourStamp(display, point.x, point.y, radius, spec, sourceRgb, stroke.displayOriginal);
+    if (full && scale !== 1) applyRecolourStamp(full.getContext('2d'), point.x / scale, point.y / scale, radius / scale, spec, sourceRgbFull, stroke.fullOriginal);
+  }
+  referenceEditor.lastPaintPoint = { x, y };
+  if (status) status.textContent = `ReColor painting with ${referenceEditor.sampledColor}. Save paint keeps it, Undo removes the last stroke.`;
+}
+
+// Sampling Once mode: the first colour clicked in a stroke is the source
+// colour being replaced. Each affected pixel keeps its difference from that
+// source. Pixels are recomputed from the stroke's original image and only the
+// strongest coverage seen in the stroke is kept, so overlapping dabs cannot
+// compound and grind away detail.
+function applyRecolourStamp(ctx, cx, cy, radius, spec, sourceRgb, originalImageData = null) {
+  const x0 = Math.max(0, Math.floor(cx - radius - 1));
+  const y0 = Math.max(0, Math.floor(cy - radius - 1));
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(cx + radius + 1));
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(cy + radius + 1));
+  if (x1 <= x0 || y1 <= y0) return;
+  const w = x1 - x0;
+  const img = ctx.getImageData(x0, y0, w, y1 - y0);
+  const data = img.data;
+  const state = recolourCanvasState(ctx, originalImageData);
+  const original = state.original.data;
+  const canvasWidth = ctx.canvas.width;
+  const tolerance = 72;
+  const feather = 36;
+  const contrast = 0.92;
+  for (let py = y0; py < y1; py++) {
+    for (let px = x0; px < x1; px++) {
+      const dx = px + 0.5 - cx;
+      const dy = py + 0.5 - cy;
+      const coverage = Math.max(0, Math.min(1, radius + 0.5 - Math.sqrt(dx * dx + dy * dy)));
+      if (coverage <= 0) continue;
+      const i = ((py - y0) * w + (px - x0)) * 4;
+      const canvasIndex = py * canvasWidth + px;
+      const previousAlpha = state.alpha[canvasIndex];
+      const oi = canvasIndex * 4;
+      const dr = original[oi] - sourceRgb[0];
+      const dg = original[oi + 1] - sourceRgb[1];
+      const db = original[oi + 2] - sourceRgb[2];
+      const distance = Math.sqrt(dr * dr + dg * dg + db * db);
+      const similarity = distance <= tolerance ? 1 : Math.max(0, 1 - (distance - tolerance) / feather);
+      const alpha = coverage * similarity;
+      if (alpha <= previousAlpha + 0.001) continue;
+      state.alpha[canvasIndex] = alpha;
+      const tinted = [
+        Math.max(0, Math.min(255, spec.rgb[0] + dr * contrast)),
+        Math.max(0, Math.min(255, spec.rgb[1] + dg * contrast)),
+        Math.max(0, Math.min(255, spec.rgb[2] + db * contrast)),
+      ];
+      data[i] = original[oi] + (tinted[0] - original[oi]) * alpha;
+      data[i + 1] = original[oi + 1] + (tinted[1] - original[oi + 1]) * alpha;
+      data[i + 2] = original[oi + 2] + (tinted[2] - original[oi + 2]) * alpha;
     }
   }
   ctx.putImageData(img, x0, y0);

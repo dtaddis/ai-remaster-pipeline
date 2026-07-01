@@ -86,6 +86,7 @@ from .references import (
     recent_color_references,
     reference_name_for_time,
     openai_reference_regeneration_command,
+    reference_edit_prompt,
     reference_regeneration_command,
     accept_reference_edit,
     regenerate_reference_image,
