@@ -1,4 +1,5 @@
 let recompMaskFrame = 0;
+let recompColorFrame = 0;
 
 function drawRecomp() {
   const st = stage('recomp');
@@ -263,7 +264,7 @@ function liveCompositeHtml(s) {
     <div class="live-composite">
       ${s.outpainted_video ? `<video id="recompVideo" class="sync-layer-video live-outpaint" src="${media(s.outpainted_video)}" controls preload="metadata"></video>` : ''}
       ${originalLiveLayerHtml(s, !s.outpainted_video)}
-      ${s.colorized_video ? `<video class="sync-layer-video live-color" src="${media(s.colorized_video)}" muted preload="metadata" style="${colorLayerStyle(s)}"></video>` : ''}
+      ${s.colorized_video ? `<video class="sync-layer-video color-preview-source" src="${media(s.colorized_video)}" muted preload="metadata" style="visibility:hidden;pointer-events:none"></video><canvas class="live-color live-color-accurate"></canvas>` : ''}
     </div>
   `;
 }
@@ -368,6 +369,7 @@ function wireEditorVideo() {
   const layers = [...document.querySelectorAll('.sync-layer-video')].filter(item => item !== mainVideo);
 
   setupSourceBlackPreview();
+  setupAccurateColorPreview();
   if (!mainVideo || !scrubber) return;
 
   const syncLayers = force => {
@@ -403,6 +405,153 @@ function wireEditorVideo() {
     });
   });
   updateRecompPreview();
+}
+
+function setupAccurateColorPreview() {
+  if (recompColorFrame) {
+    cancelAnimationFrame(recompColorFrame);
+    recompColorFrame = 0;
+  }
+  const canvas = document.querySelector('.live-color-accurate');
+  const color = document.querySelector('.color-preview-source');
+  const main = document.getElementById('recompVideo');
+  if (!canvas || !color || !main) return;
+
+  const scratch = document.createElement('canvas');
+  const scratchCtx = scratch.getContext('2d', { willReadFrequently: true });
+  const draw = () => {
+    const activeCanvas = document.querySelector('.live-color-accurate');
+    const activeColor = document.querySelector('.color-preview-source');
+    const activeMain = document.getElementById('recompVideo');
+    if (!activeCanvas || !activeColor || !activeMain) {
+      recompColorFrame = 0;
+      return;
+    }
+    drawAccurateColorComposite(activeCanvas, activeMain, activeColor, scratch, scratchCtx);
+    recompColorFrame = requestAnimationFrame(draw);
+  };
+
+  draw();
+}
+
+function drawAccurateColorComposite(canvas, mainVideo, colorVideo, scratch, scratchCtx) {
+  if (!mainVideo.videoWidth || !mainVideo.videoHeight || mainVideo.readyState < 2 || colorVideo.readyState < 2) return;
+  const scale = Math.min(1, 960 / mainVideo.videoWidth);
+  const width = Math.max(2, Math.round(mainVideo.videoWidth * scale));
+  const height = Math.max(2, Math.round(mainVideo.videoHeight * scale));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  if (scratch.width !== width || scratch.height !== height) {
+    scratch.width = width;
+    scratch.height = height;
+  }
+
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.clearRect(0, 0, width, height);
+  if (document.getElementById('showLayerOutpaint')?.checked ?? true) {
+    ctx.drawImage(mainVideo, 0, 0, width, height);
+  } else {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  const sourceVideo = document.querySelector('.source-mask-video') || document.querySelector('.live-original:not(.live-outpaint)');
+  const showOriginal = document.getElementById('showLayerOriginal')?.checked ?? true;
+  if (sourceVideo && showOriginal && sourceVideo.readyState >= 2) {
+    drawSourceLayerToContext(ctx, sourceVideo, width, height);
+  }
+
+  const base = ctx.getImageData(0, 0, width, height);
+  scratchCtx.clearRect(0, 0, width, height);
+  scratchCtx.drawImage(colorVideo, 0, 0, width, height);
+  const color = scratchCtx.getImageData(0, 0, width, height);
+  applyColorComposite(base.data, color.data, settings('recomp'));
+  ctx.putImageData(base, 0, 0);
+}
+
+function drawSourceLayerToContext(ctx, sourceVideo, width, height) {
+  const sourceAspect = sourceVideo.videoWidth / Math.max(1, sourceVideo.videoHeight);
+  const drawH = height;
+  const drawW = Math.max(2, Math.round(drawH * sourceAspect));
+  const x = Math.round((width - drawW) / 2);
+  const y = 0;
+  const temp = document.createElement('canvas');
+  temp.width = width;
+  temp.height = height;
+  const tctx = temp.getContext('2d', { willReadFrequently: true });
+  tctx.drawImage(sourceVideo, x, y, drawW, drawH);
+  const image = tctx.getImageData(0, 0, width, height);
+  const data = image.data;
+  const feather = Math.max(1, Number(settings('recomp').feather_pixels || 80));
+  const threshold = sourceBlackTransparent() ? 24 : -1;
+  for (let i = 0; i < data.length; i += 4) {
+    const pixel = i / 4;
+    const px = pixel % width;
+    const edge = Math.min(px - x, x + drawW - px);
+    let alpha = edge <= 0 ? 0 : Math.min(255, 255 * edge / feather);
+    if (threshold >= 0 && Math.max(data[i], data[i + 1], data[i + 2]) <= threshold) alpha = 0;
+    data[i + 3] = Math.min(data[i + 3], alpha);
+  }
+  tctx.putImageData(image, 0, 0);
+  ctx.drawImage(temp, 0, 0);
+}
+
+function applyColorComposite(base, color, s) {
+  const saturation = normalizedPercent(s.saturation || 100, 1);
+  const opacity = Math.max(0, Math.min(1, normalizedPercent(s.color_opacity || 100, 1)));
+  const [redBalance, blueBalance] = kelvinBalance(s.temperature || 6500);
+  for (let i = 0; i < base.length; i += 4) {
+    const br = base[i];
+    const bg = base[i + 1];
+    const bb = base[i + 2];
+    let cr = color[i];
+    let cg = color[i + 1];
+    let cb = color[i + 2];
+    [cr, cg, cb] = adjustSaturationRgb(cr, cg, cb, saturation);
+    const shadow = 1 - Math.max(cr, cg, cb) / 255;
+    cr = clampByte(cr + redBalance * shadow * 255);
+    cb = clampByte(cb + blueBalance * shadow * 255);
+    cr = br * (1 - opacity) + cr * opacity;
+    cg = bg * (1 - opacity) + cg * opacity;
+    cb = bb * (1 - opacity) + cb * opacity;
+    const y = 0.299 * br + 0.587 * bg + 0.114 * bb;
+    const u = -0.168736 * cr - 0.331264 * cg + 0.5 * cb + 128;
+    const v = 0.5 * cr - 0.418688 * cg - 0.081312 * cb + 128;
+    base[i] = clampByte(y + 1.402 * (v - 128));
+    base[i + 1] = clampByte(y - 0.344136 * (u - 128) - 0.714136 * (v - 128));
+    base[i + 2] = clampByte(y + 1.772 * (u - 128));
+    base[i + 3] = 255;
+  }
+}
+
+function normalizedPercent(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return number > 4 ? number / 100 : number;
+}
+
+function kelvinBalance(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return [0, 0];
+  if (Math.abs(number) <= 20) return [Math.max(number, 0), Math.max(-number, 0)];
+  const delta = Math.max(-4000, Math.min(4000, number - 6500));
+  const strength = Math.abs(delta) / 4000 * 0.12;
+  return delta < 0 ? [strength, 0] : [0, strength];
+}
+
+function adjustSaturationRgb(r, g, b, saturation) {
+  const y = 0.299 * r + 0.587 * g + 0.114 * b;
+  return [
+    clampByte(y + (r - y) * saturation),
+    clampByte(y + (g - y) * saturation),
+    clampByte(y + (b - y) * saturation),
+  ];
+}
+
+function clampByte(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
 }
 
 function setupSourceBlackPreview() {

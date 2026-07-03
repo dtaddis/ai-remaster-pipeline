@@ -381,7 +381,7 @@ def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height:
 
 
 def mux_audio(ffmpeg: str, video_source: Path, audio_source: Path, output: Path) -> None:
-    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    partial = output.with_suffix(output.suffix + ".mux.partial" + output.suffix)
     print("Muxing original audio into upscaled video", flush=True)
     command = [
         ffmpeg,

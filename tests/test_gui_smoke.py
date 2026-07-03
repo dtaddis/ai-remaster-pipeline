@@ -2096,6 +2096,25 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("-vf") + 1], "trim=start_frame=4,setpts=N/(23.97602398*TB),fps=23.97602398,scale=1920:1080:flags=lanczos,setsar=1")
         self.assertIn("-fps_mode", command)
 
+    def test_upscale_mux_audio_uses_distinct_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            output = folder / "preview.mp4"
+            video_source = output.with_suffix(output.suffix + ".partial" + output.suffix)
+            audio_source = folder / "source.mp4"
+
+            with (
+                mock.patch.object(upscale_video.subprocess, "run") as run,
+                mock.patch.object(upscale_video, "replace_with_retry") as replace,
+            ):
+                upscale_video.mux_audio("ffmpeg", video_source, audio_source, output)
+
+        expected_partial = output.with_suffix(output.suffix + ".mux.partial" + output.suffix)
+        command = run.call_args.args[0]
+        self.assertEqual(Path(command[-1]), expected_partial)
+        self.assertNotEqual(Path(command[-1]), video_source)
+        replace.assert_called_once_with(expected_partial, output, "Upscaled output")
+
     def test_write_manifest_details_skips_identical_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             manifest = Path(tmp_text) / "refs.csv"
