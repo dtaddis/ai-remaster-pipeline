@@ -393,8 +393,12 @@ class PipelineApp:
         """The video the soundtrack phase attaches sound to: the recomposed render when
         earlier processing is enabled, otherwise the selected source section."""
         if self.outpaint_enabled() or self.colorize_enabled():
-            return self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+            return self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
         return pipeline_source_text(self.settings)
+
+    def recomposition_base_input(self) -> str:
+        values = self.settings.get("recomp", {})
+        return values.get("outpainted_video", "") or values.get("source", "") or pipeline_source_text(self.settings)
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
@@ -930,7 +934,7 @@ class PipelineApp:
             outpainted_text = pipeline_source_text(self.settings)
             if outpainted_text:
                 self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
-                self.settings.setdefault("recomp", {})["outpainted_video"] = outpainted_text
+                self.settings.setdefault("recomp", {})["outpainted_video"] = ""
                 manifest = manifest_for_outpainted(outpainted_text)
                 self.settings.setdefault("references", {})["manifest"] = manifest
                 self.settings.setdefault("colour", {})["manifest"] = manifest
@@ -981,7 +985,7 @@ class PipelineApp:
         source = self.settings.get("global", {}).get("source")
         if source:
             self.settings.setdefault("recomp", {})["source"] = pipeline_source_text(self.settings)
-        output = recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+        output = recomposition_output_for(self.recomposition_base_input())
         if output:
             self.settings.setdefault("recomp", {})["output"] = output
         soundtrack_source = self.soundtrack_source_for()
@@ -1018,7 +1022,7 @@ class PipelineApp:
         if stage_key == "colour":
             return colorized_outputs_for_manifest(values.get("manifest", ""), values.get("method", "deepexemplar"))
         if stage_key == "recomp":
-            output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
+            output = values.get("output") or recomposition_output_for(values.get("outpainted_video", "") or values.get("source", ""))
             return [output] if output else []
         if stage_key == "audio":
             source = self.soundtrack_source_for()
@@ -1164,6 +1168,7 @@ class PipelineApp:
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
+        add(["--processing-height", values.get("processing_height", "source")])
         add(["--crf", values.get("crf", "18")])
         add(["--colormnet-memory-mode", values.get("colormnet_memory_mode", "balanced")])
         add(["--colormnet-feature-encoder", values.get("colormnet_feature_encoder", "resnet50")])
@@ -1175,14 +1180,19 @@ class PipelineApp:
     def _recomp_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
         cmd = [sys.executable, "-u", str(SCRIPTS / "final_composite.py")]
         add = cmd.extend
-        output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
-        add(["--outpainted", values.get("outpainted_video", ""), "--source", values.get("source", ""), "--output", output])
+        outpainted = values.get("outpainted_video", "")
+        output = values.get("output") or recomposition_output_for(outpainted or values.get("source", ""))
+        if outpainted:
+            add(["--outpainted", outpainted])
+        add(["--source", values.get("source", ""), "--output", output])
         if self.colorize_enabled() and values.get("colorized_video"):
             add(["--colorized", values["colorized_video"]])
-        add(["--feather-pixels", values.get("feather_pixels", "80"), "--saturation", values.get("saturation", "0.82"), "--temperature", values.get("temperature", "-0.015"), "--color-opacity", values.get("color_opacity", "1.0"), "--encoder", values.get("encoder", "h264")])
+        if outpainted:
+            add(["--feather-pixels", values.get("feather_pixels", "80")])
+        add(["--saturation", values.get("saturation", "82"), "--temperature", values.get("temperature", "6500"), "--color-opacity", values.get("color_opacity", "100"), "--encoder", values.get("encoder", "h264")])
         outpaint_values = self.settings.get("outpaint", {})
         add_value_args(cmd, outpaint_values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
-        if is_true(outpaint_values, "outpaint_all_black_regions"):
+        if outpainted and is_true(outpaint_values, "outpaint_all_black_regions"):
             add(["--source-black-transparent"])
         # Pass delivery dimensions so final_composite upscales from the model-safe LTX output
         # (e.g. 704p) back to the user's intended resolution (e.g. 720p).
@@ -1190,7 +1200,8 @@ class PipelineApp:
         aspect = outpaint_values.get("target_aspect", "16:9")
         height_text = outpaint_values.get("target_height", "720")
         delivery_w, delivery_h = outpaint_size_for_source(source_text, aspect, height_text)
-        add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
+        if outpainted:
+            add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
         return cmd
 
     def _audio_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
@@ -1271,6 +1282,11 @@ class PipelineApp:
         missing = [key for key in stage.required if not values.get(key)]
         if stage_key == "outpaint" and not self.settings.get("global", {}).get("source"):
             missing = ["source material on the Global tab"]
+        if stage_key == "recomp":
+            if self.outpaint_enabled() and not values.get("outpainted_video"):
+                missing.append("outpainted_video")
+            if self.colorize_enabled() and not values.get("colorized_video"):
+                missing.append("colorized_video")
         if missing:
             return False, "Missing settings: " + ", ".join(missing)
         if stage_key == "references" and values.get("method", "qwen") == "openai" and not values.get("openai_api_key", "").strip():
@@ -1544,7 +1560,7 @@ class PipelineApp:
             if soundtrack_output:
                 return soundtrack_output
         if self.outpaint_enabled() or self.colorize_enabled():
-            recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+            recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
             return recomposed
         return pipeline_source_text(self.settings)
 
@@ -1593,7 +1609,7 @@ class PipelineApp:
     def output_selection_state(self) -> dict[str, str]:
         upscale = self.settings.get("upscale", {})
         upscale_output = upscale_output_for(self.upscale_input_for() or upscale.get("input_video"), upscale) or upscale.get("output")
-        recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.settings.get("recomp", {}).get("outpainted_video", ""))
+        recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
         soundtrack_source = self.soundtrack_source_for()
         soundtrack_output = soundtrack_output_for(soundtrack_source, self.settings.get("audio", {})) if (self.soundtrack_enabled() and soundtrack_source) else ""
         if upscale_output and resolve(upscale_output).exists():

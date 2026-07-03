@@ -67,7 +67,109 @@ def method_suffix(method: str) -> str:
     return "colormnet" if method == "colormnet" else "deepexemplar"
 
 
-def copy_reference_to_comfy_input(reference: Path, comfy_dir: Path) -> str:
+def processing_dimensions(width: int, height: int, processing_height: str) -> tuple[int, int]:
+    text = str(processing_height or "source").strip().lower()
+    if text in {"", "source", "original", "0"}:
+        return width, height
+    try:
+        target_h = int(float(text.rstrip("p")))
+    except ValueError:
+        return width, height
+    if target_h <= 0 or height <= target_h:
+        return width, height
+    scale = target_h / height
+    target_w = max(2, int(round(width * scale / 2) * 2))
+    target_h = max(2, int(round(target_h / 2) * 2))
+    return target_w, target_h
+
+
+def downscaled_video_signature(source: Path, width: int, height: int) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "tool": "colorize_video.py",
+        "kind": "processing input",
+        "source": root_relative(source),
+        "source_fingerprint": file_fingerprint(source),
+        "width": width,
+        "height": height,
+    }
+
+
+def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int, original_width: int, original_height: int) -> Path:
+    if width == original_width and height == original_height:
+        return source
+    digest = file_fingerprint(source)["sha256"][:12]
+    output = ROOT / ".cache" / "colorize_inputs" / f"{safe_stem(source.name)}_{digest}_{width}x{height}.mp4"
+    sig = downscaled_video_signature(source, width, height)
+    if resumable_output(output, sig, width=width, height=height):
+        print(f"Reuse downscaled colourisation input: {output}", flush=True)
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"scale={width}:{height}:flags=lanczos,setsar=1",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        str(partial),
+    ]
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    replace_with_retry(partial, output)
+    write_signature(output, sig)
+    print(f"Wrote downscaled colourisation input: {output}", flush=True)
+    return output
+
+
+def prepare_processing_reference(reference: Path, width: int, height: int) -> Path:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return reference
+
+    try:
+        with Image.open(reference) as image:
+            if image.width == width and image.height == height:
+                return reference
+            digest = file_fingerprint(reference)["sha256"][:12]
+            output = ROOT / ".cache" / "colorize_refs" / f"{safe_stem(reference.stem)}_{digest}_{width}x{height}.png"
+            sig = {
+                "version": 1,
+                "tool": "colorize_video.py",
+                "kind": "processing reference",
+                "source": root_relative(reference),
+                "source_fingerprint": file_fingerprint(reference),
+                "width": width,
+                "height": height,
+            }
+            if resumable_output(output, sig, width=width, height=height):
+                return output
+            output.parent.mkdir(parents=True, exist_ok=True)
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            canvas = Image.new("RGB", (width, height), (0, 0, 0))
+            fitted = ImageOps.contain(image.convert("RGB"), (width, height), resampling)
+            canvas.paste(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+            canvas.save(output, format="PNG")
+            write_signature(output, sig)
+            return output
+    except Exception:
+        return reference
+
+
+def copy_reference_to_comfy_input(reference: Path, comfy_dir: Path, width: int | None = None, height: int | None = None) -> str:
+    if width and height:
+        reference = prepare_processing_reference(reference, width, height)
     target_dir = comfy_dir / "input" / "arp_colorize_refs"
     target_dir.mkdir(parents=True, exist_ok=True)
     digest = file_fingerprint(reference)["sha256"][:12]
@@ -138,6 +240,7 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
         "use_torch_compile": args.use_torch_compile,
         "video_format": args.video_format,
         "crf": args.crf,
+        "processing_height": args.processing_height,
     }
     if args.method == "colormnet":
         settings.update(
@@ -161,7 +264,7 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 6,
+        "version": 7,
         "tool": "colorize_video.py",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "manifest": root_relative(manifest),
@@ -282,7 +385,7 @@ def segment_signature(
     fps: float,
 ) -> dict[str, Any]:
     return {
-        "version": 6,
+        "version": 7,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
@@ -543,6 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     parser.add_argument("--comfy-output-root", default="")
+    parser.add_argument("--processing-height", default="source", help="Downscale input video before ComfyUI processing. Use source/original or a target height such as 1080.")
     parser.add_argument("--frame-propagate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-half-resolution", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-torch-compile", action=argparse.BooleanOptionalAction, default=False)
@@ -584,8 +688,11 @@ def run(args: argparse.Namespace) -> int:
     if not source_video.exists():
         raise FileNotFoundError(f"Source video not found for colourisation: {source_video}")
     output = resolve_path(args.output) if args.output else default_output(manifest, source_from_manifest, args.method)
+    source_info = video_info(source_video)
+    source_width, source_height = int(source_info["width"]), int(source_info["height"])
+    target_width, target_height = processing_dimensions(source_width, source_height, args.processing_height)
     sig = signature(args, manifest, source_video, rows)
-    if not args.force and resumable_output(output, sig, video_like=source_video):
+    if not args.force and resumable_output(output, sig, width=target_width, height=target_height):
         print(f"Reuse colorized video: {output}", flush=True)
         return 0
     if args.dry_run:
@@ -595,9 +702,10 @@ def run(args: argparse.Namespace) -> int:
     comfy_dir = resolve_path(args.comfy_dir)
     comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
     ffmpeg = find_ffmpeg(args.ffmpeg)
-    info = video_info(source_video)
+    processing_video = prepare_processing_video(ffmpeg, source_video, target_width, target_height, source_width, source_height)
+    info = video_info(processing_video)
     width, height, fps, total_frames = int(info["width"]), int(info["height"]), float(info["fps"]), int(info["frames"])
-    video_name = copy_to_comfy_input(source_video, comfy_dir, "arp_colorize")
+    video_name = copy_to_comfy_input(processing_video, comfy_dir, "arp_colorize")
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
     required_nodes = {
         "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
@@ -619,7 +727,7 @@ def run(args: argparse.Namespace) -> int:
         end_frame = item["end"]
         frame_count = max(1, end_frame - start_frame)
         reference = row_reference(row)
-        ref_name = copy_reference_to_comfy_input(reference, comfy_dir)
+        ref_name = copy_reference_to_comfy_input(reference, comfy_dir, width, height)
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):

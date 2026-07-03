@@ -19,8 +19,8 @@ final_composite.bat ^
 Useful parameters:
 
 - `--feather-pixels 50` to `100`: softer or harder transition from the real source to generated sides.
-- `--saturation`: reduce colorization intensity before blending.
-- `--temperature`: negative cools, positive warms.
+- `--saturation`: colorization intensity as a percentage before blending.
+- `--temperature`: color temperature in Kelvin. 6500 is neutral; lower warms, higher cools.
 - `--source-black-transparent`: let the outpainted plate show through near-black pixels in the original source layer. The GUI enables this automatically when Outpainting used "Outpaint all black regions".
 - `--source-black-threshold`: RGB threshold for that transparency mask. The default is `24`.
 - `--source-black-matte-shrink-pixels`: removes a small rim around detected black source regions so compressed or resampled black edges do not reappear over the outpainted plate. The default is `2`.

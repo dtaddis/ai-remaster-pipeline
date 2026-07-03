@@ -40,11 +40,12 @@ function drawRecomp() {
 }
 
 function recompLayerSummary(s) {
+  const outpaintFallback = s.outpainted_video ? 'Outpainted video not set' : 'N/A - colourisation-only workflow';
   return `
     <div class="layer-grid">
       ${recompLayerItem('Top layer - Color blend', s.colorized_video, 'Colorized video not set')}
       ${recompLayerItem('Middle layer', s.source, 'Original source not set')}
-      ${recompLayerItem('Bottom layer', s.outpainted_video, 'Outpainted video not set')}
+      ${recompLayerItem('Bottom layer', s.outpainted_video, outpaintFallback)}
     </div>
   `;
 }
@@ -74,7 +75,14 @@ function recompPathFields(st) {
 }
 
 function recompControlFields(st) {
-  const controls = ['feather_pixels', 'saturation', 'temperature', 'color_opacity', 'encoder'];
+  const hasOutpainted = !!settings('recomp').outpainted_video;
+  const controls = [
+    ...(hasOutpainted ? ['feather_pixels'] : []),
+    'saturation',
+    'temperature',
+    'color_opacity',
+    'encoder',
+  ];
   return `
     <div class="editor-controls">
       ${controls.map(key => `<div>${fieldHtml(st, st.fields.find(f => f[0] === key))}</div>`).join('')}
@@ -254,17 +262,22 @@ function liveCompositeHtml(s) {
   return `
     <div class="live-composite">
       ${s.outpainted_video ? `<video id="recompVideo" class="sync-layer-video live-outpaint" src="${media(s.outpainted_video)}" controls preload="metadata"></video>` : ''}
-      ${originalLiveLayerHtml(s)}
+      ${originalLiveLayerHtml(s, !s.outpainted_video)}
       ${s.colorized_video ? `<video class="sync-layer-video live-color" src="${media(s.colorized_video)}" muted preload="metadata" style="${colorLayerStyle(s)}"></video>` : ''}
     </div>
   `;
 }
 
-function originalLiveLayerHtml(s) {
+function originalLiveLayerHtml(s, asBase = false) {
   if (!s.source) return '';
+  const id = asBase ? ' id="recompVideo"' : '';
+  const controls = asBase ? ' controls' : '';
+  const cls = asBase ? 'live-outpaint live-original' : 'live-original';
+  const style = asBase ? 'object-fit:contain' : originalLayerStyle(s);
   if (!sourceBlackTransparent()) {
-    return `<video class="sync-layer-video live-original" src="${media(s.source)}" muted preload="metadata" style="${originalLayerStyle(s)}"></video>`;
+    return `<video${id} class="sync-layer-video ${cls}" src="${media(s.source)}"${asBase ? '' : ' muted'}${controls} preload="metadata" style="${style}"></video>`;
   }
+  if (asBase) return `<video${id} class="sync-layer-video ${cls}" src="${media(s.source)}" controls preload="metadata" style="${style}"></video>`;
   return `
     <video class="sync-layer-video source-mask-video" src="${media(s.source)}" muted preload="metadata"></video>
     <canvas class="live-original source-mask-canvas" style="${originalLayerStyle(s)}"></canvas>
@@ -274,7 +287,7 @@ function originalLiveLayerHtml(s) {
 function layerPreviewHtml(s) {
   return `
     <div class="layer-preview-grid">
-      <div><label>Outpainted</label>${layerVideo(s.outpainted_video, 'layer-outpaint')}</div>
+      <div><label>Outpainted</label>${s.outpainted_video ? layerVideo(s.outpainted_video, 'layer-outpaint') : missingImage('N/A for colourisation-only')}</div>
       <div><label>Original, feathered</label>${originalLayerPreviewHtml(s)}</div>
       <div><label>Color</label>${layerVideo(s.colorized_video, 'layer-colour', colorLayerStyle(s))}</div>
     </div>
@@ -283,6 +296,7 @@ function layerPreviewHtml(s) {
 
 function originalLayerPreviewHtml(s) {
   if (!s.source) return missingImage('Video not present');
+  if (!s.outpainted_video) return layerVideo(s.source, 'layer-original');
   if (!sourceBlackTransparent()) {
     return layerVideo(s.source, 'layer-original', originalFeatherStyle(s));
   }
@@ -299,10 +313,12 @@ function sourceBlackTransparent() {
 }
 
 function colorLayerStyle(s) {
-  const saturation = Math.max(0, Number(s.saturation || 1));
-  const temp = Number(s.temperature || 0);
-  const opacity = Math.max(0, Math.min(1, Number(s.color_opacity || 1)));
-  const hue = temp === 0 ? 0 : (temp > 0 ? -10 : 10) * Math.min(3, Math.abs(temp) * 30);
+  const rawSaturation = Math.max(0, Number(s.saturation || 100));
+  const saturation = rawSaturation > 4 ? rawSaturation / 100 : rawSaturation;
+  const temp = Number(s.temperature || 6500);
+  const rawOpacity = Math.max(0, Number(s.color_opacity || 100));
+  const opacity = Math.max(0, Math.min(1, rawOpacity > 1 ? rawOpacity / 100 : rawOpacity));
+  const hue = Math.max(-18, Math.min(18, (6500 - temp) / 180));
   return `filter:saturate(${saturation});opacity:${opacity};hue-rotate(${hue}deg)`;
 }
 

@@ -37,7 +37,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 7
+    values['version'] = 8
     return values
 
 
@@ -139,30 +139,60 @@ def source_alpha_expr(args, feather: int) -> str:
     return f"if({source_black_matte_expr(threshold, shrink)},0,{edge_alpha})"
 
 
-def build_filter(args, has_color, fps: float):
+def normalized_percent(value: float, default: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number / 100.0 if number > 4.0 else number
+
+
+def temperature_balance(value: float) -> tuple[float, float]:
+    """Return FFmpeg colorbalance red/blue shadow strengths from Kelvin.
+
+    6500K is treated as neutral. Lower Kelvin warms the color layer, higher
+    Kelvin cools it. Small legacy values are accepted by mapping negative to
+    blue and positive to red.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 6500.0
+    if abs(number) <= 20.0:
+        return max(number, 0.0), max(-number, 0.0)
+    delta = max(-4000.0, min(4000.0, number - 6500.0))
+    strength = abs(delta) / 4000.0 * 0.12
+    return (strength, 0.0) if delta < 0 else (0.0, strength)
+
+
+def build_filter(args, has_color, fps: float, has_outpainted: bool = True):
     feather = max(1, int(args.feather_pixels))
-    sat = max(0.0, args.saturation)
-    temp = args.temperature
-    color_opacity = max(0.0, min(1.0, args.color_opacity))
+    sat = max(0.0, normalized_percent(args.saturation, 0.82))
+    color_opacity = max(0.0, min(1.0, normalized_percent(args.color_opacity, 1.0)))
     fps_text = f"{fps:.8f}"
     crop = source_crop_filter(args)
+    color_input = 2 if has_outpainted else 1
     # Optionally scale the outpainted video to the delivery output dimensions.
     # This corrects for LTX's model-safe quantisation (e.g. 704p → 720p) so the
     # final composite is at the user's intended resolution.
     out_w = int(args.output_width) if args.output_width else 0
     out_h = int(args.output_height) if args.output_height else 0
     scale_base = f",scale={out_w}:{out_h}:flags=lanczos" if (out_w and out_h) else ""
-    filters = [
-        f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
-        f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
-        '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
-        f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
-        '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
-    ]
+    if has_outpainted:
+        filters = [
+            f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
+            f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
+            '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
+            f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
+            '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
+        ]
+    else:
+        filters = [
+            f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1,format=yuv444p[merged]',
+        ]
     if has_color:
-        red = max(temp, 0.0)
-        blue = max(-temp, 0.0)
-        filters.append(f'[2:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}[col0]')
+        red, blue = temperature_balance(args.temperature)
+        filters.append(f'[{color_input}:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}[col0]')
         filters.append('[col0][merged]scale2ref=w=iw:h=ih[colscaled][mergedref]')
         filters.append(f'[colscaled]eq=saturation={sat}:brightness=0:contrast=1,colorbalance=rs={red:.4f}:bs={blue:.4f},format=yuv444p[colfmt]')
         filters.append('[mergedref]format=yuv444p[basefmt]')
@@ -180,20 +210,27 @@ def build_filter(args, has_color, fps: float):
 
 
 def run(args):
-    outpainted = resolve_path(args.outpainted)
+    outpainted = resolve_path(args.outpainted) if args.outpainted else None
     source = resolve_path(args.source)
     colorized = resolve_path(args.colorized) if args.colorized else None
     output = resolve_path(args.output)
     sig = signature(args)
-    if not args.force and resumable_output(output, sig, video_like=outpainted):
+    video_like = outpainted or source
+    if not args.force and resumable_output(output, sig, video_like=video_like):
         print(f'Reuse composite: {output}')
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = probe_fps(ffmpeg, source)
-    cmd = [ffmpeg, '-y', '-i', str(outpainted), '-i', str(source)]
+    cmd = [ffmpeg, '-y']
+    if outpainted:
+        cmd += ['-i', str(outpainted), '-i', str(source)]
+        audio_input = '1:a?'
+    else:
+        cmd += ['-i', str(source)]
+        audio_input = '0:a?'
     if colorized:
         cmd += ['-i', str(colorized)]
-    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps), '-map', '[vout]', '-map', '1:a?', '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
+    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted)), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
     cmd += ['-c:a', 'copy', str(partial)]
@@ -219,14 +256,14 @@ def os_safe_pid() -> str:
 
 def build_parser():
     parser = argparse.ArgumentParser(description='Composite outpainted, original-source centre, and optional color layer into a final master.')
-    parser.add_argument('--outpainted', required=True)
+    parser.add_argument('--outpainted')
     parser.add_argument('--source', required=True)
     parser.add_argument('--colorized')
     parser.add_argument('--output', required=True)
     parser.add_argument('--feather-pixels', type=int, default=80)
-    parser.add_argument('--saturation', type=float, default=0.82)
-    parser.add_argument('--temperature', type=float, default=-0.015, help='Negative cools the color overlay; positive warms it.')
-    parser.add_argument('--color-opacity', type=float, default=1.0)
+    parser.add_argument('--saturation', type=float, default=82.0, help='Color layer saturation. Values above 4 are treated as percentages.')
+    parser.add_argument('--temperature', type=float, default=6500.0, help='Color temperature in Kelvin. 6500 is neutral; lower warms, higher cools.')
+    parser.add_argument('--color-opacity', type=float, default=100.0, help='Color layer opacity. Values above 4 are treated as percentages.')
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
     parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')

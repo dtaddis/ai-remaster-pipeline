@@ -137,7 +137,28 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["outpaint"]["prompt"] = OUTPAINT_PROMPT
     defaults["outpaint"]["seed_qwen_guides"] = "false"
     defaults["colour"].setdefault("method", "deepexemplar")
+    defaults["colour"].setdefault("processing_height", "source")
     defaults["recomp"].setdefault("colorization_method", "deepexemplar")
+    # Older builds stored recomposition color controls as small 0-1-ish floats.
+    # The UI now exposes Kelvin and percentages, so migrate old values once on load.
+    try:
+        sat = float(defaults["recomp"].get("saturation", "82"))
+        if sat <= 4:
+            defaults["recomp"]["saturation"] = str(int(round(sat * 100)))
+    except ValueError:
+        defaults["recomp"]["saturation"] = "82"
+    try:
+        opacity = float(defaults["recomp"].get("color_opacity", "100"))
+        if opacity <= 1:
+            defaults["recomp"]["color_opacity"] = str(int(round(opacity * 100)))
+    except ValueError:
+        defaults["recomp"]["color_opacity"] = "100"
+    try:
+        temp = float(defaults["recomp"].get("temperature", "6500"))
+        if abs(temp) <= 20:
+            defaults["recomp"]["temperature"] = str(int(round(6500 + (-temp * 40000))))
+    except ValueError:
+        defaults["recomp"]["temperature"] = "6500"
     config = current_config()
     defaults["references"]["comfy_output_root"] = rel(Path(comfy_output_root_for(config)))
     if not defaults["references"].get("comfy_url"):

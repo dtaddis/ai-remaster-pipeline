@@ -2609,12 +2609,13 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertTrue(output.endswith(".mp4"))
 
     def test_colorization_command_can_request_both_methods(self) -> None:
-        app.APP.settings["colour"].update({"manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "both"})
+        app.APP.settings["colour"].update({"manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "both", "processing_height": "1080"})
 
         command = app.APP.command_for("colour")
 
         self.assertIn("--method", command)
         self.assertIn("both", command)
+        self.assertEqual(command[command.index("--processing-height") + 1], "1080")
         self.assertNotIn("--output", command)
 
     def test_skip_outpainting_uses_pipeline_source_for_shot_detection(self) -> None:
@@ -2627,7 +2628,26 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("outpaint", stage_keys)
         self.assertIn("shots", stage_keys)
         self.assertEqual(app.APP.settings["shots"]["outpainted_video"], "input/example.mp4")
+        self.assertEqual(app.APP.settings["recomp"]["outpainted_video"], "")
+        self.assertEqual(app.APP.settings["recomp"]["source"], "input/example.mp4")
         self.assertIn("input/example.mp4", command)
+
+    def test_colour_only_recomposition_command_uses_source_as_base(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "true", "section_start": "0", "section_end": ""})
+        app.APP.settings["recomp"].update(
+            {
+                "outpainted_video": "",
+                "source": "input/example.mp4",
+                "colorized_video": "intermediate/outpainted_colorized/example_color.mp4",
+                "output": "output/reassembled/example_recomp.mp4",
+            }
+        )
+
+        command = app.APP.command_for("recomp")
+
+        self.assertNotIn("--outpainted", command)
+        self.assertEqual(command[command.index("--source") + 1], "input/example.mp4")
+        self.assertEqual(command[command.index("--colorized") + 1], "intermediate/outpainted_colorized/example_color.mp4")
 
     def test_no_overview_steps_selected_leaves_only_output_tab(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "false", "section_start": "0", "section_end": ""})

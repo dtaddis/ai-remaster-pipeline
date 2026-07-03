@@ -49,6 +49,18 @@ function sourceInfoHtml(info) {
 // Help text shown under stage fields. Keys are "<stage>.<field>" with a bare
 // "<field>" fallback for keys that are unique across stages.
 const FIELD_DESCRIPTIONS = {
+  'colour.processing_height':
+    'Downscale frames before they are sent to ComfyUI. Source keeps the original resolution; 1080p is a practical first stop for 4K material.',
+  'colour.use_half_resolution':
+    'DeepExemplar node option. Keep this separate from Processing scale: Processing scale changes the input video size, while this asks the node to work internally at half resolution.',
+  'recomp.temperature':
+    'Color temperature in Kelvin. 6500K is neutral; lower values warm the colour layer, higher values cool it.',
+  'recomp.saturation':
+    'Color layer saturation as a percentage before chroma is blended onto the luminance of the base composite.',
+  'recomp.color_opacity':
+    'How strongly the colorized chroma layer contributes, as a percentage.',
+  'recomp.feather_pixels':
+    'Only used when an outpainted video is present. It softens the original source edge over the generated sides.',
   'upscale.flashvsr_mode':
     'tiny = fastest, but its distilled decoder can smear fine motion such as lips. ' +
     'full = real VAE decoder with the best fidelity for faces and small movements, slowest. ' +
@@ -137,13 +149,30 @@ function selectOptionLabel(key, option) {
     return match ? `Source height (${match[1]}p)` : 'Source height';
   }
   if (key === 'target_height' && /^\d+$/.test(option)) return `${option}p`;
+  if (key === 'processing_height' && option === 'source') return 'Original / source';
+  if (key === 'processing_height' && /^\d+$/.test(option)) return `${option}p max height`;
   return option;
+}
+
+const RANGE_FIELD_UNITS = {
+  feather_pixels: ' px',
+  saturation: '%',
+  temperature: ' K',
+  color_opacity: '%',
+};
+
+const RANGE_NUDGE_FIELDS = new Set(['crop_left', 'crop_right', 'crop_top', 'crop_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
+
+function rangeDisplayValue(key, value) {
+  const number = Number(value);
+  const shown = Number.isFinite(number) && Number.isInteger(number) ? String(number) : String(value);
+  return shown + (RANGE_FIELD_UNITS[key] || '');
 }
 
 function rangeFieldHtml(key, label, kind, value) {
   const [min, max, step] = kind.slice(6).split('|');
-  const isCrop = key.startsWith('crop_');
-  const controls = isCrop ? `
+  const hasNudge = RANGE_NUDGE_FIELDS.has(key);
+  const controls = hasNudge ? `
     <div class="pixel-nudge-row">
       <button type="button" onclick="nudgeRangeField('${key}',-1)">-1</button>
       <input
@@ -160,7 +189,7 @@ function rangeFieldHtml(key, label, kind, value) {
     </div>
   ` : '';
   return `
-    <label>${label}: <span id="${key}Value">${esc(value)}</span></label>
+    <label>${label}: <span id="${key}Value">${esc(rangeDisplayValue(key, value))}</span></label>
     <input
       id="${key}Range"
       data-field="${key}"
@@ -228,7 +257,7 @@ function setRangeFieldValue(key, value, save = false) {
   next = Math.max(min, Math.min(max, Math.round(next / step) * step));
   range.value = String(next);
   const label = document.getElementById(`${key}Value`);
-  if (label) label.textContent = range.value;
+  if (label) label.textContent = rangeDisplayValue(key, range.value);
   const input = document.getElementById(`${key}Input`);
   if (input) input.value = range.value;
   if (save) range.dispatchEvent(new Event('change', { bubbles: true }));
