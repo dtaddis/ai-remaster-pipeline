@@ -401,7 +401,13 @@ class PipelineApp:
         return values.get("outpainted_video", "") or values.get("source", "") or pipeline_source_text(self.settings)
 
     def save(self) -> None:
-        SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
+        # Write to a sibling temp file and atomically replace it in. A concurrent reader (or a
+        # second saver) can then never observe a half-written file and silently lose the project
+        # config on the next load. os.replace is atomic on the same filesystem.
+        payload = json.dumps(self.settings, indent=2) + "\n"
+        tmp = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
 
     def files_for(self, stage: Stage) -> list[dict[str, str | int]]:
         exts = VIDEO_EXTS | IMAGE_EXTS | TEXT_EXTS
@@ -730,6 +736,15 @@ class PipelineApp:
         return payload
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
+        # Serialise settings mutations against readers: state() serialises self.settings under this
+        # same lock, so an unlocked writer here can trip "dictionary changed size during iteration"
+        # in the /api/state json.dumps and 500 the polling endpoint. Helpers called below
+        # (clear_derived_stage_inputs, hydrate_stage_inputs, save) do not take self.lock, so this
+        # non-reentrant lock is safe to hold across them.
+        with self.lock:
+            self._apply_settings_update(stage, values)
+
+    def _apply_settings_update(self, stage: str, values: dict[str, str]) -> None:
         previous_source = self.settings.get("global", {}).get("source", "") if stage == "global" else ""
         if stage == "global" and "source" in values:
             source = resolve_video_source(str(values.get("source", "")))
@@ -1055,7 +1070,7 @@ class PipelineApp:
         }
 
     def command_for(self, stage_key: str) -> list[str]:
-        values = self.settings[stage_key]
+        values = self.settings.get(stage_key, {})
         config = current_config()
         builder = self._stage_command_builders().get(stage_key)
         cmd = builder(config, values) if builder else [sys.executable, "-u"]
@@ -1836,7 +1851,15 @@ state.APP = APP  # register the singleton so sibling modules can reach it withou
 
 
 def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
-    crop = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    def _crop(key: str) -> int:
+        # Settings arrive as raw strings; a non-numeric crop value must not raise here, since this
+        # runs inside expected_outputs()/state() and would otherwise 500 the whole /api/state view.
+        try:
+            return int(float(values.get(key, "0") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    crop = [_crop(key) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     black = is_true(values, "outpaint_all_black_regions")
     return crop, black
 

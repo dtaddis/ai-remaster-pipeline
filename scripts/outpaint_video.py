@@ -1460,8 +1460,8 @@ def main() -> int:
                 if chunk_negative_suffix:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
                 if guide_image:
-                    source = "explicit" if explicit_guide else "auto"
-                    print(f"Chunk {chunk_index + 1} start guide ({source}): {guide_image}", flush=True)
+                    guide_source = "explicit" if explicit_guide else "auto"
+                    print(f"Chunk {chunk_index + 1} start guide ({guide_source}): {guide_image}", flush=True)
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
                 prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides)

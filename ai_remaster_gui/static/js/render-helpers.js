@@ -107,6 +107,7 @@ function fieldHelpHtml(help) {
 }
 
 function fieldHtml(st, field) {
+  if (!field) return ''; // a stage config missing an expected field must not blank the whole tab
   const [key, label, kind, defaultValue] = field;
   const value = settings(st.key)[key] ?? defaultValue ?? '';
   const help = fieldDescription(st.key, key);
@@ -340,7 +341,7 @@ function fileRow(st, file) {
   const emptyClass = thumb ? '' : 'no-thumb';
 
   return `
-    <div class="file ${emptyClass}" onclick="selected['${st.key}']='${esc(file.path)}';draw()">
+    <div class="file ${emptyClass}" onclick="selected[${jsArg(st.key)}]=${jsArg(file.path)};draw()">
       ${thumb}
       <div class="file-path">${esc(file.path)}</div>
     </div>

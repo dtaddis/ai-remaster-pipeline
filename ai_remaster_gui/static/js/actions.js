@@ -1648,7 +1648,9 @@ async function browseField(stageKey, fieldKey, kind) {
 async function showCommand(key) {
   const result = await api('/api/command?stage=' + encodeURIComponent(key));
   const el = document.getElementById('cmd');
-  if (el) el.textContent = result.command.join(' ');
+  if (!el) return;
+  if (Array.isArray(result.command)) el.textContent = result.command.join(' ');
+  else el.textContent = result.error ? `Error: ${result.error}` : '';
 }
 
 async function confirmOverwrite(key) {

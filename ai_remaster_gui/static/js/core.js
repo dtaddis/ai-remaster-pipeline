@@ -20,11 +20,25 @@ const stateUrl = (options = {}) => {
 };
 
 async function api(path, opts = {}) {
-  const response = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  return await response.json();
+  let response;
+  try {
+    response = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...opts,
+    });
+  } catch (err) {
+    return { ok: false, error: 'Could not reach the ARP server. Is it still running?' };
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, error: `The server returned an unexpected response (HTTP ${response.status}).` };
+  }
+  if (!response.ok && data && typeof data === 'object' && data.error === undefined) {
+    data.error = `Request failed (HTTP ${response.status}).`;
+  }
+  return data;
 }
 
 async function refresh(force = false) {
@@ -35,7 +49,9 @@ async function refresh(force = false) {
 
   const appHasContent = !!document.getElementById('app')?.children.length;
   const useCachedShotPreviews = !force && active === 'shots' && appHasContent;
-  state = await api(stateUrl({ shotPreviews: useCachedShotPreviews ? 'cached' : 'generate' }));
+  const nextState = await api(stateUrl({ shotPreviews: useCachedShotPreviews ? 'cached' : 'generate' }));
+  if (!nextState || !Array.isArray(nextState.stages)) return; // transient server error: keep the last good state and retry next poll
+  state = nextState;
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   notifyNewLogErrors();
@@ -389,7 +405,14 @@ async function selectTab(tab) {
   drawTabs();
   if (tab === 'outpaint') showOutpaintLoadingShell();
   else if (['shots', 'references', 'colour'].includes(tab)) showShotLoadingShell(tab);
-  state = await api(stateUrl());
+  const nextState = await api(stateUrl());
+  if (!nextState || !Array.isArray(nextState.stages)) {
+    // Server error while loading the tab; re-render the last good view instead of a stuck spinner.
+    drawTabs();
+    draw(false);
+    return;
+  }
+  state = nextState;
   pruneSelected();
   drawTabs();
   draw(false);

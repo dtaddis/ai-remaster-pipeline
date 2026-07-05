@@ -166,7 +166,7 @@ function shotSummary({ manifest, row, idx, enabled }, extra = '') {
       <div class="shot-number">Shot ${idx + 1}</div>
       <div class="shot-time">${esc(row.start_label)} to ${esc(row.end_label)}</div>
       <label>
-        <input type="checkbox" ${enabled ? 'checked' : ''} onchange="saveShotEnabled('${esc(manifest)}',${idx},this.checked)">
+        <input type="checkbox" ${enabled ? 'checked' : ''} onchange="saveShotEnabled(${jsArg(manifest)},${idx},this.checked)">
         Use shot
       </label>
       ${extra}
@@ -208,7 +208,7 @@ function shotTransitionControl(mode, manifest, row) {
           type="checkbox"
           id="fade_${row.index}"
           ${checked ? 'checked' : ''}
-          onchange="saveShotFade('${esc(manifest)}',${row.index},this.checked,document.getElementById('crossfade_${row.index}').value)"
+          onchange="saveShotFade(${jsArg(manifest)},${row.index},this.checked,document.getElementById('crossfade_${row.index}').value)"
         >
         Fading transition
       </label>
@@ -220,7 +220,7 @@ function shotTransitionControl(mode, manifest, row) {
           min="0.041"
           step="0.041"
           value="${esc(value)}"
-          onchange="saveShotFade('${esc(manifest)}',${row.index},document.getElementById('fade_${row.index}')?.checked ?? ${checked},this.value)"
+          onchange="saveShotFade(${jsArg(manifest)},${row.index},document.getElementById('fade_${row.index}')?.checked ?? ${checked},this.value)"
         >
       </label>
     </div>
@@ -255,12 +255,12 @@ function boundaryFrameCard({ manifest, row, idx }, edge) {
         data-edge="${edge}"
         data-fps="${fps}"
         data-preview-offset-frames="${previewOffsetFrames}"
-        oninput="updateShotBoundaryPreview('${esc(manifest)}',${idx},this.value,'${imgId}','${labelId}',this.dataset)"
-        onchange="setShotBoundary('${esc(manifest)}',${idx},'${edge}',this.value)"
+        oninput="updateShotBoundaryPreview(${jsArg(manifest)},${idx},this.value,'${imgId}','${labelId}',this.dataset)"
+        onchange="setShotBoundary(${jsArg(manifest)},${idx},'${edge}',this.value)"
       >
       <div class="shot-tools">
-        <button type="button" ${disabled} onclick="nudgeShotBoundary('${esc(manifest)}',${idx},'${edge}',-1)">-1 frame</button>
-        <button type="button" ${disabled} onclick="nudgeShotBoundary('${esc(manifest)}',${idx},'${edge}',1)">+1 frame</button>
+        <button type="button" ${disabled} onclick="nudgeShotBoundary(${jsArg(manifest)},${idx},'${edge}',-1)">-1 frame</button>
+        <button type="button" ${disabled} onclick="nudgeShotBoundary(${jsArg(manifest)},${idx},'${edge}',1)">+1 frame</button>
       </div>
     </div>
   `;
@@ -316,7 +316,7 @@ function referenceCard(context) {
       ${shotSummary(context, referenceTimeControl(manifest, row, idx, slider, label, img))}
       <div>
         <label>B&W screenshot</label>
-        ${sourceReady ? `<div class="thumb-wrap"><img id="${img}" src="${sourceUrl}" alt="" onclick="openImageModal(this.src,${jsArg('B&W screenshot')})"><button class="icon-button" type="button" title="Save B&W screenshot" onclick="exportMedia('${esc(row.source_reference)}')">&#128190;</button></div>` : missingImage('Image not present')}
+        ${sourceReady ? `<div class="thumb-wrap"><img id="${img}" src="${sourceUrl}" alt="" onclick="openImageModal(this.src,${jsArg('B&W screenshot')})"><button class="icon-button" type="button" title="Save B&W screenshot" onclick="exportMedia(${jsArg(row.source_reference)})">&#128190;</button></div>` : missingImage('Image not present')}
       </div>
       <div>
         <label>Color reference</label>
@@ -388,7 +388,7 @@ function referenceTimeControl(manifest, row, idx, slider, label, img) {
       data-reference-time-slider="true"
       data-shot-index="${idx}"
       data-fps="${fps}"
-      oninput="this.dataset.referenceTimeDirty='true';updateShotPreview('${esc(manifest)}',${idx},this.value,'${img}','${label}',Math.round(Number(this.value) * Number(this.dataset.fps || 24)))"
+      oninput="this.dataset.referenceTimeDirty='true';updateShotPreview(${jsArg(manifest)},${idx},this.value,'${img}','${label}',Math.round(Number(this.value) * Number(this.dataset.fps || 24)))"
     >
     <div class="shot-time" id="${label}">${esc(row.selected_label)}</div>
   `;
@@ -397,9 +397,9 @@ function referenceTimeControl(manifest, row, idx, slider, label, img) {
 function colorReferenceThumb(manifest, idx, colorUrl, row) {
   return `
     <div class="thumb-wrap">
-      <img src="${colorUrl}" alt="" onclick="openReferenceEditor('${esc(manifest)}',${idx})" title="Open advanced reference editor">
+      <img src="${colorUrl}" alt="" onclick="openReferenceEditor(${jsArg(manifest)},${idx})" title="Open advanced reference editor">
       ${row.color_reference_edited ? '<span class="edit-badge">Edited</span>' : ''}
-      <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference('${esc(manifest)}',${idx})">&#128465;</button>
+      <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference(${jsArg(manifest)},${idx})">&#128465;</button>
     </div>
   `;
 }
@@ -412,12 +412,12 @@ function referencePromptTools({ manifest, row, idx }) {
 
   return `
     <label>Shot prompt</label>
-    <textarea data-shot-prompt="${idx}" onblur="saveShotPrompt('${esc(manifest)}',${idx},this.value)" placeholder="Optional extra direction for this shot">${esc(row.prompt || '')}</textarea>
+    <textarea data-shot-prompt="${idx}" onblur="saveShotPrompt(${jsArg(manifest)},${idx},this.value)" placeholder="Optional extra direction for this shot">${esc(row.prompt || '')}</textarea>
     <div class="shot-tools">
-      <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx})">
+      <button type="button" onclick="chooseCustomReference(${jsArg(manifest)},${idx})">
         Use Custom Image
       </button>
-      <button type="button" onclick="regenerateReference('${esc(manifest)}',${idx})" ${state.running ? 'disabled' : ''}>
+      <button type="button" onclick="regenerateReference(${jsArg(manifest)},${idx})" ${state.running ? 'disabled' : ''}>
         ${regenerating ? 'Generating...' : 'Generate Reference'}
       </button>
       ${regenerating ? '<span class="spinner" aria-label="In progress"></span>' : ''}
@@ -465,7 +465,7 @@ function wireReferenceTimeControls() {
     }
 
     tools.innerHTML = `
-      <button type="button" onclick="scrubShot('${esc(manifest)}',${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
+      <button type="button" onclick="scrubShot(${jsArg(manifest)},${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
         Use Frame
       </button>
     `;

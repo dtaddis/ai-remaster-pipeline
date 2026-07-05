@@ -320,7 +320,7 @@ function colorLayerStyle(s) {
   const rawOpacity = Math.max(0, Number(s.color_opacity || 100));
   const opacity = Math.max(0, Math.min(1, rawOpacity > 1 ? rawOpacity / 100 : rawOpacity));
   const hue = Math.max(-18, Math.min(18, (6500 - temp) / 180));
-  return `filter:saturate(${saturation});opacity:${opacity};hue-rotate(${hue}deg)`;
+  return `filter:saturate(${saturation}) hue-rotate(${hue}deg);opacity:${opacity}`;
 }
 
 function originalFeatherStyle(s) {

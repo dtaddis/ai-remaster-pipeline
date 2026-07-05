@@ -202,7 +202,7 @@ def vram_status() -> dict:
                 percent = int(round((used / total) * 100)) if total else 0
                 payload = memory_payload("VRAM", used, total, percent)
                 payload["detail"] = f"{payload['detail']} - {name} - {util_text}% GPU utilization"
-                payload["gpu_utilization"] = int(util_text)
+                payload["gpu_utilization"] = int(util_text) if util_text.isdigit() else None
                 payload["gpu_name"] = name
                 return payload
         except Exception as exc:

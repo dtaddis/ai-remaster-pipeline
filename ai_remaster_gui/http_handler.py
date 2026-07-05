@@ -112,11 +112,26 @@ class Handler(BaseHTTPRequestHandler):
                 return (urlparse(value).hostname or "").lower() in LOOPBACK_HOSTNAMES
         return True  # same-origin requests may omit both; the Host check still applies
 
+    # GET endpoints that mutate state (spawn preview/crop subprocesses, write cache files) rather
+    # than being pure reads. These get the same cross-origin guard do_POST applies.
+    SIDE_EFFECT_GET_PATHS = frozenset({
+        "/api/shot-preview",
+        "/api/aspect-preview",
+        "/api/outpaint-auto-crop",
+        "/api/outpaint-chunk-preview",
+        "/api/outpaint-guide-preview",
+    })
+
     def do_GET(self) -> None:  # noqa: N802
         if not self.request_host_is_local():
             self.send_error(403)
             return
         parsed = urlparse(self.path)
+        # A page on another site can issue a simple cross-origin GET with no preflight. Block those
+        # from triggering the side-effecting endpoints (CSRF), the same way do_POST is protected.
+        if parsed.path in self.SIDE_EFFECT_GET_PATHS and not self.request_origin_is_local():
+            self.send_error(403)
+            return
         if parsed.path == "/":
             self.send_static(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         elif parsed.path.startswith("/static/"):
