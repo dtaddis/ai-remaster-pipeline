@@ -24,13 +24,22 @@ class HfModel:
     destination: str
 
 
-OUTPAINT_MODELS = [
+LTX_BASE_MODELS = [
     HfModel("QuantStack/LTX-2.3-GGUF", "LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf", "models/unet/LTX-2.3-distilled-Q4_K_M.gguf"),
     HfModel("Lightricks/LTX-2.3-fp8", "ltx-2.3-22b-dev-fp8.safetensors", "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"),
     HfModel("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors", "models/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"),
     HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_video_vae_bf16.safetensors", "models/vae/LTX23_video_vae_bf16.safetensors"),
     HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_audio_vae_bf16.safetensors", "models/vae/LTX23_audio_vae_bf16.safetensors"),
+]
+
+OUTPAINT_MODELS = [
+    *LTX_BASE_MODELS,
     HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
+]
+
+CLEANUP_MODELS = [
+    *LTX_BASE_MODELS,
+    HfModel("oumoumad/ltx-2.3-dearchive-lora", "lora_weights_step_05000.safetensors", "models/loras/ltx-2.3-dearchive-lora.safetensors"),
 ]
 
 QWEN_IMAGE_EDIT_MODELS = [
@@ -333,6 +342,10 @@ def estimate_downloaded_bytes(cache_root: Path, baseline: dict[Path, int]) -> in
 
 def ensure_outpaint_models(comfy_dir: Path) -> None:
     ensure_hf_models(comfy_dir, OUTPAINT_MODELS)
+
+
+def ensure_cleanup_models(comfy_dir: Path) -> None:
+    ensure_hf_models(comfy_dir, CLEANUP_MODELS)
 
 
 def ensure_qwen_image_edit_models(comfy_dir: Path) -> None:

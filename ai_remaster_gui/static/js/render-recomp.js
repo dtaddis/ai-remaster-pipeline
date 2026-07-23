@@ -226,9 +226,17 @@ function upscaleComparisonHtml(s, preview) {
 }
 
 function bindUpscaleComparison() {
+  bindVideoComparison('upscaleCompareSlider');
+}
+
+function bindCleanupComparison() {
+  bindVideoComparison('cleanupCompareSlider');
+}
+
+function bindVideoComparison(sliderId) {
   const before = document.querySelector('.compare-before');
   const after = document.querySelector('.compare-after');
-  const slider = document.getElementById('upscaleCompareSlider');
+  const slider = document.getElementById(sliderId);
   const mask = document.querySelector('.compare-after-mask');
   const handle = document.querySelector('.compare-handle');
   if (!before || !after || !slider || !mask || !handle) return;

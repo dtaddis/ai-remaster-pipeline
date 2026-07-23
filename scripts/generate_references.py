@@ -309,7 +309,7 @@ def write_manifest(path,source_path,rows,info):
         h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','start_frame','end_frame','selected_frame','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
         for row in rows: w.writerow(['true',row.start_frame,row.end_frame,row.selected_frame,format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
     tmp.replace(path)
-def source_signature(source_path,row,out_w=0,out_h=0): return {'version':2,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'generator':'generate_references.py'}
+def source_signature(source_path,row,out_w=0,out_h=0): return {'version':3,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'grayscale':True,'generator':'generate_references.py'}
 def extract_frames(args,source_path,info,rows):
     out_w=int(args.frame_width or 0); out_h=int(args.frame_height or 0)
     write_w=out_w or info.width; write_h=out_h or info.height
@@ -324,6 +324,10 @@ def extract_frames(args,source_path,info,rows):
         if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
         if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
         frame=read_frame(source_path,row.selected_frame)
+        # Dearchive can introduce colour. Reference generation is a separate, user-directed
+        # colourization pass, so always restore a neutral B&W source still before Qwen creates
+        # the colour guide used by Deep Exemplar/ColorMNet.
+        frame=cv2.cvtColor(cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY),cv2.COLOR_GRAY2BGR)
         if out_w and out_h and (frame.shape[1]!=out_w or frame.shape[0]!=out_h):
             frame=cv2.resize(frame,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
         write_png(row.source_reference,frame); write_signature(row.source_reference,sig); print(f'Wrote source frame {row.index:04d} ({write_w}x{write_h}): {row.source_reference}')

@@ -4,6 +4,7 @@ ComfyUI blueprints folder.
 
 Bundled workflows:
 
+- `cleanup_ltx/DeArchive.json` - the Dearchive author's LTX 2.3 IC-LoRA restoration workflow.
 - `outpaint_ltx/outpaint_LTX-IC.json` - LTX IC outpainting.
 - `qwen_image_edit/Image Edit (Qwen 2511).json` - Qwen Image Edit reference
   frame colourisation and outpaint guide-frame generation.

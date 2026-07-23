@@ -1,11 +1,12 @@
 function drawGlobal() {
   const global = state.settings.global || {};
   const source = global.source || '';
+  const cleanup = global.cleanup === 'true';
   const expandOutpaint = global.expand_outpaint !== 'false';
   const colorize = global.colorize !== 'false';
   const upscale = global.upscale === 'true';
   const soundtrack = global.add_soundtrack === 'true';
-  const noProcessing = !expandOutpaint && !colorize && !upscale && !soundtrack;
+  const noProcessing = !cleanup && !expandOutpaint && !colorize && !upscale && !soundtrack;
   const analysis = state.source_analysis || {};
   const sourceTone = source && !analysis.ready
     ? (analysis.message || 'Analyzing source material')
@@ -30,7 +31,7 @@ function drawGlobal() {
       ${overviewSourcePicker(source)}
       ${sourceAnalysisHtml(analysis)}
       ${overviewSectionPicker(global, source)}
-      ${workflowPickerHtml(expandOutpaint, colorize, upscale, soundtrack, sourceTone)}
+      ${workflowPickerHtml(cleanup, expandOutpaint, colorize, upscale, soundtrack, sourceTone)}
       ${noProcessing ? '<div class="inline-warning"><strong>No processing stages selected.</strong> Choose at least one workflow step, otherwise Run Whole Remaster has nothing to do.</div>' : ''}
       <div id="overviewFilmstrip">${overviewFilmstripInner()}</div>
       <div id="overviewSourceInfo">${sourceInfoHtml(state.source_info || {})}</div>
@@ -42,6 +43,7 @@ function drawGlobal() {
   `;
 
   document.getElementById('globalSource').addEventListener('change', saveGlobal);
+  document.getElementById('globalCleanup').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalExpandOutpaint').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalColorize').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalUpscale').addEventListener('change', saveGlobalPipelineOptions);
@@ -49,9 +51,16 @@ function drawGlobal() {
   bindOverviewSectionControls();
 }
 
-function workflowPickerHtml(expandOutpaint, colorize, upscale, soundtrack, sourceTone) {
+function workflowPickerHtml(cleanup, expandOutpaint, colorize, upscale, soundtrack, sourceTone) {
   return `
     <div class="workflow-list">
+      ${workflowOptionHtml({
+        id: 'globalCleanup',
+        checked: cleanup,
+        icon: 'cleanup',
+        title: 'Clean Up',
+        body: 'Run optional DeVignette and masked ProPainter AI DeScratch, then optionally use the LTX 2.3 Dearchive LoRA before any framing or colour work. Output keeps the source frame rate and resolution.',
+      })}
       ${workflowOptionHtml({
         id: 'globalExpandOutpaint',
         checked: expandOutpaint,

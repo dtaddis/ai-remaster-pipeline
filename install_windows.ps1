@@ -1057,6 +1057,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     Install-CustomNodePackage 'ComfyUI-LTXVideo' 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting -PreferBundled
     Install-CustomNodePackage 'ComfyUI-GGUF' 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI_ProPainter_Nodes' 'https://github.com/daniabib/ComfyUI_ProPainter_Nodes.git' (Join-Path $CustomNodes 'ComfyUI_ProPainter_Nodes') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-FlashVSR_Ultra_Fast' 'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git' (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-MMAudio' 'https://github.com/kijai/ComfyUI-MMAudio.git' (Join-Path $CustomNodes 'ComfyUI-MMAudio') -UpdateExisting
     if (-not $SkipDeepExemplar) {
@@ -1080,6 +1081,11 @@ Invoke-Step 'Verify required ComfyUI custom nodes' {
         (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') `
         'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite' `
         @('VHS_LoadVideo', 'VHS_VideoCombine')
+    Assert-CustomNodeSymbols `
+        'ComfyUI_ProPainter_Nodes' `
+        (Join-Path $CustomNodes 'ComfyUI_ProPainter_Nodes') `
+        'https://github.com/daniabib/ComfyUI_ProPainter_Nodes' `
+        @('ProPainterInpaint')
     Assert-CustomNodeSymbols `
         'ComfyUI-FlashVSR_Ultra_Fast' `
         (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') `
@@ -1127,12 +1133,13 @@ Invoke-Step 'Install local FFmpeg tools' {
 }
 
 if ($DownloadModels -and -not $SkipModelDownloads) {
-    Invoke-Step 'Download LTX 2.3 models and outpainting LoRA' {
+    Invoke-Step 'Download LTX 2.3 models, Clean Up LoRA, and outpainting LoRA' {
         Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf')
         Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' (Join-Path $ComfyDir 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors')
         Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors')
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_video_vae_bf16.safetensors')
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_audio_vae_bf16.safetensors')
+        Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-dearchive-lora.safetensors')
         Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors')
     }
 

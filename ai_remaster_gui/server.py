@@ -42,7 +42,7 @@ from .manifests import (
     write_manifest_details,
     write_outpaint_chunk_rows,
 )
-from .models import COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
+from .models import CLEANUP_NEGATIVE_PROMPT, CLEANUP_PROMPT, COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
 from .paths import even_int, format_timecode, newest, rel, resolve, resolve_served, resolve_video_source, safe_stem
 from .power import keep_awake, release_keep_awake
 from .naming import manifest_for_outpainted
@@ -365,6 +365,9 @@ class PipelineApp:
     def colorize_enabled(self) -> bool:
         return is_true(self.settings.get("global", {}), "colorize", "true")
 
+    def cleanup_enabled(self) -> bool:
+        return is_true(self.settings.get("global", {}), "cleanup")
+
     def outpaint_enabled(self) -> bool:
         return is_true(self.settings.get("global", {}), "expand_outpaint", "true")
 
@@ -377,6 +380,8 @@ class PipelineApp:
     def active_stages(self) -> tuple[Stage, ...]:
         by_key = {stage.key: stage for stage in STAGES}
         stages: list[Stage] = []
+        if self.cleanup_enabled():
+            stages.append(by_key["cleanup"])
         if self.outpaint_enabled():
             stages.append(by_key["outpaint"])
         if self.colorize_enabled():
@@ -394,11 +399,22 @@ class PipelineApp:
         earlier processing is enabled, otherwise the selected source section."""
         if self.outpaint_enabled() or self.colorize_enabled():
             return self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
-        return pipeline_source_text(self.settings)
+        return self.cleaned_source_for_downstream()
+
+    def cleanup_output(self) -> str:
+        source = pipeline_source_text(self.settings)
+        return cleanup_output_for(source, self.settings.get("cleanup", {})) if source else ""
+
+    def cleaned_source_for_downstream(self) -> str:
+        """Expected immediate output of Clean Up, or the selected source when it is disabled."""
+        return self.cleanup_output() if self.cleanup_enabled() else pipeline_source_text(self.settings)
+
+    def outpaint_source_for(self) -> str:
+        return self.cleaned_source_for_downstream()
 
     def recomposition_base_input(self) -> str:
         values = self.settings.get("recomp", {})
-        return values.get("outpainted_video", "") or values.get("source", "") or pipeline_source_text(self.settings)
+        return values.get("outpainted_video", "") or values.get("source", "") or self.cleaned_source_for_downstream()
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
@@ -702,6 +718,7 @@ class PipelineApp:
                 "phase_progress": self.phase_progress(),
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
                 "existing_outputs": {stage.key: self.existing_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
+                "cleanup_comparison": self.cleanup_comparison_state(),
                 "upscale_preview": self.upscale_preview_state(),
                 "output_selection": self.output_selection_state(),
                 "source_previews": source_media["previews"],
@@ -759,7 +776,7 @@ class PipelineApp:
             self.log.append(f"Loading source material: {values.get('source')}")
             self.clear_derived_stage_inputs()
             self.hydrate_stage_inputs("global")
-        elif stage == "global" and ({"colorize", "expand_outpaint", "upscale"} & set(values)):
+        elif stage == "global" and ({"cleanup", "colorize", "expand_outpaint", "upscale"} & set(values)):
             self.hydrate_stage_inputs("global")
         elif stage == "colour" and "method" in values:
             if values.get("method") in {"deepexemplar", "colormnet"}:
@@ -916,6 +933,7 @@ class PipelineApp:
 
     def clear_derived_stage_inputs(self) -> None:
         for stage_key, keys in {
+            "cleanup": ("output",),
             "outpaint": ("source", "output", "outpainted_video", "manifest", "colorized_video"),
             "shots": ("outpainted_video", "manifest", "colorized_video"),
             "references": ("manifest", "outpainted_video", "colorized_video"),
@@ -930,8 +948,18 @@ class PipelineApp:
                 stage_settings[key] = ""
 
     def hydrate_stage_inputs(self, completed_stage: str = "") -> None:
+        clean_expected_text = self.cleanup_output()
+        clean_expected = resolve(clean_expected_text) if clean_expected_text else None
+        clean_ready = bool(clean_expected and clean_expected.exists())
+        self.settings.setdefault("cleanup", {})["output"] = clean_expected_text
+        upstream_text = (
+            rel(clean_expected) if self.cleanup_enabled() and clean_ready
+            else "" if self.cleanup_enabled()
+            else pipeline_source_text(self.settings)
+        )
+
         if not self.outpaint_enabled():
-            outpainted_text = pipeline_source_text(self.settings)
+            outpainted_text = upstream_text
             if outpainted_text:
                 self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
                 self.settings.setdefault("recomp", {})["outpainted_video"] = ""
@@ -961,6 +989,10 @@ class PipelineApp:
                 self.settings.setdefault(stage_key, {})["outpainted_video"] = ""
             for stage_key in ("references", "colour", "recomp"):
                 self.settings.setdefault(stage_key, {})["manifest"] = ""
+        elif not self.outpaint_enabled() and not upstream_text:
+            self.settings.setdefault("shots", {})["outpainted_video"] = ""
+            for stage_key in ("references", "colour", "recomp"):
+                self.settings.setdefault(stage_key, {})["manifest"] = ""
         expected_manifest = resolve(self.expected_outputs("shots")[0]) if self.expected_outputs("shots") else None
         manifest = expected_manifest if expected_manifest and expected_manifest.exists() else None
         if manifest:
@@ -984,10 +1016,12 @@ class PipelineApp:
             self.settings.setdefault("recomp", {})["colorized_video"] = ""
         source = self.settings.get("global", {}).get("source")
         if source:
-            self.settings.setdefault("recomp", {})["source"] = pipeline_source_text(self.settings)
+            self.settings.setdefault("recomp", {})["source"] = upstream_text
         output = recomposition_output_for(self.recomposition_base_input())
         if output:
             self.settings.setdefault("recomp", {})["output"] = output
+        else:
+            self.settings.setdefault("recomp", {})["output"] = ""
         soundtrack_source = self.soundtrack_source_for()
         if soundtrack_source:
             self.settings.setdefault("audio", {})["input_video"] = soundtrack_source
@@ -1009,10 +1043,15 @@ class PipelineApp:
 
     def expected_outputs(self, stage_key: str) -> list[str]:
         values = self.settings.get(stage_key, {})
+        if stage_key == "cleanup":
+            if not self.cleanup_enabled():
+                return []
+            output = self.cleanup_output()
+            return [output] if output else []
         if stage_key == "outpaint":
             if not self.outpaint_enabled():
                 return []
-            source = pipeline_source_text(self.settings)
+            source = self.outpaint_source_for()
             return [outpaint_output_for(source, values.get("target_aspect", "16:9"), values.get("target_height", "720"))] if source else []
         if stage_key == "shots":
             manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
@@ -1045,6 +1084,7 @@ class PipelineApp:
     # Shared --force/--dry-run handling lives in command_for so it stays in one place.
     def _stage_command_builders(self) -> dict:
         return {
+            "cleanup": self._cleanup_command,
             "outpaint": self._outpaint_command,
             "shots": self._shots_command,
             "references": self._references_command,
@@ -1067,12 +1107,38 @@ class PipelineApp:
             cmd.append("--dry-run")
         return [part for part in cmd if part != ""]
 
+    def _cleanup_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        source = pipeline_source_text(self.settings)
+        output = cleanup_output_for(source, values) if source else ""
+        cmd = [sys.executable, "-u", str(SCRIPTS / "cleanup_video.py"), "--source", source, "--output", output]
+        if is_true(values, "ai_descratch"):
+            cmd.append("--ai-descratch")
+            if is_true(values, "save_scratch_mask", "true"):
+                cmd.append("--save-scratch-mask")
+        if is_true(values, "devignette"):
+            cmd.append("--devignette")
+        if not is_true(values, "dearchive", "true"):
+            cmd.append("--no-dearchive")
+        add_value_args(
+            cmd,
+            values,
+            (
+                "repair_device", "scratch_sensitivity", "scratch_mask_dilate",
+                "ai_descratch_height", "ai_chunk_frames", "chunk_seconds",
+                "overlap_frames", "source_fidelity", "prompt", "negative_prompt",
+                "lora_strength", "seed",
+            ),
+        )
+        cmd.extend(["--comfy-dir", comfy_dir_for(config), "--comfy-url", comfy_url_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+        return cmd
+
     def _outpaint_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
         cmd = [sys.executable, "-u", str(SCRIPTS / "outpaint_video.py")]
         add = cmd.extend
-        add(["--source", pipeline_source_text(self.settings)])
+        source_text = self.outpaint_source_for()
+        add(["--source", source_text])
         add(["--target-aspect", values.get("target_aspect", "16:9")])
-        add(["--target-height", str(resolved_outpaint_height(pipeline_source_text(self.settings), values.get("target_height", "720")))])
+        add(["--target-height", str(resolved_outpaint_height(source_text, values.get("target_height", "720")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
@@ -1103,7 +1169,7 @@ class PipelineApp:
             add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
             add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
             add(["--seed-min-shot-seconds", shot_values.get("min_shot_seconds", "1.0") or "1.0"])
-        manifest = outpaint_chunk_manifest_for(pipeline_source_text(self.settings), values)
+        manifest = outpaint_chunk_manifest_for(source_text, values)
         if manifest:
             add(["--chunk-manifest", manifest])
         add_value_args(cmd, values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
@@ -1123,11 +1189,16 @@ class PipelineApp:
             add(["--limit", values["limit"]])
         # Extract reference frames at model-safe dimensions (matching the prepared canvas)
         # so thumbnails are consistent with what LTX works with.
-        outpaint_values = self.settings.get("outpaint", {})
-        source_text = pipeline_source_text(self.settings)
-        aspect = outpaint_values.get("target_aspect", "16:9")
-        height_text = outpaint_values.get("target_height", "720")
-        ref_w, ref_h = outpaint_work_size_for_source(source_text, aspect, height_text)
+        source_text = values.get("outpainted_video", "")
+        if self.outpaint_enabled():
+            outpaint_values = self.settings.get("outpaint", {})
+            aspect = outpaint_values.get("target_aspect", "16:9")
+            height_text = outpaint_values.get("target_height", "720")
+            ref_w, ref_h = outpaint_work_size_for_source(self.outpaint_source_for(), aspect, height_text)
+        else:
+            metrics = video_metrics(resolve(source_text)) if source_text else {}
+            ref_w = even_int(int(metrics.get("width") or 720))
+            ref_h = even_int(int(metrics.get("height") or 720))
         add(["--frame-width", str(ref_w), "--frame-height", str(ref_h)])
         return cmd
 
@@ -1248,6 +1319,8 @@ class PipelineApp:
     def run_stage(self, stage_key: str) -> tuple[bool, str]:
         if self.quitting:
             return False, "ARP is shutting down."
+        if stage_key == "cleanup" and not self.cleanup_enabled():
+            return False, "Clean Up is disabled on the Overview tab."
         if stage_key == "outpaint" and not self.outpaint_enabled():
             return False, "Expand using Outpainting is disabled on the Overview tab."
         if stage_key in COLORIZE_STAGE_KEYS and not self.colorize_enabled():
@@ -1259,6 +1332,10 @@ class PipelineApp:
         if stage_key == "upscale" and not self.upscale_enabled():
             return False, "Upscale is disabled on the Overview tab."
         stage = next(item for item in STAGES if item.key == stage_key)
+        if stage_key != "cleanup" and self.cleanup_enabled():
+            clean_output = self.cleanup_output()
+            if not clean_output or not resolve(clean_output).exists():
+                return False, "Run Clean Up first so this phase has its upstream video."
         if stage_key == "audio":
             self.hydrate_stage_inputs("audio")
             audio_values = self.settings.get("audio", {})
@@ -1279,8 +1356,14 @@ class PipelineApp:
             if warning:
                 return False, warning
         values = self.settings[stage_key]
+        if stage_key == "cleanup" and not (
+            is_true(values, "ai_descratch")
+            or is_true(values, "devignette")
+            or is_true(values, "dearchive", "true")
+        ):
+            return False, "Select at least one Clean Up operation: AI DeScratch, DeVignette, or Dearchive."
         missing = [key for key in stage.required if not values.get(key)]
-        if stage_key == "outpaint" and not self.settings.get("global", {}).get("source"):
+        if stage_key in {"cleanup", "outpaint"} and not self.settings.get("global", {}).get("source"):
             missing = ["source material on the Global tab"]
         if stage_key == "recomp":
             if self.outpaint_enabled() and not values.get("outpainted_video"):
@@ -1301,6 +1384,7 @@ class PipelineApp:
                 return False, "Upscaling input is not available yet. Run Recomposition first when earlier phases are enabled."
         needs_comfy = (
             stage_key in {"outpaint", "colour", "audio"}
+            or (stage_key == "cleanup" and is_true(values, "dearchive", "true"))
             or (stage_key == "references" and values.get("method", "qwen") != "openai")
             or stage_key == "upscale"
         )
@@ -1562,7 +1646,7 @@ class PipelineApp:
         if self.outpaint_enabled() or self.colorize_enabled():
             recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
             return recomposed
-        return pipeline_source_text(self.settings)
+        return self.cleaned_source_for_downstream()
 
     def upscale_command(self, values: dict[str, str], source: str, output: str) -> list[str]:
         config = current_config()
@@ -1606,24 +1690,43 @@ class PipelineApp:
         exists = bool(output and resolve(output).exists())
         return {"source": source, "output": output, "exists": "true" if exists else "false", "kind": "preview", "title": "Upscale Preview"}
 
+    def cleanup_comparison_state(self) -> dict[str, str]:
+        source = pipeline_source_text(self.settings)
+        output = self.cleanup_output() if source else ""
+        exists = bool(source and output and resolve(source).exists() and resolve(output).exists())
+        return {
+            "source": source,
+            "output": output,
+            "source_exists": "true" if source and resolve(source).exists() else "false",
+            "exists": "true" if exists else "false",
+            "title": "Clean Up Comparison",
+        }
+
     def output_selection_state(self) -> dict[str, str]:
         upscale = self.settings.get("upscale", {})
         upscale_output = upscale_output_for(self.upscale_input_for() or upscale.get("input_video"), upscale) or upscale.get("output")
-        recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
+        recomposed = (
+            self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
+        ) if (self.outpaint_enabled() or self.colorize_enabled()) else ""
         soundtrack_source = self.soundtrack_source_for()
         soundtrack_output = soundtrack_output_for(soundtrack_source, self.settings.get("audio", {})) if (self.soundtrack_enabled() and soundtrack_source) else ""
+        cleanup_output = self.cleanup_output() if self.cleanup_enabled() else ""
         if upscale_output and resolve(upscale_output).exists():
             return {"path": upscale_output, "kind": "upscaled", "label": "Upscaled output"}
         if soundtrack_output and resolve(soundtrack_output).exists():
             return {"path": soundtrack_output, "kind": "soundtrack", "label": "Soundtrack output"}
         if recomposed and resolve(recomposed).exists():
             return {"path": recomposed, "kind": "recomposed", "label": "Recomposed output"}
+        if cleanup_output and resolve(cleanup_output).exists():
+            return {"path": cleanup_output, "kind": "cleanup", "label": "Clean Up output"}
         if self.upscale_enabled() and upscale_output:
             return {"path": upscale_output, "kind": "upscaled_pending", "label": "Pending upscaled output"}
         if soundtrack_output:
             return {"path": soundtrack_output, "kind": "soundtrack_pending", "label": "Pending soundtrack output"}
         if recomposed:
             return {"path": recomposed, "kind": "recomposed_pending", "label": "Pending recomposed output"}
+        if cleanup_output:
+            return {"path": cleanup_output, "kind": "cleanup_pending", "label": "Pending Clean Up output"}
         return {"path": "", "kind": "", "label": ""}
 
     def run_upscale_preview(self) -> tuple[bool, str]:
@@ -1673,7 +1776,7 @@ class PipelineApp:
         return True, "Started upscale preview."
 
     def upscale_preview_clip_source(self, preview_seconds: float) -> tuple[Path, float, float, str]:
-        if not (self.outpaint_enabled() or self.colorize_enabled()):
+        if not (self.cleanup_enabled() or self.outpaint_enabled() or self.colorize_enabled()):
             global_settings = self.settings.get("global", {})
             source_text = global_settings.get("source", "")
             source = resolve_video_source(source_text)
@@ -1839,6 +1942,53 @@ def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
     crop = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
     black = is_true(values, "outpaint_all_black_regions")
     return crop, black
+
+
+def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
+    if not source_text:
+        return ""
+    source = resolve_video_source(source_text)
+    try:
+        strength = float(values.get("lora_strength", "1.0") or 1.0)
+    except ValueError:
+        strength = 1.0
+    try:
+        source_fidelity = float(values.get("source_fidelity", "1.0") or 1.0)
+    except ValueError:
+        source_fidelity = 1.0
+    try:
+        seed = int(float(values.get("seed", "42") or 42))
+    except ValueError:
+        seed = 42
+    try:
+        scratch_sensitivity = float(values.get("scratch_sensitivity", "0.65") or 0.65)
+    except ValueError:
+        scratch_sensitivity = 0.65
+    try:
+        scratch_mask_dilate = int(float(values.get("scratch_mask_dilate", "3") or 3))
+    except ValueError:
+        scratch_mask_dilate = 3
+    try:
+        ai_chunk_frames = int(float(values.get("ai_chunk_frames", "41") or 41))
+    except ValueError:
+        ai_chunk_frames = 41
+    ident = aid.cleanup_identity(
+        source.name,
+        "ltx-2.3-dearchive-lora.safetensors",
+        values.get("prompt", CLEANUP_PROMPT),
+        values.get("negative_prompt", CLEANUP_NEGATIVE_PROMPT),
+        strength,
+        seed,
+        source_fidelity=source_fidelity,
+        ai_descratch=is_true(values, "ai_descratch"),
+        ai_descratch_height=values.get("ai_descratch_height", "720"),
+        scratch_sensitivity=scratch_sensitivity,
+        scratch_mask_dilate=scratch_mask_dilate,
+        ai_chunk_frames=ai_chunk_frames,
+        devignette=is_true(values, "devignette"),
+        dearchive=is_true(values, "dearchive", "true"),
+    )
+    return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4"))
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
@@ -2018,11 +2168,17 @@ def outpaint_chunks_state(settings: dict) -> dict:
     except Exception as exc:
         return {"manifest": "", "rows": [], "error": f"Could not prepare selected source section: {exc}"}
 
-    source_text = pipeline_source_text(settings)
+    source_text = (
+        settings.get("cleanup", {}).get("output", "")
+        if is_true(settings.get("global", {}), "cleanup")
+        else pipeline_source_text(settings)
+    )
     if not source_text:
         return {"manifest": "", "rows": []}
     source = resolve_video_source(source_text)
     if not source.exists():
+        if is_true(settings.get("global", {}), "cleanup"):
+            return {"manifest": "", "rows": [], "error": "Run Clean Up first so Outpainting has its upstream video."}
         return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
     values = settings.get("outpaint", {})
     metrics = video_metrics(source)
@@ -2163,7 +2319,11 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
             raw_identity = "current"
         return chunk_frame_preview(raw, raw_offset, f"raw_{chunk_index}_{position}_{raw_identity}")
 
-    source_text = pipeline_source_text(settings)
+    source_text = (
+        settings.get("cleanup", {}).get("output", "")
+        if is_true(settings.get("global", {}), "cleanup")
+        else pipeline_source_text(settings)
+    )
     if not source_text:
         return ""
     aspect = settings.get("outpaint", {}).get("target_aspect", "16:9")

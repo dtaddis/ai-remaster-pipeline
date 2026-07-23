@@ -87,6 +87,7 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
         "ComfyUI-LTXVideo": "https://github.com/Lightricks/ComfyUI-LTXVideo -> ComfyUI/custom_nodes/ComfyUI-LTXVideo",
         "ComfyUI-GGUF": "https://github.com/city96/ComfyUI-GGUF -> ComfyUI/custom_nodes/ComfyUI-GGUF",
         "ComfyUI-VideoHelperSuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite -> ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
+        "ComfyUI_ProPainter_Nodes": "https://github.com/daniabib/ComfyUI_ProPainter_Nodes -> ComfyUI/custom_nodes/ComfyUI_ProPainter_Nodes",
         "ComfyUI-FlashVSR_Ultra_Fast": "https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast -> ComfyUI/custom_nodes/ComfyUI-FlashVSR_Ultra_Fast",
         "ComfyUI-Reference-Based-Video-Colorization": "https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization -> ComfyUI/custom_nodes/reference-video-colorization",
         "ComfyUI-MMAudio": "https://github.com/kijai/ComfyUI-MMAudio -> ComfyUI/custom_nodes/ComfyUI-MMAudio",
@@ -237,6 +238,29 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
     links = {int(link[0]): link for link in workflow.get('links', [])}
     needed: set[str] = set()
 
+    def resolve_origin(link_id: int, seen: set[str] | None = None) -> tuple[str, int]:
+        """Follow frontend-only Reroute nodes to the executable source socket."""
+        link_key = int(link_id)
+        if link_key not in links:
+            raise ValueError(f'Workflow references missing link {link_id}')
+        link = links[link_key]
+        origin = str(link[1])
+        origin_slot = int(link[2])
+        node = nodes.get(origin)
+        if not node or node.get('type') != 'Reroute':
+            return origin, origin_slot
+        visited = set() if seen is None else set(seen)
+        if origin in visited:
+            raise ValueError(f'Reroute cycle detected at node {origin}')
+        visited.add(origin)
+        reroute_link = next(
+            (item.get('link') for item in node.get('inputs', []) if isinstance(item, dict) and item.get('link') is not None),
+            None,
+        )
+        if reroute_link is None:
+            raise ValueError(f'Reroute node {origin} has no connected input')
+        return resolve_origin(int(reroute_link), visited)
+
     def visit(node_id: str) -> None:
         if node_id in needed:
             return
@@ -252,7 +276,7 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
             link_key = int(link_id)
             if link_key not in links:
                 raise ValueError(f'Node {node_id} input "{item.get("name")}" references missing link {link_id}')
-            origin = str(links[link_key][1])
+            origin, _ = resolve_origin(link_key)
             visit(origin)
 
     visit(str(output_node_id))
@@ -267,8 +291,8 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
             link_id = item.get('link')
             has_widget = 'widget' in item
             if link_id is not None:
-                link = links[int(link_id)]
-                inputs[name] = [str(link[1]), int(link[2])]
+                origin, origin_slot = resolve_origin(int(link_id))
+                inputs[name] = [origin, origin_slot]
             elif has_widget:
                 if isinstance(widget_values, dict):
                     if name in widget_values:

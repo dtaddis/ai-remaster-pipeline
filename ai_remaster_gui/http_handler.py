@@ -243,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 chunk_index = int(query.get("chunk_index", ["0"])[0])
                 frame_idx = int(query.get("frame_idx", ["0"])[0])
-                source_text = pipeline_source_text(state.APP.settings)
+                source_text = state.APP.outpaint_source_for()
                 if not source_text:
                     self.send_json({"ok": False, "error": "No source material"})
                 else:

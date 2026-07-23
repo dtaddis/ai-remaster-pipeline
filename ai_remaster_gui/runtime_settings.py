@@ -16,7 +16,7 @@ from .config import (
     comfy_output_root_for,
     current_config,
 )
-from .models import STAGES
+from .models import CLEANUP_NEGATIVE_PROMPT, CLEANUP_PROMPT, STAGES
 from .paths import newest, rel, resolve
 
 
@@ -116,7 +116,7 @@ def qwen_masked_workflow_for(values: dict[str, str], config: dict[str, str]) -> 
 
 def base_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": "", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false", "section_start": "0", "section_end": "", "last_browse_dir": ""}
+    defaults["global"] = {"source": "", "cleanup": "false", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false", "section_start": "0", "section_end": "", "last_browse_dir": ""}
     return defaults
 
 
@@ -128,6 +128,24 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["global"]["source"] = rel(source)
     if not defaults["global"].get("source"):
         defaults["global"]["expand_outpaint"] = "true"
+    # 4.0 was the old implicit Clean Up default. It requested 96 frames at 24 fps even though
+    # Dearchive's native window is 97; migrate that untouched default to the precise duration.
+    if defaults["cleanup"].get("chunk_seconds", "") in {"4", "4.0"}:
+        defaults["cleanup"]["chunk_seconds"] = "4.04"
+    # The former deterministic DeScratch filter was removed in favour of masked AI DeScratch.
+    defaults["cleanup"].pop("descratch", None)
+    old_cleanup_prompts = {
+        "",
+        "Clean, restored archive footage with sharp detail, clean tonality, and natural cinematography.",
+    }
+    old_cleanup_negative_prompts = {
+        "",
+        "cartoon, game, 3d render, oversaturated color, color bleeding, flicker, warped geometry, smeared details",
+    }
+    if defaults["cleanup"].get("prompt", "").strip() in old_cleanup_prompts:
+        defaults["cleanup"]["prompt"] = CLEANUP_PROMPT
+    if defaults["cleanup"].get("negative_prompt", "").strip() in old_cleanup_negative_prompts:
+        defaults["cleanup"]["negative_prompt"] = CLEANUP_NEGATIVE_PROMPT
     if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
         defaults["recomp"]["colorized_video"] = ""
     old_outpaint_prompts = {

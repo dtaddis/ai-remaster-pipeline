@@ -163,6 +163,57 @@ def outpaint_name(source_name: str, aspect: str, work_w: int, work_h: int, crop:
     return f"{base}.{ext}" if ext else base
 
 
+def cleanup_identity(
+    source_name: str,
+    lora: str,
+    prompt: str,
+    negative_prompt: str,
+    strength: float,
+    seed: int,
+    *,
+    source_fidelity: float = 1.0,
+    ai_descratch: bool = False,
+    ai_descratch_height: int | str = 720,
+    scratch_sensitivity: float = 0.65,
+    scratch_mask_dilate: int = 3,
+    ai_chunk_frames: int = 41,
+    devignette: bool = False,
+    dearchive: bool = True,
+) -> dict:
+    """Identity for the geometry-preserving archive clean-up render.
+
+    Chunk size and overlap are deliberately resume settings rather than identity settings: changing
+    how a movie is divided should rebuild the same logical output path, while model/prompt changes
+    describe a genuinely different restoration.
+    """
+    identity = {
+        "v": 5,
+        "kind": "cleanup",
+        "source": safe_stem(source_name),
+        "ai_descratch": bool(ai_descratch),
+        "devignette": bool(devignette),
+        "dearchive": bool(dearchive),
+    }
+    if ai_descratch:
+        identity.update({
+            "ai_model": "propainter",
+            "ai_height": str(ai_descratch_height),
+            "scratch_sensitivity": float(scratch_sensitivity),
+            "scratch_mask_dilate": int(scratch_mask_dilate),
+            "ai_chunk_frames": int(ai_chunk_frames),
+        })
+    if dearchive:
+        identity.update({
+            "lora": Path(str(lora)).name,
+            "prompt": str(prompt).strip(),
+            "negative_prompt": str(negative_prompt).strip(),
+            "strength": float(strength),
+            "source_fidelity": float(source_fidelity),
+            "seed": int(seed),
+        })
+    return identity
+
+
 def shots_identity(outpaint_stem: str) -> dict:
     """Shot manifest is keyed on the outpainted video only, so it stays stable and user-editable
     across detection-parameter tweaks (threshold etc. live in the resume sig, not the identity)."""

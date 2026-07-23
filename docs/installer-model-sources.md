@@ -8,7 +8,18 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 - Text encoder: `Comfy-Org/ltx-2/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors`
 - Audio VAE: `Kijai/LTX2.3_comfy/vae/LTX23_audio_vae_bf16.safetensors`
 - Distilled LoRA: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384.safetensors`
+- Clean Up / Dearchive LoRA: `oumoumad/ltx-2.3-dearchive-lora/lora_weights_step_05000.safetensors` → `models/loras/ltx-2.3-dearchive-lora.safetensors`
 - Outpainting LoRA: `oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint/ltx-2.3-22b-ic-lora-outpaint.safetensors`
+
+## ProPainter (AI DeScratch)
+
+The installer adds `daniabib/ComfyUI_ProPainter_Nodes`. On the first AI DeScratch run that node
+downloads `raft-things.pth`, `recurrent_flow_completion.pth`, and `ProPainter.pth` from the official
+`sczhou/ProPainter` GitHub release into the node's `weights` folder.
+
+ProPainter is covered by the NTU S-Lab License 1.0 and is limited to non-commercial use. The GUI
+labels this restriction; do not enable AI DeScratch for commercial processing without obtaining
+separate permission from the model authors.
 
 ## Qwen Image Edit
 

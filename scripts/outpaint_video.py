@@ -319,6 +319,20 @@ def bypass_optional_preview_nodes(workflow: dict[str, Any]) -> None:
     except KeyError:
         pass
 
+    # Dearchive's demo graph uses a Crystools latent switch to optionally let source audio drive
+    # the video. Its default is the ordinary empty-audio latent, so route that branch directly
+    # into the AV concat node and keep Clean Up runnable on ARP's minimal node installation.
+    try:
+        empty_audio_link = input_link(workflow, "5112", "on_false")
+        if empty_audio_link is not None:
+            links = {int(link[0]): link for link in workflow.get("links", [])}
+            source_link = links.get(int(empty_audio_link))
+            if source_link is not None:
+                patch_link(workflow, 13649, int(source_link[1]), int(source_link[2]), 4528, 1, "LATENT")
+                set_input_link(workflow, "4528", "audio_latent", 13649)
+    except KeyError:
+        pass
+
 
 def bypass_demo_padding_node(workflow: dict[str, Any]) -> None:
     """Route around KJNodes' ImagePadKJ when ARP has already prepared the canvas."""
@@ -373,6 +387,16 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
             "widgets_values": [args.video_vae],
         },
     )
+    # Author workflows have used different link IDs for the checkpoint's video-VAE outputs
+    # (notably Dearchive uses 13619 for decode, while the outpaint workflow used 13348). Route
+    # every former checkpoint VAE edge through the standalone VAE instead of relying only on a
+    # fixed list of historical IDs.
+    vae_links: list[int] = []
+    for link in workflow.get("links", []):
+        if int(link[1]) == 3940 and int(link[2]) == 2:
+            link[1], link[2] = 9001, 0
+            vae_links.append(int(link[0]))
+    node_by_id(workflow, "9001")["outputs"][0]["links"] = sorted(set(vae_links) | {13279, 13348, 13405})
     patch_link(workflow, 13217, 3940, 0, 5011, 0, "MODEL")
     patch_link(workflow, 13279, 9001, 0, 3159, 0, "VAE")
     patch_link(workflow, 13348, 9001, 0, 4851, 1, "VAE")
@@ -382,7 +406,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     ensure_widget_input(lora_node, "lora_name")
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
     set_widget(lora_node, "0", args.outpaint_lora)
-    set_widget(lora_node, "1", 1.0)
+    set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
     audio_vae_node = node_by_id(workflow, "4010")
     ensure_widget_input(audio_vae_node, "ckpt_name")
     set_widget(audio_vae_node, "0", args.audio_vae_checkpoint)
@@ -678,6 +702,19 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # nodes must not reinterpret guide geometry.
     bypass_demo_padding_node(workflow)
     bypass_conditioning_resize_nodes(workflow)
+
+    # Clean Up uses the complete prepared clip as node 5012's video IC-LoRA guide. Keep this
+    # separate from guide_strength, which controls the optional one-frame i2v guide at node 3159.
+    # A value below 1 gives Dearchive room to repaint defects instead of copying them verbatim.
+    source_fidelity = getattr(args, "source_fidelity", None)
+    if source_fidelity is not None:
+        fidelity = float(source_fidelity)
+        if not 0.0 <= fidelity <= 1.0:
+            raise ValueError("Source fidelity must be between 0 and 1.")
+        try:
+            set_widget(node_by_id(workflow, "5012"), "1", fidelity)
+        except KeyError:
+            pass
 
     # Extra guide frames via LTXVAddGuideAdvanced — inserted after GGUF patching so the VAE
     # source is already resolved.  Each guide is chained off the previous one.

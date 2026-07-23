@@ -1490,6 +1490,7 @@ async function saveGlobalPipelineOptions() {
   await postJson('/api/settings', {
     stage: 'global',
     values: {
+      cleanup: String(document.getElementById('globalCleanup').checked),
       expand_outpaint: String(document.getElementById('globalExpandOutpaint').checked),
       colorize: String(document.getElementById('globalColorize').checked),
       upscale: String(document.getElementById('globalUpscale').checked),
@@ -1807,7 +1808,7 @@ async function clearCacheCategory(category, title) {
 
 async function clearAllCache() {
   const message = 'Clear ALL ARP cached/intermediate files?\n\n'
-    + 'This deletes generated previews, outpaint chunks, prepared videos, references, colorized intermediates, and manifests. '
+    + 'This deletes generated previews, Clean Up chunks, outpaint chunks, prepared videos, references, colorized intermediates, and manifests. '
     + 'Source videos, installed tools, and downloaded models are left alone.\n\n'
     + 'This cannot be undone.';
   if (!confirm(message)) return;

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import comfy_api  # noqa: E402
 import audio_models  # noqa: E402
 import common  # noqa: E402
+import cleanup_video  # noqa: E402
 import colorize_video  # noqa: E402
 import create_audio_track  # noqa: E402
 import generate_single_reference  # noqa: E402
@@ -99,6 +100,7 @@ class GuiSmokeTests(unittest.TestCase):
         # `python -u <script>`. Protects the dispatch while it is consolidated into a stage registry.
         self._populate_full_pipeline_settings()
         expected = {
+            "cleanup": "cleanup_video.py",
             "outpaint": "outpaint_video.py",
             "shots": "generate_references.py",
             "references": "qwen_colorize_references.py",
@@ -133,6 +135,493 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(active(F, F, F, T), ["upscale"])
         self.assertEqual(active(F, F, T, F), ["audio"])
         self.assertEqual(active(F, F, F, F), [])
+
+    def test_cleanup_is_optional_and_runs_before_outpainting(self) -> None:
+        app.APP.settings["global"].update(
+            {"cleanup": "true", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false"}
+        )
+
+        self.assertEqual(
+            [stage.key for stage in app.APP.active_stages()],
+            ["cleanup", "outpaint", "shots", "references", "colour", "recomp"],
+        )
+
+    def test_cleanup_output_name_matches_gui_and_producer(self) -> None:
+        source = app.resolve_video_source("input/example.mp4")
+        values = app.APP.settings["cleanup"]
+        args = cleanup_video.build_parser().parse_args(["--source", str(source)])
+
+        self.assertEqual(app.cleanup_output_for(str(source), values), app.rel(cleanup_video.default_output(source, args)))
+
+    def test_cleanup_output_routes_to_outpaint_when_ready(self) -> None:
+        app.APP.settings["global"].update(
+            {"source": "input/example.mp4", "cleanup": "true", "expand_outpaint": "true", "colorize": "false"}
+        )
+        cleaned = app.cleanup_output_for("input/example.mp4", app.APP.settings["cleanup"])
+        cleaned_path = app.resolve(cleaned)
+        cleaned_path.parent.mkdir(parents=True, exist_ok=True)
+        cleaned_path.write_bytes(b"placeholder")
+        try:
+            app.APP.hydrate_stage_inputs("cleanup")
+            command = app.APP.command_for("outpaint")
+        finally:
+            cleaned_path.unlink(missing_ok=True)
+
+        self.assertEqual(command[command.index("--source") + 1], cleaned)
+        self.assertEqual(app.APP.settings["recomp"]["source"], cleaned)
+
+    def test_cleanup_output_routes_directly_to_colorization_when_outpainting_is_off(self) -> None:
+        app.APP.settings["global"].update(
+            {"source": "input/example.mp4", "cleanup": "true", "expand_outpaint": "false", "colorize": "true"}
+        )
+        cleaned = app.cleanup_output_for("input/example.mp4", app.APP.settings["cleanup"])
+        cleaned_path = app.resolve(cleaned)
+        cleaned_path.parent.mkdir(parents=True, exist_ok=True)
+        cleaned_path.write_bytes(b"placeholder")
+        try:
+            app.APP.hydrate_stage_inputs("cleanup")
+            shots_command = app.APP.command_for("shots")
+        finally:
+            cleaned_path.unlink(missing_ok=True)
+
+        self.assertEqual(app.APP.settings["shots"]["outpainted_video"], cleaned)
+        self.assertEqual(shots_command[shots_command.index("--source-video") + 1], cleaned)
+        self.assertEqual(app.APP.settings["recomp"]["source"], cleaned)
+
+    def test_cleanup_only_can_feed_upscaling(self) -> None:
+        app.APP.settings["global"].update(
+            {"source": "input/example.mp4", "cleanup": "true", "expand_outpaint": "false", "colorize": "false", "upscale": "true"}
+        )
+        cleaned = app.cleanup_output_for("input/example.mp4", app.APP.settings["cleanup"])
+        cleaned_path = app.resolve(cleaned)
+        cleaned_path.parent.mkdir(parents=True, exist_ok=True)
+        cleaned_path.write_bytes(b"placeholder")
+        try:
+            app.APP.hydrate_stage_inputs("cleanup")
+            command = app.APP.command_for("upscale")
+        finally:
+            cleaned_path.unlink(missing_ok=True)
+
+        self.assertEqual([stage.key for stage in app.APP.active_stages()], ["cleanup", "upscale"])
+        self.assertEqual(command[command.index("--input") + 1], cleaned)
+
+    def test_cleanup_comparison_pairs_pipeline_source_with_finished_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            source = Path(tmp_text) / "comparison-source.mp4"
+            source.write_bytes(b"placeholder")
+            app.APP.settings["global"].update(
+                {"source": app.rel(source), "cleanup": "true", "section_start": "0", "section_end": ""}
+            )
+            output = app.resolve(app.cleanup_output_for(app.rel(source), app.APP.settings["cleanup"]))
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"placeholder")
+            try:
+                comparison = app.APP.cleanup_comparison_state()
+            finally:
+                output.unlink(missing_ok=True)
+
+        self.assertEqual(comparison["source"], app.rel(source))
+        self.assertEqual(comparison["output"], app.rel(output))
+        self.assertEqual(comparison["source_exists"], "true")
+        self.assertEqual(comparison["exists"], "true")
+
+    def test_cleanup_page_wires_the_shared_before_after_player(self) -> None:
+        helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
+        comparison = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-recomp.js").read_text(encoding="utf-8")
+
+        self.assertIn("function drawCleanup", helpers)
+        self.assertIn('id="cleanupCompareSlider"', helpers)
+        self.assertIn("bindCleanupComparison()", helpers)
+        self.assertIn("bindVideoComparison('cleanupCompareSlider')", comparison)
+
+    def test_cleanup_chunk_duration_defaults_to_97_frames_and_valid_ltx_sizes(self) -> None:
+        args = cleanup_video.build_parser().parse_args(["--source", "input/example.mp4"])
+
+        self.assertEqual(args.chunk_seconds, 4.04)
+        self.assertEqual(cleanup_video.dearchive_chunk_frames(args.chunk_seconds, 24.0), 97)
+        self.assertEqual(cleanup_video.dearchive_chunk_frames(args.chunk_seconds, 23.976), 97)
+        self.assertEqual(cleanup_video.dearchive_chunk_frames(args.chunk_seconds, 25.0), 97)
+        self.assertEqual(cleanup_video.dearchive_chunk_frames(2.0, 24.0), 49)
+        self.assertEqual(cleanup_video.dearchive_chunk_frames(20.0, 24.0), 481)
+        for seconds in (2.0, 3.25, 4.04, 10.0, 20.0):
+            self.assertEqual(cleanup_video.dearchive_chunk_frames(seconds, 24.0) % 8, 1)
+
+    def test_cleanup_chunk_duration_is_bounded_to_two_through_twenty_seconds(self) -> None:
+        parser = cleanup_video.build_parser()
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--source", "input/example.mp4", "--chunk-seconds", "1.99"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--source", "input/example.mp4", "--chunk-seconds", "20.01"])
+
+    def test_cleanup_source_fidelity_defaults_to_exact_control_and_is_bounded(self) -> None:
+        parser = cleanup_video.build_parser()
+
+        self.assertEqual(parser.parse_args(["--source", "input/example.mp4"]).source_fidelity, 1.0)
+        self.assertEqual(
+            parser.parse_args(["--source", "input/example.mp4", "--source-fidelity", "0.55"]).source_fidelity,
+            0.55,
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--source", "input/example.mp4", "--source-fidelity", "-0.01"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--source", "input/example.mp4", "--source-fidelity", "1.01"])
+
+    def test_cleanup_ui_exposes_bounded_chunk_duration_and_rounding_help(self) -> None:
+        cleanup_stage = next(stage for stage in app.STAGES if stage.key == "cleanup")
+        chunk_field = next(field for field in cleanup_stage.fields if field[0] == "chunk_seconds")
+        helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
+
+        self.assertEqual(chunk_field, ("chunk_seconds", "Dearchive chunk length", "range:2|20|0.01", "4.04"))
+        self.assertIn("frames % 8 = 1 (8n + 1)", helpers)
+        self.assertIn("4.04 seconds becomes 97 frames at 24 fps", helpers)
+        self.assertIn("const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds'", helpers)
+
+    def test_cleanup_exposes_independent_repairs_and_optional_dearchive(self) -> None:
+        cleanup_stage = next(stage for stage in app.STAGES if stage.key == "cleanup")
+        fields = {field[0]: field for field in cleanup_stage.fields}
+
+        self.assertNotIn("descratch", fields)
+        self.assertEqual(fields["ai_descratch"], ("ai_descratch", "AI DeScratch (ProPainter)", "checkbox", "false"))
+        self.assertEqual(fields["ai_descratch_height"], ("ai_descratch_height", "AI DeScratch resolution", "select:540|720|1080|source", "720"))
+        self.assertEqual(fields["ai_chunk_frames"], ("ai_chunk_frames", "AI DeScratch chunk frames", "select:25|33|41|49", "41"))
+        self.assertEqual(fields["devignette"], ("devignette", "DeVignette", "checkbox", "false"))
+        self.assertEqual(fields["dearchive"], ("dearchive", "Dearchive (LTX 2.3 LoRA)", "checkbox", "true"))
+        self.assertEqual(fields["repair_device"], ("repair_device", "DeVignette processor", "select:auto|cuda|cpu", "auto"))
+        self.assertEqual(fields["source_fidelity"], ("source_fidelity", "Source Fidelity", "range:0|1|0.05", "1.0"))
+        helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
+        self.assertIn("Lower values give Dearchive more freedom to repaint damage", helpers)
+        self.assertIn("non-commercial use only", helpers)
+        self.assertIn("${cleanupLicenseWarning(s)}", helpers)
+        self.assertIn("AI DeScratch is non-commercial only.", helpers)
+        self.assertIn("s.ai_descratch !== 'true'", helpers)
+        self.assertIn("github.com/sczhou/ProPainter/blob/main/LICENSE", helpers)
+        parser = cleanup_video.build_parser()
+        defaults = parser.parse_args(["--source", "input/example.mp4"])
+        self.assertTrue(defaults.dearchive)
+        self.assertFalse(defaults.ai_descratch)
+        self.assertEqual(defaults.ai_descratch_height, "720")
+        self.assertEqual(defaults.ai_chunk_frames, 41)
+        self.assertAlmostEqual(defaults.scratch_sensitivity, 0.65)
+        self.assertEqual(defaults.repair_device, "auto")
+        local_only = parser.parse_args([
+            "--source", "input/example.mp4", "--devignette", "--no-dearchive",
+        ])
+        self.assertTrue(local_only.devignette)
+        self.assertFalse(local_only.dearchive)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--source", "input/example.mp4", "--descratch"])
+
+    def test_cleanup_command_passes_independent_operation_flags(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "cleanup": "true"})
+        app.APP.settings["cleanup"].update({
+            "ai_descratch": "true", "devignette": "true",
+            "dearchive": "false", "source_fidelity": "0.55",
+        })
+
+        command = app.APP.command_for("cleanup")
+
+        self.assertNotIn("--descratch", command)
+        self.assertIn("--ai-descratch", command)
+        self.assertIn("--save-scratch-mask", command)
+        self.assertIn("--devignette", command)
+        self.assertIn("--no-dearchive", command)
+        self.assertEqual(command[command.index("--repair-device") + 1], "auto")
+        self.assertEqual(command[command.index("--source-fidelity") + 1], "0.55")
+        self.assertEqual(command[command.index("--ai-descratch-height") + 1], "720")
+        self.assertEqual(command[command.index("--ai-chunk-frames") + 1], "41")
+
+    def test_cleanup_identity_changes_with_each_operation(self) -> None:
+        source = "input/example.mp4"
+        base = dict(app.APP.settings["cleanup"])
+        paths = set()
+        for ai_descratch, devignette, dearchive in (
+            ("true", "false", "false"),
+            ("false", "true", "false"),
+            ("true", "true", "false"),
+            ("false", "false", "true"),
+            ("true", "true", "true"),
+        ):
+            values = dict(
+                base,
+                ai_descratch=ai_descratch,
+                devignette=devignette,
+                dearchive=dearchive,
+            )
+            paths.add(app.cleanup_output_for(source, values))
+
+        self.assertEqual(len(paths), 5)
+
+        weak = app.cleanup_output_for(source, dict(base, dearchive="true", source_fidelity="0.55"))
+        exact = app.cleanup_output_for(source, dict(base, dearchive="true", source_fidelity="1.0"))
+        self.assertNotEqual(weak, exact)
+        ai = app.cleanup_output_for(source, dict(base, ai_descratch="true", dearchive="false"))
+        local = app.cleanup_output_for(source, dict(base, ai_descratch="false", dearchive="false"))
+        self.assertNotEqual(ai, local)
+
+    def test_ai_descratch_mask_selects_vertical_damage_not_horizontal_picture_edges(self) -> None:
+        import numpy as np
+
+        height, width = 192, 320
+        frame = np.full((height, width, 3), 128, dtype=np.uint8)
+        frame[:, 91:93] = 28
+        frame[:, 206] = 230
+        frame[96:100, :] = 35
+
+        mask = cleanup_video.ai_scratch_mask(frame, 0.65)
+
+        self.assertGreater(np.count_nonzero(mask[:, 90:94]), height)
+        self.assertGreater(np.count_nonzero(mask[:, 204:208]), height // 2)
+        horizontal_only = np.concatenate(
+            (mask[94:102, 16:80], mask[94:102, 110:190], mask[94:102, 220:304]),
+            axis=1,
+        )
+        self.assertLess(np.count_nonzero(horizontal_only), 20)
+
+    def test_ai_descratch_prompt_is_masked_and_source_geometry_is_separate(self) -> None:
+        args = cleanup_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--ai-descratch", "--no-dearchive",
+        ])
+        prompt = cleanup_video.propainter_prompt(
+            Path("source.mp4"), Path("mask.mp4"), 1280, 720, 24.0, "test/repair", args
+        )
+
+        self.assertEqual(prompt["4"]["class_type"], "ProPainterInpaint")
+        self.assertEqual(prompt["4"]["inputs"]["image"], ["1", 0])
+        self.assertEqual(prompt["4"]["inputs"]["mask"], ["3", 0])
+        self.assertEqual(prompt["4"]["inputs"]["width"], 1280)
+        self.assertEqual(prompt["4"]["inputs"]["height"], 720)
+        self.assertEqual(prompt["4"]["inputs"]["subvideo_length"], 41)
+        self.assertTrue(prompt["5"]["inputs"]["save_output"])
+
+    def test_devignette_corrects_both_dark_and_light_edges(self) -> None:
+        import numpy as np
+
+        height, width = 120, 160
+        radius = cleanup_video.radial_coordinates(width, height)
+        centre = radius < 0.25
+        edge = (radius > 0.9) & (radius < 1.1)
+        for field in (1.0 - 0.34 * np.minimum(radius, 1.0) ** 2, 1.0 + 0.30 * np.minimum(radius, 1.0) ** 2):
+            frame = np.clip(128.0 * field[:, :, None] * np.ones((1, 1, 3)), 0, 255).astype(np.uint8)
+            profile, ratio = cleanup_video.vignette_profile([frame] * 4)
+            corrected = cleanup_video.apply_vignette_correction(frame, profile)
+            before = abs(float(frame[edge].mean()) - float(frame[centre].mean()))
+            after = abs(float(corrected[edge].mean()) - float(corrected[centre].mean()))
+
+            self.assertIsNotNone(profile)
+            self.assertTrue(ratio < 0.91 or ratio > 1.09)
+            self.assertLess(after, before * 0.35)
+
+    def test_devignette_excludes_and_preserves_black_presentation_bars(self) -> None:
+        import numpy as np
+
+        frame = np.zeros((120, 200, 3), dtype=np.uint8)
+        active = np.full((120, 160, 3), 128, dtype=np.float32)
+        radius = cleanup_video.radial_coordinates(160, 120)
+        active *= (1.0 - 0.30 * np.minimum(radius, 1.0) ** 2)[:, :, None]
+        frame[:, 20:180] = np.clip(active, 0, 255).astype(np.uint8)
+
+        profile, _ratio = cleanup_video.vignette_profile([frame] * 4)
+        corrected = cleanup_video.apply_vignette_correction(frame, profile)
+
+        self.assertIsNotNone(profile)
+        self.assertAlmostEqual(profile.bounds[0], 0.1, places=2)
+        self.assertAlmostEqual(profile.bounds[2], 0.9, places=2)
+        self.assertEqual(int(corrected[:, :20].max()), 0)
+        self.assertEqual(int(corrected[:, 180:].max()), 0)
+
+    def test_cuda_devignette_processor_handles_vignette(self) -> None:
+        import numpy as np
+
+        available, reason = cleanup_video.TorchDeVignetteProcessor.available()
+        if not available:
+            self.skipTest(reason)
+        height, width = 96, 256
+        radius = cleanup_video.radial_coordinates(width, height)
+        field = 1.0 - 0.25 * np.minimum(radius, 1.0) ** 2
+        frame = np.clip(128.0 * field[:, :, None], 0, 255)
+        frame = np.repeat(frame, 3, axis=2).astype(np.uint8)
+        profile, _ratio = cleanup_video.vignette_profile([frame] * 4)
+        processor = cleanup_video.TorchDeVignetteProcessor(width, height, profile, "cuda")
+
+        repaired = processor.process([frame, frame])
+        centre = radius < 0.25
+        edge = (radius > 0.9) & (radius < 1.1)
+        before = abs(float(frame[edge].mean()) - float(frame[centre].mean()))
+        after = abs(float(repaired[0][edge].mean()) - float(repaired[0][centre].mean()))
+
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(repaired[0].shape, frame.shape)
+        self.assertLess(after, before * 0.45)
+
+    def test_devignette_streams_a_geometry_preserving_video_without_comfy(self) -> None:
+        ffmpeg = common.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "damaged.mp4"
+            work = folder / "work"
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=gray:s=96x64:r=8:d=0.5",
+                    "-vf", "drawbox=x=47:y=0:w=1:h=64:color=black:t=fill",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            args = cleanup_video.build_parser().parse_args([
+                "--source", str(source), "--devignette", "--no-dearchive",
+            ])
+            info = cleanup_video.probe_video(source)
+
+            repaired = cleanup_video.prepare_devignette(ffmpeg, source, work, info, args)
+            result = cleanup_video.probe_video(repaired)
+
+        self.assertEqual((result["width"], result["height"]), (96, 64))
+        self.assertAlmostEqual(result["fps"], 8.0, places=3)
+        self.assertEqual(result["frames"], info["frames"])
+
+    def test_cleanup_workflow_uses_dearchive_lora_and_standalone_video_vae(self) -> None:
+        args = cleanup_video.build_parser().parse_args(["--source", "input/example.mp4"])
+        args.outpaint_lora = args.cleanup_lora
+        workflow = json.loads(cleanup_video.DEFAULT_WORKFLOW.read_text(encoding="utf-8-sig"))
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_cleanup/example.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_cleanup/frame.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 97, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args,
+                workflow,
+                Path("input/example.mp4"),
+                Path("tools/comfyui"),
+                "arp_cleanup/example",
+                args.prompt,
+                args.negative_prompt,
+                args.seed,
+            )
+
+        self.assertEqual(prompt["5011"]["inputs"]["lora_name"], "ltx-2.3-dearchive-lora.safetensors")
+        self.assertEqual(prompt["5011"]["inputs"]["strength_model"], 1.0)
+        self.assertEqual(prompt["5012"]["inputs"]["strength"], 1.0)
+        self.assertEqual(prompt["9001"]["class_type"], "VAELoader")
+        self.assertEqual(prompt["4851"]["inputs"]["vae"], ["9001", 0])
+        self.assertNotIn("Switch latent [Crystools]", {node["class_type"] for node in prompt.values()})
+
+    def test_cleanup_source_fidelity_controls_the_complete_video_guide(self) -> None:
+        args = cleanup_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--source-fidelity", "0.55",
+        ])
+        args.outpaint_lora = args.cleanup_lora
+        workflow = json.loads(cleanup_video.DEFAULT_WORKFLOW.read_text(encoding="utf-8-sig"))
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_cleanup/example.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_cleanup/frame.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 97, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, Path("input/example.mp4"), Path("tools/comfyui"),
+                "arp_cleanup/example", args.prompt, args.negative_prompt, args.seed,
+            )
+
+        self.assertEqual(prompt["5012"]["inputs"]["image"], ["5060", 0])
+        self.assertEqual(prompt["5012"]["inputs"]["strength"], 0.55)
+        self.assertTrue(prompt["5019"]["inputs"]["value"])
+
+    def test_cleanup_finalize_restores_exact_source_geometry_and_timing(self) -> None:
+        ffmpeg = common.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            generated = folder / "generated.mp4"
+            output = folder / "cleaned.mp4"
+            subprocess.run(
+                [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=gray:s=86x48:r=12:d=1",
+                 "-f", "lavfi", "-i", "anullsrc=channel_layout=5.1:sample_rate=48000:d=1",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-map", "0:v:0",
+                 "-map", "1:a:0", "-map", "2:a:0", "-shortest", "-vf", "setsar=1280/1281:max=100000",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=blue:s=96x64:r=12:d=0.75",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(generated)],
+                check=True,
+                capture_output=True,
+            )
+            info = cleanup_video.probe_video(source)
+
+            cleanup_video.finalize_output(ffmpeg, generated, source, output, info)
+            result = cleanup_video.probe_video(output)
+            output_sar = cleanup_video.probe_sample_aspect_ratio(ffmpeg, output)
+            ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+            audio_probe = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=channels,channel_layout",
+                 "-of", "json", str(output)], check=True, capture_output=True, text=True,
+            )
+            audio_streams = json.loads(audio_probe.stdout)["streams"]
+
+        self.assertEqual((result["width"], result["height"]), (86, 48))
+        self.assertAlmostEqual(result["fps"], 12.0, places=3)
+        self.assertEqual(result["frames"], info["frames"])
+        self.assertEqual(output_sar, "1280/1281")
+        self.assertEqual(audio_streams, [{"channels": 2, "channel_layout": "stereo"}])
+
+    def test_cleanup_finalize_handles_a_source_with_no_audio_packets(self) -> None:
+        ffmpeg = common.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "silent-source.mp4"
+            generated = folder / "generated.mp4"
+            output = folder / "cleaned.mp4"
+            for path, colour in ((source, "gray"), (generated, "blue")):
+                subprocess.run(
+                    [ffmpeg, "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=86x48:r=12:d=1",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)],
+                    check=True,
+                    capture_output=True,
+                )
+
+            self.assertIsNone(cleanup_video.first_audio_packet_stream(ffmpeg, source))
+            cleanup_video.finalize_output(ffmpeg, generated, source, output, cleanup_video.probe_video(source))
+            result = cleanup_video.probe_video(output)
+
+        self.assertEqual((result["width"], result["height"], result["frames"]), (86, 48, 12))
+
+    def test_colorization_always_builds_a_grayscale_model_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            source.write_bytes(b"fixture")
+            with (
+                mock.patch.object(colorize_video, "ROOT", folder),
+                mock.patch.object(colorize_video, "resumable_output", return_value=False),
+                mock.patch.object(colorize_video.subprocess, "run") as run,
+                mock.patch.object(colorize_video, "replace_with_retry"),
+                mock.patch.object(colorize_video, "write_signature"),
+            ):
+                output = colorize_video.prepare_processing_video("ffmpeg", source, 640, 360, 640, 360)
+
+        command = run.call_args.args[0]
+        self.assertIn("hue=s=0", command[command.index("-vf") + 1])
+        self.assertTrue(output.name.endswith("_gray.mp4"))
+        self.assertNotEqual(output, source)
+
+    def test_both_colorization_backends_consume_the_guarded_video_input(self) -> None:
+        for method, expected_node in (
+            ("deepexemplar", "DeepExColorVideoNode"),
+            ("colormnet", "ColorMNetVideo"),
+        ):
+            with self.subTest(method=method):
+                args = colorize_video.build_parser().parse_args(["--manifest", "shots.csv", "--method", method])
+                prompt = colorize_video.build_prompt(
+                    "arp_colorize/guarded_gray.mp4", "reference.png", 12, 24, 640, 360, 24.0, args, "test/output"
+                )
+
+                self.assertEqual(prompt["1"]["inputs"]["video"], "arp_colorize/guarded_gray.mp4")
+                self.assertEqual(prompt["3"]["class_type"], expected_node)
+                self.assertEqual(prompt["3"]["inputs"]["video_frames"], ["1", 0])
 
     def test_source_resolver_accepts_ascii_pipe_for_full_width_pipe_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -1817,6 +2306,15 @@ class GuiSmokeTests(unittest.TestCase):
                 settings = app.load_settings()
 
         self.assertEqual(settings["outpaint"]["seed_qwen_guides"], "false")
+
+    def test_load_settings_discards_removed_legacy_descratch_option(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            settings_file = Path(tmp_text) / "settings.json"
+            settings_file.write_text(json.dumps({"cleanup": {"descratch": "true"}}), encoding="utf-8")
+            with mock.patch.object(app, "SETTINGS_FILE", settings_file), mock.patch.object(app, "newest", return_value=None):
+                settings = app.load_settings()
+
+        self.assertNotIn("descratch", settings["cleanup"])
 
     def test_clear_overview_resets_project_ui_settings_to_defaults(self) -> None:
         app.APP.settings["global"].update({

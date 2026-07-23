@@ -30,6 +30,15 @@ def cache_categories() -> tuple[dict, ...]:
             ),
         },
         {
+            "key": "cleanup",
+            "title": "Clean Up",
+            "description": "DeVignette and AI DeScratch passes, model-safe Dearchive inputs, per-chunk renders, and geometry-preserving restored videos.",
+            "folders": (
+                ROOT / ".cache" / "cleanup_chunks",
+                ROOT / "intermediate" / "cleaned",
+            ),
+        },
+        {
             "key": "outpaint",
             "title": "Outpainting",
             "description": "Prepared inputs, per-chunk LTX renders, and stitched outpainted videos.",

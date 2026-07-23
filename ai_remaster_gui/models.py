@@ -6,6 +6,20 @@ from .config import OUTPAINT_PROMPT, REFERENCE_PROMPT, REFERENCE_PROMPT_SUFFIX
 
 COLORIZE_STAGE_KEYS = {"shots", "references", "colour"}
 
+CLEANUP_PROMPT = (
+    "Clean, restored archive footage. Remove vertical scratches, emulsion damage, dirt, dust, "
+    "blotches, gate weave, and flicker. Reconstruct clean continuous surfaces and fine natural "
+    "detail while preserving the original people, faces, hands, clothing, sets, camera motion, "
+    "composition, lighting, contrast, frame timing, and period cinematography. Natural film "
+    "texture and stable temporal consistency."
+)
+CLEANUP_NEGATIVE_PROMPT = (
+    "vertical scratches, film scratches, vertical streaks, emulsion damage, dirt, dust, blotches, "
+    "gate weave, flicker, frame jitter, torn film, smeared details, warped geometry, altered faces, "
+    "altered hands, duplicate limbs, temporal inconsistency, cartoon, game, 3d render, "
+    "oversaturated color, color bleeding"
+)
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -18,6 +32,31 @@ class Stage:
 
 
 STAGES = (
+    Stage(
+        "cleanup",
+        "Clean Up",
+        "Reconstruct masked scratches with ProPainter, correct vignettes, then optionally restore archive footage with Dearchive. Source geometry is preserved.",
+        ("intermediate/cleaned",),
+        (
+            ("ai_descratch", "AI DeScratch (ProPainter)", "checkbox", "false"),
+            ("scratch_sensitivity", "Scratch detection sensitivity", "range:0|1|0.05", "0.65"),
+            ("scratch_mask_dilate", "Scratch mask expansion", "range:0|12|1", "3"),
+            ("ai_descratch_height", "AI DeScratch resolution", "select:540|720|1080|source", "720"),
+            ("ai_chunk_frames", "AI DeScratch chunk frames", "select:25|33|41|49", "41"),
+            ("save_scratch_mask", "Save scratch-mask preview", "checkbox", "true"),
+            ("devignette", "DeVignette", "checkbox", "false"),
+            ("dearchive", "Dearchive (LTX 2.3 LoRA)", "checkbox", "true"),
+            ("repair_device", "DeVignette processor", "select:auto|cuda|cpu", "auto"),
+            ("chunk_seconds", "Dearchive chunk length", "range:2|20|0.01", "4.04"),
+            ("overlap_frames", "Overlap frames", "number", "8"),
+            ("source_fidelity", "Source Fidelity", "range:0|1|0.05", "1.0"),
+            ("prompt", "Prompt", "text", CLEANUP_PROMPT),
+            ("negative_prompt", "Negative prompt", "text", CLEANUP_NEGATIVE_PROMPT),
+            ("lora_strength", "Dearchive LoRA strength", "number", "1.0"),
+            ("seed", "Seed", "number", "42"),
+        ),
+        (),
+    ),
     Stage(
         "outpaint",
         "Outpainting",

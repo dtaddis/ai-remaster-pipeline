@@ -148,7 +148,7 @@ def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, frame_idx, fps)
 
-    source_text = pipeline_source_text(state.APP.settings)
+    source_text = state.APP.outpaint_source_for()
     if not source_text:
         raise RuntimeError("No source material is selected.")
     range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
@@ -317,7 +317,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     fps = float(row.get("fps", 24) or 24)
     start_seconds = float(row.get("start", 0.0))
     guide_source_seconds = start_seconds
-    source_text = pipeline_source_text(state.APP.settings)
+    source_text = state.APP.outpaint_source_for()
     if not source_text:
         raise RuntimeError("No source material is selected.")
     range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
@@ -358,7 +358,7 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
     end_seconds = float(row.get("end", 0.0))
     # Use the last meaningful frame (end - 1/fps) as the Qwen source for the end guide.
     guide_source_seconds = max(float(row.get("start", 0.0)), end_seconds - (1.0 / max(1.0, fps)))
-    source_text = pipeline_source_text(state.APP.settings)
+    source_text = state.APP.outpaint_source_for()
     if not source_text:
         raise RuntimeError("No source material is selected.")
     range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
@@ -543,7 +543,7 @@ def _guide_editor_source(chunk_index: int, guide_index: int, frames: list[dict])
     row = rows[chunk_index]
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, int(frames[guide_index].get("frame_idx", 0)), fps)
-    source_text = pipeline_source_text(state.APP.settings)
+    source_text = state.APP.outpaint_source_for()
     if not source_text:
         raise RuntimeError("No source material is selected.")
     prepared = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))

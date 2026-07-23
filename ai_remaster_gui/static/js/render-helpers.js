@@ -49,6 +49,32 @@ function sourceInfoHtml(info) {
 // Help text shown under stage fields. Keys are "<stage>.<field>" with a bare
 // "<field>" fallback for keys that are unique across stages.
 const FIELD_DESCRIPTIONS = {
+  'cleanup.ai_descratch':
+    'Detect only scratch-shaped damage, reconstruct those masked pixels across neighbouring frames with ProPainter, and composite them back over the untouched source. Runs after DeVignette and before Dearchive. ProPainter is licensed for non-commercial use only.',
+  'cleanup.scratch_sensitivity':
+    'How readily vertical, temporally persistent damage enters the AI repair mask. Higher values catch fainter scratches but can mistake narrow scene detail for damage. The mask preview makes this trade-off visible.',
+  'cleanup.scratch_mask_dilate':
+    'Expand each detected scratch by this many working-resolution pixels so ProPainter also replaces its damaged edges. Larger values remove wider streaks but reconstruct more source detail.',
+  'cleanup.ai_descratch_height':
+    'Working height used by ProPainter; the result is composited back at the exact source resolution. 720 is the safe default for a 24 GB GPU. Source and 1080 use substantially more VRAM.',
+  'cleanup.ai_chunk_frames':
+    'Frames processed together by ProPainter. Longer windows provide more temporal evidence but use more VRAM. 41 is a conservative default for 720p on a 24 GB GPU.',
+  'cleanup.save_scratch_mask':
+    'Save a companion black-and-white mask video beside the Clean Up output. White shows the detected base mask; Scratch mask expansion adds the chosen safety margin around those marks during repair.',
+  'cleanup.devignette':
+    'Estimate stationary dark falloff or a pale additive edge veil from samples across the clip, then apply a bounded edge correction. Black presentation bars are excluded and preserved. Runs locally before Dearchive and keeps colour intact.',
+  'cleanup.repair_device':
+    'Auto uses CUDA through ARP\'s PyTorch installation when an NVIDIA GPU is available, otherwise it falls back to CPU. Dearchive continues to use ComfyUI separately.',
+  'cleanup.dearchive':
+    'Run the LTX 2.3 Dearchive LoRA after the selected DeVignette and AI DeScratch repairs.',
+  'cleanup.chunk_seconds':
+    'Requested duration, from 2 to 20 seconds. At the source frame rate it is rounded to the nearest frame count where frames % 8 = 1 (8n + 1). For example, 4.04 seconds becomes 97 frames at 24 fps. Longer chunks reduce seams but use more VRAM.',
+  'cleanup.overlap_frames':
+    'Frames shared by neighbouring LTX chunks. They are trimmed during stitching so the final frame count stays identical to the source.',
+  'cleanup.source_fidelity':
+    'How strongly the complete input video controls LTX. 1.0 is the safe default and preserves the source most exactly, but can also preserve scratches. Lower values give Dearchive more freedom to repaint damage; very low values can change faces, hands, fine motion, or period detail.',
+  'cleanup.lora_strength':
+    'How strongly Dearchive rewrites the archive footage. 1.0 is the model author\'s workflow default.',
   'colour.processing_height':
     'Downscale frames before they are sent to ComfyUI. Source keeps the original resolution; 1080p is a practical first stop for 4K material.',
   'colour.use_half_resolution':
@@ -141,6 +167,9 @@ function selectFieldHtml(key, label, kind, value) {
 }
 
 function selectOptionLabel(key, option) {
+  if (key === 'repair_device' && option === 'auto') return 'Auto (prefer GPU)';
+  if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';
+  if (key === 'repair_device' && option === 'cpu') return 'CPU';
   if (key === 'method' && option === 'qwen') return 'Qwen 2511 (local)';
   if (key === 'method' && option === 'openai') return 'OpenAI API (cloud)';
   if (key === 'target_height' && option === 'source') {
@@ -155,13 +184,14 @@ function selectOptionLabel(key, option) {
 }
 
 const RANGE_FIELD_UNITS = {
+  chunk_seconds: ' s',
   feather_pixels: ' px',
   saturation: '%',
   temperature: ' K',
   color_opacity: '%',
 };
 
-const RANGE_NUDGE_FIELDS = new Set(['crop_left', 'crop_right', 'crop_top', 'crop_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
+const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'crop_left', 'crop_right', 'crop_top', 'crop_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
 
 function rangeDisplayValue(key, value) {
   const number = Number(value);
@@ -172,9 +202,10 @@ function rangeDisplayValue(key, value) {
 function rangeFieldHtml(key, label, kind, value) {
   const [min, max, step] = kind.slice(6).split('|');
   const hasNudge = RANGE_NUDGE_FIELDS.has(key);
+  const nudgeAmount = step || '1';
   const controls = hasNudge ? `
     <div class="pixel-nudge-row">
-      <button type="button" onclick="nudgeRangeField('${key}',-1)">-1</button>
+      <button type="button" onclick="nudgeRangeField('${key}',-1)">-${esc(nudgeAmount)}</button>
       <input
         id="${key}Input"
         class="pixel-input"
@@ -185,7 +216,7 @@ function rangeFieldHtml(key, label, kind, value) {
         value="${esc(value)}"
         onchange="setRangeFieldValue('${key}',this.value,true)"
       >
-      <button type="button" onclick="nudgeRangeField('${key}',1)">+1</button>
+      <button type="button" onclick="nudgeRangeField('${key}',1)">+${esc(nudgeAmount)}</button>
     </div>
   ` : '';
   return `
@@ -353,6 +384,7 @@ function drawStage(st) {
   const expected = (state.expected_outputs && state.expected_outputs[st.key]) || [];
   const sp = stageProgress(st.key);
 
+  if (st.key === 'cleanup') return drawCleanup(st, s, expected, sp);
   if (st.key === 'outpaint') return drawOutpaint(st, s, expected, sp);
 
   document.getElementById('app').innerHTML = `
@@ -386,6 +418,76 @@ function drawStage(st) {
 
   bindStageFields(st.key);
   showCommand(st.key);
+}
+
+function drawCleanup(st, s, expected, sp) {
+  const comparison = state.cleanup_comparison || {};
+  document.getElementById('app').innerHTML = `
+    <div class="editor-page">
+      <section class="card">
+        <h2>${st.title}</h2>
+        <p>${st.description}</p>
+        ${progressHtml(sp.percent, sp.label)}
+        ${cleanupLicenseWarning(s)}
+        ${st.fields.map(f => fieldHtml(st, f)).join('')}
+        ${shotOutputList(expected, null)}
+        ${stageCheckboxes(s)}
+        <div class="actions">
+          <button class="primary" onclick="runStage('cleanup')" ${state.running ? 'disabled' : ''}>Run Clean Up</button>
+          <button class="warn" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
+        </div>
+        <div class="command" id="cmd"></div>
+      </section>
+      <section class="card editor-viewer">
+        <h2>${esc(comparison.title || 'Clean Up Comparison')}</h2>
+        ${cleanupComparisonHtml(comparison)}
+      </section>
+    </div>
+    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
+  `;
+
+  bindStageFields('cleanup');
+  bindCleanupComparison();
+  showCommand('cleanup');
+}
+
+function cleanupLicenseWarning(s) {
+  if (s.ai_descratch !== 'true') return '';
+  return `
+    <div class="inline-warning">
+      <strong>AI DeScratch is non-commercial only.</strong>
+      ProPainter's code and models use the NTU S-Lab License 1.0. Do not use this option for paid,
+      monetised, or other commercial work unless you have separate written permission from the authors.
+      <a href="https://github.com/sczhou/ProPainter/blob/main/LICENSE" target="_blank" rel="noopener">View licence</a>.
+    </div>
+  `;
+}
+
+function cleanupComparisonHtml(comparison) {
+  const before = comparison.source || '';
+  const after = comparison.exists === 'true' ? comparison.output : '';
+  if (!before || comparison.source_exists !== 'true') {
+    return '<p class="shot-empty">Choose source material on the Overview page, then run Clean Up.</p>';
+  }
+  if (!after) {
+    return `
+      <video src="${media(before)}" controls preload="metadata"></video>
+      <p class="shot-empty">The before/after comparison will appear here when Clean Up finishes.</p>
+    `;
+  }
+  return `
+    <div class="comparison-player">
+      <video class="compare-before" src="${media(before)}" controls preload="metadata"></video>
+      <video class="compare-after" src="${media(after)}" muted preload="metadata"></video>
+      <div class="compare-after-mask" style="width:50%"></div>
+      <div class="compare-handle" style="left:50%"></div>
+    </div>
+    <input id="cleanupCompareSlider" class="compare-slider" type="range" min="0" max="100" value="50" aria-label="Clean Up before after split">
+    <div class="source-info">
+      <div><span>Before</span><strong>${esc(before)}</strong></div>
+      <div><span>After</span><strong>${esc(after)}</strong></div>
+    </div>
+  `;
 }
 
 function audioStemLinksHtml() {

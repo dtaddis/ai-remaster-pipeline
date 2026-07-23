@@ -85,24 +85,28 @@ def processing_dimensions(width: int, height: int, processing_height: str) -> tu
 
 def downscaled_video_signature(source: Path, width: int, height: int) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "tool": "colorize_video.py",
-        "kind": "processing input",
+        "kind": "grayscale processing input",
         "source": root_relative(source),
         "source_fingerprint": file_fingerprint(source),
         "width": width,
         "height": height,
+        "grayscale": True,
     }
 
 
 def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int, original_width: int, original_height: int) -> Path:
-    if width == original_width and height == original_height:
-        return source
+    """Create the shared, always-grayscale video input used by both colourisation backends.
+
+    Dearchive can introduce colour, so this intermediate is produced even when the requested
+    processing dimensions match the source. Shot ranges are selected from this file in ComfyUI.
+    """
     digest = file_fingerprint(source)["sha256"][:12]
-    output = ROOT / ".cache" / "colorize_inputs" / f"{safe_stem(source.name)}_{digest}_{width}x{height}.mp4"
+    output = ROOT / ".cache" / "colorize_inputs" / f"{safe_stem(source.name)}_{digest}_{width}x{height}_gray.mp4"
     sig = downscaled_video_signature(source, width, height)
     if resumable_output(output, sig, width=width, height=height):
-        print(f"Reuse downscaled colourisation input: {output}", flush=True)
+        print(f"Reuse grayscale colourisation input: {output}", flush=True)
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
@@ -112,7 +116,7 @@ def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int,
         "-i",
         str(source),
         "-vf",
-        f"scale={width}:{height}:flags=lanczos,setsar=1",
+        f"scale={width}:{height}:flags=lanczos,hue=s=0,setsar=1",
         "-an",
         "-c:v",
         "libx264",
@@ -128,7 +132,7 @@ def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int,
     subprocess.run(cmd, check=True)
     replace_with_retry(partial, output)
     write_signature(output, sig)
-    print(f"Wrote downscaled colourisation input: {output}", flush=True)
+    print(f"Wrote grayscale colourisation input: {output}", flush=True)
     return output
 
 
@@ -264,13 +268,14 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 7,
+        "version": 8,
         "tool": "colorize_video.py",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
+        "grayscale_video_input": True,
         "references": [reference_signature(row) for row in rows],
         "shot_inputs": [shot_input_signature(row) for row in rows],
         "settings": method_settings_signature(args),
@@ -385,12 +390,13 @@ def segment_signature(
     fps: float,
 ) -> dict[str, Any]:
     return {
-        "version": 7,
+        "version": 8,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
+        "grayscale_video_input": True,
         "reference": root_relative(reference),
         "reference_fingerprint": file_fingerprint(reference),
         "shot_input": shot_input_signature(row),

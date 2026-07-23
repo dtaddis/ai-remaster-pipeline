@@ -6,7 +6,7 @@
 
 ARP is a local GUI app for remastering public-domain or properly licensed film material with ComfyUI-powered AI tools.
 
-It is built around an old-film workflow: choose a black-and-white source movie, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the outpainted video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
+It is built around an old-film workflow: choose source material, optionally clean archive damage, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
 
 The app is still alpha software, but the goal is simple: you should be able to run the whole remaster from the GUI, then inspect and adjust each stage when the AI needs a little human steering.
 
@@ -19,6 +19,7 @@ The app is still alpha software, but the goal is simple: you should be able to r
 - Outpaints 4:3 or similar archive footage into common target aspect ratios such as `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, and `1.85:1`.
 - Splits video into shots and lets you review, merge, enable, disable, and adjust shot boundaries.
 - Generates per-shot reference frames and colorizes them with Qwen Image Edit.
+- Optionally reconstructs vertical scratches with masked ProPainter inpainting, corrects light/dark vignettes, then optionally restores archive footage with the LTX 2.3 Dearchive LoRA while preserving source geometry.
 - Uses reference-guided video colorization for the outpainted footage.
 - Recombines the original, outpainted, and colorized layers into a final output.
 - Keeps intermediate files deterministic and resumable, so reruns can reuse valid existing work.
@@ -120,7 +121,7 @@ Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
 1. Open the Overview tab.
 2. Choose your source material with Browse.
 3. Check the preview frames, duration, resolution, frame rate, codecs, and color/monochrome guess.
-4. Leave Colorize enabled for black-and-white sources, or turn it off if you only want outpainting.
+4. Enable Clean Up when the source needs archive restoration; it defaults off. Inside the phase, select any combination of AI DeScratch, DeVignette, and Dearchive. Leave Colorize enabled for black-and-white sources, or turn it off if you only want cleanup/outpainting.
 5. Click Run Whole Remaster for a first pass.
 6. Use the stage tabs to inspect or rerun individual phases.
 
@@ -133,6 +134,16 @@ Every stage writes predictable intermediate files under `intermediate/`, manifes
 Choose the source video, see useful media info, and run the whole pipeline.
 
 ![Overview tab](assets/screenshots/walkthrough/arp-walkthrough-overview.jpg)
+
+### Clean Up
+
+Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA and defaults on.
+
+The order is DeVignette, AI DeScratch, then Dearchive. AI DeScratch defaults to a 720p working copy and 41-frame windows on a 24 GB GPU, but always returns the source resolution and timing. Sensitivity controls how faint a vertical mark may be before it enters the mask; mask expansion includes damaged edges around each detected line. Enable the mask preview to write a companion `_scratch_mask.mp4`; white shows the detected base mask, before the selected expansion margin. ProPainter's model and upstream code use the NTU S-Lab License 1.0 and are restricted to non-commercial use.
+
+DeVignette defaults to **Auto (prefer GPU)**. ARP uses its installed PyTorch CUDA stack directly and processes frames in adaptive batches when an NVIDIA GPU is available; otherwise it logs the reason and falls back to OpenCV/NumPy on the CPU. The log reports the selected processor, GPU name, batch size, sampled-frame analysis time, frames per second, elapsed time, and ETA.
+
+When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps); the UI accepts 2 to 20 seconds and rounds the requested duration at the source frame rate to the nearest LTX-valid `8n + 1` frame count. **Source Fidelity** controls the strength of the complete input-video IC-LoRA guide. Its safe default of `1.0` preserves the source most exactly, while lower values let Dearchive repaint more damage at increasing risk of changes to faces, hands, motion, and fine period detail. Every combination returns a video with the source resolution, sample aspect ratio, frame rate, frame count, and audio. The passes preserve colour; aspect-ratio expansion and delivery scaling happen only in later phases.
 
 ### Outpainting
 
@@ -162,6 +173,8 @@ Pick the reference time inside each shot, regenerate individual Qwen color refer
 
 Review each shot's color reference alongside the corresponding colorized video segment. This stage uses the generated references to guide video colorization.
 
+Because Dearchive can introduce colour of its own, ARP converts extracted source stills and the video stream back to neutral grayscale before reference generation and before Deep Exemplar/ColorMNet. The generated colour reference stays in colour and guides the selected model as usual.
+
 ![Colorization tab](assets/screenshots/walkthrough/arp-walkthrough-colorization.jpg)
 
 ### Recomposition
@@ -185,6 +198,9 @@ Settings contains ComfyUI connection details, queue/log inspection, and global p
 ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended stack includes:
 
 - LTX 2.3 distilled GGUF Q4_K_M for lightweight outpainting.
+- CUDA-accelerated automatic light/dark DeVignette correction for optional archive repair.
+- Masked ProPainter video inpainting for optional AI DeScratch (non-commercial NTU S-Lab licence).
+- LTX 2.3 Dearchive IC-LoRA for optional generative archive cleanup.
 - LTX 2.3 IC outpainting LoRA.
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
 - Qwen Image Edit Lightning LoRA.
@@ -194,6 +210,7 @@ The repo stores orchestration code, GUI code, workflows, wrappers, docs, and sma
 
 ARP bundles the ComfyUI workflow JSONs it needs to queue jobs:
 
+- `workflows/cleanup_ltx/DeArchive.json` for LTX Dearchive cleanup.
 - `workflows/outpaint_ltx/outpaint_LTX-IC.json` for LTX IC outpainting.
 - `workflows/qwen_image_edit/Image Edit (Qwen 2511).json` for Qwen Image Edit reference frames and outpaint guide frames.
 
@@ -203,6 +220,7 @@ Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON f
 
 ```text
 input/                                   Optional source clips
+intermediate/cleaned/                    Geometry-preserving Clean Up outputs
 intermediate/outpaint_prepared/          Expanded/lifted clips prepared for LTX
 intermediate/outpainted/                 Widescreen/outpainted clips
 intermediate/outpainted_references/      Per-shot black-and-white reference stills
@@ -225,7 +243,7 @@ The GUI is also designed around deterministic intermediate paths. When one stage
 
 ## Direct Script Use
 
-The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
+The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `cleanup_video.bat`, `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
 
 Those scripts are what the GUI calls internally, and the GUI shows the equivalent command before running a stage.
 
