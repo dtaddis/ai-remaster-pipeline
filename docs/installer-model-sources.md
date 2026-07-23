@@ -51,4 +51,19 @@ Downloaded into `models/mmaudio/`:
 (Confirm the exact filenames against the repo if a download 404s; update `SFX_MODELS` in
 `scripts/dependency_manager.py` to match.)
 
-These are large files. The downloader skips already-present destination files and keeps Hugging Face cache files under `.cache/huggingface` while downloading.
+These are large files. The downloader skips already-present destination files and keeps Hugging Face
+cache files in the configured cache location (ARP's `.cache/huggingface` by default).
+
+## Custom cache and model locations
+
+The Hugging Face cache location is selected in this order:
+
+1. `ARP_HF_CACHE_DIR`
+2. `HF_HUB_CACHE`
+3. the standard `hub` directory below `HF_HOME`
+4. ARP's `.cache/huggingface` directory
+
+When ComfyUI has an `extra_model_paths.yaml`, ARP reuses models found in its configured search
+paths. New downloads use `download_model_base` (or the relevant category path) from the section
+marked `is_default`. This keeps ARP and ComfyUI/ComfyUI-Manager pointed at the same centralized
+model store.

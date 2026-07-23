@@ -3,4 +3,5 @@ opencv-contrib-python
 numpy
 pillow
 imageio-ffmpeg
+pyyaml
 sam2

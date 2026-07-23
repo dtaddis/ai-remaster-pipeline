@@ -12,7 +12,16 @@
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
-$DownloadCache = Join-Path $Root '.cache\huggingface'
+$DefaultDownloadCache = Join-Path $Root '.cache\huggingface'
+$DownloadCache = if (-not [string]::IsNullOrWhiteSpace($env:ARP_HF_CACHE_DIR)) {
+    $env:ARP_HF_CACHE_DIR
+} elseif (-not [string]::IsNullOrWhiteSpace($env:HF_HUB_CACHE)) {
+    $env:HF_HUB_CACHE
+} elseif (-not [string]::IsNullOrWhiteSpace($env:HF_HOME)) {
+    Join-Path $env:HF_HOME 'hub'
+} else {
+    $DefaultDownloadCache
+}
 $DefaultComfyDir = Join-Path $Root 'tools\comfyui'
 $PipelinePython = Join-Path $Root '.venv\Scripts\python.exe'
 $BundledCustomNodes = Join-Path $Root 'vendor\comfyui_custom_nodes'
@@ -108,6 +117,33 @@ function Invoke-Step {
     & $Block
 }
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Argument)
+    if ([string]::IsNullOrEmpty($Argument)) {
+        return '""'
+    }
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    # Start-Process joins ArgumentList entries with spaces. Quote using the Windows
+    # command-line escaping rules so paths such as "E:\AI Remaster\..." stay intact.
+    $escaped = [regex]::Replace($Argument, '(\\*)"', {
+        param($match)
+        return ($match.Groups[1].Value * 2) + '\"'
+    })
+    $trailingBackslashes = [regex]::Match($escaped, '\\+$')
+    if ($trailingBackslashes.Success) {
+        $escaped += $trailingBackslashes.Value
+    }
+    return '"' + $escaped + '"'
+}
+
+function Join-NativeArguments {
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+}
+
 function Invoke-External {
     param([string[]]$Command, [string]$WorkingDirectory = $Root)
     if (-not $Command -or $Command.Count -eq 0) {
@@ -123,7 +159,7 @@ function Invoke-External {
         PassThru = $true
     }
     if ($Command.Count -gt 1) {
-        $startArgs.ArgumentList = @($Command[1..($Command.Count - 1)])
+        $startArgs.ArgumentList = Join-NativeArguments @($Command[1..($Command.Count - 1)])
     }
     $process = Start-Process @startArgs
     if ($process.ExitCode -ne 0) {
@@ -146,7 +182,7 @@ function Invoke-External-Optional {
         PassThru = $true
     }
     if ($Command.Count -gt 1) {
-        $startArgs.ArgumentList = @($Command[1..($Command.Count - 1)])
+        $startArgs.ArgumentList = Join-NativeArguments @($Command[1..($Command.Count - 1)])
     }
     $process = Start-Process @startArgs
     return $process.ExitCode -eq 0
@@ -226,7 +262,7 @@ function Invoke-CapturedProcess {
             RedirectStandardError = $stderr
         }
         if ($Arguments.Count -gt 0) {
-            $startArgs.ArgumentList = $Arguments
+            $startArgs.ArgumentList = Join-NativeArguments $Arguments
         }
         $process = Start-Process @startArgs
         return [pscustomobject]@{
@@ -945,6 +981,9 @@ function Download-HfFile {
         [string]$File,
         [string]$Destination
     )
+    if (-not [System.IO.Path]::IsPathRooted($Destination)) {
+        $Destination = Resolve-ComfyModelDestination $Destination
+    }
     if (Test-Path -LiteralPath $Destination) {
         Write-Host "Model already exists: $Destination"
         return
@@ -977,6 +1016,23 @@ function Download-HfFile {
     }
     Move-Item -LiteralPath $source -Destination $Destination
     Write-Host "Downloaded: $Destination"
+}
+
+function Resolve-ComfyModelDestination {
+    param([string]$Destination)
+    $resolver = Join-Path $Root 'scripts\model_paths.py'
+    $result = Invoke-CapturedProcess `
+        -FilePath $PipelinePython `
+        -Arguments @($resolver, '--comfy-dir', $ComfyDir, '--destination', $Destination)
+    if ($result.ExitCode -ne 0) {
+        $detail = (($result.Stdout, $result.Stderr) -join "`n").Trim()
+        throw "Could not resolve ComfyUI model destination '$Destination': $detail"
+    }
+    $resolved = $result.Stdout.Trim()
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        throw "ComfyUI model destination resolver returned an empty path for '$Destination'."
+    }
+    return $resolved
 }
 
 $mode = Resolve-ComfyInstallMode
@@ -1124,7 +1180,7 @@ Invoke-Step 'Install custom-node requirements' {
 
 Invoke-Step 'Create model directories' {
     foreach ($dir in @('checkpoints','diffusion_models','loras','text_encoders','unet','vae','latent_upscale_models','mmaudio')) {
-        Ensure-Directory (Join-Path $ComfyDir "models\$dir")
+        Ensure-Directory (Resolve-ComfyModelDestination "models\$dir")
     }
 }
 
@@ -1134,20 +1190,20 @@ Invoke-Step 'Install local FFmpeg tools' {
 
 if ($DownloadModels -and -not $SkipModelDownloads) {
     Invoke-Step 'Download LTX 2.3 models, Clean Up LoRA, and outpainting LoRA' {
-        Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf')
-        Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' (Join-Path $ComfyDir 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors')
-        Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors')
-        Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_video_vae_bf16.safetensors')
-        Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' (Join-Path $ComfyDir 'models\vae\LTX23_audio_vae_bf16.safetensors')
-        Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-dearchive-lora.safetensors')
-        Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' (Join-Path $ComfyDir 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors')
+        Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf'
+        Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors'
+        Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors'
+        Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' 'models\vae\LTX23_video_vae_bf16.safetensors'
+        Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' 'models\vae\LTX23_audio_vae_bf16.safetensors'
+        Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' 'models\loras\ltx-2.3-dearchive-lora.safetensors'
+        Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors'
     }
 
     Invoke-Step 'Download Qwen Image Edit 2511 GGUF Q4_K_M models and Lightning LoRA' {
-        Download-HfFile 'unsloth/Qwen-Image-Edit-2511-GGUF' 'qwen-image-edit-2511-Q4_K_M.gguf' (Join-Path $ComfyDir 'models\diffusion_models\qwen-image-edit-2511-Q4_K_M.gguf')
-        Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors' (Join-Path $ComfyDir 'models\text_encoders\qwen_2.5_vl_7b_fp8_scaled.safetensors')
-        Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/vae/qwen_image_vae.safetensors' (Join-Path $ComfyDir 'models\vae\qwen_image_vae.safetensors')
-        Download-HfFile 'lightx2v/Qwen-Image-Edit-2511-Lightning' 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors' (Join-Path $ComfyDir 'models\loras\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
+        Download-HfFile 'unsloth/Qwen-Image-Edit-2511-GGUF' 'qwen-image-edit-2511-Q4_K_M.gguf' 'models\diffusion_models\qwen-image-edit-2511-Q4_K_M.gguf'
+        Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors' 'models\text_encoders\qwen_2.5_vl_7b_fp8_scaled.safetensors'
+        Download-HfFile 'Comfy-Org/Qwen-Image_ComfyUI' 'split_files/vae/qwen_image_vae.safetensors' 'models\vae\qwen_image_vae.safetensors'
+        Download-HfFile 'lightx2v/Qwen-Image-Edit-2511-Lightning' 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors' 'models\loras\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
     }
 
     Invoke-Step 'Download soundtrack models (music + sound effects)' {
@@ -1156,18 +1212,18 @@ if ($DownloadModels -and -not $SkipModelDownloads) {
         # (or set HF_TOKEN) for this to succeed. Wrapped so a skip never fails the install;
         # it is retried on demand when the Create Audio Track stage first runs.
         try {
-            Download-HfFile 'stabilityai/stable-audio-open-1.0' 'model.safetensors' (Join-Path $ComfyDir 'models\checkpoints\stable_audio_open_1.0.safetensors')
+            Download-HfFile 'stabilityai/stable-audio-open-1.0' 'model.safetensors' 'models\checkpoints\stable_audio_open_1.0.safetensors'
         } catch {
             Write-Warning "Skipped Stable Audio Open (music). Accept the licence + 'hf auth login', or it downloads on first use. Details: $_"
         }
         try {
-            Download-HfFile 'google-t5/t5-base' 'model.safetensors' (Join-Path $ComfyDir 'models\text_encoders\t5_base.safetensors')
+            Download-HfFile 'google-t5/t5-base' 'model.safetensors' 'models\text_encoders\t5_base.safetensors'
         } catch {
             Write-Warning "Skipped T5-base text encoder for Stable Audio music; it downloads on first use. Details: $_"
         }
         foreach ($mmaudioFile in @('mmaudio_large_44k_v2_fp16.safetensors','mmaudio_vae_44k_fp16.safetensors','mmaudio_synchformer_fp16.safetensors','apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors')) {
             try {
-                Download-HfFile 'Kijai/MMAudio_safetensors' $mmaudioFile (Join-Path $ComfyDir "models\mmaudio\$mmaudioFile")
+                Download-HfFile 'Kijai/MMAudio_safetensors' $mmaudioFile "models\mmaudio\$mmaudioFile"
             } catch {
                 Write-Warning "Skipped MMAudio file $mmaudioFile (sound effects); it downloads on first use. Details: $_"
             }

@@ -71,6 +71,11 @@ Models and LoRAs are downloaded on demand when a stage first needs them. If a la
 install_windows.bat -DownloadModels
 ```
 
+ARP respects Hugging Face's `HF_HOME` and `HF_HUB_CACHE` environment variables. You can also set
+`ARP_HF_CACHE_DIR` for an ARP-specific cache override. For an existing ComfyUI installation, model
+downloads also follow the default section of `extra_model_paths.yaml`, including its
+`download_model_base` setting.
+
 Useful installer options:
 
 ```bat

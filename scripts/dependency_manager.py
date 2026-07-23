@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import QWEN_IMAGE_EDIT_MODEL, ROOT
+from model_paths import huggingface_cache_dir, resolve_comfy_model_path
 
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
@@ -119,7 +120,7 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
     """
     ensure_huggingface_hub()
 
-    cache_root = ROOT / ".cache" / "huggingface"
+    cache_root = huggingface_cache_dir(ROOT / ".cache" / "huggingface")
     cache_root.mkdir(parents=True, exist_ok=True)
     old_python_utf8 = os.environ.get("PYTHONUTF8")
     old_python_io = os.environ.get("PYTHONIOENCODING")
@@ -131,7 +132,7 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     try:
         for model in models:
-            destination = comfy_dir / model.destination
+            destination = resolve_comfy_model_path(comfy_dir, model.destination)
             print(f"Checking model: {model.repo}/{model.file}", flush=True)
             if destination.exists():
                 print(f"Model already exists: {destination}", flush=True)
