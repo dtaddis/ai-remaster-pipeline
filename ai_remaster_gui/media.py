@@ -758,7 +758,9 @@ def source_section_output_for(settings: dict) -> Path:
     start = section_float(global_settings.get("section_start", "0"), 0.0)
     end = section_float(global_settings.get("section_end", ""), 0.0)
     suffix = f"{int(round(start * 1000)):010d}_{int(round(end * 1000)):010d}"
-    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}{source.suffix or '.mp4'}"
+    # Section clips are transcoded to H.264/AAC below, so they must use an MP4
+    # container even when the original source is WebM, MKV, or another format.
+    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}.mp4"
 
 def source_section_is_active(settings: dict) -> bool:
     global_settings = settings.get("global", {})

@@ -2194,6 +2194,15 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("0000012000_0000024000", first.name)
         self.assertIn("0000045000_0000060000", second.name)
 
+    def test_webm_source_section_uses_mp4_container_for_h264_aac(self) -> None:
+        app.APP.settings["global"].update(
+            {"source": "input/example.webm", "section_start": "12", "section_end": "24"}
+        )
+
+        output = app.source_section_output_for(app.APP.settings)
+
+        self.assertEqual(output.suffix, ".mp4")
+
     def test_pipeline_source_uses_section_when_trim_points_are_set(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
 
