@@ -18,11 +18,12 @@ from .process_utils import format_duration
 from .project_io import source_analysis_key, source_signature
 
 SOURCE_PREVIEW_COUNT = 3
-ASPECT_PREVIEW_STYLE_VERSION = 4
+ASPECT_PREVIEW_STYLE_VERSION = 5
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
+from outpaint_geometry import crop_box, source_placement  # noqa: E402
 
 
 def aspect_preview_identity(source: Path, size: int, mtime_ns: int, aspect: str, crops: tuple[int, int, int, int], seconds: float, offset_x: int = 0, offset_y: int = 0) -> dict:
@@ -260,7 +261,7 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
         from PIL import Image, ImageOps
     except ModuleNotFoundError:
         state.APP.log.append("Pillow is not available; using FFmpeg for the aspect preview.")
-        preview = ffmpeg_aspect_preview(source, target, aspect, mtime_ns, offset_x, offset_y)
+        preview = ffmpeg_aspect_preview(source, target, aspect, mtime_ns, crops, offset_x, offset_y)
         if preview:
             aid.write_identity(target, identity, label="Aspect preview")
         return preview or source_frame
@@ -268,19 +269,19 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
     image = Image.open(resolve(source_frame)).convert("RGB")
     width, height = image.size
     left, right, top, bottom = crops
-    crop_box = (min(left, width - 2), min(top, height - 2), max(min(width - right, width), left + 2), max(min(height - bottom, height), top + 2))
-    image = image.crop(crop_box)
-    width, height = image.size
+    crop_left, _crop_right, crop_top, _crop_bottom, crop_width, crop_height = crop_box(width, height, left, right, top, bottom)
+    cropped = image.crop((crop_left, crop_top, crop_left + crop_width, crop_top + crop_height))
     if width / height < ratio:
         target_h = height
         target_w = int(round(height * ratio))
     else:
         target_w = width
         target_h = int(round(width / ratio))
+    placement = source_placement(width, height, target_w, target_h, crops)
     canvas = patterned_canvas(target_w, target_h)
-    paste_xy = ((target_w - width) // 2 + int(offset_x), (target_h - height) // 2 + int(offset_y))
-    canvas.paste(image, paste_xy)
-    draw_source_frame_border(canvas, paste_xy, (width, height))
+    paste_xy = (placement.x + int(offset_x), placement.y + int(offset_y))
+    canvas.paste(cropped.resize((placement.width, placement.height), Image.Resampling.LANCZOS), paste_xy)
+    draw_source_frame_border(canvas, paste_xy, (placement.width, placement.height))
     preview = ImageOps.contain(canvas, (960, 540), Image.Resampling.LANCZOS)
     target.parent.mkdir(parents=True, exist_ok=True)
     preview.save(target, quality=90)
@@ -316,7 +317,7 @@ def patterned_canvas(width: int, height: int):
         draw.line((offset, 0, offset - height, height), fill=accent, width=max(2, spacing // 10))
     return canvas
 
-def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int, offset_x: int = 0, offset_y: int = 0) -> str:
+def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int, crops: tuple[int, int, int, int] = (0, 0, 0, 0), offset_x: int = 0, offset_y: int = 0) -> str:
     ffmpeg = local_tool("ffmpeg")
     dims = video_dimensions(source)
     if not ffmpeg or not dims:
@@ -332,16 +333,20 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
     scale = min(960 / canvas_w, 540 / canvas_h, 1.0)
     out_w = max(2, even_int(canvas_w * scale))
     out_h = max(2, even_int(canvas_h * scale))
-    scaled_w = max(2, even_int(source_w * scale))
-    scaled_h = max(2, even_int(source_h * scale))
+    placement = source_placement(source_w, source_h, canvas_w, canvas_h, crops)
+    left, _right, top, _bottom, crop_width, crop_height = crop_box(source_w, source_h, *crops)
+    placed_x = int(round(placement.x * scale))
+    placed_y = int(round(placement.y * scale))
+    placed_w = max(2, even_int(placement.width * scale))
+    placed_h = max(2, even_int(placement.height * scale))
     scaled_offset_x = int(round(offset_x * scale))
     scaled_offset_y = int(round(offset_y * scale))
     target.parent.mkdir(parents=True, exist_ok=True)
     filter_text = (
-        f"scale={scaled_w}:{scaled_h}[src];"
+        f"crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale={placed_w}:{placed_h}[src];"
         f"color=c=0x15272b:s={out_w}x{out_h}[bg];"
         f"[bg]geq=r='34+34*mod(floor((X+Y)/18)\\,2)':g='62+48*mod(floor((X+Y)/18)\\,2)':b='67+40*mod(floor((X+Y)/18)\\,2)'[pat];"
-        f"[pat][src]overlay=(W-w)/2+{scaled_offset_x}:(H-h)/2+{scaled_offset_y}"
+        f"[pat][src]overlay={placed_x + scaled_offset_x}:{placed_y + scaled_offset_y}"
     )
     command = [ffmpeg, "-y", "-ss", "10", "-i", str(source), "-frames:v", "1", "-vf", filter_text, "-q:v", "3", str(target)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)

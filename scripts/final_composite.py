@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
+from outpaint_geometry import source_placement
 
 
 def find_ffmpeg(explicit: str | None):
@@ -37,7 +38,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 8
+    values['version'] = 9
     return values
 
 
@@ -83,6 +84,22 @@ def probe_fps(ffmpeg: str, source: Path) -> float:
         return parse_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "24")
     except Exception:
         return 24.0
+
+
+def probe_dimensions(ffmpeg: str, source: Path) -> tuple[int, int]:
+    ffprobe = Path(ffmpeg).with_name("ffprobe.exe") if Path(ffmpeg).suffix.lower() == ".exe" else Path("ffprobe")
+    result = subprocess.run(
+        [str(ffprobe), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream = json.loads(result.stdout).get("streams", [{}])[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Could not probe video dimensions: {source}")
+    return width, height
 
 
 def source_crop_filter(args) -> str:
@@ -131,7 +148,14 @@ def source_black_matte_expr(threshold: int, shrink: int) -> str:
 
 
 def source_alpha_expr(args, feather: int) -> str:
-    edge_alpha = f"if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))"
+    horizontal_alpha = f"if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))"
+    edge_alpha = horizontal_alpha
+    top = max(0, int(getattr(args, "crop_top", 0)))
+    bottom = max(0, int(getattr(args, "crop_bottom", 0)))
+    if top or bottom:
+        top_alpha = f"if(lt(Y,{feather}),255*Y/{feather},255)" if top else "255"
+        bottom_alpha = f"if(gt(Y,H-{feather}),255*(H-Y)/{feather},255)" if bottom else "255"
+        edge_alpha = f"min({horizontal_alpha},min({top_alpha},{bottom_alpha}))"
     if not getattr(args, "source_black_transparent", False):
         return edge_alpha
     threshold = max(0, min(255, int(getattr(args, "source_black_threshold", 24))))
@@ -165,7 +189,7 @@ def temperature_balance(value: float) -> tuple[float, float]:
     return (strength, 0.0) if delta < 0 else (0.0, strength)
 
 
-def build_filter(args, has_color, fps: float, has_outpainted: bool = True):
+def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
     color_opacity = max(0.0, min(1.0, normalized_percent(args.color_opacity, 1.0)))
@@ -179,13 +203,23 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True):
     out_h = int(args.output_height) if args.output_height else 0
     scale_base = f",scale={out_w}:{out_h}:flags=lanczos" if (out_w and out_h) else ""
     if has_outpainted:
-        filters = [
-            f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
-            f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
-            '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
-            f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
-            '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
-        ]
+        if source_size and base_size:
+            crops = tuple(max(0, int(getattr(args, key))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+            placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
+            filters = [
+                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
+                f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}scale={placement.width}:{placement.height}:flags=lanczos,setsar=1[src]',
+                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
+                f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]',
+            ]
+        else:
+            filters = [
+                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
+                f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
+                '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
+                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
+                '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
+            ]
     else:
         filters = [
             f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1,format=yuv444p[merged]',
@@ -221,6 +255,10 @@ def run(args):
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = probe_fps(ffmpeg, source)
+    source_size = probe_dimensions(ffmpeg, source)
+    base_size = None
+    if outpainted:
+        base_size = (int(args.output_width), int(args.output_height)) if args.output_width and args.output_height else probe_dimensions(ffmpeg, outpainted)
     cmd = [ffmpeg, '-y']
     if outpainted:
         cmd += ['-i', str(outpainted), '-i', str(source)]
@@ -230,7 +268,7 @@ def run(args):
         audio_input = '0:a?'
     if colorized:
         cmd += ['-i', str(colorized)]
-    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted)), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
+    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
     cmd += ['-c:a', 'copy', str(partial)]

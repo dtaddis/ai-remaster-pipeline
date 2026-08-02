@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 
 from common import file_fingerprint, format_time, resolve_path, root_relative, resumable_output, write_signature
+from outpaint_geometry import crop_box, source_placement
 
 
 def parse_aspect(value: str) -> float:
@@ -59,40 +60,28 @@ def encoder_args(args):
 
 
 def crop_values(args, info: dict) -> tuple[int, int, int, int, int, int]:
-    left = max(0, int(args.crop_left))
-    right = max(0, int(args.crop_right))
-    top = max(0, int(args.crop_top))
-    bottom = max(0, int(args.crop_bottom))
-    width = max(2, info["width"] - left - right)
-    height = max(2, info["height"] - top - bottom)
-    width = width if width % 2 == 0 else width - 1
-    height = height if height % 2 == 0 else height - 1
-    return left, right, top, bottom, width, height
-
-
-def fit_size(width: int, height: int, target_width: int, target_height: int) -> tuple[int, int]:
-    scale = min(target_width / width, target_height / height)
-    out_width = min(target_width, max(2, even(width * scale)))
-    out_height = min(target_height, max(2, even(height * scale)))
-    return out_width, out_height
+    return crop_box(
+        int(info["width"]),
+        int(info["height"]),
+        int(args.crop_left),
+        int(args.crop_right),
+        int(args.crop_top),
+        int(args.crop_bottom),
+    )
 
 
 def source_placement_size(args, info: dict, target_width: int, target_height: int) -> tuple[int, int, int, int]:
     delivery_w = int(args.delivery_width or target_width)
     delivery_h = int(args.delivery_height or target_height)
-    _left, _right, _top, _bottom, crop_width, crop_height = crop_values(args, info)
-    full_w, full_h = fit_size(int(info["width"]), int(info["height"]), delivery_w, delivery_h)
-    source_scale = min(full_w / int(info["width"]), full_h / int(info["height"]))
-    delivery_source_w = min(delivery_w, max(2, even(crop_width * source_scale)))
-    delivery_source_h = min(delivery_h, max(2, even(crop_height * source_scale)))
-    target_source_w = min(target_width, max(2, even(delivery_source_w * target_width / delivery_w)))
-    target_source_h = min(target_height, max(2, even(delivery_source_h * target_height / delivery_h)))
-    return delivery_source_w, delivery_source_h, target_source_w, target_source_h
+    crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+    delivery = source_placement(int(info["width"]), int(info["height"]), delivery_w, delivery_h, crops)
+    target = source_placement(int(info["width"]), int(info["height"]), target_width, target_height, crops, delivery_w, delivery_h)
+    return delivery.width, delivery.height, target.width, target.height
 
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 8,
+        'version': 9,
         'tool': 'prepare_outpaint_input.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
@@ -136,7 +125,13 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     #   Step 2 - squish the delivery placement proportionally into the model-safe canvas.
     #            This preserves the existing LTX workaround without forcing cropped sources
     #            to fill the axis they no longer occupy.
-    delivery_source_w, delivery_source_h, target_source_w, target_source_h = source_placement_size(args, info, target_width, target_height)
+    delivery_w = int(args.delivery_width or target_width)
+    delivery_h = int(args.delivery_height or target_height)
+    crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+    delivery = source_placement(int(info["width"]), int(info["height"]), delivery_w, delivery_h, crops)
+    target = source_placement(int(info["width"]), int(info["height"]), target_width, target_height, crops, delivery_w, delivery_h)
+    delivery_source_w, delivery_source_h = delivery.width, delivery.height
+    target_source_w, target_source_h = target.width, target.height
     scale_steps = f"scale=w={delivery_source_w}:h={delivery_source_h}:flags=lanczos"
     if (delivery_source_w, delivery_source_h) != (target_source_w, target_source_h):
         scale_steps += f",scale=w={target_source_w}:h={target_source_h}:flags=lanczos"
@@ -147,7 +142,7 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
         source_filters,
-        '[bg][src]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1:format=auto,format=yuv420p[v]',
+        f'[bg][src]overlay=x={target.x}:y={target.y}:shortest=1:format=auto,format=yuv420p[v]',
     ])
 
 

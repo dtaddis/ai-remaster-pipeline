@@ -3592,7 +3592,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["3"]["inputs"]["seed"], 123)
         self.assertEqual(prompt["4"]["class_type"], "VHS_VideoCombine")
         self.assertEqual(prompt["4"]["inputs"]["images"], ["3", 0])
-        self.assertEqual(prompt["4"]["inputs"]["audio"], ["1", 2])
+        self.assertNotIn("audio", prompt["4"]["inputs"])
 
     def test_upscale_signature_only_records_advanced_knobs_when_changed(self) -> None:
         parser = upscale_video.build_parser()

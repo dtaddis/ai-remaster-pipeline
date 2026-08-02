@@ -2,6 +2,8 @@
 
 The LTX 2.3 outpainting IC-LoRA only treats pure black pixels as the region to fill. That creates a nasty edge case: real black pixels inside the original movie can be interpreted as outpaint mask.
 
+Source crop values deliberately create additional pure-black outpaint regions on those same edges. The remaining source keeps the scale and position it had before cropping, so cropping 20 pixels from each side and 10 pixels from the top and bottom asks LTX to regenerate those borders as well as any extra canvas required by the target aspect ratio.
+
 The pipeline handles this with a reversible-ish lift:
 
 1. Lift the source movie image away from pure black.

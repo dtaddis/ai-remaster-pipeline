@@ -244,7 +244,10 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
             "class_type": "VHS_VideoCombine",
             "inputs": {
                 "images": ["3", 0],
-                "audio": ["1", 2],
+                # Upscale chunks are intentionally encoded without audio.  Asking
+                # VHS_LoadVideo for its lazy audio output makes silent chunks fail
+                # before FlashVSR runs; the source audio is muxed back after the
+                # scaled chunks are stitched.
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": prefix,

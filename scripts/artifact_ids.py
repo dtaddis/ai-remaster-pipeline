@@ -138,7 +138,7 @@ def outpaint_identity(source_name: str, aspect: str, work_w: int, work_h: int, c
     canvas, chunk manifest, guide directory and seed guides. Mirrors the tokens the old filename
     encoded (aspect, work WxH, crop, all-black mode)."""
     left, right, top, bottom = ([int(v) for v in crop] + [0, 0, 0, 0])[:4]
-    return {
+    identity = {
         "v": 1,
         "kind": "outpaint",
         "source": safe_stem(source_name),
@@ -148,6 +148,9 @@ def outpaint_identity(source_name: str, aspect: str, work_w: int, work_h: int, c
         "crop": [left, right, top, bottom],
         "black": bool(black),
     }
+    if any((left, right, top, bottom)):
+        identity["crop_fill"] = 2
+    return identity
 
 
 def outpaint_basename(source_name: str, aspect: str, work_w: int, work_h: int, crop: Iterable[int], black: bool, tag: str) -> str:
