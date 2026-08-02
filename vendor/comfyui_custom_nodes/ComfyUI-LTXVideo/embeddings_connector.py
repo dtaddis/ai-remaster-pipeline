@@ -10,10 +10,17 @@ from comfy.ldm.lightricks.model import (
     LTXFrequenciesPrecision,
     LTXRopeType,
     generate_freq_grid_np,
-    interleaved_freqs_cis,
-    split_freqs_cis,
 )
 from torch import nn
+
+try:
+    # New core (since ComfyUI PR #15056) replaced interleaved_freqs_cis/split_freqs_cis with a single freqs_cis_matrix helper
+    from comfy.ldm.lightricks.model import freqs_cis_matrix
+    _USE_FREQS_CIS_MATRIX = True
+except ImportError:
+    # Legacy core: cos/sin freqs consumed as a (cos, sin, split) tuple.
+    from comfy.ldm.lightricks.model import interleaved_freqs_cis, split_freqs_cis
+    _USE_FREQS_CIS_MATRIX = False
 
 from .pos_embedding_exp_values import POS_EMBEDDING_EXP_VALUES
 
@@ -251,11 +258,21 @@ class Embeddings1DConnector(nn.Module):
             expected_freqs = dim // 2
             current_freqs = freqs.shape[-1]
             pad_size = expected_freqs - current_freqs
+        else:
+            pad_size = dim % n_elem
+
+        if _USE_FREQS_CIS_MATRIX:
+            return freqs_cis_matrix(
+                freqs, pad_size, self.split_rope, self.num_attention_heads, self.dtype
+            )
+
+        # Legacy core: returns (cos, sin, split_rope).
+        if self.split_rope:
             cos_freq, sin_freq = split_freqs_cis(
                 freqs, pad_size, self.num_attention_heads
             )
         else:
-            cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem)
+            cos_freq, sin_freq = interleaved_freqs_cis(freqs, pad_size)
         return cos_freq.to(self.dtype), sin_freq.to(self.dtype), self.split_rope
 
     def forward(

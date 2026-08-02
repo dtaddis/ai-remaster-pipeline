@@ -1027,6 +1027,11 @@ class GuiSmokeTests(unittest.TestCase):
                 for symbol in symbols:
                     self.assertIn(symbol, texts)
 
+        ltx_connector = vendor_root / "ComfyUI-LTXVideo" / "embeddings_connector.py"
+        connector_text = ltx_connector.read_text(encoding="utf-8")
+        self.assertIn("from comfy.ldm.lightricks.model import freqs_cis_matrix", connector_text)
+        self.assertIn("_USE_FREQS_CIS_MATRIX = True", connector_text)
+
     def test_wait_for_prompt_retries_transient_polling_errors(self) -> None:
         calls = {"count": 0}
 

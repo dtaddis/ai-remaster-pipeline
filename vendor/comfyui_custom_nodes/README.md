@@ -26,7 +26,9 @@ Bundled node packs:
   - Excludes: large checkpoint/model files and sample assets.
 - `ComfyUI-LTXVideo`
   - Upstream: https://github.com/Lightricks/ComfyUI-LTXVideo
-  - Source revision: `229437c6b65796d6a7a63ae34be2bd5ba31fa543`
+  - Source revision: `229437c6b65796d6a7a63ae34be2bd5ba31fa543`, with the
+    ComfyUI rope compatibility fix from `548a39373bc2fdb880a233944e4621efb1a8950e`
+    backported.
   - License: LTX-2 Community License Agreement.
   - Used for: `LTXVImgToVideoConditionOnly`, `LTXAddVideoICLoRAGuide`,
     `LTXVPreprocess`, and related LTX helpers.
