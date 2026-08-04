@@ -148,6 +148,7 @@ function drawUpscale() {
         ${progressHtml(sp.percent, sp.label)}
         ${upscaleInputSummary(s)}
         ${upscaleMainFields(st)}
+        ${upscaleShotBreakdownHtml(s)}
         ${shotOutputList(expected, null)}
         ${stageCheckboxes(s)}
         <div class="actions">
@@ -180,7 +181,7 @@ function upscaleMainFields(st) {
     'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
     'flashvsr_seed',
   ];
-  fieldKeys.push('target_width', 'target_height', 'chunk_seconds', 'overlap_frames', 'preview_seconds');
+  fieldKeys.push('blend_strength', 'target_width', 'target_height', 'chunk_seconds', 'overlap_frames', 'preview_seconds');
   return fieldKeys
     .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
     .join('');
@@ -227,6 +228,37 @@ function upscaleComparisonHtml(s, preview) {
 
 function bindUpscaleComparison() {
   bindVideoComparison('upscaleCompareSlider');
+}
+
+function upscaleShotBreakdownHtml(s) {
+  const view = state.shot_views || {};
+  const rows = view.upscale || [];
+  const manifest = view.upscale_manifest || '';
+  if (!rows.length || !manifest) {
+    return '<div class="inline-warning">Run Shot Detection to set different AI upscale strengths by shot.</div>';
+  }
+  const defaultStrength = Math.max(0, Math.min(100, Number(s.blend_strength || 100)));
+  return `
+    <h3>Shot Upscale Strength</h3>
+    <p class="shot-empty">Lower values mix back more conventionally resized source detail and its original motion blur. Strength changes tween across transitions marked as fades in Shot Detection.</p>
+    <div class="shot-strength-list">
+      ${rows.map(row => {
+        const inherited = String(row.upscale_strength || '').trim() === '';
+        const value = inherited ? defaultStrength : Math.max(0, Math.min(100, Number(row.upscale_strength)));
+        const transition = String(row.fade_to_next || '').toLowerCase() === 'true'
+          ? `Tween ${esc(row.crossfade_seconds || '0')}s to next shot`
+          : 'Cut to next shot strength';
+        return `
+          <label class="shot-strength-row">
+            <span><strong>Shot ${row.index + 1}</strong><small>${esc(row.start_label)}–${esc(row.end_label)} · ${transition}</small></span>
+            <input type="range" min="0" max="100" step="1" value="${value}" oninput="this.nextElementSibling.value=this.value" onchange="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},this.value)">
+            <output>${value}</output><span>%</span>
+            <button type="button" title="Use the default strength" onclick="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},'')" ${inherited ? 'disabled' : ''}>Default</button>
+          </label>
+        `;
+      }).join('')}
+    </div>
+  `;
 }
 
 function bindCleanupComparison() {

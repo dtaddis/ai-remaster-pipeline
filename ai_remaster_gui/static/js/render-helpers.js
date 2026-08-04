@@ -118,6 +118,8 @@ const FIELD_DESCRIPTIONS = {
     'Unload the diffusion model before decoding to lower peak VRAM. Slower; only needed if decoding runs out of memory.',
   'upscale.flashvsr_seed':
     'Changes the detail the model invents. If a face renders wrong, re-rolling the seed (with Regenerate) often fixes it.',
+  'upscale.blend_strength':
+    'How much of the AI reconstruction is used by default. The remainder is a conventional resize of the source, which restores source-derived motion blur and reduces the stop-motion look. Each shot can override this.',
   'upscale.chunk_seconds':
     'The clip is upscaled in chunks of roughly this many seconds; each chunk restarts the model’s temporal stream. 0 sends the whole clip at once.',
   'upscale.overlap_frames':

@@ -374,6 +374,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_result("Shot boundary update", update_boundary_result)
         elif parsed.path == "/api/shot-fade":
             self._send_result("Shot fade update", lambda: {**update_shot_fade(str(data.get("manifest", "")), int(data.get("index", 0)), bool(data.get("enabled")), str(data.get("crossfade_seconds", ""))), "state": state.APP.state("shots")})
+        elif parsed.path == "/api/shot-upscale-strength":
+            def update_upscale_strength():
+                manifest = str(data.get("manifest", ""))
+                index = int(data.get("index", 0))
+                raw = str(data.get("strength", "")).strip()
+                if raw:
+                    strength = max(0.0, min(100.0, float(raw)))
+                    raw = f"{strength:.3f}".rstrip("0").rstrip(".")
+                update_manifest_row(resolve(manifest), index, {"upscale_strength": raw})
+                return {"strength": raw, "state": state.APP.state("upscale")}
+            self._send_result("Shot upscale strength update", update_upscale_strength)
         elif parsed.path == "/api/reference-regenerate":
             self._send_action("Reference regeneration", lambda: state.APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("provider", "qwen"))))
         elif parsed.path == "/api/reference-delete":

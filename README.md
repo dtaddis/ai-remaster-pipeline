@@ -156,9 +156,11 @@ Set the target aspect ratio, output height, chunk length, overlap frames, and so
 
 Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
 
+Outpainting uses Lightricks' official LTX 2.3 v0.9 in/outpainting IC-LoRA. ARP derives a frame-aligned binary mask from the prepared canvas, then runs the official two-stage graph: a coarse masked generation pass followed by boundary refinement and Laplacian blending of the protected source back into both passes. The model is gated on Hugging Face: access must first be accepted in the browser for the same individual account used by ARP. The GUI opens that page on first use; authenticate with `hf auth login --force` (or `HF_TOKEN`) if the saved token still receives a 403.
+
 Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point.
 
-If outpainting fails immediately with missing `LTXVImgToVideoConditionOnly` or `LTXAddVideoICLoRAGuide` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
+If outpainting fails immediately with missing `LTXVInpaintPreprocess`, `LTXVLaplacianPyramidBlend`, or `LTXAddVideoICLoRAGuideAdvanced` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
 
 If you use ComfyUI portable, select either the inner folder that contains `main.py` or the portable parent folder; ARP will look for `ComfyUI\main.py` inside it.
 
@@ -194,6 +196,12 @@ Once recomposition finishes, the Output tab plays the final render.
 
 ![Output tab](assets/screenshots/walkthrough/arp-walkthrough-output.jpg)
 
+### Upscaling and source motion
+
+FlashVSR can make motion look unnaturally crisp when it reconstructs every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full FlashVSR render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
+
+After Shot Detection, the Upscaling page also exposes this strength per shot. A hard cut switches strength on the cut; a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength FlashVSR render is cached separately, so changing only these blend decisions does not rerun the AI upscale.
+
 ### Settings
 
 Settings contains ComfyUI connection details, queue/log inspection, and global pipeline defaults that are useful but too noisy for the main stage tabs.
@@ -206,7 +214,7 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 - CUDA-accelerated automatic light/dark DeVignette correction for optional archive repair.
 - Masked ProPainter video inpainting for optional AI DeScratch (non-commercial NTU S-Lab licence).
 - LTX 2.3 Dearchive IC-LoRA for optional generative archive cleanup.
-- LTX 2.3 IC outpainting LoRA.
+- Official LTX 2.3 v0.9 in/outpainting IC-LoRA (mask-conditioned, two-stage).
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
 - Qwen Image Edit Lightning LoRA.
 - Deep Exemplar reference-guided video colorization.

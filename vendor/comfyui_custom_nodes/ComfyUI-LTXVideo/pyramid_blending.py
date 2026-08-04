@@ -127,9 +127,9 @@ def _pyramid_blend(
         raise ValueError(
             f"input images must have the same size, {image1.shape} != {image2.shape}"
         )
-    if image1.shape[0] != mask.shape[0]:
+    if mask.shape[0] not in (1, image1.shape[0]):
         raise ValueError(
-            "image_a, image_b, and mask must have the same frame count for blending"
+            "mask must have one frame or the same frame count as the images for blending"
         )
     if image1.shape[-2:] != mask.shape[-2:]:
         raise ValueError(
@@ -154,7 +154,9 @@ def _pyramid_blend(
 
         img1_chunk, _ = _pad_for_laplacian(image1[start:end])
         img2_chunk, _ = _pad_for_laplacian(image2[start:end])
-        mask_chunk = mask[start:end]
+        mask_chunk = mask if mask.shape[0] == 1 else mask[start:end]
+        if mask_chunk.shape[0] == 1 and end - start > 1:
+            mask_chunk = mask_chunk.expand(end - start, -1, -1, -1)
 
         if device is not None:
             img1_chunk = img1_chunk.to(device)
@@ -242,13 +244,16 @@ class LTXVLaplacianPyramidBlend(io.ComfyNode):
             )
 
         if trim_to_shortest:
-            shortest = min(image_a.shape[0], image_b.shape[0], mask.shape[0])
+            shortest = min(image_a.shape[0], image_b.shape[0])
+            if mask.shape[0] != 1:
+                shortest = min(shortest, mask.shape[0])
             image_a = image_a[:shortest]
             image_b = image_b[:shortest]
-            mask = mask[:shortest]
-        elif not (image_a.shape[0] == image_b.shape[0] == mask.shape[0]):
+            if mask.shape[0] != 1:
+                mask = mask[:shortest]
+        elif image_a.shape[0] != image_b.shape[0] or mask.shape[0] not in (1, image_a.shape[0]):
             raise ValueError(
-                "image_a, image_b, and mask must have the same frame count unless trim_to_shortest is enabled"
+                "image_a and image_b must match, and mask must have one frame or match them unless trim_to_shortest is enabled"
             )
 
         original = image_a.permute(0, 3, 1, 2)

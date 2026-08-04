@@ -121,7 +121,7 @@ class PatchExtraGuidesTests(unittest.TestCase):
         stub = lambda guide, comfy_dir, w, h, source_frame=None: f"stub_{Path(str(guide)).stem}.png"  # noqa: E731
         with mock.patch.object(ov, "copy_guide_image_to_comfy_input", stub), contextlib.redirect_stdout(io.StringIO()):
             ov._patch_extra_guides(workflow, args, extra_guides, 1280, 704, None, frames)
-        return workflow_to_prompt(workflow, "5076")
+        return workflow_to_prompt(workflow, "5228")
 
     def consumers_of(self, prompt: dict, node_id: str, exclude: set[str] = frozenset()) -> set[str]:
         return {
@@ -143,8 +143,8 @@ class PatchExtraGuidesTests(unittest.TestCase):
         nodes = {nid: n for nid, n in prompt.items() if n["class_type"] == "LTXVAddGuideAdvanced"}
         self.assertEqual(sorted(nodes), ["9060", "9061", "9062", "9063"])
         self.assertEqual([nodes[nid]["inputs"]["frame_idx"] for nid in sorted(nodes)], [200, 56, 480, 120])
-        # Chain: 5012 -> 9060 -> 9061 -> 9062 -> 9063
-        self.assertEqual(nodes["9060"]["inputs"]["positive"][0], "5012")
+        # Chain: official IC guide -> 9060 -> 9061 -> 9062 -> 9063
+        self.assertEqual(nodes["9060"]["inputs"]["positive"][0], "5114")
         self.assertEqual(nodes["9061"]["inputs"]["positive"][0], "9060")
         self.assertEqual(nodes["9062"]["inputs"]["positive"][0], "9061")
         self.assertEqual(nodes["9063"]["inputs"]["positive"][0], "9062")
@@ -155,10 +155,10 @@ class PatchExtraGuidesTests(unittest.TestCase):
 
     def test_all_guides_skipped_leaves_workflow_untouched(self) -> None:
         # A lone guide resolving to frame 0 is dropped entirely; the prompt must keep
-        # 5012's direct wiring instead of dangling guide nodes.
+        # The official IC guide's direct wiring instead of dangling guide nodes.
         prompt = self.patch_and_convert([{"frame_idx": -9, "strength": 1.0, "image": "imgA.png"}], frames=9)
         self.assertFalse(any(n["class_type"] == "LTXVAddGuideAdvanced" for n in prompt.values()))
-        self.assertIn("CFGGuider", self.consumers_of(prompt, "5012"))
+        self.assertIn("CFGGuider", self.consumers_of(prompt, "5114"))
 
 
 if __name__ == "__main__":

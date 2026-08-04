@@ -1126,7 +1126,7 @@ Invoke-Step 'Verify required ComfyUI custom nodes' {
         'ComfyUI-LTXVideo' `
         (Join-Path $CustomNodes 'ComfyUI-LTXVideo') `
         'https://github.com/Lightricks/ComfyUI-LTXVideo' `
-        @('LTXVImgToVideoConditionOnly', 'LTXAddVideoICLoRAGuide', 'LTXVPreprocess')
+        @('LTXVImgToVideoConditionOnly', 'LTXAddVideoICLoRAGuideAdvanced', 'LTXVInpaintPreprocess', 'LTXVLaplacianPyramidBlend')
     Assert-CustomNodeSymbols `
         'ComfyUI-GGUF' `
         (Join-Path $CustomNodes 'ComfyUI-GGUF') `
@@ -1196,7 +1196,7 @@ if ($DownloadModels -and -not $SkipModelDownloads) {
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' 'models\vae\LTX23_video_vae_bf16.safetensors'
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' 'models\vae\LTX23_audio_vae_bf16.safetensors'
         Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' 'models\loras\ltx-2.3-dearchive-lora.safetensors'
-        Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors'
+        Download-HfFile 'Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting' 'ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors'
     }
 
     Invoke-Step 'Download Qwen Image Edit 2511 GGUF Q4_K_M models and Lightning LoRA' {

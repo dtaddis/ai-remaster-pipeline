@@ -345,6 +345,16 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
             out['resize_type.multiplier'] = values[1]
         elif resize_type == 'scale to multiple' and len(values) > 1:
             out['resize_type.multiple'] = values[1]
+        elif resize_type == 'scale longer dimension' and len(values) > 1:
+            out['resize_type.longer_size'] = values[1]
+        elif resize_type == 'scale shorter dimension' and len(values) > 1:
+            out['resize_type.shorter_size'] = values[1]
+        elif resize_type == 'scale width' and len(values) > 1:
+            out['resize_type.width'] = values[1]
+        elif resize_type == 'scale height' and len(values) > 1:
+            out['resize_type.height'] = values[1]
+        elif resize_type == 'scale total pixels' and len(values) > 1:
+            out['resize_type.megapixels'] = values[1]
         elif resize_type == 'match size' and len(values) > 1:
             out['resize_type.crop'] = values[1]
         elif resize_type == 'scale dimensions':
@@ -363,6 +373,17 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
         'LTXVImgToVideoConditionOnly': ('strength', 'bypass'),
         'CLIPTextEncode': ('text',),
         'LTXAddVideoICLoRAGuide': ('frame_idx', 'strength', 'latent_downscale_factor', 'crop', 'use_tiled_encode', 'tile_size', 'tile_overlap'),
+        'LTXAddVideoICLoRAGuideAdvanced': ('frame_idx', 'strength', 'latent_downscale_factor', 'crop', 'use_tiled_encode', 'tile_size', 'tile_overlap', 'attention_strength'),
+        'LTXICLoRALoaderModelOnly': ('lora_name', 'strength_model'),
+        'LTXAVTextEncoderLoader': ('text_encoder', 'ckpt_name', 'device'),
+        'LTXVAudioVAELoader': ('ckpt_name',),
+        'LTXVLaplacianPyramidBlend': ('trim_to_shortest', 'mask_low_res_dilation'),
+        'LTXVTiledVAEDecode': ('horizontal_tiles', 'vertical_tiles', 'overlap', 'last_frame_fix', 'working_device', 'working_dtype'),
+        'ImagePadForOutpaintTargetSize': ('target_width', 'target_height', 'feathering', 'mask_interpolation'),
+        'LoadVideo': ('file',),
+        'SaveVideo': ('filename_prefix', 'format', 'codec'),
+        'CreateVideo': ('fps',),
+        'VAEEncodeTiled': ('tile_size', 'overlap', 'temporal_size', 'temporal_overlap'),
         'LTXVEmptyLatentAudio': ('frames_number', 'frame_rate', 'batch_size'),
         'RandomNoise': ('noise_seed', 'control_after_generate'),
         'CFGGuider': ('cfg',),

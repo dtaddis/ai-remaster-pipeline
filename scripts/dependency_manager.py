@@ -25,6 +25,26 @@ class HfModel:
     destination: str
 
 
+class HuggingFaceAccessError(RuntimeError):
+    """A gated Hugging Face model could not be read with the active credentials."""
+
+
+def huggingface_access_denied(exc: BaseException) -> bool:
+    """Recognize Hub access failures without depending on a particular hub/httpx version."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if getattr(response, "status_code", None) in {401, 403}:
+            return True
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(marker in text for marker in ("gatedrepoerror", "401 unauthorized", "403 forbidden", "access to model", "gated repo")):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 LTX_BASE_MODELS = [
     HfModel("QuantStack/LTX-2.3-GGUF", "LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf", "models/unet/LTX-2.3-distilled-Q4_K_M.gguf"),
     HfModel("Lightricks/LTX-2.3-fp8", "ltx-2.3-22b-dev-fp8.safetensors", "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"),
@@ -35,7 +55,11 @@ LTX_BASE_MODELS = [
 
 OUTPAINT_MODELS = [
     *LTX_BASE_MODELS,
-    HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
+    HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
+]
+
+OUTPAINT_DISTILLED_LORA_MODELS = [
+    HfModel("Lightricks/LTX-2.3", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
 ]
 
 CLEANUP_MODELS = [
@@ -147,6 +171,12 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
                 print(f"Downloaded: {destination}", flush=True)
             except Exception as exc:
                 if required:
+                    if huggingface_access_denied(exc):
+                        model_url = f"https://huggingface.co/{model.repo}"
+                        raise HuggingFaceAccessError(
+                            "Approve the official LTX outpainting model download on Hugging Face. "
+                            f"ARP will open {model_url}; approve access there, then run Outpainting again."
+                        ) from None
                     raise
                 print(f"Warning: could not auto-download {model.repo}/{model.file}: {exc}", flush=True)
                 print(
@@ -341,8 +371,11 @@ def estimate_downloaded_bytes(cache_root: Path, baseline: dict[Path, int]) -> in
     return best
 
 
-def ensure_outpaint_models(comfy_dir: Path) -> None:
-    ensure_hf_models(comfy_dir, OUTPAINT_MODELS)
+def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False) -> None:
+    models = [*OUTPAINT_MODELS]
+    if include_distilled_lora:
+        models.extend(OUTPAINT_DISTILLED_LORA_MODELS)
+    ensure_hf_models(comfy_dir, models)
 
 
 def ensure_cleanup_models(comfy_dir: Path) -> None:

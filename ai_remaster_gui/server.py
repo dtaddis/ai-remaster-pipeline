@@ -198,12 +198,15 @@ from .media import (
 MODEL_SIZE_MULTIPLE = 32
 STABLE_AUDIO_LICENSE_URL = "https://huggingface.co/stabilityai/stable-audio-open-1.0"
 STABLE_AUDIO_DEFAULT_CHECKPOINT = "stable_audio_open_1.0.safetensors"
+OUTPAINT_LICENSE_URL = "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"
+OUTPAINT_LORA_DESTINATION = "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 
 # Shared artifact identity/naming/sizing (single source of truth, also imported by the producer
 # scripts). Lives under scripts/, so put that on the path before importing.
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
+from model_paths import resolve_comfy_model_path  # noqa: E402
 
 from . import state  # shared singleton registry; sibling modules read state.APP
 
@@ -266,6 +269,37 @@ def stable_audio_browser_handoff(checkpoint: str) -> tuple[bool, str]:
         f"{action} {STABLE_AUDIO_LICENSE_URL} in your browser, sign in, accept the license, then click Run Create Audio Track again. "
         f"ARP will download the checkpoint to {target}. "
         f"If the download still needs credentials after accepting, run 'hf auth login' or set HF_TOKEN."
+    )
+
+
+def outpaint_handoff_marker_path() -> Path:
+    return ROOT / ".cache" / "handoffs" / "ltx_2_3_official_outpaint_approval_v2.json"
+
+
+def outpaint_browser_handoff() -> tuple[bool, str]:
+    comfy_dir = Path(comfy_dir_for(current_config()))
+    target = resolve_comfy_model_path(comfy_dir, OUTPAINT_LORA_DESTINATION)
+    if target.exists():
+        return True, ""
+    marker = outpaint_handoff_marker_path()
+    if marker.exists():
+        return True, ""
+    opened = False
+    if os.environ.get("AI_REMASTER_NO_BROWSER") != "1":
+        try:
+            opened = bool(webbrowser.open(OUTPAINT_LICENSE_URL))
+        except Exception:
+            opened = False
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"url": OUTPAINT_LICENSE_URL, "opened": opened}, indent=2) + "\n", encoding="utf-8")
+    if opened:
+        return False, (
+            "Approve the official LTX outpainting model download on Hugging Face. "
+            "ARP opened the approval page in a new browser tab. After approving it, click Run Outpainting again."
+        )
+    return False, (
+        "Approve the official LTX outpainting model download on Hugging Face. "
+        f"ARP could not open the browser automatically; open {OUTPAINT_LICENSE_URL}, approve access, then click Run Outpainting again."
     )
 
 
@@ -742,8 +776,11 @@ class PipelineApp:
                 "log": "\n".join(self.log[-800:]),
                 "log_count": len(self.log),
             }
-        if view in {"shots", "references", "colour"}:
-            payload["shot_views"] = shot_views(settings_snapshot, generate_previews=generate_shot_previews)
+        if view in {"shots", "references", "colour", "upscale"}:
+            payload["shot_views"] = shot_views(
+                settings_snapshot,
+                generate_previews=generate_shot_previews if view != "upscale" else False,
+            )
         return payload
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
@@ -1336,6 +1373,10 @@ class PipelineApp:
             clean_output = self.cleanup_output()
             if not clean_output or not resolve(clean_output).exists():
                 return False, "Run Clean Up first so this phase has its upstream video."
+        if stage_key == "outpaint":
+            ok, message = outpaint_browser_handoff()
+            if not ok:
+                return False, message
         if stage_key == "audio":
             self.hydrate_stage_inputs("audio")
             audio_values = self.settings.get("audio", {})
@@ -1668,6 +1709,14 @@ class PipelineApp:
         add(["--flashvsr-sparse-ratio", values.get("flashvsr_sparse_ratio") or "2.0"])
         add(["--flashvsr-kv-ratio", values.get("flashvsr_kv_ratio") or "3.0"])
         add(["--flashvsr-seed", values.get("flashvsr_seed", "0")])
+        add(["--blend-strength", values.get("blend_strength", "100")])
+        shot_manifest = (
+            self.settings.get("colour", {}).get("manifest", "")
+            or self.settings.get("references", {}).get("manifest", "")
+            or manifest_for_outpainted(self.settings.get("shots", {}).get("outpainted_video", ""))
+        )
+        if shot_manifest:
+            add(["--shot-manifest", shot_manifest])
         add(["--chunk-seconds", values.get("chunk_seconds", "6")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add_bool_flags(cmd, values, ("flashvsr_tiled_vae", "flashvsr_tiled_dit", "flashvsr_color_fix"), "true")

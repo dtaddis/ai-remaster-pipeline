@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import webbrowser
 from pathlib import Path
 from typing import Any
 
@@ -25,13 +27,16 @@ from common import (
     root_relative,
     resumable_output,
     safe_stem,
+    signature_path,
+    split_sidecar_path,
     split_matches_source,
     write_signature,
     write_split_sidecar,
 )
-from dependency_manager import ensure_outpaint_models
+from dependency_manager import HuggingFaceAccessError, ensure_outpaint_models
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
+from outpaint_geometry import source_placement
 from qwen_seed_guides import DEFAULT_SEED_PROMPT, seed_guides
 import artifact_ids as aid
 
@@ -46,15 +51,32 @@ def _crop_black(args: Any | None) -> tuple[list[int], bool]:
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 DEFAULT_OUTPAINT_PROMPT = "outpaint"
+OUTPAINT_ACCESS_URL = "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"
 RECOMMENDED_OVERLAP_FRAMES = 8
 MODEL_SIZE_MULTIPLE = 32
 OUTPAINT_REQUIRED_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
-    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+    "LTXAddVideoICLoRAGuideAdvanced": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
-    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
-    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+    "LTXVInpaintPreprocess": "ComfyUI-LTXVideo",
+    "LTXVLaplacianPyramidBlend": "ComfyUI-LTXVideo",
+    "LTXVEmptyLatentAudio": "ComfyUI core",
+    "ImageToMask": "ComfyUI core",
+    "ThresholdMask": "ComfyUI core",
+    "InvertMask": "ComfyUI core",
+    "LoadVideo": "ComfyUI core",
+    "SaveVideo": "ComfyUI core",
 }
+
+
+def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
+    try:
+        opened = bool(webbrowser.open(OUTPAINT_ACCESS_URL))
+    except Exception:
+        opened = False
+    if opened:
+        return "Approve the official LTX outpainting model download in the Hugging Face tab ARP just opened, then run Outpainting again."
+    return str(exc)
 
 
 def aspect_slug(value: str) -> str:
@@ -110,6 +132,21 @@ def run_command(command: list[str], dry_run: bool) -> None:
     print(" ".join(command), flush=True)
     if not dry_run:
         subprocess.run(command, check=True)
+
+
+def video_has_audio(ffmpeg: str, source: Path) -> bool:
+    ffmpeg_path = Path(ffmpeg)
+    ffprobe = str(ffmpeg_path.with_name("ffprobe.exe")) if ffmpeg_path.suffix.lower() == ".exe" else "ffprobe"
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "json", str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return bool(json.loads(result.stdout or "{}").get("streams"))
+    except Exception:
+        return False
 
 
 def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
@@ -240,7 +277,16 @@ def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
 def set_widget_if_node(workflow: dict[str, Any], node_id: str | None, widget: str | int, value: Any) -> None:
     if not node_id:
         return
-    set_widget(node_by_id(workflow, node_id), widget, value)
+    node = node_by_id(workflow, node_id)
+    widgets = node.get("widgets_values")
+    if isinstance(widgets, list) and isinstance(widget, str) and not widget.isdigit():
+        named_indices = {
+            "video": 0,
+            "filename_prefix": 0,
+            "image": 0,
+        }
+        widget = named_indices.get(widget, widget)
+    set_widget(node, widget, value)
 
 
 def add_or_replace_node(workflow: dict[str, Any], node: dict[str, Any]) -> None:
@@ -365,6 +411,242 @@ def bypass_conditioning_resize_nodes(workflow: dict[str, Any]) -> None:
         pass
 
 
+def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[int, int, int, int] | None:
+    base_prepared = prepared
+    offset_x = 0
+    offset_y = 0
+    split_sig = split_sidecar_path(prepared)
+    if split_sig.exists():
+        try:
+            split_data = json.loads(split_sig.read_text(encoding="utf-8-sig"))
+            base_prepared = resolve_path(split_data["source"])
+            offset_x = int(split_data.get("offset_x", 0))
+            offset_y = int(split_data.get("offset_y", 0))
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if not (offset_x or offset_y):
+        offset_match = re.search(r"_ox([+-]\d+)_oy([+-]\d+)$", prepared.stem)
+        if offset_match:
+            offset_x, offset_y = int(offset_match.group(1)), int(offset_match.group(2))
+
+    sig_path = signature_path(base_prepared)
+    if not sig_path.exists():
+        return None
+    try:
+        sig = json.loads(sig_path.read_text(encoding="utf-8-sig"))
+        if sig.get("tool") != "prepare_outpaint_input.py":
+            return None
+        target_width = int(sig["target_width"])
+        target_height = int(sig["target_height"])
+        if (target_width, target_height) != (width, height):
+            return None
+        crops = tuple(int(sig.get(key, 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+        placement = source_placement(
+            int(sig["source_width"]),
+            int(sig["source_height"]),
+            target_width,
+            target_height,
+            crops,
+            int(sig.get("delivery_width") or target_width),
+            int(sig.get("delivery_height") or target_height),
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    left = max(0, placement.x + offset_x)
+    top = max(0, placement.y + offset_y)
+    right = min(width, placement.x + offset_x + placement.width)
+    bottom = min(height, placement.y + offset_y + placement.height)
+    return (left, top, right, bottom) if left < right and top < bottom else None
+
+
+def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
+    """Build one geometric mask frame; the LTX nodes broadcast it across the clip."""
+    target = ROOT / ".cache" / "outpaint_masks" / f"{safe_stem(prepared.name)}_official_mask.png"
+    sig = {
+        "version": 2,
+        "tool": "outpaint_video.py/official_mask",
+        "prepared": root_relative(prepared),
+        "prepared_fingerprint": file_fingerprint(prepared),
+        "threshold": 3,
+        "content_axis_fraction": 0.035,
+    }
+    if not args.force and resumable_output(target, sig, width=width, height=height):
+        return target
+
+    import cv2
+    import numpy as np
+
+    rectangle = prepared_source_rectangle(prepared, width, height)
+    if rectangle is None:
+        cap = cv2.VideoCapture(str(prepared))
+        frame_count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+        combined_content = np.zeros((height, width), dtype=bool)
+        for frame_index in np.linspace(0, frame_count - 1, min(12, frame_count), dtype=int):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            if frame.shape[1] != width or frame.shape[0] != height:
+                cap.release()
+                raise RuntimeError(f"Prepared outpaint mask geometry changed: expected {width}x{height}, got {frame.shape[1]}x{frame.shape[0]}")
+            combined_content |= np.any(frame > 3, axis=2)
+        cap.release()
+        content_columns = np.flatnonzero(combined_content.mean(axis=0) >= 0.035)
+        content_rows = np.flatnonzero(combined_content.mean(axis=1) >= 0.035)
+        if not content_columns.size or not content_rows.size:
+            raise RuntimeError("Could not locate the protected source rectangle in the prepared outpaint canvas.")
+        rectangle = (int(content_columns[0]), int(content_rows[0]), int(content_columns[-1]) + 1, int(content_rows[-1]) + 1)
+
+    left, top, right, bottom = rectangle
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    mask[top:bottom, left:right] = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".partial.png")
+    print(f"Building broadcast LTX outpaint mask: {target} (source rectangle {left},{top}-{right},{bottom})", flush=True)
+    if not cv2.imwrite(str(partial), mask):
+        raise RuntimeError(f"Could not write the official LTX outpaint mask: {partial}")
+    replace_with_retry(partial, target, "Official outpaint mask")
+    write_signature(target, sig)
+    return target
+
+
+def patch_official_two_stage_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int, fps: float) -> None:
+    """Feed ARP's already-expanded canvas and an exact video mask into the official graph."""
+    try:
+        node_by_id(workflow, "5266")
+        node_by_id(workflow, "5226")
+        node_by_id(workflow, "5114")
+    except KeyError:
+        return
+
+    source_link = 14364
+    mask_link = 14369
+    patch_link(workflow, source_link, 5168, 0, 5360, 0, "IMAGE")
+    set_input_link(workflow, "5360", "input", source_link)
+
+    if getattr(args, "outpaint_all_black_regions", False):
+        # Reuse the already-decoded source frames. This mode needs a time-varying mask, but it
+        # does not need the former second 480-frame RGB video allocation.
+        image_mask_link, threshold_link = 19100, 19101
+        add_or_replace_node(workflow, {
+            "id": 9100,
+            "type": "ImageToMask",
+            "title": "ARP source black level",
+            "mode": 0,
+            "inputs": [
+                {"name": "image", "type": "IMAGE", "link": image_mask_link},
+                {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+            ],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [threshold_link]}],
+            "widgets_values": ["red"],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9101,
+            "type": "ThresholdMask",
+            "title": "ARP protect non-black pixels",
+            "mode": 0,
+            "inputs": [
+                {"name": "mask", "type": "MASK", "link": threshold_link},
+                {"name": "value", "type": "FLOAT", "widget": {"name": "value"}},
+            ],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [19102]}],
+            "widgets_values": [3.0 / 255.0],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9102,
+            "type": "InvertMask",
+            "title": "ARP outpaint black pixels",
+            "mode": 0,
+            "inputs": [{"name": "mask", "type": "MASK", "link": 19102}],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_link]}],
+            "widgets_values": [],
+        })
+        patch_link(workflow, image_mask_link, 5168, 0, 9100, 0, "IMAGE")
+        patch_link(workflow, threshold_link, 9100, 0, 9101, 0, "MASK")
+        patch_link(workflow, 19102, 9101, 0, 9102, 0, "MASK")
+        patch_link(workflow, mask_link, 9102, 0, 5365, 0, "MASK")
+    else:
+        mask = official_mask_image(prepared, args, width, height)
+        mask_name = copy_to_comfy_input(mask, comfy_dir, "arp_outpaint_mask")
+        load_link = 19100
+        add_or_replace_node(workflow, {
+            "id": 9100,
+            "type": "LoadImage",
+            "title": "ARP broadcast outpaint mask",
+            "mode": 0,
+            "inputs": [],
+            "outputs": [
+                {"name": "IMAGE", "type": "IMAGE", "links": [load_link]},
+                {"name": "MASK", "type": "MASK", "links": []},
+            ],
+            "widgets_values": [mask_name, "image"],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9101,
+            "type": "ImageToMask",
+            "title": "ARP broadcast mask channel",
+            "mode": 0,
+            "inputs": [
+                {"name": "image", "type": "IMAGE", "link": load_link},
+                {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+            ],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_link]}],
+            "widgets_values": ["red"],
+        })
+        patch_link(workflow, load_link, 9100, 0, 9101, 0, "IMAGE")
+        patch_link(workflow, mask_link, 9101, 0, 5365, 0, "MASK")
+    set_input_link(workflow, "5365", "input", mask_link)
+
+    # Use time-aligned source audio when present. Truly silent chunks still need an audio
+    # latent because the LTX 2.3 model is AV-shaped, so give those a frozen empty latent.
+    if not video_has_audio(find_ffmpeg(), prepared):
+        empty_audio_id = 9110
+        audio_vae_link = 19130
+        empty_audio_link = 19131
+        add_or_replace_node(workflow, {
+            "id": empty_audio_id,
+            "type": "LTXVEmptyLatentAudio",
+            "title": "ARP empty audio latent for silent outpaint chunks",
+            "mode": 0,
+            "inputs": [
+                {"name": "audio_vae", "type": "VAE", "link": audio_vae_link},
+                {"name": "frames_number", "type": "INT", "widget": {"name": "frames_number"}},
+                {"name": "frame_rate", "type": "FLOAT", "widget": {"name": "frame_rate"}},
+                {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}},
+            ],
+            "outputs": [{"name": "Latent", "type": "LATENT", "links": [empty_audio_link]}],
+            "widgets_values": [int(probe_video(prepared)["frames"]), float(fps), 1],
+        })
+        patch_link(workflow, audio_vae_link, 5385, 0, empty_audio_id, 0, "VAE")
+        audio_input_slot = next(
+            index for index, item in enumerate(node_by_id(workflow, "5390").get("inputs", []))
+            if item.get("name") == "audio_latent"
+        )
+        patch_link(workflow, empty_audio_link, empty_audio_id, 0, 5390, audio_input_slot, "LATENT")
+        set_input_link(workflow, "5390", "audio_latent", empty_audio_link)
+        audio_vae_outputs = node_by_id(workflow, "5385").get("outputs", [])
+        if audio_vae_outputs:
+            existing_audio_vae_links = list(audio_vae_outputs[0].get("links") or [])
+            if audio_vae_link not in existing_audio_vae_links:
+                audio_vae_outputs[0]["links"] = existing_audio_vae_links + [audio_vae_link]
+
+    # Full-canvas ARP guides should not be resized to the official demo's 1024px guide size.
+    guide_link = 19120
+    patch_link(workflow, guide_link, 2004, 0, 3159, 1, "IMAGE")
+    set_input_link(workflow, "3159", "image", guide_link)
+
+
+def is_official_two_stage_graph(workflow: dict[str, Any]) -> bool:
+    try:
+        node_by_id(workflow, "5266")
+        node_by_id(workflow, "5226")
+        node_by_id(workflow, "5114")
+        return True
+    except KeyError:
+        return False
+
+
 # The LTX example workflow is a frontend graph with stable-but-opaque node IDs.
 # Keep ARP's edits explicit here so model/backend assumptions remain auditable.
 def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
@@ -373,7 +655,8 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     model_node["title"] = "Unet Loader (GGUF)"
     model_node["inputs"] = [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}}]
     model_node["widgets_values"] = [args.gguf_model]
-    model_node["outputs"] = [{"name": "MODEL", "type": "MODEL", "links": [13217]}]
+    original_model_links = [int(link) for output in model_node.get("outputs", [])[:1] for link in (output.get("links") or [])]
+    model_node["outputs"] = [{"name": "MODEL", "type": "MODEL", "links": original_model_links or [13217]}]
 
     add_or_replace_node(
         workflow,
@@ -383,7 +666,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
             "title": "LTX 2.3 Video VAE",
             "mode": 0,
             "inputs": [{"name": "vae_name", "type": "COMBO", "widget": {"name": "vae_name"}}],
-            "outputs": [{"name": "VAE", "type": "VAE", "links": [13279, 13348, 13405]}],
+            "outputs": [{"name": "VAE", "type": "VAE", "links": []}],
             "widgets_values": [args.video_vae],
         },
     )
@@ -396,18 +679,41 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
         if int(link[1]) == 3940 and int(link[2]) == 2:
             link[1], link[2] = 9001, 0
             vae_links.append(int(link[0]))
-    node_by_id(workflow, "9001")["outputs"][0]["links"] = sorted(set(vae_links) | {13279, 13348, 13405})
-    patch_link(workflow, 13217, 3940, 0, 5011, 0, "MODEL")
-    patch_link(workflow, 13279, 9001, 0, 3159, 0, "VAE")
-    patch_link(workflow, 13348, 9001, 0, 4851, 1, "VAE")
-    patch_link(workflow, 13405, 9001, 0, 5012, 2, "VAE")
-    set_input_link(workflow, "5011", "model", 13217)
+    node_by_id(workflow, "9001")["outputs"][0]["links"] = sorted(set(vae_links))
+    # The legacy ARP workflow placed the IC-LoRA immediately after the base loader; the
+    # official graph places the distilled LoRA first. Preserve whichever graph is bundled.
+    try:
+        node_by_id(workflow, "5114")
+        node_by_id(workflow, "5266")
+        official_two_stage = True
+    except KeyError:
+        official_two_stage = False
+    if not official_two_stage:
+        patch_link(workflow, 13217, 3940, 0, 5011, 0, "MODEL")
+        set_input_link(workflow, "5011", "model", 13217)
+    else:
+        # The lightweight backend is already the distilled Q4 model. The official graph's
+        # 7.6 GB distillation LoRA is only for the full dev checkpoint; applying it here would
+        # distill the model twice. Feed the distilled GGUF directly into the IC-LoRA loader.
+        ic_model_link = input_link(workflow, "5011", "model")
+        if ic_model_link is None:
+            raise ValueError("Official outpaint IC-LoRA loader has no model input link.")
+        target_slot = next(
+            index for index, item in enumerate(node_by_id(workflow, "5011").get("inputs", []))
+            if item.get("name") == "model"
+        )
+        patch_link(workflow, ic_model_link, 3940, 0, 5011, target_slot, "MODEL")
+        set_input_link(workflow, "5011", "model", ic_model_link)
+        model_node["outputs"][0]["links"] = [ic_model_link]
     lora_node = node_by_id(workflow, "5011")
     ensure_widget_input(lora_node, "lora_name")
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
     set_widget(lora_node, "0", args.outpaint_lora)
     set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
-    audio_vae_node = node_by_id(workflow, "4010")
+    try:
+        audio_vae_node = node_by_id(workflow, "5385")
+    except KeyError:
+        audio_vae_node = node_by_id(workflow, "4010")
     ensure_widget_input(audio_vae_node, "ckpt_name")
     set_widget(audio_vae_node, "0", args.audio_vae_checkpoint)
     text_node = node_by_id(workflow, "5023")
@@ -416,6 +722,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     ensure_widget_input(text_node, "device")
     set_widget(text_node, "0", args.text_encoder)
     set_widget(text_node, "1", args.text_encoder_checkpoint)
+    set_widget(text_node, "2", getattr(args, "text_encoder_device", "cpu"))
 
 
 def resolve_guide_coords(extra_guides: "list[dict]", num_pixel_frames: int) -> "list[dict]":
@@ -469,7 +776,7 @@ def _patch_extra_guides(
     """Chain one LTXVAddGuideAdvanced node per extra guide frame.
 
     Nodes are assigned IDs starting at 9050 (LoadImage) and 9060 (LTXVAddGuideAdvanced),
-    incrementing by 1 per guide.  The first guide node redirects 5012's downstream
+    incrementing by 1 per guide.  The first guide node redirects the IC guide's downstream
     consumers; each subsequent guide node redirects the previous guide node's consumers.
     """
     from pathlib import Path as _Path
@@ -479,12 +786,18 @@ def _patch_extra_guides(
     if not extra_guides:
         return
 
-    # Find the VAE source from node 5012's vae input (already resolved by GGUF patching).
+    base_guide_id = 5114
+    try:
+        node_by_id(workflow, str(base_guide_id))
+    except KeyError:
+        base_guide_id = 5012
+
+    # Find the VAE source from the active IC guide's vae input.
     links_map = {lnk[0]: lnk for lnk in workflow.get("links", [])}
     vae_src_node: int = 3940
     vae_src_slot: int = 2
     try:
-        ic_node = node_by_id(workflow, "5012")
+        ic_node = node_by_id(workflow, str(base_guide_id))
         for inp in ic_node.get("inputs", []):
             if inp.get("name") == "vae" and inp.get("link") is not None:
                 lnk = links_map[inp["link"]]
@@ -493,10 +806,7 @@ def _patch_extra_guides(
     except KeyError:
         pass
 
-    # These links carry 5012's outputs to downstream nodes.  The first guide node
-    # will redirect them; subsequent nodes redirect the previous guide's outputs.
-    REDIRECT_FROM_5012 = {13409, 13410, 13413, 13414, 13444}
-    current_src = 5012  # the node whose outputs we redirect on each iteration
+    current_src = base_guide_id
 
     new_links_all: list[list] = []
     reserved_ids = set()
@@ -564,20 +874,11 @@ def _patch_extra_guides(
 
         # Redirect the PREVIOUS source's downstream consumers to this new node.
         prev_src = current_src
-        redirect_ids = REDIRECT_FROM_5012 if prev_src == 5012 else set()
-        # For nodes after the first, redirect any links that still point from prev_src
-        # (these are the downstream links we haven't yet redirected).
+        # Redirect every downstream consumer, leaving the newly-added guide inputs connected
+        # to the previous source through the reserved link IDs.
         for lnk in workflow["links"]:
             if int(lnk[1]) == prev_src and lnk[0] not in reserved_ids and lnk[0] not in {l[0] for l in new_links_all}:
-                if prev_src == 5012 and lnk[0] in redirect_ids:
-                    lnk[1] = guide_id
-                elif prev_src != 5012:
-                    lnk[1] = guide_id
-
-        if prev_src == 5012:
-            for lnk in workflow["links"]:
-                if lnk[0] in REDIRECT_FROM_5012 and int(lnk[1]) == 5012:
-                    lnk[1] = guide_id
+                lnk[1] = guide_id
 
         current_src = guide_id
 
@@ -600,6 +901,15 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # and guide images all use the same dimensions — no mismatch, no crop.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
+    patch_official_two_stage_graph(
+        workflow,
+        args,
+        prepared,
+        comfy_dir,
+        canvas_width,
+        canvas_height,
+        float(prepared_info.get("fps") or 24.0),
+    )
     source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
         # Extract the first frame of the prepared video to use as source fill for guide black bands.
@@ -615,12 +925,14 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             print(f"Warning: could not extract source frame for guide compositing: {_e}", flush=True)
 
         image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame)
-        # Node 5019 "bypass_i2v": False = run LTXVImgToVideoConditionOnly, True = bypass it.
-        try:
-            bypass_node = node_by_id(workflow, "5019")
-            bypass_node["widgets_values"] = [False]
-        except KeyError:
-            pass
+        # Official v0.9 uses node 5088; the legacy workflow used 5019.
+        for bypass_id in ("5088", "5019"):
+            try:
+                bypass_node = node_by_id(workflow, bypass_id)
+                bypass_node["widgets_values"] = [False]
+                break
+            except KeyError:
+                continue
         # Apply start-guide strength to LTXVImgToVideoConditionOnly (node 3159) widget 0.
         guide_strength = getattr(args, "guide_strength", 0.7)
         try:
@@ -632,11 +944,13 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     else:
         image_name = copy_reference_frame_to_comfy_input(prepared, comfy_dir)
         # Keep bypass_i2v = True (default in workflow) so i2v has no effect.
-        try:
-            bypass_node = node_by_id(workflow, "5019")
-            bypass_node["widgets_values"] = [True]
-        except KeyError:
-            pass
+        for bypass_id in ("5088", "5019"):
+            try:
+                bypass_node = node_by_id(workflow, bypass_id)
+                bypass_node["widgets_values"] = [True]
+                break
+            except KeyError:
+                continue
 
     try:
         image_node = node_by_id(workflow, "2004")
@@ -665,22 +979,32 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     except KeyError:
         pass
 
-    try:
-        latent_video_node = node_by_id(workflow, "3059")
-        for input_name in ("width", "height", "length"):
-            clear_input_link(workflow, "3059", input_name)
-        set_widget(latent_video_node, "0", canvas_width)
-        set_widget(latent_video_node, "1", canvas_height)
-        set_widget(latent_video_node, "2", int(prepared_info["frames"]))
-        set_widget(latent_video_node, "3", 1)
-    except KeyError:
-        pass
+    if not is_official_two_stage_graph(workflow):
+        try:
+            latent_video_node = node_by_id(workflow, "3059")
+            for input_name in ("width", "height", "length"):
+                clear_input_link(workflow, "3059", input_name)
+            set_widget(latent_video_node, "0", canvas_width)
+            set_widget(latent_video_node, "1", canvas_height)
+            set_widget(latent_video_node, "2", int(prepared_info["frames"]))
+            set_widget(latent_video_node, "3", 1)
+        except KeyError:
+            pass
 
     try:
-        if args.save_node_id != "5076":
+        save_node = node_by_id(workflow, args.save_node_id)
+        if save_node.get("type") == "VHS_VideoCombine" and args.save_node_id != "5076":
             set_input_link(workflow, args.save_node_id, "images", 13594)
     except KeyError:
         pass
+
+    text_node = node_by_id(workflow, "5023")
+    ensure_widget_input(text_node, "text_encoder")
+    ensure_widget_input(text_node, "ckpt_name")
+    ensure_widget_input(text_node, "device")
+    set_widget(text_node, "0", args.text_encoder)
+    set_widget(text_node, "1", args.text_encoder_checkpoint)
+    set_widget(text_node, "2", getattr(args, "text_encoder_device", "cpu"))
 
     if args.model_backend == "gguf":
         patch_lightweight_gguf(workflow, args)
@@ -690,7 +1014,8 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             "4010": ("0", "ltx-2.3-22b-dev-fp8.safetensors"),
             "5023": ("0", args.text_encoder),
             "5011": ("0", args.outpaint_lora),
-            "4922": ("0", "ltx-2.3-22b-distilled-lora-384.safetensors"),
+            "4922": ("0", "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
+            "5385": ("0", args.audio_vae_checkpoint),
         }
         for node_id, (widget, value) in model_patches.items():
             try:
@@ -728,7 +1053,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 27,
+        "version": 28,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -766,6 +1091,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "model_backend": args.model_backend,
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
+        "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
         "outpaint_lora": args.outpaint_lora,
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
@@ -1074,8 +1400,10 @@ def apply_qwen_seed_guides(args, prepared: Path, ranges: list[tuple[int, int, in
 
 
 def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool, offset_x: int = 0, offset_y: int = 0, prepared_fingerprint: dict[str, Any] | None = None) -> None:
+    has_audio = video_has_audio(ffmpeg, prepared)
     if chunk_path.exists() and not force and (prepared_fingerprint is None or split_matches_source(chunk_path, prepared_fingerprint)):
-        return
+        if not has_audio or video_has_audio(ffmpeg, chunk_path):
+            return
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
     partial = chunk_path.with_suffix(chunk_path.suffix + ".partial" + chunk_path.suffix)
     trim = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
@@ -1096,10 +1424,28 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
         )
     else:
         vf = trim
-    subprocess.run([ffmpeg, "-y", "-i", str(prepared), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
+    command = [ffmpeg, "-y", "-i", str(prepared)]
+    if has_audio:
+        start_seconds = start_frame / fps
+        end_seconds = end_frame / fps
+        filters = f"[0:v]{vf}[v];[0:a:0]atrim=start={start_seconds:.8f}:end={end_seconds:.8f},asetpts=PTS-STARTPTS[a]"
+        command.extend(["-filter_complex", filters, "-map", "[v]", "-map", "[a]"])
+    else:
+        command.extend(["-vf", vf, "-an"])
+    command.extend(["-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast"])
+    if has_audio:
+        # Normalize WebM/Opus and other source codecs to a broadly supported chunk codec.
+        command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+    command.append(str(partial))
+    subprocess.run(command, check=True)
     replace_unless_identical(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
     if prepared_fingerprint is not None:
         write_split_sidecar(chunk_path, prepared, prepared_fingerprint)
+        sidecar = split_sidecar_path(chunk_path)
+        split_data = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+        split_data["offset_x"] = int(offset_x)
+        split_data["offset_y"] = int(offset_y)
+        sidecar.write_text(json.dumps(split_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def overlap_context_before_anchor(overlap_frames: int, anchor_seconds: str, fps: float, total_frames: int) -> int:
@@ -1257,19 +1603,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-vae-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
     parser.add_argument("--text-encoder", default="gemma_3_12B_it_fp8_scaled.safetensors")
     parser.add_argument("--text-encoder-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
-    parser.add_argument("--outpaint-lora", default="ltx-2.3-22b-ic-lora-outpaint.safetensors")
+    parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")
+    parser.add_argument("--outpaint-lora", default="ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors")
     parser.add_argument("--output")
     parser.add_argument("--raw-output")
     parser.add_argument("--workflow", default=str(DEFAULT_WORKFLOW))
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(DEFAULT_COMFY_DIR)))
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-output-root")
-    parser.add_argument("--load-video-node-id", default="5060")
+    parser.add_argument("--load-video-node-id", default="5368")
     parser.add_argument("--video-widget", default="video")
-    parser.add_argument("--save-node-id", default="5076")
-    parser.add_argument("--extra-save-node-id", action="append", default=["5069"])
+    parser.add_argument("--save-node-id", default="5228")
+    parser.add_argument("--extra-save-node-id", action="append", default=[])
     parser.add_argument("--save-prefix-widget", default="filename_prefix")
-    parser.add_argument("--output-node-id", default="5076")
+    parser.add_argument("--output-node-id", default="5228")
     parser.add_argument("--positive-node-id", default="2483")
     parser.add_argument("--negative-node-id", default="2612")
     parser.add_argument("--prompt-widget", default="0")
@@ -1325,7 +1672,7 @@ def main() -> int:
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
-        ensure_outpaint_models(comfy_dir)
+        ensure_outpaint_models(comfy_dir, include_distilled_lora=args.model_backend != "gguf")
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
         required_nodes = dict(OUTPAINT_REQUIRED_NODES)
@@ -1562,4 +1909,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except HuggingFaceAccessError as exc:
+        print(f"ERROR: {outpaint_access_error_message(exc)}", file=sys.stderr, flush=True)
+        raise SystemExit(2)

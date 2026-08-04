@@ -7,9 +7,9 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 - Base checkpoint: `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors`
 - Text encoder: `Comfy-Org/ltx-2/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors`
 - Audio VAE: `Kijai/LTX2.3_comfy/vae/LTX23_audio_vae_bf16.safetensors`
-- Distilled LoRA: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384.safetensors`
+- Distilled LoRA for the full dev-model backend: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384-1.1.safetensors` → `models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors`. The default distilled-GGUF backend bypasses this 7.6 GB LoRA because its weights are already distilled.
 - Clean Up / Dearchive LoRA: `oumoumad/ltx-2.3-dearchive-lora/lora_weights_step_05000.safetensors` → `models/loras/ltx-2.3-dearchive-lora.safetensors`
-- Outpainting LoRA: `oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint/ltx-2.3-22b-ic-lora-outpaint.safetensors`
+- In/Outpainting LoRA: `Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors` (gated; accept/request browser access for the same individual account used by ARP, then run `hf auth login --force` if the saved token still receives a 403)
 
 ## ProPainter (AI DeScratch)
 

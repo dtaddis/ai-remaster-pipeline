@@ -30,8 +30,10 @@ Bundled node packs:
     ComfyUI rope compatibility fix from `548a39373bc2fdb880a233944e4621efb1a8950e`
     backported.
   - License: LTX-2 Community License Agreement.
-  - Used for: `LTXVImgToVideoConditionOnly`, `LTXAddVideoICLoRAGuide`,
-    `LTXVPreprocess`, and related LTX helpers.
+  - Used for: `LTXVImgToVideoConditionOnly`, `LTXAddVideoICLoRAGuideAdvanced`,
+    `LTXVInpaintPreprocess`, `LTXVLaplacianPyramidBlend`, and related LTX helpers.
+  - ARP patch: singleton masks are broadcast per blend chunk instead of expanded
+    into a full video-sized mask tensor.
 - `ComfyUI-MMAudio`
   - Upstream: https://github.com/kijai/ComfyUI-MMAudio
   - Source revision: `8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2`

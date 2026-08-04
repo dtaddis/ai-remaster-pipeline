@@ -1011,7 +1011,7 @@ class GuiSmokeTests(unittest.TestCase):
 
     def test_required_custom_nodes_are_bundled(self) -> None:
         required = {
-            "ComfyUI-LTXVideo": ("LTXVImgToVideoConditionOnly", "LTXAddVideoICLoRAGuide", "LTXVPreprocess"),
+            "ComfyUI-LTXVideo": ("LTXVImgToVideoConditionOnly", "LTXAddVideoICLoRAGuideAdvanced", "LTXVInpaintPreprocess", "LTXVLaplacianPyramidBlend"),
             "ComfyUI-GGUF": ("UnetLoaderGGUF",),
             "ComfyUI-VideoHelperSuite": ("VHS_LoadVideo", "VHS_VideoCombine"),
             "ComfyUI-FlashVSR_Ultra_Fast": ("FlashVSRInitPipe", "FlashVSRNodeAdv"),
@@ -1047,17 +1047,17 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(calls["count"], 3)
         self.assertEqual(history["status"]["completed"], True)
 
-    def test_outpaint_prompt_bypasses_unbundled_kj_padding_node(self) -> None:
+    def test_outpaint_prompt_is_official_two_stage_graph(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
 
-        outpaint_video.bypass_optional_preview_nodes(workflow)
-        outpaint_video.bypass_demo_padding_node(workflow)
-        prompt = comfy_api.workflow_to_prompt(workflow, "5076")
+        prompt = comfy_api.workflow_to_prompt(workflow, "5228")
 
         class_types = {node["class_type"] for node in prompt.values()}
         self.assertNotIn("ImagePadKJ", class_types)
-        self.assertIn("VHS_LoadVideo", class_types)
-        self.assertIn("VHS_VideoCombine", class_types)
+        self.assertIn("LoadVideo", class_types)
+        self.assertIn("SaveVideo", class_types)
+        self.assertEqual(sum(node["class_type"] == "SamplerCustomAdvanced" for node in prompt.values()), 2)
+        self.assertEqual(sum(node["class_type"] == "LTXVLaplacianPyramidBlend" for node in prompt.values()), 2)
 
     def test_outpaint_prompt_sent_to_ic_lora_guide_combines_global_and_chunk_suffix(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1076,6 +1076,7 @@ class GuiSmokeTests(unittest.TestCase):
         with (
             mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
             mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
             mock.patch.object(outpaint_video, "probe_video", return_value={"width": 1280, "height": 704, "frames": 24, "fps": 24.0}),
         ):
             prompt = outpaint_video.patch_workflow(
@@ -1090,7 +1091,7 @@ class GuiSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(prompt["2483"]["inputs"]["text"], "outpaint with natural film grain. continue the wallpaper")
-        self.assertEqual(prompt["5012"]["inputs"]["positive"], ["1241", 0])
+        self.assertEqual(prompt["5114"]["inputs"]["positive"], ["1241", 0])
         self.assertEqual(prompt["1241"]["inputs"]["positive"], ["2483", 0])
 
     def test_outpaint_conditioning_bypasses_resize_without_replacing_video_control(self) -> None:
@@ -1103,6 +1104,7 @@ class GuiSmokeTests(unittest.TestCase):
             with (
                 mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
                 mock.patch.object(outpaint_video, "copy_guide_image_to_comfy_input", return_value="arp_outpaint/guide_864x480.png"),
+                mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
                 mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
             ):
                 prompt = outpaint_video.patch_workflow(
@@ -1117,9 +1119,134 @@ class GuiSmokeTests(unittest.TestCase):
                     guide,
                 )
 
-        self.assertEqual(prompt["3336"]["inputs"]["image"], ["2004", 0])
-        self.assertEqual(prompt["5012"]["inputs"]["image"], ["5060", 0])
+        self.assertEqual(prompt["5361"]["inputs"]["images"], ["5360", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["images"], ["5357", 0])
+        self.assertEqual(prompt["5361"]["inputs"]["mask"], ["5365", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["5364", 0])
+        self.assertEqual(prompt["5360"]["inputs"]["input"], ["5168", 0])
+        self.assertEqual(prompt["5365"]["inputs"]["input"], ["9101", 0])
+        self.assertEqual(prompt["5360"]["inputs"]["resize_type"], "scale to multiple")
+        self.assertEqual(prompt["5360"]["inputs"]["resize_type.multiple"], 64)
+        self.assertEqual(prompt["5364"]["inputs"]["resize_type"], "scale by multiplier")
+        self.assertEqual(prompt["5364"]["inputs"]["resize_type.multiplier"], 0.5)
+        self.assertEqual(prompt["5357"]["inputs"]["resize_type"], "match size")
+        self.assertEqual(prompt["5114"]["inputs"]["image"], ["5358", 0])
+        self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
         self.assertEqual(prompt["2004"]["inputs"]["image"], "arp_outpaint/guide_864x480.png")
+        self.assertNotIn("4922", prompt)
+        self.assertEqual(prompt["5011"]["inputs"]["model"], ["3940", 0])
+        self.assertEqual(prompt["5368"]["inputs"]["file"], "arp_outpaint/prepared.mp4")
+        self.assertEqual(prompt["9100"]["class_type"], "LoadImage")
+        self.assertEqual(prompt["9101"]["class_type"], "ImageToMask")
+        self.assertEqual(prompt["3059"]["inputs"]["width"], ["5054", 0])
+        self.assertEqual(prompt["3059"]["inputs"]["height"], ["5054", 1])
+        self.assertEqual(prompt["3059"]["inputs"]["length"], ["5054", 2])
+        self.assertEqual(prompt["5023"]["inputs"]["device"], "cpu")
+        self.assertEqual(prompt["5188"]["inputs"]["resize_type.longer_size"], 1024)
+        self.assertNotIn("5382", prompt)
+        self.assertEqual(prompt["9110"]["class_type"], "LTXVEmptyLatentAudio")
+        self.assertEqual(prompt["9110"]["inputs"]["frames_number"], 24)
+        self.assertEqual(prompt["9110"]["inputs"]["frame_rate"], 24.0)
+        self.assertEqual(prompt["9110"]["inputs"]["audio_vae"], ["5385", 0])
+        self.assertEqual(prompt["5390"]["inputs"]["audio_latent"], ["9110", 0])
+
+    def test_outpaint_official_graph_uses_source_audio_when_chunk_has_a_track(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--dry-run"])
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            mock.patch.object(outpaint_video, "video_has_audio", return_value=True),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                args.prompt, args.negative_prompt, 42,
+            )
+
+        self.assertIn("5382", prompt)
+        self.assertNotIn("9110", prompt)
+        self.assertEqual(prompt["5382"]["inputs"]["audio"], ["5168", 1])
+
+    def test_outpaint_all_black_mode_reuses_source_frames_for_dynamic_mask(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args(
+            ["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--outpaint-all-black-regions", "--dry-run"]
+        )
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            mock.patch.object(outpaint_video, "video_has_audio", return_value=False),
+            mock.patch.object(outpaint_video, "official_mask_image") as static_mask,
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                args.prompt, args.negative_prompt, 42,
+            )
+
+        static_mask.assert_not_called()
+        self.assertEqual(prompt["9100"]["class_type"], "ImageToMask")
+        self.assertEqual(prompt["9100"]["inputs"]["image"], ["5168", 0])
+        self.assertEqual(prompt["9101"]["class_type"], "ThresholdMask")
+        self.assertEqual(prompt["9102"]["class_type"], "InvertMask")
+        self.assertEqual(prompt["5365"]["inputs"]["input"], ["9102", 0])
+
+    def test_outpaint_static_mask_is_one_geometric_frame(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((32, 64, 3), dtype=np.uint8)
+        frame[:, 16:48] = 5
+        capture = mock.Mock()
+        capture.get.return_value = 1
+        capture.read.return_value = (True, frame)
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            prepared = root / "prepared.mp4"
+            prepared.write_bytes(b"prepared")
+            args = argparse.Namespace(force=True)
+            with (
+                mock.patch.object(outpaint_video, "ROOT", root),
+                mock.patch.object(outpaint_video, "file_fingerprint", return_value={"size": 8, "mtime_ns": 1, "sha256": "test"}),
+                mock.patch.object(cv2, "VideoCapture", return_value=capture),
+            ):
+                mask_path = outpaint_video.official_mask_image(prepared, args, 64, 32)
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
+        self.assertEqual(mask.shape, (32, 64))
+        self.assertTrue(np.all(mask[:, :16] == 255))
+        self.assertTrue(np.all(mask[:, 16:48] == 0))
+        self.assertTrue(np.all(mask[:, 48:] == 255))
+
+    def test_outpaint_chunk_transcodes_opus_audio_to_aac(self) -> None:
+        ffmpeg = outpaint_video.find_ffmpeg()
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source_with_opus.mkv"
+            chunk = folder / "chunk.mp4"
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=gray:s=96x64:r=8:d=2",
+                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-shortest", str(source),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            outpaint_video.split_chunk(ffmpeg, source, chunk, 4, 12, 8.0, True)
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(chunk)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), "aac")
 
     def test_qwen_seed_guides_do_not_overwrite_existing_set_guides(self) -> None:
         args = argparse.Namespace(
@@ -2155,6 +2282,34 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(message, "")
         open_browser.assert_not_called()
+
+    def test_outpaint_missing_official_lora_opens_huggingface_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            root = Path(tmp_text)
+            comfy = root / "ComfyUI"
+            comfy.mkdir()
+            with (
+                mock.patch.object(server, "current_config", return_value={"comfy_dir": str(comfy)}),
+                mock.patch.object(server, "ROOT", root),
+                mock.patch.object(server.webbrowser, "open", return_value=True) as open_browser,
+            ):
+                ok, message = server.outpaint_browser_handoff()
+
+        self.assertFalse(ok)
+        self.assertIn("Approve the official LTX outpainting model download", message)
+        self.assertIn("opened the approval page", message)
+        open_browser.assert_called_once_with(server.OUTPAINT_LICENSE_URL)
+
+    def test_outpaint_403_reopens_approval_page_with_short_message(self) -> None:
+        error = outpaint_video.HuggingFaceAccessError("long recovery instructions")
+        with mock.patch.object(outpaint_video.webbrowser, "open", return_value=True) as open_browser:
+            message = outpaint_video.outpaint_access_error_message(error)
+
+        self.assertEqual(
+            message,
+            "Approve the official LTX outpainting model download in the Hugging Face tab ARP just opened, then run Outpainting again.",
+        )
+        open_browser.assert_called_once_with(outpaint_video.OUTPAINT_ACCESS_URL)
 
     def test_audio_state_exposes_lossless_stems(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -3297,12 +3452,14 @@ class GuiSmokeTests(unittest.TestCase):
                 "flashvsr_local_range": "11",
                 "flashvsr_sparse_ratio": "2.0",
                 "flashvsr_kv_ratio": "3.0",
+                "blend_strength": "65",
                 "chunk_seconds": "6",
                 "overlap_frames": "8",
             }
         )
 
         app.APP.hydrate_stage_inputs("global")
+        app.APP.settings["colour"]["manifest"] = "work/shots.csv"
         stage_keys = [stage.key for stage in app.APP.active_stages()]
         command = app.APP.command_for("upscale")
 
@@ -3323,6 +3480,8 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--flashvsr-local-range") + 1], "11")
         self.assertEqual(command[command.index("--flashvsr-sparse-ratio") + 1], "2.0")
         self.assertEqual(command[command.index("--flashvsr-kv-ratio") + 1], "3.0")
+        self.assertEqual(command[command.index("--blend-strength") + 1], "65")
+        self.assertEqual(command[command.index("--shot-manifest") + 1], "work/shots.csv")
         self.assertEqual(command[command.index("--chunk-seconds") + 1], "6")
         self.assertEqual(command[command.index("--overlap-frames") + 1], "8")
         self.assertIn("scripts\\upscale_video.py", " ".join(command))

@@ -1209,6 +1209,13 @@ async function saveShotFade(manifest, index, enabled, crossfade_seconds) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function saveShotUpscaleStrength(manifest, index, strength) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-upscale-strength', { manifest, index, strength });
+  if (!result.ok) return alert(result.error || 'Could not update shot upscale strength');
+  await redrawWithState(result.state, snap, true);
+}
+
 function nudgeShotBoundary(manifest, index, edge, frames) {
   const rows = (state.shot_views && state.shot_views.shots) || [];
   const row = rows[index];

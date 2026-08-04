@@ -48,3 +48,4 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 .checkbox-described-text{display:flex;flex-direction:column;gap:3px}
 .checkbox-described-text strong{font-size:13px;font-weight:600;color:var(--text)}
 .checkbox-described-text small{color:var(--muted);font-size:11.5px;line-height:1.45}
+.shot-strength-list{display:grid;gap:8px;margin:12px 0 18px}.shot-strength-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(140px,2fr) 3ch auto auto;gap:8px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:7px;background:#10171b}.shot-strength-row>span:first-child{display:grid;gap:2px}.shot-strength-row small{color:var(--muted);font-weight:400}.shot-strength-row output{text-align:right;font-variant-numeric:tabular-nums}.shot-strength-row button{padding:6px 9px}@media(max-width:720px){.shot-strength-row{grid-template-columns:1fr 3ch auto auto}.shot-strength-row>span:first-child{grid-column:1/-1}}

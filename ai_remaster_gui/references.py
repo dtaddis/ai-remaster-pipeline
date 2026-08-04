@@ -61,6 +61,7 @@ def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = Tr
     shots_manifest = manifest_for_outpainted(settings.get("shots", {}).get("outpainted_video", ""))
     references_manifest = settings.get("references", {}).get("manifest", "")
     colour_manifest = settings.get("colour", {}).get("manifest", "") or references_manifest
+    upscale_manifest = colour_manifest or references_manifest or shots_manifest
     return {
         "shots_manifest": shots_manifest,
         "shots": shot_rows(shots_manifest, include_previews=True, generate_previews=generate_previews),
@@ -68,6 +69,8 @@ def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = Tr
         "references": shot_rows(references_manifest),
         "colour_manifest": colour_manifest,
         "colour": shot_rows(colour_manifest),
+        "upscale_manifest": upscale_manifest,
+        "upscale": shot_rows(upscale_manifest),
     }
 
 def shot_rows(
@@ -135,6 +138,7 @@ def shot_rows(
                 "can_fade_next": index < len(rows) - 1,
                 "fade_to_next": row.get("fade_to_next", "false"),
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
+                "upscale_strength": row.get("upscale_strength", ""),
                 "prompt": row.get("prompt", ""),
             }
         if include_previews and (preview_index_set is None or index in preview_index_set):

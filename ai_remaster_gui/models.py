@@ -194,6 +194,7 @@ STAGES = (
             ("flashvsr_tiled_vae", "Tiled decode (tiled_vae)", "checkbox", "true"),
             ("flashvsr_unload_dit", "Unload before decode (unload_dit)", "checkbox", "false"),
             ("flashvsr_seed", "FlashVSR seed", "number", "0"),
+            ("blend_strength", "Default AI upscale strength", "range:0|100|1", "100"),
             ("chunk_seconds", "Chunk seconds", "number", "6"),
             ("overlap_frames", "Overlap frames", "number", "8"),
             ("preview_seconds", "Preview seconds", "number", "6"),

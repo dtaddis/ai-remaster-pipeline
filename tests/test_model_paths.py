@@ -109,6 +109,27 @@ archive:
 
 
 class DependencyManagerPathTests(unittest.TestCase):
+    def test_gated_model_403_is_rewritten_as_actionable_access_error(self) -> None:
+        class Response:
+            status_code = 403
+
+        denied = RuntimeError("download denied")
+        denied.response = Response()
+        with tempfile.TemporaryDirectory() as tmp_text:
+            comfy = Path(tmp_text) / "ComfyUI"
+            comfy.mkdir()
+            model = dependency_manager.HfModel("owner/gated-model", "model.safetensors", "models/loras/model.safetensors")
+            with (
+                mock.patch.object(dependency_manager, "ensure_huggingface_hub"),
+                mock.patch.object(dependency_manager, "remote_file_size", return_value=0),
+                mock.patch.object(dependency_manager, "download_hf_file", side_effect=denied),
+                self.assertRaises(dependency_manager.HuggingFaceAccessError) as raised,
+            ):
+                dependency_manager.ensure_hf_models(comfy, [model])
+
+        self.assertIn("https://huggingface.co/owner/gated-model", str(raised.exception))
+        self.assertIn("approve access", str(raised.exception))
+
     def test_download_uses_configured_cache_and_comfy_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             root = Path(tmp_text)

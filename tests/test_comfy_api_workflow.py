@@ -12,6 +12,29 @@ from comfy_api import workflow_to_prompt  # noqa: E402
 
 
 class WorkflowToPromptTests(unittest.TestCase):
+    def test_core_load_video_uses_file_widget_name(self) -> None:
+        workflow = {
+            "nodes": [{"id": 1, "type": "LoadVideo", "inputs": [], "widgets_values": ["clip.mp4", "image"]}],
+            "links": [],
+        }
+
+        prompt = workflow_to_prompt(workflow, "1")
+
+        self.assertEqual(prompt["1"]["inputs"], {"file": "clip.mp4"})
+
+    def test_resize_longer_dimension_emits_dynamic_combo_value(self) -> None:
+        workflow = {
+            "nodes": [{"id": 1, "type": "ResizeImageMaskNode", "inputs": [], "widgets_values": ["scale longer dimension", 1024, "lanczos"]}],
+            "links": [],
+        }
+
+        prompt = workflow_to_prompt(workflow, "1")
+
+        self.assertEqual(
+            prompt["1"]["inputs"],
+            {"resize_type": "scale longer dimension", "resize_type.longer_size": 1024, "scale_method": "lanczos"},
+        )
+
     def test_collapses_frontend_reroute_nodes(self) -> None:
         workflow = {
             "nodes": [

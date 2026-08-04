@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import re
 import shutil
@@ -165,11 +166,126 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flashvsr-seed", type=int, default=0)
     parser.add_argument("--chunk-seconds", type=float, default=6.0, help="Upscale in chunks of roughly this many seconds. Use 0 to send the whole clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated before each chunk, then trimmed before stitching.")
+    parser.add_argument("--blend-strength", type=float, default=100.0, help="FlashVSR contribution in the final delivery. 0 is a conventional Lanczos resize; 100 is the full AI upscale.")
+    parser.add_argument("--shot-manifest", default="", help="Optional shot CSV containing per-row upscale_strength plus fade_to_next/crossfade_seconds tween metadata.")
     parser.add_argument("--fps", type=float, default=0.0)
     parser.add_argument("--ffmpeg", default="")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
+
+
+def normalized_blend_strength(value: Any, default: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, number / 100.0))
+
+
+def truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
+def optional_int(value: Any) -> int | None:
+    try:
+        text = str(value or "").strip()
+        return int(float(text)) if text else None
+    except (TypeError, ValueError):
+        return None
+
+
+def read_upscale_shots(manifest: Path | None, total_frames: int, fps: float, default_strength: float) -> list[dict[str, Any]]:
+    if manifest is None or not manifest.is_file():
+        return []
+    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        lines = [line for line in handle if not line.startswith("#")]
+    rows = list(csv.DictReader(lines)) if lines else []
+    shots: list[dict[str, Any]] = []
+    start_frame = 0
+    for index, row in enumerate(rows):
+        explicit_start = optional_int(row.get("start_frame"))
+        if explicit_start is not None:
+            start_frame = max(0, min(max(0, total_frames - 1), explicit_start))
+        end_frame = optional_int(row.get("end_frame"))
+        if end_frame is None:
+            try:
+                end_text = str(row.get("end", "0")).strip()
+                parts = [float(part) for part in end_text.split(":")]
+                seconds = sum(part * (60 ** power) for power, part in enumerate(reversed(parts)))
+            except (TypeError, ValueError):
+                seconds = start_frame / max(fps, 1e-6)
+            end_frame = int(round(seconds * fps))
+        end_frame = min(total_frames, max(start_frame + 1, end_frame))
+        if index == len(rows) - 1:
+            end_frame = total_frames
+        shots.append({
+            "start": start_frame,
+            "end": end_frame,
+            "strength": normalized_blend_strength(row.get("upscale_strength", ""), default_strength),
+            "fade": truthy(row.get("fade_to_next")),
+            "crossfade_seconds": row.get("crossfade_seconds", ""),
+        })
+        start_frame = end_frame
+    return shots
+
+
+def blend_weight_expression(shots: list[dict[str, Any]], fps: float, default_strength: float) -> str:
+    if not shots:
+        return f"{default_strength:.8f}"
+    expression = f"{float(shots[-1]['strength']):.8f}"
+    for index in range(len(shots) - 2, -1, -1):
+        current = float(shots[index]["strength"])
+        following = float(shots[index + 1]["strength"])
+        boundary = int(shots[index]["end"])
+        transition_frames = 0
+        if shots[index].get("fade"):
+            try:
+                transition_frames = max(0, int(round(float(shots[index].get("crossfade_seconds") or 0.0) * fps)))
+            except (TypeError, ValueError):
+                transition_frames = 0
+        transition_frames = min(
+            transition_frames,
+            max(0, int(shots[index]["end"]) - int(shots[index]["start"])),
+            max(0, int(shots[index + 1]["end"]) - int(shots[index + 1]["start"])),
+        )
+        if transition_frames <= 0 or abs(current - following) < 1e-9:
+            expression = f"if(lt(N,{boundary}),{current:.8f},{expression})"
+            continue
+        ramp_start = boundary - transition_frames // 2
+        ramp_end = ramp_start + transition_frames
+        ramp = f"{current:.8f}+({following - current:.8f})*(N-{ramp_start})/{max(1, transition_frames)}"
+        expression = f"if(lt(N,{ramp_start}),{current:.8f},if(lt(N,{ramp_end}),{ramp},{expression}))"
+    return expression
+
+
+def blend_upscale_delivery(
+    ffmpeg: str,
+    source: Path,
+    ai_upscale: Path,
+    output: Path,
+    width: int,
+    height: int,
+    fps: float,
+    shots: list[dict[str, Any]],
+    default_strength: float,
+) -> None:
+    weight = blend_weight_expression(shots, fps, default_strength)
+    partial = output.with_suffix(output.suffix + ".blend.partial" + output.suffix)
+    filters = (
+        f"[0:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[src];"
+        f"[1:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[ai];"
+        f"[src][ai]blend=all_expr='A*(1-({weight}))+B*({weight})',format=yuv420p[vout]"
+    )
+    command = [
+        ffmpeg, "-y", "-i", str(source), "-i", str(ai_upscale),
+        "-filter_complex", filters, "-map", "[vout]", "-map", "0:a?", "-shortest",
+        "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16",
+        "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(partial),
+    ]
+    print("Blending source motion/detail with FlashVSR by shot", flush=True)
+    subprocess.run(command, check=True)
+    replace_with_retry(partial, output, "Blended upscaled output")
 
 
 def default_from_spec(spec: Any) -> Any:
@@ -602,8 +718,16 @@ def run(args: argparse.Namespace) -> int:
     output_width, output_height = fit_dimensions(int(info["width"]), int(info["height"]), args.target_width, args.target_height)
     output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height)
     sig = signature(args, source, output_width, output_height)
+    manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
+    final_sig = dict(sig)
+    final_sig.update({
+        "version": 7,
+        "blend_strength": float(args.blend_strength),
+        "shot_manifest": root_relative(manifest) if manifest else "",
+        "shot_manifest_fingerprint": file_fingerprint(manifest) if manifest and manifest.is_file() else None,
+    })
 
-    if not args.force and resumable_output(output, sig, video_like=source, width=output_width, height=output_height):
+    if not args.force and resumable_output(output, final_sig, video_like=source, width=output_width, height=output_height):
         print(f"Reuse upscaled video: {output}", flush=True)
         return 0
     if args.dry_run:
@@ -622,8 +746,24 @@ def run(args: argparse.Namespace) -> int:
         processing_source = pre_downscale_source(ffmpeg, args, source, output_width, output_height, info)
         processing_info = video_info(processing_source)
         processing_fingerprint = file_fingerprint(processing_source)
-    chunked_flashvsr_run(args, processing_source, output, output_width, output_height, processing_info, processing_fingerprint, audio_source=source)
-    write_signature(output, sig)
+    ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_flashvsr.mp4"
+    ai_output.parent.mkdir(parents=True, exist_ok=True)
+    if args.force or not resumable_output(ai_output, sig, video_like=source, width=output_width, height=output_height):
+        chunked_flashvsr_run(args, processing_source, ai_output, output_width, output_height, processing_info, processing_fingerprint, audio_source=source)
+        write_signature(ai_output, sig)
+    else:
+        print(f"Reuse full-strength FlashVSR render: {ai_output}", flush=True)
+    ffmpeg = find_ffmpeg(args.ffmpeg)
+    default_strength = normalized_blend_strength(args.blend_strength)
+    shots = read_upscale_shots(manifest, int(info["frames"]), float(info["fps"]), default_strength)
+    strengths = [float(shot["strength"]) for shot in shots] or [default_strength]
+    if all(abs(strength - 1.0) < 1e-9 for strength in strengths):
+        full_partial = output.with_suffix(output.suffix + ".full.partial" + output.suffix)
+        shutil.copy2(ai_output, full_partial)
+        replace_with_retry(full_partial, output, "Full-strength upscaled output")
+    else:
+        blend_upscale_delivery(ffmpeg, source, ai_output, output, output_width, output_height, float(info["fps"]), shots, default_strength)
+    write_signature(output, final_sig)
     print(f"Wrote upscaled video: {output}", flush=True)
     return 0
 
