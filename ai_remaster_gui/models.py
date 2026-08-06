@@ -67,6 +67,8 @@ STAGES = (
             ("target_height", "Output height", "select:source|480|544|576|720|768|1080", "source"),
             ("chunk_seconds", "Chunk seconds", "number", "20"),
             ("overlap_frames", "Overlap frames", "range:0|48|1", "8"),
+            ("generation_mask_overlap", "Generation mask overlap", "range:0|96|8", "64"),
+            ("mask_blend_dilation", "Mask seam blend", "range:0|15|1", "5"),
             ("seed_qwen_guides", "Seed with Qwen guide frames", "checkbox", "false"),
             ("outpaint_all_black_regions", "Outpaint all black regions", "checkbox", "false"),
             ("prompt", "Prompt", "text", OUTPAINT_PROMPT),

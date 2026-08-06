@@ -1,8 +1,8 @@
 ﻿This directory is for ComfyUI LTX 2.3 IC outpainting workflows.
 
-`outpaint_LTX-IC.json` is the bundled workflow used by `scripts/outpaint_video.py`. It is Lightricks' official `LTX-2.3_ICLoRA_Outpaint_Two_Stage_Distilled` workflow for the v0.9 in/outpainting IC-LoRA.
+`outpaint_LTX-IC.json` is Lightricks' official `LTX-2.3_ICLoRA_Outpaint_Two_Stage_Distilled` workflow for the v0.9 in/outpainting IC-LoRA. `scripts/outpaint_video.py` uses it as a node template but routes execution through one full-resolution masked pass, bypassing the half-resolution draft, Lanczos enlargement, and second sampler.
 
-At runtime ARP patches this workflow to use the LTX 2.3 distilled GGUF Q4_K_M model through ComfyUI-GGUF, a separate LTX 2.3 video VAE, and the official IC-LoRA. ARP supplies a binary video mask derived from its prepared canvas. The workflow performs a coarse first pass, a boundary-refinement second pass, and Laplacian blending of the protected source region.
+At runtime ARP patches this workflow to use the LTX 2.3 distilled GGUF Q4_K_M model through ComfyUI-GGUF, a separate LTX 2.3 video VAE, and the official IC-LoRA. ARP supplies an expanded, latent-safe copy of its binary mask to the full-resolution inpaint preprocessor, while the final Laplacian blend receives the exact requested mask and untouched prepared source so the green conditioning sentinel and hidden overlap cannot leak into protected pixels.
 
 ARP preserves each chunk's time-aligned source audio for the official AV conditioning path, normalizing codecs such as WebM/Opus to AAC for reliable ComfyUI decoding. If a source is genuinely silent, ARP supplies a frozen empty LTX audio latent instead.
 

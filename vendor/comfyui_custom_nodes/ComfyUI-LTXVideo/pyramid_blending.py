@@ -122,6 +122,7 @@ def _pyramid_blend(
     max_level: int = 7,
     device: torch.device | None = None,
     output_device: torch.device | None = None,
+    exact_image1_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if image1.shape != image2.shape:
         raise ValueError(
@@ -158,15 +159,40 @@ def _pyramid_blend(
         if mask_chunk.shape[0] == 1 and end - start > 1:
             mask_chunk = mask_chunk.expand(end - start, -1, -1, -1)
 
+        exact_mask_chunk = None
+        if exact_image1_mask is not None:
+            exact_mask_chunk = (
+                exact_image1_mask
+                if exact_image1_mask.shape[0] == 1
+                else exact_image1_mask[start:end]
+            )
+            if exact_mask_chunk.shape[0] == 1 and end - start > 1:
+                exact_mask_chunk = exact_mask_chunk.expand(
+                    end - start, -1, -1, -1
+                )
+
         if device is not None:
             img1_chunk = img1_chunk.to(device)
             img2_chunk = img2_chunk.to(device)
             mask_chunk = mask_chunk.to(device)
+            if exact_mask_chunk is not None:
+                exact_mask_chunk = exact_mask_chunk.to(device)
 
         out_chunk = _pyramid_blend_chunk(
             img1_chunk, img2_chunk, mask_chunk, max_level=max_level
         )
         cropped = out_chunk[..., :orig_h, :orig_w].clamp(0, 1)
+        if exact_mask_chunk is not None:
+            # Pyramid blending deliberately softens the mask at every scale. A
+            # very thin fully-masked band can therefore disappear completely
+            # and reveal image_b (the prepared canvas) instead of image_a (the
+            # generated result). Preserve the blend at the boundary, but honour
+            # pure-white mask pixels exactly at full resolution.
+            exact_mask_chunk = (exact_mask_chunk[..., :orig_h, :orig_w] >= 0.999).to(
+                dtype=cropped.dtype
+            )
+            exact_image1 = img1_chunk[..., :orig_h, :orig_w]
+            cropped = exact_image1 * exact_mask_chunk + cropped * (1 - exact_mask_chunk)
         results.append(
             cropped.to(output_device) if output_device is not None else cropped
         )
@@ -258,8 +284,10 @@ class LTXVLaplacianPyramidBlend(io.ComfyNode):
 
         original = image_a.permute(0, 3, 1, 2)
         target = image_b.permute(0, 3, 1, 2)
-        mask_4d = mask.unsqueeze(1).float()
-        mask_4d = _apply_low_res_mask_dilation(mask_4d, mask_low_res_dilation)
+        exact_mask_4d = mask.unsqueeze(1).float()
+        mask_4d = _apply_low_res_mask_dilation(
+            exact_mask_4d, mask_low_res_dilation
+        )
 
         result = _pyramid_blend(
             original,
@@ -268,6 +296,7 @@ class LTXVLaplacianPyramidBlend(io.ComfyNode):
             max_level=7,
             device=device,
             output_device=comfy.model_management.intermediate_device(),
+            exact_image1_mask=exact_mask_4d,
         )
 
         return io.NodeOutput(result.permute(0, 2, 3, 1))

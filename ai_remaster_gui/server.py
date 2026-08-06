@@ -1178,6 +1178,8 @@ class PipelineApp:
         add(["--target-height", str(resolved_outpaint_height(source_text, values.get("target_height", "720")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
+        add(["--generation-mask-overlap", values.get("generation_mask_overlap", "64")])
+        add(["--mask-blend-dilation", values.get("mask_blend_dilation", "5")])
         add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
         if values.get("negative_prompt"):
             add(["--negative-prompt", values.get("negative_prompt", "")])

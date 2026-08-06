@@ -36,21 +36,23 @@ def inverse_filter(args, info: dict) -> str:
     scale = ""
     if target_width != int(info["width"]) or target_height != int(info["height"]):
         scale = f",scale={target_width}:{target_height}:flags=lanczos"
+    monochrome = ",hue=s=0" if args.monochrome else ""
     if args.skip_restore:
-        return f'[0:v]format=yuv420p{scale}[v]'
+        return f'[0:v]format=yuv420p{monochrome}{scale}[v]'
     expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
-    return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}',format=yuv420p{scale}[v]"
+    return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}'{monochrome},format=yuv420p{scale}[v]"
 
 
 def signature(args, source: Path) -> dict:
     return {
-        'version': 5,
+        'version': 6,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
         'black_lift': args.black_lift,
         'gamma': args.gamma,
         'skip_restore': args.skip_restore,
+        'monochrome': args.monochrome,
         'target_width': args.target_width,
         'target_height': args.target_height,
         'encoder': args.encoder,
@@ -87,6 +89,7 @@ def build_parser():
     parser.add_argument('--black-lift', type=float, default=0.018, help='Must match prepare_outpaint_input.py.')
     parser.add_argument('--gamma', type=float, default=1.06, help='Must match prepare_outpaint_input.py.')
     parser.add_argument('--skip-restore', action='store_true', help='Only remux/re-encode. Useful for comparisons.')
+    parser.add_argument('--monochrome', action='store_true', help='Remove residual chroma from monochrome-source outpainting.')
     parser.add_argument('--target-width', type=int, help='Scale the restored clip to this delivery width.')
     parser.add_argument('--target-height', type=int, help='Scale the restored clip to this delivery height.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')

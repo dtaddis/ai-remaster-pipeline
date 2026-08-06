@@ -31,6 +31,7 @@ import generate_references  # noqa: E402
 import guide_frame_utils  # noqa: E402
 import edit_reference_image  # noqa: E402
 import final_composite  # noqa: E402
+import finalize_outpaint_output  # noqa: E402
 import openai_generate_reference  # noqa: E402
 import outpaint_video  # noqa: E402
 import prepare_outpaint_input  # noqa: E402
@@ -1047,7 +1048,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(calls["count"], 3)
         self.assertEqual(history["status"]["completed"], True)
 
-    def test_outpaint_prompt_is_official_two_stage_graph(self) -> None:
+    def test_bundled_outpaint_template_contains_official_two_stage_nodes(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
 
         prompt = comfy_api.workflow_to_prompt(workflow, "5228")
@@ -1119,17 +1120,8 @@ class GuiSmokeTests(unittest.TestCase):
                     guide,
                 )
 
-        self.assertEqual(prompt["5361"]["inputs"]["images"], ["5360", 0])
-        self.assertEqual(prompt["5358"]["inputs"]["images"], ["5357", 0])
-        self.assertEqual(prompt["5361"]["inputs"]["mask"], ["5365", 0])
-        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["5364", 0])
-        self.assertEqual(prompt["5360"]["inputs"]["input"], ["5168", 0])
-        self.assertEqual(prompt["5365"]["inputs"]["input"], ["9101", 0])
-        self.assertEqual(prompt["5360"]["inputs"]["resize_type"], "scale to multiple")
-        self.assertEqual(prompt["5360"]["inputs"]["resize_type.multiple"], 64)
-        self.assertEqual(prompt["5364"]["inputs"]["resize_type"], "scale by multiplier")
-        self.assertEqual(prompt["5364"]["inputs"]["resize_type.multiplier"], 0.5)
-        self.assertEqual(prompt["5357"]["inputs"]["resize_type"], "match size")
+        self.assertEqual(prompt["5358"]["inputs"]["images"], ["5168", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9105", 0])
         self.assertEqual(prompt["5114"]["inputs"]["image"], ["5358", 0])
         self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
         self.assertEqual(prompt["2004"]["inputs"]["image"], "arp_outpaint/guide_864x480.png")
@@ -1138,17 +1130,31 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5368"]["inputs"]["file"], "arp_outpaint/prepared.mp4")
         self.assertEqual(prompt["9100"]["class_type"], "LoadImage")
         self.assertEqual(prompt["9101"]["class_type"], "ImageToMask")
+        self.assertEqual(prompt["9103"]["class_type"], "LTXVDilateVideoMask")
+        self.assertEqual(prompt["9103"]["inputs"]["spatial_radius"], 30)
+        self.assertEqual(prompt["9103"]["inputs"]["mask"], ["9101", 0])
+        self.assertEqual(prompt["9104"]["inputs"]["spatial_radius"], 30)
+        self.assertEqual(prompt["9104"]["inputs"]["mask"], ["9103", 0])
+        self.assertEqual(prompt["9105"]["inputs"]["spatial_radius"], 4)
+        self.assertEqual(prompt["9105"]["inputs"]["mask"], ["9104", 0])
         self.assertEqual(prompt["3059"]["inputs"]["width"], ["5054", 0])
         self.assertEqual(prompt["3059"]["inputs"]["height"], ["5054", 1])
         self.assertEqual(prompt["3059"]["inputs"]["length"], ["5054", 2])
         self.assertEqual(prompt["5023"]["inputs"]["device"], "cpu")
-        self.assertEqual(prompt["5188"]["inputs"]["resize_type.longer_size"], 1024)
         self.assertNotIn("5382", prompt)
         self.assertEqual(prompt["9110"]["class_type"], "LTXVEmptyLatentAudio")
         self.assertEqual(prompt["9110"]["inputs"]["frames_number"], 24)
         self.assertEqual(prompt["9110"]["inputs"]["frame_rate"], 24.0)
         self.assertEqual(prompt["9110"]["inputs"]["audio_vae"], ["5385", 0])
         self.assertEqual(prompt["5390"]["inputs"]["audio_latent"], ["9110", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9101", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["image_b"], ["5168", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask_low_res_dilation"], 5)
+        self.assertEqual(prompt["5227"]["inputs"]["images"], ["5266", 0])
+        self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
+        self.assertEqual(sum(node["class_type"] == "SamplerCustomAdvanced" for node in prompt.values()), 1)
+        for bypassed_node in ("5211", "5214", "5226", "5357", "5360", "5361", "5364", "5365", "5379", "5380"):
+            self.assertNotIn(bypassed_node, prompt)
 
     def test_outpaint_official_graph_uses_source_audio_when_chunk_has_a_track(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1168,6 +1174,12 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("5382", prompt)
         self.assertNotIn("9110", prompt)
         self.assertEqual(prompt["5382"]["inputs"]["audio"], ["5168", 1])
+
+    def test_outpaint_monochrome_finish_removes_residual_chroma(self) -> None:
+        args = finalize_outpaint_output.build_parser().parse_args(["--source", "input.mp4", "--monochrome"])
+        filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 1280, "height": 704})
+
+        self.assertIn(",hue=s=0,", filter_graph)
 
     def test_outpaint_all_black_mode_reuses_source_frames_for_dynamic_mask(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1191,7 +1203,9 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["9100"]["inputs"]["image"], ["5168", 0])
         self.assertEqual(prompt["9101"]["class_type"], "ThresholdMask")
         self.assertEqual(prompt["9102"]["class_type"], "InvertMask")
-        self.assertEqual(prompt["5365"]["inputs"]["input"], ["9102", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9105", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9102", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["image_b"], ["5168", 0])
 
     def test_outpaint_static_mask_is_one_geometric_frame(self) -> None:
         import cv2
@@ -1219,6 +1233,46 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(mask[:, :16] == 255))
         self.assertTrue(np.all(mask[:, 16:48] == 0))
         self.assertTrue(np.all(mask[:, 48:] == 255))
+
+    def test_ltx_laplacian_blend_keeps_fully_masked_thin_bands_exact(self) -> None:
+        import importlib
+        import sys
+        import types
+
+        import torch
+
+        package_name = "arp_test_ltxvideo"
+        comfy_dir = app.ROOT / "tools" / "comfyui"
+        package_dir = app.ROOT / "tools" / "comfyui" / "custom_nodes" / "ComfyUI-LTXVideo"
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(package_dir)]
+        sys.modules[package_name] = package
+        original_sys_path = list(sys.path)
+        scripts_dir = str(app.ROOT / "scripts")
+        sys.path[:] = [str(comfy_dir)] + [entry for entry in sys.path if entry != scripts_dir]
+        script_comfy_api = sys.modules.pop("comfy_api", None)
+        try:
+            blending = importlib.import_module(f"{package_name}.pyramid_blending")
+        finally:
+            sys.path[:] = original_sys_path
+            if script_comfy_api is not None:
+                sys.modules["comfy_api"] = script_comfy_api
+
+        generated = torch.ones((1, 3, 32, 64), dtype=torch.float32)
+        prepared = torch.zeros_like(generated)
+        exact_mask = torch.zeros((1, 1, 32, 64), dtype=torch.float32)
+        exact_mask[:, :, :2, :] = 1.0
+        pyramid_mask = blending._apply_low_res_mask_dilation(exact_mask, 5)
+
+        result = blending._pyramid_blend(
+            generated,
+            prepared,
+            pyramid_mask,
+            max_level=5,
+            exact_image1_mask=exact_mask,
+        )
+
+        self.assertTrue(torch.equal(result[:, :, :2, :], generated[:, :, :2, :]))
 
     def test_outpaint_chunk_transcodes_opus_audio_to_aac(self) -> None:
         ffmpeg = outpaint_video.find_ffmpeg()
