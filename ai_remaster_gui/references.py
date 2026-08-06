@@ -233,7 +233,7 @@ def reference_edit_prompt(instruction: str, sampled_color: str = "") -> str:
     color = sampled_color.strip()
     if color:
         parts.append(f"Use the sampled colour exactly where relevant: {color}, including its brightness/value.")
-    if text or color:
+    if color:
         parts.append(
             "If the requested material colour is lighter than the current one, raise the masked area's "
             "luminance to the target colour while preserving texture, shadows, edges, composition, and identity; "

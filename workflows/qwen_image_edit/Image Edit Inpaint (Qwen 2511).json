@@ -1,8 +1,8 @@
 {
   "id": "arp-qwen-image-edit-2511-inpaint",
   "revision": 1,
-  "last_node_id": 126,
-  "last_link_id": 696,
+  "last_node_id": 164,
+  "last_link_id": 714,
   "nodes": [
     {
       "id": 10,
@@ -29,7 +29,7 @@
       "mode": 0,
       "inputs": [],
       "outputs": [
-        {"name": "IMAGE", "type": "IMAGE", "links": [509, 510, 705]},
+        {"name": "IMAGE", "type": "IMAGE", "links": [705, 706, 709, 711]},
         {"name": "MASK", "type": "MASK", "links": []}
       ],
       "title": "Source Image",
@@ -48,7 +48,7 @@
         {"name": "image", "type": "COMBO", "widget": {"name": "image"}},
         {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}}
       ],
-      "outputs": [{"name": "MASK", "type": "MASK", "links": [696]}],
+      "outputs": [{"name": "MASK", "type": "MASK", "links": [707, 708]}],
       "title": "Mask Image",
       "properties": {"Node name for S&R": "LoadImageMask"},
       "widgets_values": ["mask.png", "red"]
@@ -59,7 +59,7 @@
       "pos": [2600, 760],
       "size": [140, 46],
       "flags": {},
-      "order": 13,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {"name": "samples", "type": "LATENT", "link": 674},
@@ -75,32 +75,15 @@
       "pos": [2760, 760],
       "size": [520, 300],
       "flags": {},
-      "order": 14,
+      "order": 16,
       "mode": 0,
       "inputs": [
-        {"name": "images", "type": "IMAGE", "link": 596},
+        {"name": "images", "type": "IMAGE", "link": 598},
         {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}}
       ],
       "outputs": [],
       "properties": {"Node name for S&R": "SaveImage"},
       "widgets_values": ["ai_remaster_qwen_edits/edit"]
-    },
-    {
-      "id": 24,
-      "type": "LoraLoaderModelOnly",
-      "pos": [1260, 430],
-      "size": [300, 82],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {"name": "model", "type": "MODEL", "link": 443},
-        {"name": "lora_name", "type": "COMBO", "widget": {"name": "lora_name"}},
-        {"name": "strength_model", "type": "FLOAT", "widget": {"name": "strength_model"}}
-      ],
-      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [376]}],
-      "properties": {"Node name for S&R": "LoraLoaderModelOnly"},
-      "widgets_values": ["Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 1]
     },
     {
       "id": 30,
@@ -111,28 +94,12 @@
       "order": 6,
       "mode": 0,
       "inputs": [
-        {"name": "model", "type": "MODEL", "link": 376},
+        {"name": "model", "type": "MODEL", "link": 443},
         {"name": "shift", "type": "FLOAT", "widget": {"name": "shift"}}
       ],
-      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [51]}],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [675]}],
       "properties": {"Node name for S&R": "ModelSamplingAuraFlow"},
       "widgets_values": [3.1]
-    },
-    {
-      "id": 31,
-      "type": "CFGNorm",
-      "pos": [1880, 430],
-      "size": [270, 58],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [
-        {"name": "model", "type": "MODEL", "link": 51},
-        {"name": "strength", "type": "FLOAT", "widget": {"name": "strength"}}
-      ],
-      "outputs": [{"name": "patched_model", "type": "MODEL", "links": [675]}],
-      "properties": {"Node name for S&R": "CFGNorm"},
-      "widgets_values": [1]
     },
     {
       "id": 32,
@@ -178,7 +145,7 @@
       "inputs": [
         {"name": "clip", "type": "CLIP", "link": 115},
         {"name": "vae", "shape": 7, "type": "VAE", "link": 449},
-        {"name": "image1", "shape": 7, "type": "IMAGE", "link": 510},
+        {"name": "image1", "shape": 7, "type": "IMAGE", "link": 714},
         {"name": "prompt", "type": "STRING", "widget": {"name": "prompt"}}
       ],
       "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [673]}],
@@ -197,7 +164,7 @@
       "inputs": [
         {"name": "clip", "type": "CLIP", "link": 56},
         {"name": "vae", "shape": 7, "type": "VAE", "link": 448},
-        {"name": "image1", "shape": 7, "type": "IMAGE", "link": 509},
+        {"name": "image1", "shape": 7, "type": "IMAGE", "link": 713},
         {"name": "prompt", "type": "STRING", "widget": {"name": "prompt"}}
       ],
       "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [648]}],
@@ -227,7 +194,7 @@
       "pos": [2060, 980],
       "size": [188, 46],
       "flags": {},
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {"name": "samples", "type": "LATENT", "link": 467},
@@ -243,7 +210,7 @@
       "pos": [2240, 620],
       "size": [270, 262],
       "flags": {},
-      "order": 12,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {"name": "model", "type": "MODEL", "link": 675},
@@ -260,30 +227,130 @@
       ],
       "outputs": [{"name": "LATENT", "type": "LATENT", "links": [674]}],
       "properties": {"Node name for S&R": "KSampler"},
-      "widgets_values": [0, "randomize", 4, 1, "euler", "simple", 1]
+      "widgets_values": [0, "randomize", 12, 4, "euler", "simple", 1]
+    },
+    {
+      "id": 161,
+      "type": "GrowMask",
+      "pos": [1880, 1120],
+      "size": [270, 82],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "mask", "type": "MASK", "link": 707},
+        {"name": "expand", "type": "INT", "widget": {"name": "expand"}},
+        {"name": "tapered_corners", "type": "BOOLEAN", "widget": {"name": "tapered_corners"}}
+      ],
+      "outputs": [{"name": "MASK", "type": "MASK", "links": [696, 712]}],
+      "properties": {"Node name for S&R": "GrowMask"},
+      "widgets_values": [32, true]
+    },
+    {
+      "id": 162,
+      "type": "GrowMask",
+      "pos": [2200, 1220],
+      "size": [270, 82],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {"name": "mask", "type": "MASK", "link": 708},
+        {"name": "expand", "type": "INT", "widget": {"name": "expand"}},
+        {"name": "tapered_corners", "type": "BOOLEAN", "widget": {"name": "tapered_corners"}}
+      ],
+      "outputs": [{"name": "MASK", "type": "MASK", "links": [697]}],
+      "properties": {"Node name for S&R": "GrowMask"},
+      "widgets_values": [8, true]
+    },
+    {
+      "id": 163,
+      "type": "ImageBlur",
+      "pos": [1260, 1120],
+      "size": [270, 106],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "image", "type": "IMAGE", "link": 709},
+        {"name": "blur_radius", "type": "INT", "widget": {"name": "blur_radius"}},
+        {"name": "sigma", "type": "FLOAT", "widget": {"name": "sigma"}}
+      ],
+      "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [710]}],
+      "title": "Remove selected content from conditioning",
+      "properties": {"Node name for S&R": "ImageBlur"},
+      "widgets_values": [31, 10]
+    },
+    {
+      "id": 164,
+      "type": "ImageCompositeMasked",
+      "pos": [1570, 1120],
+      "size": [270, 166],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "destination", "type": "IMAGE", "link": 711},
+        {"name": "source", "type": "IMAGE", "link": 710},
+        {"name": "x", "type": "INT", "widget": {"name": "x"}},
+        {"name": "y", "type": "INT", "widget": {"name": "y"}},
+        {"name": "resize_source", "type": "BOOLEAN", "widget": {"name": "resize_source"}},
+        {"name": "mask", "shape": 7, "type": "MASK", "link": 712}
+      ],
+      "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [713, 714]}],
+      "title": "Masked conditioning image",
+      "properties": {"Node name for S&R": "ImageCompositeMasked"},
+      "widgets_values": [0, 0, false]
+    },
+    {
+      "id": 160,
+      "type": "ImageCompositeMasked",
+      "pos": [2760, 760],
+      "size": [270, 166],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {"name": "destination", "type": "IMAGE", "link": 706},
+        {"name": "source", "type": "IMAGE", "link": 596},
+        {"name": "x", "type": "INT", "widget": {"name": "x"}},
+        {"name": "y", "type": "INT", "widget": {"name": "y"}},
+        {"name": "resize_source", "type": "BOOLEAN", "widget": {"name": "resize_source"}},
+        {"name": "mask", "shape": 7, "type": "MASK", "link": 697}
+      ],
+      "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [598]}],
+      "properties": {"Node name for S&R": "ImageCompositeMasked"},
+      "widgets_values": [0, 0, false]
     }
   ],
   "links": [
     [10, 10, 0, 13, 1, "VAE"],
-    [51, 30, 0, 31, 0, "MODEL"],
     [56, 33, 0, 1, 0, "CLIP"],
     [115, 33, 0, 39, 0, "CLIP"],
-    [376, 24, 0, 30, 0, "MODEL"],
     [434, 10, 0, 119, 1, "VAE"],
-    [443, 32, 0, 24, 0, "MODEL"],
+    [443, 32, 0, 30, 0, "MODEL"],
     [448, 10, 0, 1, 1, "VAE"],
     [449, 10, 0, 39, 1, "VAE"],
     [467, 119, 0, 126, 0, "LATENT"],
-    [509, 11, 0, 1, 2, "IMAGE"],
-    [510, 11, 0, 39, 2, "IMAGE"],
-    [596, 13, 0, 14, 0, "IMAGE"],
+    [596, 13, 0, 160, 1, "IMAGE"],
+    [598, 160, 0, 14, 0, "IMAGE"],
     [648, 1, 0, 152, 1, "CONDITIONING"],
     [652, 126, 0, 152, 3, "LATENT"],
     [673, 39, 0, 152, 2, "CONDITIONING"],
     [674, 152, 0, 13, 0, "LATENT"],
-    [675, 31, 0, 152, 0, "MODEL"],
-    [696, 12, 0, 126, 1, "MASK"],
-    [705, 11, 0, 119, 0, "IMAGE"]
+    [675, 30, 0, 152, 0, "MODEL"],
+    [696, 161, 0, 126, 1, "MASK"],
+    [697, 162, 0, 160, 5, "MASK"],
+    [705, 11, 0, 119, 0, "IMAGE"],
+    [706, 11, 0, 160, 0, "IMAGE"],
+    [707, 12, 0, 161, 0, "MASK"],
+    [708, 12, 0, 162, 0, "MASK"],
+    [709, 11, 0, 163, 0, "IMAGE"],
+    [710, 163, 0, 164, 1, "IMAGE"],
+    [711, 11, 0, 164, 0, "IMAGE"],
+    [712, 161, 0, 164, 5, "MASK"],
+    [713, 164, 0, 1, 2, "IMAGE"],
+    [714, 164, 0, 39, 2, "IMAGE"]
   ],
   "groups": [
     {"id": 1, "title": "ARP Qwen masked edit", "bounding": [930, 390, 2370, 990], "color": "#3f789e", "font_size": 24, "flags": {}}

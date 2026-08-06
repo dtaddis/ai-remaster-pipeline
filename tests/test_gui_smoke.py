@@ -3080,6 +3080,13 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("raise the masked area's luminance", prompt)
         self.assertIn("do not merely darken", prompt)
 
+    def test_semantic_edit_prompt_does_not_add_colour_instructions_without_a_sample(self) -> None:
+        reference_prompt = app.reference_edit_prompt("remove the masked text", "")
+        guide_prompt = outpaint_guides._guide_edit_prompt("remove the masked text", "")
+
+        self.assertEqual(reference_prompt, "remove the masked text")
+        self.assertEqual(guide_prompt, "remove the masked text")
+
     def test_reference_edit_accept_and_revert_updates_manifest(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -3277,6 +3284,27 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["1"]["inputs"]["prompt"], "Replace the masked hat with a bright green hat.")
         self.assertEqual(prompt["12"]["inputs"]["image"], "arp_qwen_ref_masks/mask.png")
         self.assertEqual(prompt["11"]["inputs"]["image"], "arp_qwen_ref_edits/source.png")
+        self.assertEqual(prompt["152"]["inputs"]["model"], ["30", 0])
+        self.assertEqual(prompt["152"]["inputs"]["steps"], 12)
+        self.assertEqual(prompt["152"]["inputs"]["cfg"], 4)
+        self.assertNotIn("24", prompt)
+        self.assertNotIn("31", prompt)
+        self.assertEqual(prompt["161"]["inputs"]["mask"], ["12", 0])
+        self.assertEqual(prompt["161"]["inputs"]["expand"], 32)
+        self.assertEqual(prompt["162"]["inputs"]["mask"], ["12", 0])
+        self.assertEqual(prompt["162"]["inputs"]["expand"], 8)
+        self.assertEqual(prompt["163"]["inputs"]["image"], ["11", 0])
+        self.assertEqual(prompt["163"]["inputs"]["blur_radius"], 31)
+        self.assertEqual(prompt["164"]["inputs"]["destination"], ["11", 0])
+        self.assertEqual(prompt["164"]["inputs"]["source"], ["163", 0])
+        self.assertEqual(prompt["164"]["inputs"]["mask"], ["161", 0])
+        self.assertEqual(prompt["1"]["inputs"]["image1"], ["164", 0])
+        self.assertEqual(prompt["39"]["inputs"]["image1"], ["164", 0])
+        self.assertEqual(prompt["126"]["inputs"]["mask"], ["161", 0])
+        self.assertEqual(prompt["160"]["inputs"]["destination"], ["11", 0])
+        self.assertEqual(prompt["160"]["inputs"]["source"], ["13", 0])
+        self.assertEqual(prompt["160"]["inputs"]["mask"], ["162", 0])
+        self.assertEqual(prompt["14"]["inputs"]["images"], ["160", 0])
 
     def test_guide_edit_accept_and_revert_updates_guide_frames(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
