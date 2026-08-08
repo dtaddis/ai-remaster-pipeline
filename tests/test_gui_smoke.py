@@ -1776,10 +1776,13 @@ class GuiSmokeTests(unittest.TestCase):
                 mock.patch.object(server, "outpaint_chunk_dir_for", return_value=folder),
             ):
                 state = app.outpaint_chunks_state(settings)
+                with mock.patch.object(server, "write_outpaint_chunk_rows") as rewrite:
+                    app.outpaint_chunks_state(settings)
 
         row = state["rows"][0]
         self.assertEqual(row["effective_prompt"], "outpaint with natural edges. extend the wallpaper")
         self.assertEqual(row["effective_negative_prompt"], "text. extra hands")
+        rewrite.assert_not_called()
 
 
     def test_clearing_outpaint_guide_deletes_cached_chunk_guides(self) -> None:
@@ -2965,6 +2968,57 @@ class GuiSmokeTests(unittest.TestCase):
 
             self.assertEqual(sig["extra_guides"][0]["image_fingerprint"]["sha256"], common.file_fingerprint(guide)["sha256"])
 
+    def test_unchanged_auto_guide_pixels_preserve_resume_signature(self) -> None:
+        import cv2
+        import numpy as np
+
+        class FakeCapture:
+            def __init__(self, frame):
+                self.frame = frame
+
+            def get(self, _property):
+                return 2
+
+            def set(self, _property, _value):
+                return True
+
+            def read(self):
+                return True, self.frame.copy()
+
+            def release(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            previous_raw = folder / "raw_0000.mp4"
+            previous_raw.write_bytes(b"regenerated chunk")
+            target = folder / "guide_prev_raw_0000.png"
+            next_chunk = folder / "raw_0001.mp4"
+            next_chunk.write_bytes(b"cached next chunk")
+            original = np.full((3, 4, 3), 42, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(target), original))
+            os.utime(target, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(previous_raw, ns=(2_000_000_000, 2_000_000_000))
+
+            before = common.file_fingerprint(target)
+            common.write_signature(next_chunk, {"guide_fingerprint": before})
+            with mock.patch("cv2.VideoCapture", return_value=FakeCapture(original)):
+                extracted = outpaint_video.extract_last_frame_as_guide(previous_raw, folder)
+            after = common.file_fingerprint(extracted)
+
+            self.assertEqual(after, before)
+            self.assertTrue(common.signature_matches(next_chunk, {"guide_fingerprint": after}))
+
+            changed = original.copy()
+            changed[0, 0, 0] += 1
+            os.utime(previous_raw, ns=(3_000_000_000, 3_000_000_000))
+            with mock.patch("cv2.VideoCapture", return_value=FakeCapture(changed)):
+                outpaint_video.extract_last_frame_as_guide(previous_raw, folder)
+
+            changed_fingerprint = common.file_fingerprint(target)
+            self.assertNotEqual(changed_fingerprint["sha256"], before["sha256"])
+            self.assertFalse(common.signature_matches(next_chunk, {"guide_fingerprint": changed_fingerprint}))
+
     def test_openai_reference_command_requires_key_and_uses_selected_model(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -3312,7 +3366,10 @@ class GuiSmokeTests(unittest.TestCase):
                 mask_image_widget="0",
                 prompt_widget="0",
                 save_prefix_widget="0",
+                model_backend="gguf",
+                gguf_model="qwen-image-edit-2511-Q4_K_M.gguf",
             )
+            qwen_colorize_references.patch_qwen_model_backend(args, workflow)
 
             prompt = edit_reference_image.patch_masked_workflow(
                 args,
@@ -3326,11 +3383,12 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["1"]["inputs"]["prompt"], "Replace the masked hat with a bright green hat.")
         self.assertEqual(prompt["12"]["inputs"]["image"], "arp_qwen_ref_masks/mask.png")
         self.assertEqual(prompt["11"]["inputs"]["image"], "arp_qwen_ref_edits/source.png")
-        self.assertEqual(prompt["152"]["inputs"]["model"], ["30", 0])
-        self.assertEqual(prompt["152"]["inputs"]["steps"], 12)
-        self.assertEqual(prompt["152"]["inputs"]["cfg"], 4)
-        self.assertNotIn("24", prompt)
-        self.assertNotIn("31", prompt)
+        self.assertEqual(prompt["152"]["inputs"]["model"], ["31", 0])
+        self.assertEqual(prompt["152"]["inputs"]["steps"], 4)
+        self.assertEqual(prompt["152"]["inputs"]["cfg"], 1)
+        self.assertEqual(prompt["24"]["inputs"]["lora_name"], "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+        self.assertEqual(prompt["31"]["class_type"], "CFGNorm")
+        self.assertEqual(prompt["32"]["class_type"], "UnetLoaderGGUF")
         self.assertEqual(prompt["161"]["inputs"]["mask"], ["12", 0])
         self.assertEqual(prompt["161"]["inputs"]["expand"], 32)
         self.assertEqual(prompt["162"]["inputs"]["mask"], ["12", 0])

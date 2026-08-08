@@ -7,16 +7,14 @@ blueprints folder.
 
 `Image Edit Inpaint (Qwen 2511).json` is the default masked-edit workflow used
 by the advanced reference/guide editor when a SAM2/brush/wand mask is present.
-It uses the Qwen Image Edit 2511 base model at 12 steps/CFG 4 plus ComfyUI's
-latent `SetLatentNoiseMask` path. The generation mask is expanded by 32 pixels
+It uses the Qwen Image Edit 2511 four-step Lightning LoRA plus ComfyUI's latent
+`SetLatentNoiseMask` path. The generation mask is expanded by 32 pixels
 so small brush selections remain large enough to affect Qwen's latent image.
 The same area is blurred in Qwen's conditioning image, preventing the model
 from simply copying the selected object back into the generated pixels.
-The four-step Lightning LoRA is deliberately not used here: with a masked
-source latent it tends to reconstruct the selected pixels instead of following
-the edit instruction. The decoded result is finally composited over the source
-with an 8-pixel mask safety margin, preserving the rest of the image while
-avoiding a fringe of the original object around the edit.
+The decoded result is finally composited over the source with an 8-pixel mask
+safety margin, preserving the rest of the image while avoiding a fringe of the
+original object around the edit.
 
 The wrapper can patch arbitrary node IDs for:
 - load image

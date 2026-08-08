@@ -302,7 +302,24 @@ def extract_last_frame_as_guide(previous_raw: Path, chunk_dir: Path) -> Path:
     if not ok or frame is None:
         raise RuntimeError(f"Could not extract last frame from previous chunk: {previous_raw}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(target), frame)
+
+    # Keep the existing PNG byte-for-byte when the newly decoded handoff frame has the
+    # same pixels.  Chunk resume signatures fingerprint this file, so preserving it is
+    # what lets an unchanged boundary stop invalidation after an earlier chunk is rerun.
+    # Comparing decoded pixels (rather than freshly encoded PNG bytes) also makes this
+    # independent of encoder/compression differences.
+    if target.exists():
+        existing = cv2.imread(str(target), cv2.IMREAD_UNCHANGED)
+        if (
+            existing is not None
+            and existing.shape == frame.shape
+            and existing.dtype == frame.dtype
+            and bool((existing == frame).all())
+        ):
+            return target
+
+    if not cv2.imwrite(str(target), frame):
+        raise RuntimeError(f"Could not write previous-chunk guide frame: {target}")
     return target
 
 

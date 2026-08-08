@@ -86,6 +86,23 @@
       "widgets_values": ["ai_remaster_qwen_edits/edit"]
     },
     {
+      "id": 24,
+      "type": "LoraLoaderModelOnly",
+      "pos": [1260, 430],
+      "size": [300, 82],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "MODEL", "link": 443},
+        {"name": "lora_name", "type": "COMBO", "widget": {"name": "lora_name"}},
+        {"name": "strength_model", "type": "FLOAT", "widget": {"name": "strength_model"}}
+      ],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [376]}],
+      "properties": {"Node name for S&R": "LoraLoaderModelOnly"},
+      "widgets_values": ["Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 1]
+    },
+    {
       "id": 30,
       "type": "ModelSamplingAuraFlow",
       "pos": [1580, 430],
@@ -94,12 +111,28 @@
       "order": 6,
       "mode": 0,
       "inputs": [
-        {"name": "model", "type": "MODEL", "link": 443},
+        {"name": "model", "type": "MODEL", "link": 376},
         {"name": "shift", "type": "FLOAT", "widget": {"name": "shift"}}
       ],
-      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [675]}],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [51]}],
       "properties": {"Node name for S&R": "ModelSamplingAuraFlow"},
       "widgets_values": [3.1]
+    },
+    {
+      "id": 31,
+      "type": "CFGNorm",
+      "pos": [1880, 430],
+      "size": [270, 58],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "MODEL", "link": 51},
+        {"name": "strength", "type": "FLOAT", "widget": {"name": "strength"}}
+      ],
+      "outputs": [{"name": "patched_model", "type": "MODEL", "links": [675]}],
+      "properties": {"Node name for S&R": "CFGNorm"},
+      "widgets_values": [1]
     },
     {
       "id": 32,
@@ -227,7 +260,7 @@
       ],
       "outputs": [{"name": "LATENT", "type": "LATENT", "links": [674]}],
       "properties": {"Node name for S&R": "KSampler"},
-      "widgets_values": [0, "randomize", 12, 4, "euler", "simple", 1]
+      "widgets_values": [0, "randomize", 4, 1, "euler", "simple", 1]
     },
     {
       "id": 161,
@@ -325,10 +358,12 @@
   ],
   "links": [
     [10, 10, 0, 13, 1, "VAE"],
+    [51, 30, 0, 31, 0, "MODEL"],
     [56, 33, 0, 1, 0, "CLIP"],
     [115, 33, 0, 39, 0, "CLIP"],
     [434, 10, 0, 119, 1, "VAE"],
-    [443, 32, 0, 30, 0, "MODEL"],
+    [376, 24, 0, 30, 0, "MODEL"],
+    [443, 32, 0, 24, 0, "MODEL"],
     [448, 10, 0, 1, 1, "VAE"],
     [449, 10, 0, 39, 1, "VAE"],
     [467, 119, 0, 126, 0, "LATENT"],
@@ -338,7 +373,7 @@
     [652, 126, 0, 152, 3, "LATENT"],
     [673, 39, 0, 152, 2, "CONDITIONING"],
     [674, 152, 0, 13, 0, "LATENT"],
-    [675, 30, 0, 152, 0, "MODEL"],
+    [675, 31, 0, 152, 0, "MODEL"],
     [696, 161, 0, 126, 1, "MASK"],
     [697, 162, 0, 160, 5, "MASK"],
     [705, 11, 0, 119, 0, "IMAGE"],

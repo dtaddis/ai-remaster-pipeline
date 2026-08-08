@@ -2284,6 +2284,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
     global_prompt = values.get("prompt") or OUTPAINT_PROMPT
     global_negative = values.get("negative_prompt", "")
     rows = []
+    manifest_needs_write = len(ranges) != len(existing)
     for index, start_frame, end_frame in ranges:
         row = dict(existing.get(index, {}))
         row.setdefault("offset_x", "0")
@@ -2311,8 +2312,13 @@ def outpaint_chunks_state(settings: dict) -> dict:
         row.setdefault("guide_end_strength", "1.0")
         row.setdefault("guide_frames", "")
         row.setdefault("auto_start_guide", "true")
+        if row != existing.get(index):
+            manifest_needs_write = True
         rows.append(row)
-    write_outpaint_chunk_rows(manifest, rows)
+    # State polling is read-only once the chunk structure is current. Rewriting an
+    # unchanged snapshot here can race an Accept request and restore its old guide image.
+    if manifest_needs_write:
+        write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
     for row in rows:
         raw = resolve(row["raw_path"])
