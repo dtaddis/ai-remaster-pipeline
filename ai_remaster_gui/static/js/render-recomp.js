@@ -148,7 +148,6 @@ function drawUpscale() {
         ${progressHtml(sp.percent, sp.label)}
         ${upscaleInputSummary(s)}
         ${upscaleMainFields(st)}
-        ${upscaleShotBreakdownHtml(s)}
         ${shotOutputList(expected, null)}
         ${stageCheckboxes(s)}
         <div class="actions">
@@ -163,11 +162,13 @@ function drawUpscale() {
         ${upscaleComparisonHtml(s, preview)}
       </section>
     </div>
+    ${upscaleShotBreakdownHtml(s)}
     <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields('upscale');
   bindUpscaleComparison();
+  bindUpscaleShotComparisons();
   showCommand('upscale');
 }
 
@@ -235,30 +236,129 @@ function upscaleShotBreakdownHtml(s) {
   const rows = view.upscale || [];
   const manifest = view.upscale_manifest || '';
   if (!rows.length || !manifest) {
-    return '<div class="inline-warning">Run Shot Detection to set different AI upscale strengths by shot.</div>';
+    return '<section class="card upscale-shot-panel"><div class="inline-warning">Run Shot Detection to set different AI upscale strengths by shot.</div></section>';
   }
   const defaultStrength = Math.max(0, Math.min(100, Number(s.blend_strength || 100)));
   return `
-    <h3>Shot Upscale Strength</h3>
-    <p class="shot-empty">Lower values mix back more conventionally resized source detail and its original motion blur. Strength changes tween across transitions marked as fades in Shot Detection.</p>
-    <div class="shot-strength-list">
+    <section class="card upscale-shot-panel">
+      <div class="upscale-shot-heading">
+        <div>
+          <h2>Per-shot Upscale</h2>
+          <p class="shot-empty">Set the restoration strength for each shot, then drag its comparison slider to inspect the latest render against the input. Lower values retain more conventionally resized source detail and original motion blur.</p>
+        </div>
+        <div class="comparison-key" aria-label="Comparison key"><span>Before</span><span>Rendered</span></div>
+      </div>
+      <div class="upscale-shot-list">
       ${rows.map(row => {
         const inherited = String(row.upscale_strength || '').trim() === '';
         const value = inherited ? defaultStrength : Math.max(0, Math.min(100, Number(row.upscale_strength)));
         const transition = String(row.fade_to_next || '').toLowerCase() === 'true'
           ? `Tween ${esc(row.crossfade_seconds || '0')}s to next shot`
           : 'Cut to next shot strength';
+        const thumb = row.source_reference && row.source_reference_mtime
+          ? media(row.source_reference) + '&t=' + row.source_reference_mtime
+          : '';
         return `
-          <label class="shot-strength-row">
-            <span><strong>Shot ${row.index + 1}</strong><small>${esc(row.start_label)}–${esc(row.end_label)} · ${transition}</small></span>
-            <input type="range" min="0" max="100" step="1" value="${value}" oninput="this.nextElementSibling.value=this.value" onchange="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},this.value)">
-            <output>${value}</output><span>%</span>
-            <button type="button" title="Use the default strength" onclick="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},'')" ${inherited ? 'disabled' : ''}>Default</button>
-          </label>
+          <article class="upscale-shot-card">
+            <div class="upscale-shot-comparison" data-upscale-shot-comparison data-index="${row.index}" data-time="${row.selected_time}">
+              <div class="comparison-player">
+                ${thumb ? `<img class="compare-before" src="${thumb}" alt="Shot ${row.index + 1} input">` : '<div class="compare-before upscale-shot-missing">Loading input frame...</div>'}
+                <img class="compare-after hidden" alt="Shot ${row.index + 1} rendered output">
+                <div class="compare-after-mask" style="width:50%"></div>
+                <div class="compare-handle" style="left:50%"></div>
+                <div class="upscale-comparison-status">Loading comparison...</div>
+              </div>
+              <input id="shotCompareSlider_${row.index}" class="compare-slider" type="range" min="0" max="100" value="50" aria-label="Shot ${row.index + 1} before and after split" disabled>
+              <div class="upscale-compare-labels"><span>Input</span><span>Latest upscale</span></div>
+            </div>
+            <div class="upscale-shot-controls">
+              <div class="upscale-shot-title">
+                <div><strong>Shot ${row.index + 1}</strong><small>${esc(row.start_label)}–${esc(row.end_label)} · ${transition}</small></div>
+                <span class="upscale-strength-readout"><output>${value}</output>%</span>
+              </div>
+              <label for="shotStrength_${row.index}">AI upscale strength</label>
+              <input id="shotStrength_${row.index}" class="upscale-strength-slider" type="range" min="0" max="100" step="1" value="${value}" oninput="this.closest('.upscale-shot-controls').querySelector('output').value=this.value" onchange="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},this.value)">
+              <div class="upscale-shot-actions">
+                <small>${inherited ? `Using the ${defaultStrength}% default` : 'Custom strength for this shot'}</small>
+                <button type="button" title="Use the default strength" onclick="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},'')" ${inherited ? 'disabled' : ''}>Use Default</button>
+              </div>
+            </div>
+          </article>
         `;
       }).join('')}
-    </div>
+      </div>
+    </section>
   `;
+}
+
+function bindUpscaleShotComparisons() {
+  const cards = [...document.querySelectorAll('[data-upscale-shot-comparison]')];
+  cards.forEach(card => {
+    const player = card.querySelector('.comparison-player');
+    const slider = card.querySelector('.compare-slider');
+    const after = player && player.querySelector('.compare-after');
+    const mask = player && player.querySelector('.compare-after-mask');
+    const handle = player && player.querySelector('.compare-handle');
+    const status = player && player.querySelector('.upscale-comparison-status');
+    if (!player || !slider || !after || !mask || !handle || !status) return;
+
+    const setSplit = () => {
+      after.style.clipPath = `inset(0 ${100 - Number(slider.value)}% 0 0)`;
+      mask.style.width = slider.value + '%';
+      handle.style.left = slider.value + '%';
+    };
+    slider.addEventListener('input', setSplit);
+    setSplit();
+  });
+
+  if (!('IntersectionObserver' in window)) {
+    cards.forEach(loadUpscaleShotComparison);
+    return;
+  }
+  const observer = new IntersectionObserver(entries => {
+    entries.filter(entry => entry.isIntersecting).forEach(entry => {
+      observer.unobserve(entry.target);
+      loadUpscaleShotComparison(entry.target);
+    });
+  }, { rootMargin: '500px 0px' });
+  cards.forEach(card => observer.observe(card));
+}
+
+async function loadUpscaleShotComparison(card) {
+  const player = card.querySelector('.comparison-player');
+  const slider = card.querySelector('.compare-slider');
+  const after = player && player.querySelector('.compare-after');
+  const status = player && player.querySelector('.upscale-comparison-status');
+  if (!player || !slider || !after || !status) return;
+  const query = new URLSearchParams({ index: card.dataset.index, time: card.dataset.time });
+  try {
+    const result = await api('/api/upscale-shot-comparison?' + query.toString());
+    if (!result.ok) throw new Error(result.error || 'Comparison unavailable');
+    const before = player.querySelector('.compare-before');
+    if (result.before) {
+      if (before && before.tagName === 'IMG') before.src = media(result.before);
+      else if (before) before.outerHTML = `<img class="compare-before" src="${media(result.before)}" alt="Shot ${Number(card.dataset.index) + 1} input">`;
+    }
+    if (result.after) {
+      after.addEventListener('load', () => {
+        after.classList.remove('hidden');
+        player.classList.add('has-render');
+        slider.disabled = false;
+        status.textContent = result.stale === 'true' ? 'Settings changed — run Upscaling to refresh this comparison' : '';
+        status.classList.toggle('is-warning', result.stale === 'true');
+        status.classList.toggle('hidden', !status.textContent);
+      }, { once: true });
+      after.src = media(result.after);
+    } else {
+      slider.disabled = true;
+      status.textContent = 'Run Upscaling to add the rendered side';
+      status.classList.add('is-muted');
+    }
+  } catch (error) {
+    slider.disabled = true;
+    status.textContent = error.message || 'Comparison unavailable';
+    status.classList.add('is-warning');
+  }
 }
 
 function bindCleanupComparison() {

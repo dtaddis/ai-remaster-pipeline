@@ -1741,6 +1741,35 @@ class PipelineApp:
         exists = bool(output and resolve(output).exists())
         return {"source": source, "output": output, "exists": "true" if exists else "false", "kind": "preview", "title": "Upscale Preview"}
 
+    def upscale_shot_comparison_frames(self, index: int, seconds: float) -> dict[str, str]:
+        """Return cached input/output stills for one shot's upscale comparison card."""
+        values = self.settings.get("upscale", {})
+        source_text = self.upscale_input_for() or values.get("input_video", "")
+        source = resolve(source_text) if source_text else None
+        if source is None or not source.is_file():
+            return {"before": "", "after": "", "stale": "false"}
+
+        shot_index = max(0, int(index))
+        shot_seconds = max(0.0, float(seconds))
+        suffix = f"shot_{shot_index:04d}_{int(round(shot_seconds * 1000)):010d}"
+        target_dir = PREVIEW_DIR / "upscale_compare"
+        before = extract_video_frame_at(source, target_dir, suffix, shot_seconds)
+
+        predicted_output = upscale_output_for(source_text, values)
+        output = resolve(predicted_output) if predicted_output else None
+        if output is None or not output.is_file():
+            return {"before": before, "after": "", "stale": "false"}
+
+        after = extract_video_frame_at(output, target_dir, suffix, shot_seconds)
+        manifest_text = (
+            self.settings.get("colour", {}).get("manifest", "")
+            or self.settings.get("references", {}).get("manifest", "")
+            or manifest_for_outpainted(self.settings.get("shots", {}).get("outpainted_video", ""))
+        )
+        manifest = resolve(manifest_text) if manifest_text else None
+        stale = bool(manifest and manifest.is_file() and output.stat().st_mtime_ns < manifest.stat().st_mtime_ns)
+        return {"before": before, "after": after, "stale": "true" if stale else "false"}
+
     def cleanup_comparison_state(self) -> dict[str, str]:
         source = pipeline_source_text(self.settings)
         output = self.cleanup_output() if source else ""

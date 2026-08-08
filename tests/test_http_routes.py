@@ -28,6 +28,7 @@ EXPECTED_GET_ROUTES = {
     "/api/logfile",
     "/api/openai-models",
     "/api/shot-preview",
+    "/api/upscale-shot-comparison",
     "/api/aspect-preview",
     "/api/outpaint-auto-crop",
     "/api/outpaint-chunk-preview",
@@ -143,6 +144,19 @@ class HelperBehaviourTests(unittest.TestCase):
 
         self.assertEqual(handler.responses["json"], {"ok": True})
         state.APP.state.assert_called_once_with("shots", generate_shot_previews=False)
+
+    def test_upscale_shot_comparison_returns_cached_frame_pair(self) -> None:
+        state.APP.upscale_shot_comparison_frames = mock.Mock(
+            return_value={"before": "before.jpg", "after": "after.jpg", "stale": "false"}
+        )
+        handler = _Handler("/api/upscale-shot-comparison?index=3&time=4.25")
+        handler.do_GET()
+
+        self.assertEqual(
+            handler.responses["json"],
+            {"ok": True, "before": "before.jpg", "after": "after.jpg", "stale": "false"},
+        )
+        state.APP.upscale_shot_comparison_frames.assert_called_once_with(3, 4.25)
 
     def test_send_action_returns_ok_message_state(self) -> None:
         state.APP.run_reference_regeneration = lambda *a: (True, "done")

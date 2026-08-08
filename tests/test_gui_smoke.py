@@ -235,6 +235,48 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("bindCleanupComparison()", helpers)
         self.assertIn("bindVideoComparison('cleanupCompareSlider')", comparison)
 
+    def test_upscale_page_uses_a_full_width_per_shot_comparison_panel(self) -> None:
+        comparison = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-recomp.js").read_text(encoding="utf-8")
+
+        self.assertIn('class="card upscale-shot-panel"', comparison)
+        self.assertIn('data-upscale-shot-comparison', comparison)
+        self.assertIn('/api/upscale-shot-comparison?', comparison)
+        self.assertIn('bindUpscaleShotComparisons()', comparison)
+
+    def test_upscale_shot_comparison_uses_latest_full_output_and_marks_it_stale(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "comparison-source.mp4"
+            manifest = folder / "shots.csv"
+            source.write_bytes(b"source")
+            manifest.write_text("end\n1.0\n", encoding="utf-8")
+            app.APP.settings["global"].update({
+                "source": app.rel(source),
+                "expand_outpaint": "false",
+                "colorize": "false",
+                "upscale": "true",
+                "section_start": "0",
+                "section_end": "",
+            })
+            app.APP.settings["colour"]["manifest"] = app.rel(manifest)
+            output = app.resolve(app.upscale_output_for(app.rel(source), app.APP.settings["upscale"]))
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"output")
+            old = time.time() - 10
+            os.utime(output, (old, old))
+
+            try:
+                with mock.patch.object(server, "extract_video_frame_at", side_effect=["before.jpg", "after.jpg"]) as extract:
+                    result = app.APP.upscale_shot_comparison_frames(2, 4.25)
+            finally:
+                output.unlink(missing_ok=True)
+
+        self.assertEqual(result, {"before": "before.jpg", "after": "after.jpg", "stale": "true"})
+        self.assertEqual(extract.call_count, 2)
+        self.assertEqual(extract.call_args_list[0].args[0], source)
+        self.assertEqual(extract.call_args_list[1].args[0], output)
+        self.assertEqual(extract.call_args_list[0].args[3], 4.25)
+
     def test_cleanup_chunk_duration_defaults_to_97_frames_and_valid_ltx_sizes(self) -> None:
         args = cleanup_video.build_parser().parse_args(["--source", "input/example.mp4"])
 

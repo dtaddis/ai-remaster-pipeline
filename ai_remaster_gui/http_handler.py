@@ -211,6 +211,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "path": path})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/upscale-shot-comparison":
+            query = parse_qs(parsed.query)
+            try:
+                frames = state.APP.upscale_shot_comparison_frames(
+                    int(query.get("index", ["0"])[0]),
+                    float(query.get("time", ["0"])[0]),
+                )
+                self.send_json({"ok": True, **frames})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/aspect-preview":
             query = parse_qs(parsed.query)
             try:
