@@ -33,7 +33,12 @@ from common import (
     write_signature,
     write_split_sidecar,
 )
-from dependency_manager import HuggingFaceAccessError, ensure_outpaint_models
+from dependency_manager import (
+    DEFAULT_OUTPAINT_LORA,
+    OUMOUMAD_OUTPAINT_LORA,
+    HuggingFaceAccessError,
+    ensure_outpaint_models,
+)
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
 from outpaint_geometry import source_placement
@@ -56,20 +61,30 @@ MONOCHROME_NEGATIVE_SUFFIX = "green tint, magenta tint, colour cast, colored ima
 OUTPAINT_ACCESS_URL = "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"
 RECOMMENDED_OVERLAP_FRAMES = 8
 MODEL_SIZE_MULTIPLE = 32
-OUTPAINT_REQUIRED_NODES = {
+LTX_SPATIAL_MASK_CELL = 32
+OUTPAINT_COMMON_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
-    "LTXAddVideoICLoRAGuideAdvanced": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
-    "LTXVInpaintPreprocess": "ComfyUI-LTXVideo",
-    "LTXVDilateVideoMask": "ComfyUI-LTXVideo",
-    "LTXVLaplacianPyramidBlend": "ComfyUI-LTXVideo",
     "LTXVEmptyLatentAudio": "ComfyUI core",
-    "ImageToMask": "ComfyUI core",
-    "ThresholdMask": "ComfyUI core",
-    "InvertMask": "ComfyUI core",
     "LoadVideo": "ComfyUI core",
     "SaveVideo": "ComfyUI core",
 }
+OFFICIAL_OUTPAINT_REQUIRED_NODES = {
+    "LTXAddVideoICLoRAGuideAdvanced": "ComfyUI-LTXVideo",
+    "LTXVInpaintPreprocess": "ComfyUI-LTXVideo",
+    "LTXVDilateVideoMask": "ComfyUI-LTXVideo",
+    "LTXVLaplacianPyramidBlend": "ComfyUI-LTXVideo",
+    "ImageToMask": "ComfyUI core",
+    "ThresholdMask": "ComfyUI core",
+    "InvertMask": "ComfyUI core",
+}
+LEGACY_OUTPAINT_REQUIRED_NODES = {
+    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+}
+
+
+def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
+    return Path(outpaint_lora.replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 
 
 def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
@@ -560,6 +575,108 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     return target
 
 
+def generation_mask_image(exact_mask: Path, args) -> Path:
+    """Grow only sub-latent-cell edge bands for LTX conditioning.
+
+    A fixed dilation is counterproductive for a very thin top or bottom trim: it hides a
+    large strip of the nearest source context from the IC-LoRA.  Instead, make each requested
+    edge band at least one LTX spatial cell wide and leave already-large aspect-ratio padding
+    alone.  The exact mask is still used by the final blend.
+    """
+    target = exact_mask.with_name(f"{exact_mask.stem}_generation.png")
+    overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 64)))
+    sig = {
+        "version": 1,
+        "tool": "outpaint_video.py/generation_mask",
+        "exact_mask": root_relative(exact_mask),
+        "exact_mask_fingerprint": file_fingerprint(exact_mask),
+        "spatial_cell": LTX_SPATIAL_MASK_CELL,
+        "overlap_limit": overlap_limit,
+    }
+    if not getattr(args, "force", False) and resumable_output(target, sig):
+        return target
+
+    import cv2
+    import numpy as np
+
+    exact = cv2.imread(str(exact_mask), cv2.IMREAD_GRAYSCALE)
+    if exact is None:
+        raise RuntimeError(f"Could not read the exact outpaint mask: {exact_mask}")
+    protected = exact < 128
+    protected_columns = np.flatnonzero(protected.any(axis=0))
+    protected_rows = np.flatnonzero(protected.any(axis=1))
+    if not protected_columns.size or not protected_rows.size:
+        raise RuntimeError(f"The exact outpaint mask has no protected source rectangle: {exact_mask}")
+
+    height, width = exact.shape
+    left = int(protected_columns[0])
+    right = int(protected_columns[-1]) + 1
+    top = int(protected_rows[0])
+    bottom = int(protected_rows[-1]) + 1
+
+    def inward_growth(band_width: int) -> int:
+        if band_width <= 0 or band_width >= LTX_SPATIAL_MASK_CELL:
+            return 0
+        return min(overlap_limit, LTX_SPATIAL_MASK_CELL - band_width)
+
+    generation_left = min(right - 1, left + inward_growth(left))
+    generation_right = max(generation_left + 1, right - inward_growth(width - right))
+    generation_top = min(bottom - 1, top + inward_growth(top))
+    generation_bottom = max(generation_top + 1, bottom - inward_growth(height - bottom))
+
+    generation = np.full_like(exact, 255)
+    generation[generation_top:generation_bottom, generation_left:generation_right] = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".partial.png")
+    print(
+        "Building latent-safe LTX generation mask: "
+        f"{target} (exact source rectangle {left},{top}-{right},{bottom}; "
+        f"generation source rectangle {generation_left},{generation_top}-"
+        f"{generation_right},{generation_bottom})",
+        flush=True,
+    )
+    if not cv2.imwrite(str(partial), generation):
+        raise RuntimeError(f"Could not write the LTX generation mask: {partial}")
+    replace_with_retry(partial, target, "LTX generation mask")
+    write_signature(target, sig)
+    return target
+
+
+def patch_source_audio_graph(workflow: dict[str, Any], prepared: Path, fps: float) -> None:
+    """Use source audio when present and a correctly-sized empty latent for silent chunks."""
+    if video_has_audio(find_ffmpeg(), prepared):
+        return
+    empty_audio_id = 9110
+    audio_vae_link = 19130
+    empty_audio_link = 19131
+    add_or_replace_node(workflow, {
+        "id": empty_audio_id,
+        "type": "LTXVEmptyLatentAudio",
+        "title": "ARP empty audio latent for silent outpaint chunks",
+        "mode": 0,
+        "inputs": [
+            {"name": "audio_vae", "type": "VAE", "link": audio_vae_link},
+            {"name": "frames_number", "type": "INT", "widget": {"name": "frames_number"}},
+            {"name": "frame_rate", "type": "FLOAT", "widget": {"name": "frame_rate"}},
+            {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}},
+        ],
+        "outputs": [{"name": "Latent", "type": "LATENT", "links": [empty_audio_link]}],
+        "widgets_values": [int(probe_video(prepared)["frames"]), float(fps), 1],
+    })
+    patch_link(workflow, audio_vae_link, 5385, 0, empty_audio_id, 0, "VAE")
+    audio_input_slot = next(
+        index for index, item in enumerate(node_by_id(workflow, "5390").get("inputs", []))
+        if item.get("name") == "audio_latent"
+    )
+    patch_link(workflow, empty_audio_link, empty_audio_id, 0, 5390, audio_input_slot, "LATENT")
+    set_input_link(workflow, "5390", "audio_latent", empty_audio_link)
+    audio_vae_outputs = node_by_id(workflow, "5385").get("outputs", [])
+    if audio_vae_outputs:
+        existing_audio_vae_links = list(audio_vae_outputs[0].get("links") or [])
+        if audio_vae_link not in existing_audio_vae_links:
+            audio_vae_outputs[0]["links"] = existing_audio_vae_links + [audio_vae_link]
+
+
 def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int, fps: float) -> None:
     """Use the official v0.9 mask conditioning in one full-resolution generation pass.
 
@@ -625,9 +742,51 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         patch_link(workflow, threshold_link, 9100, 0, 9101, 0, "MASK")
         patch_link(workflow, 19102, 9101, 0, 9102, 0, "MASK")
         mask_source_id = 9102
+        generation_source_id = mask_source_id
+
+        # Dynamic masks can contain arbitrary black regions, so there is no single source
+        # rectangle from which to size individual edge bands. Retain bounded dilation here.
+        generation_overlap = max(0, int(getattr(args, "generation_mask_overlap", 64)))
+        remaining_overlap = generation_overlap
+        dilation_index = 0
+        first_dilation_link: int | None = None
+        while remaining_overlap > 0:
+            radius = min(30, remaining_overlap)
+            node_id = 9103 + dilation_index
+            input_link = 19110 + dilation_index
+            if first_dilation_link is None:
+                first_dilation_link = input_link
+            add_or_replace_node(workflow, {
+                "id": node_id,
+                "type": "LTXVDilateVideoMask",
+                "title": f"ARP dynamic generation mask overlap {dilation_index + 1}",
+                "mode": 0,
+                "inputs": [
+                    {"name": "spatial_radius", "type": "INT", "widget": {"name": "spatial_radius"}},
+                    {"name": "temporal_radius", "type": "INT", "widget": {"name": "temporal_radius"}},
+                    {"name": "mask", "type": "MASK", "link": input_link},
+                    {"name": "image_as_mask", "type": "IMAGE", "link": None},
+                ],
+                "outputs": [{"name": "mask", "type": "MASK", "links": []}],
+                "widgets_values": [radius, 0],
+            })
+            patch_link(workflow, input_link, generation_source_id, 0, node_id, 2, "MASK")
+            generation_source_id = node_id
+            remaining_overlap -= radius
+            dilation_index += 1
+
+        source_mask_node = node_by_id(workflow, str(mask_source_id))
+        source_mask_node["outputs"][0]["links"] = [14377] + (
+            [first_dilation_link] if first_dilation_link is not None else [mask_link]
+        )
+        for index in range(dilation_index):
+            output_link = mask_link if index == dilation_index - 1 else 19110 + index + 1
+            node_by_id(workflow, str(9103 + index))["outputs"][0]["links"] = [output_link]
     else:
         mask = official_mask_image(prepared, args, width, height)
+        generation_mask = generation_mask_image(mask, args)
         mask_name = copy_to_comfy_input(mask, comfy_dir, "arp_outpaint_mask")
+        generation_mask_name = copy_to_comfy_input(generation_mask, comfy_dir, "arp_outpaint_generation_mask")
         load_link = 19100
         add_or_replace_node(workflow, {
             "id": 9100,
@@ -655,48 +814,36 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         })
         patch_link(workflow, load_link, 9100, 0, 9101, 0, "IMAGE")
         mask_source_id = 9101
-
-    # Keep the exact user-requested mask for the final composite, but grow the generation
-    # mask beneath the protected source. LTX's effective spatial cells are much larger than
-    # a 10-pixel crop; without this overlap, a thin top/bottom band can remain #66ff00.
-    exact_mask_link = 14377
-    generation_overlap = max(0, int(getattr(args, "generation_mask_overlap", 64)))
-    previous_mask_id = mask_source_id
-    remaining_overlap = generation_overlap
-    dilation_index = 0
-    first_dilation_link: int | None = None
-    while remaining_overlap > 0:
-        radius = min(30, remaining_overlap)
-        node_id = 9103 + dilation_index
-        input_link = 19110 + dilation_index
-        if first_dilation_link is None:
-            first_dilation_link = input_link
         add_or_replace_node(workflow, {
-            "id": node_id,
-            "type": "LTXVDilateVideoMask",
-            "title": f"ARP generation mask overlap {dilation_index + 1}",
+            "id": 9103,
+            "type": "LoadImage",
+            "title": "ARP latent-safe generation mask",
+            "mode": 0,
+            "inputs": [],
+            "outputs": [
+                {"name": "IMAGE", "type": "IMAGE", "links": [19103]},
+                {"name": "MASK", "type": "MASK", "links": []},
+            ],
+            "widgets_values": [generation_mask_name, "image"],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9104,
+            "type": "ImageToMask",
+            "title": "ARP generation mask channel",
             "mode": 0,
             "inputs": [
-                {"name": "spatial_radius", "type": "INT", "widget": {"name": "spatial_radius"}},
-                {"name": "temporal_radius", "type": "INT", "widget": {"name": "temporal_radius"}},
-                {"name": "mask", "type": "MASK", "link": input_link},
-                {"name": "image_as_mask", "type": "IMAGE", "link": None},
+                {"name": "image", "type": "IMAGE", "link": 19103},
+                {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
             ],
-            "outputs": [{"name": "mask", "type": "MASK", "links": []}],
-            "widgets_values": [radius, 0],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_link]}],
+            "widgets_values": ["red"],
         })
-        patch_link(workflow, input_link, previous_mask_id, 0, node_id, 2, "MASK")
-        previous_mask_id = node_id
-        remaining_overlap -= radius
-        dilation_index += 1
+        patch_link(workflow, 19103, 9103, 0, 9104, 0, "IMAGE")
+        generation_source_id = 9104
+        node_by_id(workflow, str(mask_source_id))["outputs"][0]["links"] = [14377]
 
-    source_mask_node = node_by_id(workflow, str(mask_source_id))
-    source_mask_node["outputs"][0]["links"] = [exact_mask_link] + ([first_dilation_link] if first_dilation_link is not None else [mask_link])
-    for index in range(dilation_index):
-        output_link = mask_link if index == dilation_index - 1 else 19110 + index + 1
-        node_by_id(workflow, str(9103 + index))["outputs"][0]["links"] = [output_link]
-
-    patch_link(workflow, mask_link, previous_mask_id, 0, 5358, 1, "MASK")
+    exact_mask_link = 14377
+    patch_link(workflow, mask_link, generation_source_id, 0, 5358, 1, "MASK")
     set_input_link(workflow, "5358", "mask", mask_link)
     patch_link(workflow, exact_mask_link, mask_source_id, 0, 5266, 2, "MASK")
     set_input_link(workflow, "5266", "mask", exact_mask_link)
@@ -720,43 +867,52 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
     set_input_link(workflow, "5227", "audio", 14433)
 
-    # Use time-aligned source audio when present. Truly silent chunks still need an audio
-    # latent because the LTX 2.3 model is AV-shaped, so give those a frozen empty latent.
-    if not video_has_audio(find_ffmpeg(), prepared):
-        empty_audio_id = 9110
-        audio_vae_link = 19130
-        empty_audio_link = 19131
-        add_or_replace_node(workflow, {
-            "id": empty_audio_id,
-            "type": "LTXVEmptyLatentAudio",
-            "title": "ARP empty audio latent for silent outpaint chunks",
-            "mode": 0,
-            "inputs": [
-                {"name": "audio_vae", "type": "VAE", "link": audio_vae_link},
-                {"name": "frames_number", "type": "INT", "widget": {"name": "frames_number"}},
-                {"name": "frame_rate", "type": "FLOAT", "widget": {"name": "frame_rate"}},
-                {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}},
-            ],
-            "outputs": [{"name": "Latent", "type": "LATENT", "links": [empty_audio_link]}],
-            "widgets_values": [int(probe_video(prepared)["frames"]), float(fps), 1],
-        })
-        patch_link(workflow, audio_vae_link, 5385, 0, empty_audio_id, 0, "VAE")
-        audio_input_slot = next(
-            index for index, item in enumerate(node_by_id(workflow, "5390").get("inputs", []))
-            if item.get("name") == "audio_latent"
-        )
-        patch_link(workflow, empty_audio_link, empty_audio_id, 0, 5390, audio_input_slot, "LATENT")
-        set_input_link(workflow, "5390", "audio_latent", empty_audio_link)
-        audio_vae_outputs = node_by_id(workflow, "5385").get("outputs", [])
-        if audio_vae_outputs:
-            existing_audio_vae_links = list(audio_vae_outputs[0].get("links") or [])
-            if audio_vae_link not in existing_audio_vae_links:
-                audio_vae_outputs[0]["links"] = existing_audio_vae_links + [audio_vae_link]
+    patch_source_audio_graph(workflow, prepared, fps)
 
     # Full-canvas ARP guides should not be resized to the official demo's 1024px guide size.
     guide_link = 19120
     patch_link(workflow, guide_link, 2004, 0, 3159, 1, "IMAGE")
     set_input_link(workflow, "3159", "image", guide_link)
+
+
+def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path, fps: float) -> None:
+    """Run oumoumad's IC-LoRA with its original pure-black sentinel conditioning.
+
+    The prepared video already lifts real source blacks/gamma while leaving synthetic padding
+    exactly black. Feed those frames straight to the legacy guide node: the official v0.9
+    inpaint preprocessor would replace the padding with green and is incompatible with this LoRA.
+    """
+    legacy_guide = node_by_id(workflow, "5114")
+    legacy_guide["type"] = "LTXAddVideoICLoRAGuide"
+    legacy_guide["title"] = "ARP legacy pure-black IC-LoRA guide"
+    legacy_guide["inputs"] = [
+        item for item in legacy_guide.get("inputs", [])
+        if item.get("name") != "attention_mask"
+    ]
+    widgets = list(legacy_guide.get("widgets_values") or [])
+    legacy_guide["widgets_values"] = widgets[:7]
+
+    # GetVideoComponents (5168) exposes the gamma-lifted, black-padded prepared frames.
+    patch_link(workflow, 14372, 5168, 0, 5114, 4, "IMAGE")
+    set_input_link(workflow, "5114", "image", 14372)
+    size_link = input_link(workflow, "5054", "image")
+    if size_link is None:
+        raise ValueError("Official outpaint template has no Stage 1 image-size link.")
+    patch_link(workflow, size_link, 5168, 0, 5054, 0, "IMAGE")
+    set_input_link(workflow, "5054", "image", size_link)
+
+    # The legacy method returns the decoded diffusion result directly. Do not route it through
+    # the official mask compositor or Laplacian source blend, either of which can restore green.
+    patch_link(workflow, 13934, 4851, 0, 5227, 0, "IMAGE")
+    set_input_link(workflow, "5227", "images", 13934)
+    patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
+    set_input_link(workflow, "5227", "audio", 14433)
+
+    patch_source_audio_graph(workflow, prepared, fps)
+
+    # Start-frame guides remain separate i2v conditioning and stay at full canvas size.
+    patch_link(workflow, 19120, 2004, 0, 3159, 1, "IMAGE")
+    set_input_link(workflow, "3159", "image", 19120)
 
 
 def is_official_outpaint_template(workflow: dict[str, Any]) -> bool:
@@ -1023,15 +1179,19 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # and guide images all use the same dimensions — no mismatch, no crop.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
-    patch_official_masked_graph(
-        workflow,
-        args,
-        prepared,
-        comfy_dir,
-        canvas_width,
-        canvas_height,
-        float(prepared_info.get("fps") or 24.0),
-    )
+    prepared_fps = float(prepared_info.get("fps") or 24.0)
+    if uses_legacy_black_outpaint(args.outpaint_lora):
+        patch_legacy_black_graph(workflow, prepared, prepared_fps)
+    else:
+        patch_official_masked_graph(
+            workflow,
+            args,
+            prepared,
+            comfy_dir,
+            canvas_width,
+            canvas_height,
+            prepared_fps,
+        )
     source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
         # Extract the first frame of the prepared video to use as source fill for guide black bands.
@@ -1175,7 +1335,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 33,
+        "version": 34,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1214,7 +1374,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "single_stage_full_resolution_dual_mask_v3",
+        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_v4",
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "outpaint_lora": args.outpaint_lora,
@@ -1731,7 +1891,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")
     parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=64, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
     parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=5, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
-    parser.add_argument("--outpaint-lora", default="ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors")
+    parser.add_argument("--outpaint-lora", default=DEFAULT_OUTPAINT_LORA)
     parser.add_argument("--output")
     parser.add_argument("--raw-output")
     parser.add_argument("--workflow", default=str(DEFAULT_WORKFLOW))
@@ -1806,10 +1966,19 @@ def main() -> int:
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
-        ensure_outpaint_models(comfy_dir, include_distilled_lora=args.model_backend != "gguf")
+        ensure_outpaint_models(
+            comfy_dir,
+            include_distilled_lora=args.model_backend != "gguf",
+            outpaint_lora=args.outpaint_lora,
+        )
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-        required_nodes = dict(OUTPAINT_REQUIRED_NODES)
+        required_nodes = dict(OUTPAINT_COMMON_NODES)
+        required_nodes.update(
+            LEGACY_OUTPAINT_REQUIRED_NODES
+            if uses_legacy_black_outpaint(args.outpaint_lora)
+            else OFFICIAL_OUTPAINT_REQUIRED_NODES
+        )
         if args.model_backend == "gguf":
             required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)

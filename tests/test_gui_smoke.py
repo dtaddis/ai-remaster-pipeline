@@ -836,6 +836,27 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("lutrgb=", filter_text)
         self.assertIn("color=c=black:s=1280x704", filter_text)
 
+    def test_standard_outpaint_preparation_lifts_source_but_keeps_padding_pure_black(self) -> None:
+        args = argparse.Namespace(
+            delivery_width=1280,
+            delivery_height=720,
+            crop_left=0,
+            crop_right=0,
+            crop_top=0,
+            crop_bottom=0,
+            black_lift=0.018,
+            gamma=1.06,
+            outpaint_all_black_regions=False,
+        )
+        info = {"width": 960, "height": 720, "fps": 24.0}
+
+        filter_text = prepare_outpaint_input.build_filter(args, info, 1280, 704)
+
+        self.assertIn("color=c=black:s=1280x704", filter_text)
+        self.assertIn("lutrgb=", filter_text)
+        self.assertIn("0.018", filter_text)
+        self.assertIn("1/1.06", filter_text)
+
     def test_prepare_outpaint_partial_output_paths_are_per_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             output = Path(tmp_text) / "Example_prepared_12345678.mp4"
@@ -1120,6 +1141,7 @@ class GuiSmokeTests(unittest.TestCase):
             mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
             mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
             mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
             mock.patch.object(outpaint_video, "probe_video", return_value={"width": 1280, "height": 704, "frames": 24, "fps": 24.0}),
         ):
             prompt = outpaint_video.patch_workflow(
@@ -1148,6 +1170,7 @@ class GuiSmokeTests(unittest.TestCase):
                 mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
                 mock.patch.object(outpaint_video, "copy_guide_image_to_comfy_input", return_value="arp_outpaint/guide_864x480.png"),
                 mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+                mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
                 mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
             ):
                 prompt = outpaint_video.patch_workflow(
@@ -1163,7 +1186,7 @@ class GuiSmokeTests(unittest.TestCase):
                 )
 
         self.assertEqual(prompt["5358"]["inputs"]["images"], ["5168", 0])
-        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9105", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9104", 0])
         self.assertEqual(prompt["5114"]["inputs"]["image"], ["5358", 0])
         self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
         self.assertEqual(prompt["2004"]["inputs"]["image"], "arp_outpaint/guide_864x480.png")
@@ -1172,13 +1195,9 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5368"]["inputs"]["file"], "arp_outpaint/prepared.mp4")
         self.assertEqual(prompt["9100"]["class_type"], "LoadImage")
         self.assertEqual(prompt["9101"]["class_type"], "ImageToMask")
-        self.assertEqual(prompt["9103"]["class_type"], "LTXVDilateVideoMask")
-        self.assertEqual(prompt["9103"]["inputs"]["spatial_radius"], 30)
-        self.assertEqual(prompt["9103"]["inputs"]["mask"], ["9101", 0])
-        self.assertEqual(prompt["9104"]["inputs"]["spatial_radius"], 30)
-        self.assertEqual(prompt["9104"]["inputs"]["mask"], ["9103", 0])
-        self.assertEqual(prompt["9105"]["inputs"]["spatial_radius"], 4)
-        self.assertEqual(prompt["9105"]["inputs"]["mask"], ["9104", 0])
+        self.assertEqual(prompt["9103"]["class_type"], "LoadImage")
+        self.assertEqual(prompt["9104"]["class_type"], "ImageToMask")
+        self.assertEqual(prompt["9104"]["inputs"]["image"], ["9103", 0])
         self.assertEqual(prompt["3059"]["inputs"]["width"], ["5054", 0])
         self.assertEqual(prompt["3059"]["inputs"]["height"], ["5054", 1])
         self.assertEqual(prompt["3059"]["inputs"]["length"], ["5054", 2])
@@ -1198,6 +1217,35 @@ class GuiSmokeTests(unittest.TestCase):
         for bypassed_node in ("5211", "5214", "5226", "5357", "5360", "5361", "5364", "5365", "5379", "5380"):
             self.assertNotIn(bypassed_node, prompt)
 
+    def test_oumoumad_outpaint_uses_legacy_black_frames_without_green_mask_graph(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args(
+            [
+                "--source", "input/example.mp4",
+                "--comfy-dir", str(app.ROOT),
+                "--outpaint-lora", config.OUMOUMAD_OUTPAINT_LORA,
+                "--dry-run",
+            ]
+        )
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            mock.patch.object(outpaint_video, "video_has_audio", return_value=True),
+            mock.patch.object(outpaint_video, "official_mask_image") as official_mask,
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                args.prompt, args.negative_prompt, 42,
+            )
+
+        official_mask.assert_not_called()
+        self.assertEqual(prompt["5114"]["class_type"], "LTXAddVideoICLoRAGuide")
+        self.assertEqual(prompt["5114"]["inputs"]["image"], ["5168", 0])
+        self.assertEqual(prompt["5227"]["inputs"]["images"], ["4851", 0])
+        self.assertNotIn("5358", prompt)
+        self.assertNotIn("5266", prompt)
+
     def test_outpaint_official_graph_uses_source_audio_when_chunk_has_a_track(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
         args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--dry-run"])
@@ -1205,6 +1253,7 @@ class GuiSmokeTests(unittest.TestCase):
             mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
             mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
             mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
             mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
             mock.patch.object(outpaint_video, "video_has_audio", return_value=True),
         ):
@@ -1275,6 +1324,27 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(mask[:, :16] == 255))
         self.assertTrue(np.all(mask[:, 16:48] == 0))
         self.assertTrue(np.all(mask[:, 48:] == 255))
+
+    def test_outpaint_generation_mask_only_grows_thin_edge_bands_to_one_latent_cell(self) -> None:
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            exact_path = Path(tmp_text) / "exact.png"
+            exact = np.full((704, 1280), 255, dtype=np.uint8)
+            exact[4:700, 161:1119] = 0
+            self.assertTrue(cv2.imwrite(str(exact_path), exact))
+            args = argparse.Namespace(force=True, generation_mask_overlap=64)
+
+            generation_path = outpaint_video.generation_mask_image(exact_path, args)
+            generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
+            exact_after = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
+
+        self.assertTrue(np.array_equal(exact_after, exact))
+        self.assertTrue(np.all(generation[:32] == 255))
+        self.assertTrue(np.all(generation[32:672, :161] == 255))
+        self.assertTrue(np.all(generation[32:672, 161:1119] == 0))
+        self.assertTrue(np.all(generation[672:] == 255))
 
     def test_ltx_laplacian_blend_keeps_fully_masked_thin_bands_exact(self) -> None:
         import importlib
@@ -1405,6 +1475,14 @@ class GuiSmokeTests(unittest.TestCase):
         command = app.APP.command_for("outpaint")
 
         self.assertEqual(command[command.index("--prompt") + 1], "outpaint with restrained natural edges")
+
+    def test_outpaint_command_uses_selected_lora(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"]["outpaint_lora"] = config.OUMOUMAD_OUTPAINT_LORA
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--outpaint-lora") + 1], config.OUMOUMAD_OUTPAINT_LORA)
 
     def test_outpaint_command_falls_back_to_activation_prompt_when_global_prompt_blank(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
@@ -2399,6 +2477,14 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("opened the approval page", message)
         open_browser.assert_called_once_with(server.OUTPAINT_LICENSE_URL)
 
+    def test_oumoumad_outpaint_lora_skips_official_huggingface_handoff(self) -> None:
+        with mock.patch.object(server.webbrowser, "open") as open_browser:
+            ok, message = server.outpaint_browser_handoff(config.OUMOUMAD_OUTPAINT_LORA)
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "")
+        open_browser.assert_not_called()
+
     def test_outpaint_403_reopens_approval_page_with_short_message(self) -> None:
         error = outpaint_video.HuggingFaceAccessError("long recovery instructions")
         with mock.patch.object(outpaint_video.webbrowser, "open", return_value=True) as open_browser:
@@ -2777,6 +2863,16 @@ class GuiSmokeTests(unittest.TestCase):
             changed = copy.deepcopy(signature)
             changed["guide_fingerprint"]["sha256"] = "0" * 64
             self.assertFalse(common.signature_matches(output, changed))
+
+    def test_signature_match_ignores_outpaint_lora_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            output = Path(tmp_text) / "chunk.mp4"
+            output.write_bytes(b"chunk")
+            common.write_signature(output, {"outpaint_lora": config.DEFAULT_OUTPAINT_LORA, "seed": 42})
+
+            selected = {"outpaint_lora": config.OUMOUMAD_OUTPAINT_LORA, "seed": 42}
+
+            self.assertTrue(common.signature_matches(output, selected))
 
     def test_replace_unless_identical_keeps_matching_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -4253,6 +4349,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(settings["global"]["expand_outpaint"], "true")
         self.assertEqual(settings["outpaint"]["target_height"], "source")
         self.assertEqual(settings["outpaint"]["seed_qwen_guides"], "false")
+        self.assertEqual(settings["outpaint"]["outpaint_lora"], config.DEFAULT_OUTPAINT_LORA)
 
     def test_blank_loaded_project_defaults_outpainting_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

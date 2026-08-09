@@ -109,6 +109,15 @@ archive:
 
 
 class DependencyManagerPathTests(unittest.TestCase):
+    def test_outpaint_download_selects_only_requested_lora(self) -> None:
+        selected_name = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
+        with mock.patch.object(dependency_manager, "ensure_hf_models") as ensure:
+            dependency_manager.ensure_outpaint_models(Path("ComfyUI"), outpaint_lora=selected_name)
+
+        models = ensure.call_args.args[1]
+        loras = [model for model in models if model.destination.startswith("models/loras/")]
+        self.assertEqual([model.file for model in loras], [selected_name])
+
     def test_gated_model_403_is_rewritten_as_actionable_access_error(self) -> None:
         class Response:
             status_code = 403

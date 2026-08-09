@@ -56,7 +56,12 @@ LTX_BASE_MODELS = [
 OUTPAINT_MODELS = [
     *LTX_BASE_MODELS,
     HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
+    HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
 ]
+
+DEFAULT_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
+OUMOUMAD_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
+OUTPAINT_LORA_MODELS = {Path(model.destination).name: model for model in OUTPAINT_MODELS[len(LTX_BASE_MODELS):]}
 
 OUTPAINT_DISTILLED_LORA_MODELS = [
     HfModel("Lightricks/LTX-2.3", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
@@ -371,8 +376,11 @@ def estimate_downloaded_bytes(cache_root: Path, baseline: dict[Path, int]) -> in
     return best
 
 
-def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False) -> None:
-    models = [*OUTPAINT_MODELS]
+def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False, outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> None:
+    models = [*LTX_BASE_MODELS]
+    selected = OUTPAINT_LORA_MODELS.get(Path(outpaint_lora.replace("\\", "/")).name)
+    if selected is not None:
+        models.append(selected)
     if include_distilled_lora:
         models.extend(OUTPAINT_DISTILLED_LORA_MODELS)
     ensure_hf_models(comfy_dir, models)

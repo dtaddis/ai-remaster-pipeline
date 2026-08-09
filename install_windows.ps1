@@ -1189,13 +1189,14 @@ Invoke-Step 'Install local FFmpeg tools' {
 }
 
 if ($DownloadModels -and -not $SkipModelDownloads) {
-    Invoke-Step 'Download LTX 2.3 models, Clean Up LoRA, and outpainting LoRA' {
+    Invoke-Step 'Download LTX 2.3 models, Clean Up LoRA, and outpainting LoRAs' {
         Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf'
         Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors'
         Download-HfFile 'Comfy-Org/ltx-2' 'split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors' 'models\text_encoders\gemma_3_12B_it_fp8_scaled.safetensors'
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' 'models\vae\LTX23_video_vae_bf16.safetensors'
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' 'models\vae\LTX23_audio_vae_bf16.safetensors'
         Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' 'models\loras\ltx-2.3-dearchive-lora.safetensors'
+        Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors'
         Download-HfFile 'Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting' 'ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors'
     }
 

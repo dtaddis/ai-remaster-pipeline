@@ -6,7 +6,9 @@ import sys
 from pathlib import Path
 
 from .config import (
+    DEFAULT_OUTPAINT_LORA,
     OUTPAINT_PROMPT,
+    OUTPAINT_LORA_CHOICES,
     QWEN_IMAGE_EDIT_MODEL,
     REFERENCE_PROMPT,
     REFERENCE_PROMPT_SUFFIX,
@@ -116,6 +118,7 @@ def qwen_masked_workflow_for(values: dict[str, str], config: dict[str, str]) -> 
 
 def base_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
+    defaults["outpaint"]["outpaint_lora"] = DEFAULT_OUTPAINT_LORA
     defaults["global"] = {"source": "", "cleanup": "false", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false", "section_start": "0", "section_end": "", "last_browse_dir": ""}
     return defaults
 
@@ -153,6 +156,8 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     }
     if defaults["outpaint"].get("prompt", "").strip() != OUTPAINT_PROMPT or defaults["outpaint"].get("prompt", "") in old_outpaint_prompts:
         defaults["outpaint"]["prompt"] = OUTPAINT_PROMPT
+    if defaults["outpaint"].get("outpaint_lora") not in OUTPAINT_LORA_CHOICES:
+        defaults["outpaint"]["outpaint_lora"] = DEFAULT_OUTPAINT_LORA
     defaults["outpaint"]["seed_qwen_guides"] = "false"
     defaults["colour"].setdefault("method", "deepexemplar")
     defaults["colour"].setdefault("processing_height", "source")

@@ -24,6 +24,9 @@ TEXT_EXTS = {".csv", ".json", ".txt", ".log", ".md"}
 REFERENCE_PROMPT = "Colorize this image."
 REFERENCE_PROMPT_SUFFIX = "Preserve composition, lighting, identity, and detail. Do not add text or new objects."
 OUTPAINT_PROMPT = "outpaint"
+DEFAULT_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
+OUMOUMAD_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
+OUTPAINT_LORA_CHOICES = {DEFAULT_OUTPAINT_LORA, OUMOUMAD_OUTPAINT_LORA}
 
 # The single Qwen Image Edit model used everywhere we run Qwen (colour references, outpaint
 # guide frames, and shot-change seed guides). Keep this as the one source of truth.

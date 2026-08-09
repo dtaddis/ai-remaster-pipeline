@@ -59,7 +59,9 @@ def _without_mtime(value: Any) -> Any:
         return {
             key: _without_mtime(item)
             for key, item in value.items()
-            if key not in {"mtime_ns", "color_reference_previous"}
+            # The two supported outpaint LoRAs can be mixed within one project. Keep the
+            # recorded model for diagnostics, but do not make it part of resume compatibility.
+            if key not in {"mtime_ns", "color_reference_previous", "outpaint_lora"}
         }
     if isinstance(value, list):
         return [_without_mtime(item) for item in value]

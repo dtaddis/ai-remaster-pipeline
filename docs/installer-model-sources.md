@@ -10,6 +10,7 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 - Distilled LoRA for the full dev-model backend: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384-1.1.safetensors` → `models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors`. The default distilled-GGUF backend bypasses this 7.6 GB LoRA because its weights are already distilled.
 - Clean Up / Dearchive LoRA: `oumoumad/ltx-2.3-dearchive-lora/lora_weights_step_05000.safetensors` → `models/loras/ltx-2.3-dearchive-lora.safetensors`
 - In/Outpainting LoRA: `Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors` (gated; accept/request browser access for the same individual account used by ARP, then run `hf auth login --force` if the saved token still receives a 403)
+- Lower-VRAM Outpainting LoRA: `oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint/ltx-2.3-22b-ic-lora-outpaint.safetensors`. ARP uses this with the legacy pure-black sentinel workflow and the reversible source gamma/black lift, not the official green-mask preprocessing graph.
 
 ## ProPainter (AI DeScratch)
 

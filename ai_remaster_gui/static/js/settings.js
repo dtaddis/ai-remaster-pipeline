@@ -10,9 +10,28 @@ function drawSettings() {
       ${comfySettingsHtml()}
       ${qwenSettingsHtml(refs)}
       ${openAISettingsHtml(refs)}
+      ${outpaintSettingsHtml(outpaint)}
       ${pipelineDefaultsHtml(outpaint, colour, recomp)}
       ${logFileSettingsHtml()}
     </section>
+  `;
+}
+
+function outpaintSettingsHtml(outpaint) {
+  const official = 'ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors';
+  const oumoumad = 'ltx-2.3-22b-ic-lora-outpaint.safetensors';
+  const selected = outpaint.outpaint_lora || official;
+  return `
+    <h3>Outpainting</h3>
+    <label>Outpainting LoRA</label>
+    <select id="outpaintLora">
+      <option value="${official}" ${selected === official ? 'selected' : ''}>Official LTX v0.9 (mask-based, higher VRAM)</option>
+      <option value="${oumoumad}" ${selected === oumoumad ? 'selected' : ''}>oumoumad (legacy pure-black + gamma lift)</option>
+    </select>
+    <small class="field-help">The selected LoRA is used for new renders. Existing chunks from either LoRA remain reusable.</small>
+    <div class="actions">
+      <button type="button" class="primary" onclick="saveOutpaintSettings()">Save Outpainting Settings</button>
+    </div>
   `;
 }
 
@@ -137,6 +156,16 @@ async function saveQwenEditSettings() {
     stage: 'references',
     values: {
       masked_workflow: document.getElementById('qwenMaskedWorkflow')?.value || '',
+    },
+  });
+  state = await api(stateUrl());
+}
+
+async function saveOutpaintSettings() {
+  await postJson('/api/settings', {
+    stage: 'outpaint',
+    values: {
+      outpaint_lora: document.getElementById('outpaintLora')?.value || 'ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors',
     },
   });
   state = await api(stateUrl());

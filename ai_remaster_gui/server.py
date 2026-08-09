@@ -14,6 +14,7 @@ from pathlib import Path
 from .config import (
     ASPECT_PREVIEW_DIR,
     CONFIG_FILE,
+    DEFAULT_OUTPAINT_LORA,
     FILE_PREVIEW_DIR,
     IMAGE_EXTS,
     MEDIA_CLIP_DIR,
@@ -199,7 +200,7 @@ MODEL_SIZE_MULTIPLE = 32
 STABLE_AUDIO_LICENSE_URL = "https://huggingface.co/stabilityai/stable-audio-open-1.0"
 STABLE_AUDIO_DEFAULT_CHECKPOINT = "stable_audio_open_1.0.safetensors"
 OUTPAINT_LICENSE_URL = "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"
-OUTPAINT_LORA_DESTINATION = "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
+OUTPAINT_LORA_DESTINATION = f"models/loras/{DEFAULT_OUTPAINT_LORA}"
 
 # Shared artifact identity/naming/sizing (single source of truth, also imported by the producer
 # scripts). Lives under scripts/, so put that on the path before importing.
@@ -276,7 +277,10 @@ def outpaint_handoff_marker_path() -> Path:
     return ROOT / ".cache" / "handoffs" / "ltx_2_3_official_outpaint_approval_v2.json"
 
 
-def outpaint_browser_handoff() -> tuple[bool, str]:
+def outpaint_browser_handoff(outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> tuple[bool, str]:
+    # oumoumad's alternative is public, so only the gated official LoRA needs this preflight.
+    if Path(outpaint_lora.replace("\\", "/")).name != DEFAULT_OUTPAINT_LORA:
+        return True, ""
     comfy_dir = Path(comfy_dir_for(current_config()))
     target = resolve_comfy_model_path(comfy_dir, OUTPAINT_LORA_DESTINATION)
     if target.exists():
@@ -1187,6 +1191,7 @@ class PipelineApp:
             add(["--guide-strength", values.get("guide_strength", "0.7")])
         if values.get("guide_end_strength"):
             add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
+        add(["--outpaint-lora", values.get("outpaint_lora", DEFAULT_OUTPAINT_LORA)])
         if is_true(values, "outpaint_all_black_regions"):
             add(["--outpaint-all-black-regions"])
         if is_true(values, "seed_qwen_guides"):
@@ -1376,7 +1381,8 @@ class PipelineApp:
             if not clean_output or not resolve(clean_output).exists():
                 return False, "Run Clean Up first so this phase has its upstream video."
         if stage_key == "outpaint":
-            ok, message = outpaint_browser_handoff()
+            outpaint_lora = self.settings.get("outpaint", {}).get("outpaint_lora", DEFAULT_OUTPAINT_LORA)
+            ok, message = outpaint_browser_handoff(outpaint_lora)
             if not ok:
                 return False, message
         if stage_key == "audio":
