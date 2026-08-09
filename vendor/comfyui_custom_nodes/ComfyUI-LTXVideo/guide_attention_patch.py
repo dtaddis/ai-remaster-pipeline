@@ -53,8 +53,41 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
         if torch.is_grad_enabled() or token_count <= chunk_tokens:
             return current_forward(self, x)
 
+        # ComfyUI-GGUF normally dequantizes a Linear's weight inside every
+        # forward call. Calling the complete MLP once per token slice would
+        # therefore dequantize both very large weights dozens of times. Hold
+        # each dequantized weight for this one MLP invocation and reuse it
+        # across slices. LoRA patches are already applied by cast_bias_weight.
+        network = getattr(self, "net", None)
+        project_in = getattr(network[0], "proj", None) if network is not None else None
+        project_out = network[-1] if network is not None else None
+        is_quantized_in = callable(
+            getattr(project_in, "is_ggml_quantized", None)
+        ) and project_in.is_ggml_quantized()
+        is_quantized_out = callable(
+            getattr(project_out, "is_ggml_quantized", None)
+        ) and project_out.is_ggml_quantized()
+        if is_quantized_in and is_quantized_out:
+            weight_in, bias_in = project_in.cast_bias_weight(x)
+            weight_out, bias_out = project_out.cast_bias_weight(x)
+            middle_layers = tuple(network[1:-1])
+
+            def run_chunk(chunk):
+                hidden = torch.nn.functional.linear(chunk, weight_in, bias_in)
+                hidden = torch.nn.functional.gelu(hidden, approximate="tanh")
+                for layer in middle_layers:
+                    hidden = layer(hidden)
+                return torch.nn.functional.linear(hidden, weight_out, bias_out)
+
+            if not chunked_forward._arp_reported_gguf_reuse:
+                LOGGER.info("ARP chunked LTX feed-forward is reusing dequantized GGUF weights")
+                chunked_forward._arp_reported_gguf_reuse = True
+        else:
+            def run_chunk(chunk):
+                return current_forward(self, chunk)
+
         first_count = min(chunk_tokens, token_count)
-        first = current_forward(self, x.narrow(-2, 0, first_count))
+        first = run_chunk(x.narrow(-2, 0, first_count))
         output_shape = list(x.shape)
         output_shape[-1] = first.shape[-1]
         output = torch.empty(output_shape, device=first.device, dtype=first.dtype)
@@ -63,12 +96,13 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
 
         for start in range(first_count, token_count, chunk_tokens):
             count = min(chunk_tokens, token_count - start)
-            chunk = current_forward(self, x.narrow(-2, start, count))
+            chunk = run_chunk(x.narrow(-2, start, count))
             output.narrow(-2, start, count).copy_(chunk)
             del chunk
         return output
 
     chunked_forward._arp_chunked_feed_forward = True
+    chunked_forward._arp_reported_gguf_reuse = False
     feed_forward.forward = chunked_forward
     LOGGER.info("ARP exact-semantics chunked LTX feed-forward enabled (%d tokens)", chunk_tokens)
     return True

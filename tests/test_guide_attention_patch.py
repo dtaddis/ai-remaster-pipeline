@@ -44,8 +44,49 @@ class SparseGuideAttentionTests(unittest.TestCase):
         model._attention_with_guide_mask = lambda *_args, **_kwargs: None
         feed_forward_calls: list[int] = []
 
+        class FakeQuantizedLinear:
+            def __init__(self, weight, bias):
+                self.weight = weight
+                self.bias = bias
+                self.cast_calls = 0
+
+            def is_ggml_quantized(self):
+                return True
+
+            def cast_bias_weight(self, _input):
+                self.cast_calls += 1
+                return self.weight, self.bias
+
+            def __call__(self, x):
+                weight, bias = self.cast_bias_weight(x)
+                return torch.nn.functional.linear(x, weight, bias)
+
+        class FakeGelu:
+            def __init__(self, projection):
+                self.proj = projection
+
+            def __call__(self, x):
+                return torch.nn.functional.gelu(self.proj(x), approximate="tanh")
+
         class FakeFeedForward:
+            def __init__(self, quantized=False):
+                self.net = None
+                if quantized:
+                    weight_in = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4) / 100
+                    bias_in = torch.arange(8, dtype=torch.float32) / 50
+                    weight_out = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8) / 80
+                    bias_out = torch.arange(4, dtype=torch.float32) / 40
+                    self.net = [
+                        FakeGelu(FakeQuantizedLinear(weight_in, bias_in)),
+                        torch.nn.Identity(),
+                        FakeQuantizedLinear(weight_out, bias_out),
+                    ]
+
             def forward(self, x):
+                if self.net is not None:
+                    hidden = self.net[0](x)
+                    hidden = self.net[1](hidden)
+                    return self.net[2](hidden)
                 feed_forward_calls.append(x.shape[-2])
                 return x.square() + 0.25
 
@@ -61,7 +102,19 @@ class SparseGuideAttentionTests(unittest.TestCase):
             mock.patch.dict(sys.modules, fake_modules),
             mock.patch.dict(os.environ, {"ARP_LTX_FF_CHUNK_TOKENS": "256"}),
         ):
+            quantized_ff = model.FeedForward(quantized=True)
+            quantized_input = torch.arange(600 * 4, dtype=torch.float32).reshape(1, 600, 4) / 100
+            with torch.inference_mode():
+                quantized_expected = quantized_ff.forward(quantized_input)
+            quantized_ff.net[0].proj.cast_calls = 0
+            quantized_ff.net[2].cast_calls = 0
             self.assertTrue(patch_module.install_sparse_guide_attention_patch())
+
+        with torch.inference_mode():
+            quantized_actual = quantized_ff.forward(quantized_input)
+        self.assertTrue(torch.equal(quantized_actual, quantized_expected))
+        self.assertEqual(quantized_ff.net[0].proj.cast_calls, 1)
+        self.assertEqual(quantized_ff.net[2].cast_calls, 1)
 
         ff_input = torch.arange(600 * 4, dtype=torch.float32).reshape(1, 600, 4) / 100
         with torch.inference_mode():
