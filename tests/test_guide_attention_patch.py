@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import os
 import sys
 import types
 import unittest
@@ -41,6 +42,14 @@ class SparseGuideAttentionTests(unittest.TestCase):
         model.comfy = comfy
         model.GuideAttentionMask = type("OriginalGuideAttentionMask", (), {})
         model._attention_with_guide_mask = lambda *_args, **_kwargs: None
+        feed_forward_calls: list[int] = []
+
+        class FakeFeedForward:
+            def forward(self, x):
+                feed_forward_calls.append(x.shape[-2])
+                return x.square() + 0.25
+
+        model.FeedForward = FakeFeedForward
 
         fake_modules = {
             "comfy": comfy,
@@ -48,8 +57,17 @@ class SparseGuideAttentionTests(unittest.TestCase):
             "comfy.ldm.lightricks": lightricks,
             "comfy.ldm.lightricks.model": model,
         }
-        with mock.patch.dict(sys.modules, fake_modules):
+        with (
+            mock.patch.dict(sys.modules, fake_modules),
+            mock.patch.dict(os.environ, {"ARP_LTX_FF_CHUNK_TOKENS": "256"}),
+        ):
             self.assertTrue(patch_module.install_sparse_guide_attention_patch())
+
+        ff_input = torch.arange(600 * 4, dtype=torch.float32).reshape(1, 600, 4) / 100
+        with torch.inference_mode():
+            ff_actual = model.FeedForward().forward(ff_input)
+        self.assertTrue(torch.equal(ff_actual, ff_input.square() + 0.25))
+        self.assertEqual(feed_forward_calls, [256, 256, 88])
 
         weights = torch.tensor([[1.0, 1.0, 0.5, 0.0]], dtype=torch.float32)
         guide_mask = model.GuideAttentionMask(8, 3, 4, weights)
