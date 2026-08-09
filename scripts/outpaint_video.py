@@ -65,7 +65,6 @@ LTX_SPATIAL_MASK_CELL = 32
 OUTPAINT_COMMON_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
-    "LTXVEmptyLatentAudio": "ComfyUI core",
     "LoadVideo": "ComfyUI core",
     "SaveVideo": "ComfyUI core",
 }
@@ -642,42 +641,22 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     return target
 
 
-def patch_source_audio_graph(workflow: dict[str, Any], prepared: Path, fps: float) -> None:
-    """Use source audio when present and a correctly-sized empty latent for silent chunks."""
-    if video_has_audio(find_ffmpeg(), prepared):
-        return
-    empty_audio_id = 9110
-    audio_vae_link = 19130
-    empty_audio_link = 19131
-    add_or_replace_node(workflow, {
-        "id": empty_audio_id,
-        "type": "LTXVEmptyLatentAudio",
-        "title": "ARP empty audio latent for silent outpaint chunks",
-        "mode": 0,
-        "inputs": [
-            {"name": "audio_vae", "type": "VAE", "link": audio_vae_link},
-            {"name": "frames_number", "type": "INT", "widget": {"name": "frames_number"}},
-            {"name": "frame_rate", "type": "FLOAT", "widget": {"name": "frame_rate"}},
-            {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}},
-        ],
-        "outputs": [{"name": "Latent", "type": "LATENT", "links": [empty_audio_link]}],
-        "widgets_values": [int(probe_video(prepared)["frames"]), float(fps), 1],
-    })
-    patch_link(workflow, audio_vae_link, 5385, 0, empty_audio_id, 0, "VAE")
-    audio_input_slot = next(
-        index for index, item in enumerate(node_by_id(workflow, "5390").get("inputs", []))
-        if item.get("name") == "audio_latent"
-    )
-    patch_link(workflow, empty_audio_link, empty_audio_id, 0, 5390, audio_input_slot, "LATENT")
-    set_input_link(workflow, "5390", "audio_latent", empty_audio_link)
-    audio_vae_outputs = node_by_id(workflow, "5385").get("outputs", [])
-    if audio_vae_outputs:
-        existing_audio_vae_links = list(audio_vae_outputs[0].get("links") or [])
-        if audio_vae_link not in existing_audio_vae_links:
-            audio_vae_outputs[0]["links"] = existing_audio_vae_links + [audio_vae_link]
+def patch_video_only_sampling(workflow: dict[str, Any]) -> None:
+    """Remove LTX audio latents from ARP's outpaint diffusion dependency graph.
+
+    Outpainting changes pixels only. The original audio track is already routed from
+    GetVideoComponents directly into CreateVideo, so encoding, sampling, separating,
+    and decoding an audio latent wastes VRAM and time without affecting the result.
+    """
+    sampler_latent_link = 14423
+    crop_latent_link = 14425
+    patch_link(workflow, sampler_latent_link, 5114, 2, 5093, 4, "LATENT")
+    set_input_link(workflow, "5093", "latent_image", sampler_latent_link)
+    patch_link(workflow, crop_latent_link, 5093, 1, 5013, 2, "LATENT")
+    set_input_link(workflow, "5013", "latent", crop_latent_link)
 
 
-def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int, fps: float) -> None:
+def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int) -> None:
     """Use the official v0.9 mask conditioning in one full-resolution generation pass.
 
     Lightricks' example graph generates a half-resolution draft, enlarges it with Lanczos,
@@ -863,11 +842,9 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     patch_link(workflow, 13934, 5266, 0, 5227, 0, "IMAGE")
     set_input_link(workflow, "5227", "images", 13934)
     # Preserve the original track in the temporary Comfy render; the chunk stitcher handles
-    # final audio separately. This also avoids decoding the unused second-stage audio latent.
+    # final audio separately. Audio never enters the diffusion graph.
     patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
     set_input_link(workflow, "5227", "audio", 14433)
-
-    patch_source_audio_graph(workflow, prepared, fps)
 
     # Full-canvas ARP guides should not be resized to the official demo's 1024px guide size.
     guide_link = 19120
@@ -875,7 +852,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     set_input_link(workflow, "3159", "image", guide_link)
 
 
-def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path, fps: float) -> None:
+def patch_legacy_black_graph(workflow: dict[str, Any]) -> None:
     """Run oumoumad's IC-LoRA with its original pure-black sentinel conditioning.
 
     The prepared video already lifts real source blacks/gamma while leaving synthetic padding
@@ -907,8 +884,6 @@ def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path, fps: floa
     set_input_link(workflow, "5227", "images", 13934)
     patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
     set_input_link(workflow, "5227", "audio", 14433)
-
-    patch_source_audio_graph(workflow, prepared, fps)
 
     # Start-frame guides remain separate i2v conditioning and stay at full canvas size.
     patch_link(workflow, 19120, 2004, 0, 3159, 1, "IMAGE")
@@ -988,12 +963,6 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
     set_widget(lora_node, "0", args.outpaint_lora)
     set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
-    try:
-        audio_vae_node = node_by_id(workflow, "5385")
-    except KeyError:
-        audio_vae_node = node_by_id(workflow, "4010")
-    ensure_widget_input(audio_vae_node, "ckpt_name")
-    set_widget(audio_vae_node, "0", args.audio_vae_checkpoint)
     text_node = node_by_id(workflow, "5023")
     ensure_widget_input(text_node, "text_encoder")
     ensure_widget_input(text_node, "ckpt_name")
@@ -1179,19 +1148,19 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # and guide images all use the same dimensions — no mismatch, no crop.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
-    prepared_fps = float(prepared_info.get("fps") or 24.0)
-    if uses_legacy_black_outpaint(args.outpaint_lora):
-        patch_legacy_black_graph(workflow, prepared, prepared_fps)
-    else:
-        patch_official_masked_graph(
-            workflow,
-            args,
-            prepared,
-            comfy_dir,
-            canvas_width,
-            canvas_height,
-            prepared_fps,
-        )
+    if is_official_outpaint_template(workflow):
+        if uses_legacy_black_outpaint(args.outpaint_lora):
+            patch_legacy_black_graph(workflow)
+        else:
+            patch_official_masked_graph(
+                workflow,
+                args,
+                prepared,
+                comfy_dir,
+                canvas_width,
+                canvas_height,
+            )
+        patch_video_only_sampling(workflow)
     source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
         # Extract the first frame of the prepared video to use as source fill for guide black bands.
@@ -1252,15 +1221,6 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
 
     bypass_optional_preview_nodes(workflow)
 
-    # Avoid depending on the optional ComfyMath CM_FloatToInt node; the audio latent node accepts
-    # a normal integer widget value when its frame_rate link is cleared.
-    try:
-        clear_input_link(workflow, "3980", "frame_rate")
-        audio_latent_node = node_by_id(workflow, "3980")
-        set_widget(audio_latent_node, "1", int(round(float(prepared_info.get("fps") or 24))))
-    except KeyError:
-        pass
-
     if not is_official_outpaint_template(workflow):
         try:
             latent_video_node = node_by_id(workflow, "3059")
@@ -1297,7 +1257,6 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             "5023": ("0", args.text_encoder),
             "5011": ("0", args.outpaint_lora),
             "4922": ("0", "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
-            "5385": ("0", args.audio_vae_checkpoint),
         }
         for node_id, (widget, value) in model_patches.items():
             try:
@@ -1335,7 +1294,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 34,
+        "version": 35,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1374,7 +1333,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_v4",
+        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v5",
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "outpaint_lora": args.outpaint_lora,
@@ -1885,7 +1844,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-backend", choices=["gguf", "checkpoint"], default="gguf")
     parser.add_argument("--gguf-model", default="LTX-2.3-distilled-Q4_K_M.gguf")
     parser.add_argument("--video-vae", default="LTX23_video_vae_bf16.safetensors")
-    parser.add_argument("--audio-vae-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
     parser.add_argument("--text-encoder", default="gemma_3_12B_it_fp8_scaled.safetensors")
     parser.add_argument("--text-encoder-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
     parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")

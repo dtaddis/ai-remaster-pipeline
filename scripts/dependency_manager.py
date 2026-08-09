@@ -45,23 +45,28 @@ def huggingface_access_denied(exc: BaseException) -> bool:
     return False
 
 
-LTX_BASE_MODELS = [
+LTX_VIDEO_MODELS = [
     HfModel("QuantStack/LTX-2.3-GGUF", "LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf", "models/unet/LTX-2.3-distilled-Q4_K_M.gguf"),
     HfModel("Lightricks/LTX-2.3-fp8", "ltx-2.3-22b-dev-fp8.safetensors", "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"),
     HfModel("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors", "models/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"),
     HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_video_vae_bf16.safetensors", "models/vae/LTX23_video_vae_bf16.safetensors"),
+]
+
+LTX_AUDIO_MODELS = [
     HfModel("Kijai/LTX2.3_comfy", "vae/LTX23_audio_vae_bf16.safetensors", "models/vae/LTX23_audio_vae_bf16.safetensors"),
 ]
 
-OUTPAINT_MODELS = [
-    *LTX_BASE_MODELS,
+LTX_BASE_MODELS = [*LTX_VIDEO_MODELS, *LTX_AUDIO_MODELS]
+
+OUTPAINT_LORA_FILES = [
     HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
     HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
 ]
+OUTPAINT_MODELS = [*LTX_VIDEO_MODELS, *OUTPAINT_LORA_FILES]
 
 DEFAULT_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 OUMOUMAD_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
-OUTPAINT_LORA_MODELS = {Path(model.destination).name: model for model in OUTPAINT_MODELS[len(LTX_BASE_MODELS):]}
+OUTPAINT_LORA_MODELS = {Path(model.destination).name: model for model in OUTPAINT_LORA_FILES}
 
 OUTPAINT_DISTILLED_LORA_MODELS = [
     HfModel("Lightricks/LTX-2.3", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
@@ -377,7 +382,7 @@ def estimate_downloaded_bytes(cache_root: Path, baseline: dict[Path, int]) -> in
 
 
 def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False, outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> None:
-    models = [*LTX_BASE_MODELS]
+    models = [*LTX_VIDEO_MODELS]
     selected = OUTPAINT_LORA_MODELS.get(Path(outpaint_lora.replace("\\", "/")).name)
     if selected is not None:
         models.append(selected)

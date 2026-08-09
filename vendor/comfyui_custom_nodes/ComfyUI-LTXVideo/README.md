@@ -11,6 +11,8 @@
 
 A collection of powerful custom nodes that extend ComfyUI's capabilities for the LTX-2 video generation model.
 
+> **ARP bundled patch:** `guide_attention_patch.py` partitions LTX guide queries into generated, full-strength guide, and soft-strength guide groups. Full-strength video-guide rows use ordinary unmasked attention, so only genuinely attenuated still-guide rows allocate the large per-row mask. This preserves ComfyUI's guide-attention semantics while avoiding the multi-gigabyte all-zero mask created by long video guides.
+
 LTX-2 is built into ComfyUI core ([see it here](https://github.com/comfyanonymous/ComfyUI/tree/master/comfy/ldm/lightricks)), making it readily accessible to all ComfyUI users. This repository hosts additional nodes and workflows to help you get the most out of LTX-2's advanced features.
 
 **To learn more about LTX-2** See the [main LTX-2 repository](https://github.com/Lightricks/LTX-2) for model details and additional resources.

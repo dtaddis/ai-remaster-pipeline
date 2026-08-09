@@ -117,6 +117,7 @@ class DependencyManagerPathTests(unittest.TestCase):
         models = ensure.call_args.args[1]
         loras = [model for model in models if model.destination.startswith("models/loras/")]
         self.assertEqual([model.file for model in loras], [selected_name])
+        self.assertFalse(any("audio_vae" in model.file for model in models))
 
     def test_gated_model_403_is_rewritten_as_actionable_access_error(self) -> None:
         class Response:

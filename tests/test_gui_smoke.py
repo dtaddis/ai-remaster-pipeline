@@ -1202,12 +1202,10 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["3059"]["inputs"]["height"], ["5054", 1])
         self.assertEqual(prompt["3059"]["inputs"]["length"], ["5054", 2])
         self.assertEqual(prompt["5023"]["inputs"]["device"], "cpu")
-        self.assertNotIn("5382", prompt)
-        self.assertEqual(prompt["9110"]["class_type"], "LTXVEmptyLatentAudio")
-        self.assertEqual(prompt["9110"]["inputs"]["frames_number"], 24)
-        self.assertEqual(prompt["9110"]["inputs"]["frame_rate"], 24.0)
-        self.assertEqual(prompt["9110"]["inputs"]["audio_vae"], ["5385", 0])
-        self.assertEqual(prompt["5390"]["inputs"]["audio_latent"], ["9110", 0])
+        self.assertEqual(prompt["5093"]["inputs"]["latent_image"], ["5114", 2])
+        self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
+        for audio_diffusion_node in ("5382", "5383", "5385", "5386", "5389", "5390", "9110"):
+            self.assertNotIn(audio_diffusion_node, prompt)
         self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9101", 0])
         self.assertEqual(prompt["5266"]["inputs"]["image_b"], ["5168", 0])
         self.assertEqual(prompt["5266"]["inputs"]["mask_low_res_dilation"], 5)
@@ -1231,7 +1229,6 @@ class GuiSmokeTests(unittest.TestCase):
             mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
             mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
             mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
-            mock.patch.object(outpaint_video, "video_has_audio", return_value=True),
             mock.patch.object(outpaint_video, "official_mask_image") as official_mask,
         ):
             prompt = outpaint_video.patch_workflow(
@@ -1242,11 +1239,16 @@ class GuiSmokeTests(unittest.TestCase):
         official_mask.assert_not_called()
         self.assertEqual(prompt["5114"]["class_type"], "LTXAddVideoICLoRAGuide")
         self.assertEqual(prompt["5114"]["inputs"]["image"], ["5168", 0])
+        self.assertEqual(prompt["5093"]["inputs"]["latent_image"], ["5114", 2])
+        self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
         self.assertEqual(prompt["5227"]["inputs"]["images"], ["4851", 0])
+        self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
         self.assertNotIn("5358", prompt)
         self.assertNotIn("5266", prompt)
+        for audio_diffusion_node in ("5382", "5383", "5385", "5386", "5389", "5390", "9110"):
+            self.assertNotIn(audio_diffusion_node, prompt)
 
-    def test_outpaint_official_graph_uses_source_audio_when_chunk_has_a_track(self) -> None:
+    def test_outpaint_official_graph_remuxes_source_audio_without_audio_diffusion(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
         args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--dry-run"])
         with (
@@ -1255,16 +1257,43 @@ class GuiSmokeTests(unittest.TestCase):
             mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
             mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
             mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
-            mock.patch.object(outpaint_video, "video_has_audio", return_value=True),
         ):
             prompt = outpaint_video.patch_workflow(
                 args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
                 args.prompt, args.negative_prompt, 42,
             )
 
-        self.assertIn("5382", prompt)
-        self.assertNotIn("9110", prompt)
-        self.assertEqual(prompt["5382"]["inputs"]["audio"], ["5168", 1])
+        self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
+        self.assertEqual(prompt["5093"]["inputs"]["latent_image"], ["5114", 2])
+        self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
+        for audio_diffusion_node in ("5382", "5383", "5385", "5386", "5389", "5390", "9110"):
+            self.assertNotIn(audio_diffusion_node, prompt)
+
+    def test_outpaint_extra_guides_remain_in_video_only_sampler_chain(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--dry-run"])
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            guide = Path(tmp_text) / "guide.png"
+            guide.write_bytes(b"guide")
+            with (
+                mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+                mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+                mock.patch.object(outpaint_video, "copy_guide_image_to_comfy_input", return_value="arp_outpaint/extra.png"),
+                mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+                mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+                mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            ):
+                prompt = outpaint_video.patch_workflow(
+                    args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                    args.prompt, args.negative_prompt, 42,
+                    extra_guides=[{"frame_idx": 16, "strength": 0.5, "image": guide}],
+                )
+
+        self.assertEqual(prompt["5093"]["inputs"]["latent_image"], ["9060", 2])
+        self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
+        self.assertEqual(prompt["9060"]["inputs"]["latent"], ["5114", 2])
+        self.assertNotIn("5383", prompt)
+        self.assertNotIn("5386", prompt)
 
     def test_outpaint_monochrome_finish_removes_residual_chroma(self) -> None:
         args = finalize_outpaint_output.build_parser().parse_args(["--source", "input.mp4", "--monochrome"])
