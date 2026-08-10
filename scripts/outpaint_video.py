@@ -961,6 +961,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     lora_node = node_by_id(workflow, "5011")
     ensure_widget_input(lora_node, "lora_name")
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
+    ensure_widget_input(lora_node, "video_only", "BOOLEAN")
     set_widget(lora_node, "0", args.outpaint_lora)
     set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
     text_node = node_by_id(workflow, "5023")

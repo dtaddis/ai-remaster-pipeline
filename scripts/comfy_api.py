@@ -374,7 +374,7 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
         'CLIPTextEncode': ('text',),
         'LTXAddVideoICLoRAGuide': ('frame_idx', 'strength', 'latent_downscale_factor', 'crop', 'use_tiled_encode', 'tile_size', 'tile_overlap'),
         'LTXAddVideoICLoRAGuideAdvanced': ('frame_idx', 'strength', 'latent_downscale_factor', 'crop', 'use_tiled_encode', 'tile_size', 'tile_overlap', 'attention_strength'),
-        'LTXICLoRALoaderModelOnly': ('lora_name', 'strength_model'),
+        'LTXICLoRALoaderModelOnly': ('lora_name', 'strength_model', 'video_only'),
         'LTXAVTextEncoderLoader': ('text_encoder', 'ckpt_name', 'device'),
         'LTXVAudioVAELoader': ('ckpt_name',),
         'LTXVLaplacianPyramidBlend': ('trim_to_shortest', 'mask_low_res_dilation'),

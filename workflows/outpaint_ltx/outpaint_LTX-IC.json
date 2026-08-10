@@ -2631,7 +2631,8 @@
       },
       "widgets_values": [
         "ltxv/ltx2/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors",
-        1
+        1,
+        true
       ]
     },
     {

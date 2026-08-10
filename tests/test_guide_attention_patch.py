@@ -17,6 +17,51 @@ PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-LTXVideo" / "gu
 
 
 class SparseGuideAttentionTests(unittest.TestCase):
+    def test_video_only_pruning_removes_only_audio_block_modules(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_video_only_patch_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        class Block:
+            def __init__(self):
+                self.attn1 = object()
+                self.ff = object()
+                for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+                    setattr(self, attribute, object())
+
+        diffusion_model = types.SimpleNamespace(transformer_blocks=[Block(), Block()])
+        shared_model = types.SimpleNamespace(diffusion_model=diffusion_model)
+
+        class Patcher:
+            def __init__(self):
+                self.model = shared_model
+                self.size = 123
+                self.patches = {
+                    "diffusion_model.transformer_blocks.0.attn1.weight": ["video"],
+                    "diffusion_model.transformer_blocks.0.audio_ff.weight": ["audio"],
+                }
+
+            def clone(self):
+                clone = Patcher.__new__(Patcher)
+                clone.model = self.model
+                clone.size = self.size
+                clone.patches = self.patches.copy()
+                return clone
+
+        original = Patcher()
+        pruned = patch_module.prune_ltxav_audio_transformer_blocks(original)
+
+        self.assertIsNot(pruned, original)
+        self.assertEqual(pruned.size, 0)
+        self.assertIn("diffusion_model.transformer_blocks.0.attn1.weight", pruned.patches)
+        self.assertNotIn("diffusion_model.transformer_blocks.0.audio_ff.weight", pruned.patches)
+        for block in diffusion_model.transformer_blocks:
+            self.assertTrue(hasattr(block, "attn1"))
+            self.assertTrue(hasattr(block, "ff"))
+            for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+                self.assertFalse(hasattr(block, attribute))
+
     def test_full_strength_rows_are_unmasked_without_changing_results(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None

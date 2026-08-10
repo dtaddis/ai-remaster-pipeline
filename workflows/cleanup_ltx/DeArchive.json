@@ -1264,7 +1264,8 @@
       },
       "widgets_values": [
         "ltx-2\\real_ltx-2.3\\prodigy\\dearchive\\lora_weights_step_05000.safetensors",
-        1
+        1,
+        false
       ]
     },
     {

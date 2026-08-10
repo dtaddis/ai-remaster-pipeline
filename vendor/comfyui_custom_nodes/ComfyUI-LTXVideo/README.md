@@ -13,6 +13,8 @@ A collection of powerful custom nodes that extend ComfyUI's capabilities for the
 
 > **ARP bundled patch:** `guide_attention_patch.py` partitions LTX guide queries into generated, full-strength guide, and soft-strength guide groups. Full-strength video-guide rows use accelerated unmasked attention, while masked rows are kept on broadcast-safe PyTorch SDPA so xFormers cannot expand their mask to many gigabytes. It also evaluates the token-independent LTX feed-forward layers in 8,192-token slices, avoiding a multi-gigabyte four-times-width GELU tensor on long guided videos while retaining substantially more GPU throughput than smaller slices. GGUF weights are dequantized once per MLP and reused across its slices. These changes preserve the model's conditioning semantics; `ARP_LTX_FF_CHUNK_TOKENS` can override the feed-forward slice size.
 
+> ARP's video-only outpainting workflow also asks the IC-LoRA loader to remove the LTXAV transformer's unused audio self-attention, cross-attention, and feed-forward modules before model loading. The Q4 GGUF contains about 3.24 GiB of these block weights even when the audio latent is empty. Source audio is remuxed after video diffusion, so removing them changes neither video execution nor delivered audio.
+
 LTX-2 is built into ComfyUI core ([see it here](https://github.com/comfyanonymous/ComfyUI/tree/master/comfy/ldm/lightricks)), making it readily accessible to all ComfyUI users. This repository hosts additional nodes and workflows to help you get the most out of LTX-2's advanced features.
 
 **To learn more about LTX-2** See the [main LTX-2 repository](https://github.com/Lightricks/LTX-2) for model details and additional resources.

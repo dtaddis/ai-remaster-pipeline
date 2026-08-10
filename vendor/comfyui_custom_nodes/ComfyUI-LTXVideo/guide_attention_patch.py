@@ -20,6 +20,62 @@ import os
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 8192
+_LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
+    "audio_attn1",
+    "audio_attn2",
+    "audio_to_video_attn",
+    "video_to_audio_attn",
+    "audio_ff",
+    "audio_scale_shift_table",
+    "audio_prompt_scale_shift_table",
+    "scale_shift_table_a2v_ca_audio",
+    "scale_shift_table_a2v_ca_video",
+)
+
+
+def prune_ltxav_audio_transformer_blocks(model_patcher):
+    """Remove LTXAV block modules that cannot run for a video-only latent."""
+    pruned = model_patcher.clone()
+    diffusion_model = getattr(getattr(pruned, "model", None), "diffusion_model", None)
+    blocks = getattr(diffusion_model, "transformer_blocks", None)
+    if blocks is None:
+        raise ValueError("ARP video-only mode requires an LTXAV diffusion model")
+    if getattr(diffusion_model, "_arp_video_only_audio_pruned", False):
+        pruned.size = 0
+        return pruned
+
+    removed = 0
+    for block in blocks:
+        for attribute in _LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+            if hasattr(block, attribute):
+                delattr(block, attribute)
+                removed += 1
+
+    if removed == 0:
+        raise ValueError("ARP video-only mode found no LTXAV audio transformer modules")
+
+    # LoRA patches are attached lazily. Discard patches targeting modules that
+    # have just been removed so the GGUF patcher never tries to resolve them.
+    patches = getattr(pruned, "patches", None)
+    if isinstance(patches, dict):
+        pruned.patches = {
+            key: value
+            for key, value in patches.items()
+            if not any(
+                f".{attribute}." in key or key.endswith(f".{attribute}")
+                for attribute in _LTXAV_AUDIO_BLOCK_ATTRIBUTES
+            )
+        }
+
+    diffusion_model._arp_video_only_audio_pruned = True
+    # ModelPatcher caches model size. Force the model manager to measure the
+    # smaller module tree before deciding how much of the GGUF fits in VRAM.
+    pruned.size = 0
+    LOGGER.info(
+        "ARP video-only LTXAV model removed %d unused audio transformer modules",
+        removed,
+    )
+    return pruned
 
 
 def _feed_forward_chunk_tokens() -> int:

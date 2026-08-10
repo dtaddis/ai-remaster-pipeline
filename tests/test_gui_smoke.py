@@ -1192,6 +1192,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["2004"]["inputs"]["image"], "arp_outpaint/guide_864x480.png")
         self.assertNotIn("4922", prompt)
         self.assertEqual(prompt["5011"]["inputs"]["model"], ["3940", 0])
+        self.assertIs(prompt["5011"]["inputs"]["video_only"], True)
         self.assertEqual(prompt["5368"]["inputs"]["file"], "arp_outpaint/prepared.mp4")
         self.assertEqual(prompt["9100"]["class_type"], "LoadImage")
         self.assertEqual(prompt["9101"]["class_type"], "ImageToMask")
