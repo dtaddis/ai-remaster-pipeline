@@ -1116,6 +1116,13 @@ Invoke-Step 'Install ComfyUI custom nodes' {
         Git-Clone-IfMissing 'https://github.com/ltdrdata/ComfyUI-Manager.git' (Join-Path $CustomNodes 'ComfyUI-Manager') -UpdateExisting
     }
     Install-CustomNodePackage 'ComfyUI-LTXVideo' 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting -PreferBundled
+    $legacyArpPatch = Join-Path $CustomNodes 'ComfyUI-LTXVideo\guide_attention_patch.py'
+    if (Test-Path -LiteralPath $legacyArpPatch -PathType Leaf) {
+        Remove-Item -LiteralPath $legacyArpPatch -Force
+    }
+    if (-not (Copy-BundledCustomNode 'ComfyUI-ARP' (Join-Path $CustomNodes 'ComfyUI-ARP') -UpdateExisting)) {
+        throw 'Bundled ComfyUI-ARP custom node is missing from the installer payload.'
+    }
     Install-CustomNodePackage 'ComfyUI-GGUF' 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI_ProPainter_Nodes' 'https://github.com/daniabib/ComfyUI_ProPainter_Nodes.git' (Join-Path $CustomNodes 'ComfyUI_ProPainter_Nodes') -UpdateExisting
@@ -1127,6 +1134,11 @@ Invoke-Step 'Install ComfyUI custom nodes' {
 }
 
 Invoke-Step 'Verify required ComfyUI custom nodes' {
+    Assert-CustomNodeSymbols `
+        'ComfyUI-ARP' `
+        (Join-Path $CustomNodes 'ComfyUI-ARP') `
+        'bundled with ARP' `
+        @('ARPLTXVideoOnlyICLoRALoader')
     Assert-CustomNodeSymbols `
         'ComfyUI-LTXVideo' `
         (Join-Path $CustomNodes 'ComfyUI-LTXVideo') `
@@ -1201,7 +1213,6 @@ if ($DownloadModels -and -not $SkipModelDownloads) {
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_video_vae_bf16.safetensors' 'models\vae\LTX23_video_vae_bf16.safetensors'
         Download-HfFile 'Kijai/LTX2.3_comfy' 'vae/LTX23_audio_vae_bf16.safetensors' 'models\vae\LTX23_audio_vae_bf16.safetensors'
         Download-HfFile 'oumoumad/ltx-2.3-dearchive-lora' 'lora_weights_step_05000.safetensors' 'models\loras\ltx-2.3-dearchive-lora.safetensors'
-        Download-HfFile 'oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint' 'ltx-2.3-22b-ic-lora-outpaint.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-outpaint.safetensors'
         Download-HfFile 'Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting' 'ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors' 'models\loras\ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors'
     }
 

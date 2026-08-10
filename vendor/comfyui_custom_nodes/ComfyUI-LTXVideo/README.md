@@ -11,12 +11,6 @@
 
 A collection of powerful custom nodes that extend ComfyUI's capabilities for the LTX-2 video generation model.
 
-> **ARP bundled patch:** `guide_attention_patch.py` partitions LTX guide queries into generated, full-strength guide, and soft-strength guide groups. Scalar guide-strength masks are decomposed into unmasked key partitions, evaluated with xFormers, and recombined from their log-sum-exp normalizers. Query rows are processed in 4,096-token slices so the fully loaded model does not thrash VRAM while retaining the same attention context. This is algebraically the same softmax without the pathological long-sequence masked kernel; complex spatial masks safely fall back to PyTorch SDPA. It also evaluates the token-independent LTX feed-forward layers in 4,096-token slices, avoiding a multi-gigabyte four-times-width GELU tensor on long guided videos. GGUF weights are dequantized once per MLP and reused across its slices. These changes preserve the model's conditioning semantics; `ARP_LTX_ATTN_QUERY_CHUNK_TOKENS` and `ARP_LTX_FF_CHUNK_TOKENS` can override the slice sizes.
-
-> ARP's video-only outpainting workflow also asks the IC-LoRA loader to remove the LTXAV transformer's unused audio self-attention, cross-attention, and feed-forward modules before model loading. The Q4 GGUF contains about 3.24 GiB of these block weights even when the audio latent is empty. Source audio is remuxed after video diffusion, so removing them changes neither video execution nor delivered audio.
-
-> ComfyUI 0.30 assigns LTXAV a placeholder activation-memory factor of `0.077`, which can fully load the pruned model and oversubscribe a 24 GiB GPU by several GiB on long guided clips. ARP's video-only loader raises this clone's factor to `13`, making ComfyUI retain only the weights that fit beside the real guided activation set. `ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR` can override the factor for other GPU sizes.
-
 LTX-2 is built into ComfyUI core ([see it here](https://github.com/comfyanonymous/ComfyUI/tree/master/comfy/ldm/lightricks)), making it readily accessible to all ComfyUI users. This repository hosts additional nodes and workflows to help you get the most out of LTX-2's advanced features.
 
 **To learn more about LTX-2** See the [main LTX-2 repository](https://github.com/Lightricks/LTX-2) for model details and additional resources.

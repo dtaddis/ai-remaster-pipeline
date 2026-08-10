@@ -1,4 +1,4 @@
-"""Memory-efficient, exact-semantics LTX guide execution for ARP.
+"""Lazy, memory-efficient, exact-semantics LTX guide execution for ARP.
 
 ComfyUI's grouped guide mask still allocates one row for every tracked guide
 token. An IC-LoRA video guide can contain tens of thousands of full-strength
@@ -14,6 +14,8 @@ resolution, or guide behavior.
 
 from __future__ import annotations
 
+import copy
+import inspect
 import logging
 import os
 import time
@@ -37,16 +39,46 @@ _LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
 )
 
 
-def prune_ltxav_audio_transformer_blocks(model_patcher):
-    """Remove LTXAV block modules that cannot run for a video-only latent."""
-    pruned = model_patcher.clone()
-    diffusion_model = getattr(getattr(pruned, "model", None), "diffusion_model", None)
+def _copy_module_structure(module):
+    """Copy a torch module's registries while sharing its tensor/module values."""
+    cloned = copy.copy(module)
+    for registry in ("_modules", "_parameters", "_buffers"):
+        values = getattr(module, registry, None)
+        if isinstance(values, dict):
+            setattr(cloned, registry, values.copy())
+    return cloned
+
+
+def _video_only_model_structure(base_model):
+    """Privatize only containers that ARP mutates; never duplicate model weights."""
+    diffusion_model = getattr(base_model, "diffusion_model", None)
     blocks = getattr(diffusion_model, "transformer_blocks", None)
     if blocks is None:
         raise ValueError("ARP video-only mode requires an LTXAV diffusion model")
+
+    private_base = _copy_module_structure(base_model)
+    private_diffusion = _copy_module_structure(diffusion_model)
+    if hasattr(blocks, "_modules"):
+        private_blocks = _copy_module_structure(blocks)
+        for index, block in enumerate(blocks):
+            private_blocks._modules[str(index)] = _copy_module_structure(block)
+    else:
+        private_blocks = [_copy_module_structure(block) for block in blocks]
+    setattr(private_diffusion, "transformer_blocks", private_blocks)
+    setattr(private_base, "diffusion_model", private_diffusion)
+    return private_base, private_diffusion, private_blocks
+
+
+def prune_ltxav_audio_transformer_blocks(model_patcher):
+    """Remove LTXAV block modules that cannot run for a video-only latent."""
+    pruned = model_patcher.clone()
+    original_base = getattr(pruned, "model", None)
+    diffusion_model = getattr(original_base, "diffusion_model", None)
     if getattr(diffusion_model, "_arp_video_only_audio_pruned", False):
         pruned.size = 0
         return pruned
+    base_model, diffusion_model, blocks = _video_only_model_structure(original_base)
+    pruned.model = base_model
 
     # ComfyUI 0.30's LTXAV config uses a placeholder memory_usage_factor of
     # 0.077, versus roughly 11 for the same-width LTXV model. That causes its
@@ -67,7 +99,6 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
         )
     except (TypeError, ValueError):
         configured_factor = DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR
-    base_model = getattr(pruned, "model", None)
     base_model.memory_usage_factor = max(
         float(getattr(base_model, "memory_usage_factor", 0.0)),
         configured_factor,
@@ -146,8 +177,10 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
     """Bound LTX MLP activation memory by slicing its independent token axis."""
     feed_forward = getattr(ltx_model, "FeedForward", None)
     if feed_forward is None:
-        LOGGER.warning("ARP chunked LTX feed-forward is unsupported by this ComfyUI version")
-        return False
+        raise ARPLTXCompatibilityError(
+            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            "the LTX FeedForward class is missing. Update ARP before rendering."
+        )
 
     current_forward = feed_forward.forward
     if getattr(current_forward, "_arp_chunked_feed_forward", False):
@@ -343,20 +376,71 @@ def _xformers_partitioned_attention(torch, q, k, v, heads, partitions):
     return merged_out.reshape(batch, query_count, inner_dim)
 
 
+class ARPLTXCompatibilityError(RuntimeError):
+    """The installed ComfyUI/LTX implementation is incompatible with ARP's patch."""
+
+
+def _require_parameters(callable_object, required: set[str], label: str) -> None:
+    try:
+        available = set(inspect.signature(callable_object).parameters)
+    except (TypeError, ValueError) as exc:
+        raise ARPLTXCompatibilityError(
+            f"ARP could not inspect {label}; the installed ComfyUI version is unsupported."
+        ) from exc
+    missing = sorted(required - available)
+    if missing:
+        raise ARPLTXCompatibilityError(
+            f"ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            f"{label} is missing {', '.join(missing)}. Update ARP before rendering."
+        )
+
+
 def install_sparse_guide_attention_patch() -> bool:
-    """Patch current ComfyUI's LTX guide attention without changing its mask semantics."""
+    """Lazily patch LTX guide execution, failing closed on incompatible internals."""
     try:
         import torch
         import comfy.ldm.lightricks.model as ltx_model
-    except Exception as exc:  # ComfyUI reports custom-node import failures separately.
-        LOGGER.warning("ARP could not import the LTX guide-attention implementation: %s", exc)
-        return False
+    except Exception as exc:
+        raise ARPLTXCompatibilityError(
+            "ARP could not import ComfyUI's LTX guide-attention implementation. "
+            "Re-run the ARP installer or update ARP before rendering."
+        ) from exc
 
     current_mask = getattr(ltx_model, "GuideAttentionMask", None)
     current_attention = getattr(ltx_model, "_attention_with_guide_mask", None)
     if current_mask is None or current_attention is None:
-        LOGGER.warning("ARP sparse guide attention is unsupported by this ComfyUI version")
-        return False
+        raise ARPLTXCompatibilityError(
+            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            "guide-attention hooks are missing. Update ARP before rendering."
+        )
+    _require_parameters(
+        current_attention,
+        {"q", "k", "v", "heads", "guide_mask", "attn_precision", "transformer_options"},
+        "ComfyUI LTX guide attention",
+    )
+    _require_parameters(
+        current_mask,
+        {"total_tokens", "guide_start", "tracked_count", "tracked_weights"},
+        "ComfyUI LTX guide mask",
+    )
+    feed_forward = getattr(ltx_model, "FeedForward", None)
+    if feed_forward is None:
+        raise ARPLTXCompatibilityError(
+            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            "the LTX FeedForward class is missing. Update ARP before rendering."
+        )
+    _require_parameters(feed_forward.forward, {"self", "x"}, "ComfyUI LTX feed-forward")
+    try:
+        import xformers.ops as xops
+    except Exception as exc:
+        raise ARPLTXCompatibilityError(
+            "ARP video-only LTX requires xFormers. Re-run the ARP installer before rendering."
+        ) from exc
+    if not callable(getattr(xops, "memory_efficient_attention_forward_requires_grad", None)):
+        raise ARPLTXCompatibilityError(
+            "The installed xFormers build lacks the attention API required by ARP. "
+            "Re-run the ARP installer before rendering."
+        )
     if getattr(current_mask, "_arp_sparse_full_strength_rows", False):
         return _install_chunked_feed_forward(torch, ltx_model)
 
@@ -618,5 +702,5 @@ def install_sparse_guide_attention_patch() -> bool:
 
     ltx_model.GuideAttentionMask = SparseGuideAttentionMask
     ltx_model._attention_with_guide_mask = sparse_attention_with_guide_mask
-    LOGGER.info("ARP sparse exact-semantics LTX guide attention enabled")
+    LOGGER.info("ARP lazily enabled exact-semantics LTX guide attention")
     return _install_chunked_feed_forward(torch, ltx_model)

@@ -13,7 +13,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-LTXVideo" / "guide_attention_patch.py"
+PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-ARP" / "ltx_video_only_patch.py"
 
 
 class SparseGuideAttentionTests(unittest.TestCase):
@@ -63,11 +63,16 @@ class SparseGuideAttentionTests(unittest.TestCase):
         )
         self.assertIn("diffusion_model.transformer_blocks.0.attn1.weight", pruned.patches)
         self.assertNotIn("diffusion_model.transformer_blocks.0.audio_ff.weight", pruned.patches)
-        for block in diffusion_model.transformer_blocks:
+        for block in pruned.model.diffusion_model.transformer_blocks:
             self.assertTrue(hasattr(block, "attn1"))
             self.assertTrue(hasattr(block, "ff"))
             for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
                 self.assertFalse(hasattr(block, attribute))
+        # The cached/shared source model remains structurally intact for a
+        # later non-ARP or audio-capable workflow.
+        for block in diffusion_model.transformer_blocks:
+            for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+                self.assertTrue(hasattr(block, attribute))
 
     def test_partitioned_xformers_preserves_exact_guide_mask_results(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)
@@ -120,8 +125,15 @@ class SparseGuideAttentionTests(unittest.TestCase):
         lightricks.model = model
         comfy.ldm = ldm
         model.comfy = comfy
-        model.GuideAttentionMask = type("OriginalGuideAttentionMask", (), {})
-        model._attention_with_guide_mask = lambda *_args, **_kwargs: None
+        class OriginalGuideAttentionMask:
+            def __init__(self, total_tokens, guide_start, tracked_count, tracked_weights):
+                pass
+
+        model.GuideAttentionMask = OriginalGuideAttentionMask
+        def original_attention(q, k, v, heads, guide_mask, attn_precision, transformer_options):
+            return None
+
+        model._attention_with_guide_mask = original_attention
         feed_forward_calls: list[int] = []
 
         class FakeQuantizedLinear:
@@ -204,11 +216,12 @@ class SparseGuideAttentionTests(unittest.TestCase):
         self.assertTrue(torch.equal(ff_actual, ff_input.square() + 0.25))
         self.assertEqual(feed_forward_calls, [256, 256, 88])
 
-        weights = torch.tensor([[1.0, 1.0, 0.5, 0.0]], dtype=torch.float32)
+        weights = torch.tensor([[1.0, 1.0, 0.95, 0.0]], dtype=torch.float32)
         guide_mask = model.GuideAttentionMask(8, 3, 4, weights)
         self.assertEqual(guide_mask.full_query_indices.tolist(), [3, 4])
         self.assertEqual(guide_mask.soft_query_indices.tolist(), [5, 6])
         self.assertEqual(guide_mask.soft_mask.numel(), 2 * 8)
+        self.assertAlmostEqual(float(guide_mask.tracked_log_weights[2]), math.log(0.95), places=6)
 
         generator = torch.Generator().manual_seed(42)
         q = torch.randn((1, 8, 4), generator=generator)

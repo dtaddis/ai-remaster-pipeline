@@ -71,6 +71,7 @@ STAGES = (
             ("mask_blend_dilation", "Mask seam blend", "range:0|15|1", "5"),
             ("seed_qwen_guides", "Seed with Qwen guide frames", "checkbox", "false"),
             ("outpaint_all_black_regions", "Outpaint all black regions", "checkbox", "false"),
+            ("black_mask_threshold", "Black mask threshold", "range:0|32|1", "12"),
             ("prompt", "Prompt", "text", OUTPAINT_PROMPT),
             ("negative_prompt", "Negative prompt", "text", "cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands"),
             ("crop_left", "Crop left", "range:0|960|1", "0"),

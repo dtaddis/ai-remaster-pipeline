@@ -488,15 +488,6 @@ class LTXICLoRALoaderModelOnly(io.ComfyNode):
                     max=100.0,
                     step=0.01,
                 ),
-                io.Boolean.Input(
-                    "video_only",
-                    default=False,
-                    tooltip=(
-                        "Remove LTXAV audio-only transformer modules before model loading. "
-                        "Use only when the diffusion latent contains video and source audio "
-                        "will be remuxed without audio diffusion."
-                    ),
-                ),
             ],
             outputs=[
                 io.Model.Output("model"),
@@ -505,7 +496,7 @@ class LTXICLoRALoaderModelOnly(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, lora_name, strength_model, video_only=False) -> io.NodeOutput:
+    def execute(cls, model, lora_name, strength_model) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
 
         # Load lora and extract metadata
@@ -528,10 +519,6 @@ class LTXICLoRALoaderModelOnly(io.ComfyNode):
             model_lora, _ = comfy.sd.load_lora_for_models(
                 model, None, lora, strength_model, 0
             )
-        if video_only:
-            from .guide_attention_patch import prune_ltxav_audio_transformer_blocks
-
-            model_lora = prune_ltxav_audio_transformer_blocks(model_lora)
         return io.NodeOutput(model_lora, latent_downscale_factor)
 
 

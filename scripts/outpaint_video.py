@@ -35,7 +35,6 @@ from common import (
 )
 from dependency_manager import (
     DEFAULT_OUTPAINT_LORA,
-    OUMOUMAD_OUTPAINT_LORA,
     HuggingFaceAccessError,
     ensure_outpaint_models,
 )
@@ -63,6 +62,7 @@ RECOMMENDED_OVERLAP_FRAMES = 8
 MODEL_SIZE_MULTIPLE = 32
 LTX_SPATIAL_MASK_CELL = 32
 OUTPAINT_COMMON_NODES = {
+    "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
     "LoadVideo": "ComfyUI core",
@@ -77,15 +77,6 @@ OFFICIAL_OUTPAINT_REQUIRED_NODES = {
     "ThresholdMask": "ComfyUI core",
     "InvertMask": "ComfyUI core",
 }
-LEGACY_OUTPAINT_REQUIRED_NODES = {
-    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
-}
-
-
-def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
-    return Path(outpaint_lora.replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
-
-
 def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
     try:
         opened = bool(webbrowser.open(OUTPAINT_ACCESS_URL))
@@ -706,7 +697,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 {"name": "value", "type": "FLOAT", "widget": {"name": "value"}},
             ],
             "outputs": [{"name": "MASK", "type": "MASK", "links": [19102]}],
-            "widgets_values": [3.0 / 255.0],
+            "widgets_values": [int(getattr(args, "black_mask_threshold", 12)) / 255.0],
         })
         add_or_replace_node(workflow, {
             "id": 9102,
@@ -852,44 +843,6 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     set_input_link(workflow, "3159", "image", guide_link)
 
 
-def patch_legacy_black_graph(workflow: dict[str, Any]) -> None:
-    """Run oumoumad's IC-LoRA with its original pure-black sentinel conditioning.
-
-    The prepared video already lifts real source blacks/gamma while leaving synthetic padding
-    exactly black. Feed those frames straight to the legacy guide node: the official v0.9
-    inpaint preprocessor would replace the padding with green and is incompatible with this LoRA.
-    """
-    legacy_guide = node_by_id(workflow, "5114")
-    legacy_guide["type"] = "LTXAddVideoICLoRAGuide"
-    legacy_guide["title"] = "ARP legacy pure-black IC-LoRA guide"
-    legacy_guide["inputs"] = [
-        item for item in legacy_guide.get("inputs", [])
-        if item.get("name") != "attention_mask"
-    ]
-    widgets = list(legacy_guide.get("widgets_values") or [])
-    legacy_guide["widgets_values"] = widgets[:7]
-
-    # GetVideoComponents (5168) exposes the gamma-lifted, black-padded prepared frames.
-    patch_link(workflow, 14372, 5168, 0, 5114, 4, "IMAGE")
-    set_input_link(workflow, "5114", "image", 14372)
-    size_link = input_link(workflow, "5054", "image")
-    if size_link is None:
-        raise ValueError("Official outpaint template has no Stage 1 image-size link.")
-    patch_link(workflow, size_link, 5168, 0, 5054, 0, "IMAGE")
-    set_input_link(workflow, "5054", "image", size_link)
-
-    # The legacy method returns the decoded diffusion result directly. Do not route it through
-    # the official mask compositor or Laplacian source blend, either of which can restore green.
-    patch_link(workflow, 13934, 4851, 0, 5227, 0, "IMAGE")
-    set_input_link(workflow, "5227", "images", 13934)
-    patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
-    set_input_link(workflow, "5227", "audio", 14433)
-
-    # Start-frame guides remain separate i2v conditioning and stay at full canvas size.
-    patch_link(workflow, 19120, 2004, 0, 3159, 1, "IMAGE")
-    set_input_link(workflow, "3159", "image", 19120)
-
-
 def is_official_outpaint_template(workflow: dict[str, Any]) -> bool:
     try:
         node_by_id(workflow, "5266")
@@ -959,9 +912,15 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
         set_input_link(workflow, "5011", "model", ic_model_link)
         model_node["outputs"][0]["links"] = [ic_model_link]
     lora_node = node_by_id(workflow, "5011")
+    # ARP owns the lifecycle-sensitive performance patch. The upstream
+    # ComfyUI-LTXVideo loader remains untouched and updateable.
+    lora_node["type"] = "ARPLTXVideoOnlyICLoRALoader"
+    lora_node["title"] = "ARP video-only IC-LoRA loader"
+    lora_node["inputs"] = [
+        item for item in lora_node.get("inputs", []) if item.get("name") != "video_only"
+    ]
     ensure_widget_input(lora_node, "lora_name")
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
-    ensure_widget_input(lora_node, "video_only", "BOOLEAN")
     set_widget(lora_node, "0", args.outpaint_lora)
     set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
     text_node = node_by_id(workflow, "5023")
@@ -1150,17 +1109,14 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
     if is_official_outpaint_template(workflow):
-        if uses_legacy_black_outpaint(args.outpaint_lora):
-            patch_legacy_black_graph(workflow)
-        else:
-            patch_official_masked_graph(
-                workflow,
-                args,
-                prepared,
-                comfy_dir,
-                canvas_width,
-                canvas_height,
-            )
+        patch_official_masked_graph(
+            workflow,
+            args,
+            prepared,
+            comfy_dir,
+            canvas_width,
+            canvas_height,
+        )
         patch_video_only_sampling(workflow)
     source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
@@ -1295,7 +1251,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 35,
+        "version": 36,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1305,6 +1261,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "delivery_target_height": args.target_height,
         "model_size_multiple": MODEL_SIZE_MULTIPLE,
         "outpaint_all_black_regions": bool(getattr(args, "outpaint_all_black_regions", False)),
+        "black_mask_threshold": int(getattr(args, "black_mask_threshold", 12)),
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
         "negative_suffix": negative_suffix,
@@ -1334,10 +1291,9 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v5",
+        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v6",
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
-        "outpaint_lora": args.outpaint_lora,
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
         "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
@@ -1850,7 +1806,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")
     parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=64, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
     parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=5, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
-    parser.add_argument("--outpaint-lora", default=DEFAULT_OUTPAINT_LORA)
+    parser.add_argument("--black-mask-threshold", type=int, choices=range(0, 65), default=12, metavar="0-64", help="Maximum source level treated as black in dynamic all-black-region masks. Raise only when encoded bars are not truly zero.")
+    # Internal workflow value, deliberately not exposed as a model selector.
+    parser.set_defaults(outpaint_lora=DEFAULT_OUTPAINT_LORA)
     parser.add_argument("--output")
     parser.add_argument("--raw-output")
     parser.add_argument("--workflow", default=str(DEFAULT_WORKFLOW))
@@ -1928,16 +1886,11 @@ def main() -> int:
         ensure_outpaint_models(
             comfy_dir,
             include_distilled_lora=args.model_backend != "gguf",
-            outpaint_lora=args.outpaint_lora,
         )
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
         required_nodes = dict(OUTPAINT_COMMON_NODES)
-        required_nodes.update(
-            LEGACY_OUTPAINT_REQUIRED_NODES
-            if uses_legacy_black_outpaint(args.outpaint_lora)
-            else OFFICIAL_OUTPAINT_REQUIRED_NODES
-        )
+        required_nodes.update(OFFICIAL_OUTPAINT_REQUIRED_NODES)
         if args.model_backend == "gguf":
             required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)

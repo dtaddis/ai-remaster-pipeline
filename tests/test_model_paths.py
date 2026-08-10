@@ -109,14 +109,16 @@ archive:
 
 
 class DependencyManagerPathTests(unittest.TestCase):
-    def test_outpaint_download_selects_only_requested_lora(self) -> None:
-        selected_name = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
+    def test_outpaint_downloads_only_official_video_lora(self) -> None:
         with mock.patch.object(dependency_manager, "ensure_hf_models") as ensure:
-            dependency_manager.ensure_outpaint_models(Path("ComfyUI"), outpaint_lora=selected_name)
+            dependency_manager.ensure_outpaint_models(Path("ComfyUI"))
 
         models = ensure.call_args.args[1]
         loras = [model for model in models if model.destination.startswith("models/loras/")]
-        self.assertEqual([model.file for model in loras], [selected_name])
+        self.assertEqual(
+            [model.file for model in loras],
+            [dependency_manager.DEFAULT_OUTPAINT_LORA],
+        )
         self.assertFalse(any("audio_vae" in model.file for model in models))
 
     def test_gated_model_403_is_rewritten_as_actionable_access_error(self) -> None:

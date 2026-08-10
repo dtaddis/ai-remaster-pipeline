@@ -277,10 +277,7 @@ def outpaint_handoff_marker_path() -> Path:
     return ROOT / ".cache" / "handoffs" / "ltx_2_3_official_outpaint_approval_v2.json"
 
 
-def outpaint_browser_handoff(outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> tuple[bool, str]:
-    # oumoumad's alternative is public, so only the gated official LoRA needs this preflight.
-    if Path(outpaint_lora.replace("\\", "/")).name != DEFAULT_OUTPAINT_LORA:
-        return True, ""
+def outpaint_browser_handoff() -> tuple[bool, str]:
     comfy_dir = Path(comfy_dir_for(current_config()))
     target = resolve_comfy_model_path(comfy_dir, OUTPAINT_LORA_DESTINATION)
     if target.exists():
@@ -1184,6 +1181,7 @@ class PipelineApp:
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add(["--generation-mask-overlap", values.get("generation_mask_overlap", "64")])
         add(["--mask-blend-dilation", values.get("mask_blend_dilation", "5")])
+        add(["--black-mask-threshold", values.get("black_mask_threshold", "12")])
         add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
         if values.get("negative_prompt"):
             add(["--negative-prompt", values.get("negative_prompt", "")])
@@ -1191,7 +1189,6 @@ class PipelineApp:
             add(["--guide-strength", values.get("guide_strength", "0.7")])
         if values.get("guide_end_strength"):
             add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
-        add(["--outpaint-lora", values.get("outpaint_lora", DEFAULT_OUTPAINT_LORA)])
         if is_true(values, "outpaint_all_black_regions"):
             add(["--outpaint-all-black-regions"])
         if is_true(values, "seed_qwen_guides"):
@@ -1309,6 +1306,7 @@ class PipelineApp:
         add_value_args(cmd, outpaint_values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
         if outpainted and is_true(outpaint_values, "outpaint_all_black_regions"):
             add(["--source-black-transparent"])
+            add(["--source-black-threshold", outpaint_values.get("black_mask_threshold", "12")])
         # Pass delivery dimensions so final_composite upscales from the model-safe LTX output
         # (e.g. 704p) back to the user's intended resolution (e.g. 720p).
         source_text = pipeline_source_text(self.settings)
@@ -1381,8 +1379,7 @@ class PipelineApp:
             if not clean_output or not resolve(clean_output).exists():
                 return False, "Run Clean Up first so this phase has its upstream video."
         if stage_key == "outpaint":
-            outpaint_lora = self.settings.get("outpaint", {}).get("outpaint_lora", DEFAULT_OUTPAINT_LORA)
-            ok, message = outpaint_browser_handoff(outpaint_lora)
+            ok, message = outpaint_browser_handoff()
             if not ok:
                 return False, message
         if stage_key == "audio":

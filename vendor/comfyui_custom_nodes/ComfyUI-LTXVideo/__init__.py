@@ -1,10 +1,3 @@
-from .guide_attention_patch import install_sparse_guide_attention_patch
-
-# ARP outpainting supplies a full video IC guide plus optional soft still guides.
-# Install before node registration so ComfyUI never materializes zero-valued mask
-# rows for the full-strength video guide.
-install_sparse_guide_attention_patch()
-
 from .conditioning_loader import LTXVLoadConditioning
 from .conditioning_saver import LTXVSaveConditioning
 from .decoder_noise import DecoderNoise
