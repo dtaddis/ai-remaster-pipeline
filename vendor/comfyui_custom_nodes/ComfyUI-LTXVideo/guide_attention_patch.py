@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 8192
+DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 4096
+DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS = 4096
 MAX_PARTITIONED_ATTENTION_RUNS = 32
 _LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
     "audio_attn1",
@@ -89,6 +91,29 @@ def _feed_forward_chunk_tokens() -> int:
         return DEFAULT_FEED_FORWARD_CHUNK_TOKENS
 
 
+def _attention_query_chunk_tokens() -> int:
+    try:
+        configured = os.environ.get(
+            "ARP_LTX_ATTN_QUERY_CHUNK_TOKENS",
+            DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS,
+        )
+        return max(256, int(configured))
+    except (TypeError, ValueError):
+        return DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS
+
+
+def _cuda_memory_summary(torch, device) -> str:
+    if not getattr(device, "type", None) == "cuda":
+        return "non-CUDA"
+    free, total = torch.cuda.mem_get_info(device)
+    mib = 1024 ** 2
+    return (
+        f"allocated={torch.cuda.memory_allocated(device) / mib:.0f} MiB, "
+        f"reserved={torch.cuda.memory_reserved(device) / mib:.0f} MiB, "
+        f"device_free={free / mib:.0f} MiB/{total / mib:.0f} MiB"
+    )
+
+
 def _install_chunked_feed_forward(torch, ltx_model) -> bool:
     """Bound LTX MLP activation memory by slicing its independent token axis."""
     feed_forward = getattr(ltx_model, "FeedForward", None)
@@ -124,9 +149,24 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
         is_quantized_out = callable(
             getattr(project_out, "is_ggml_quantized", None)
         ) and project_out.is_ggml_quantized()
+        diagnose_first = not chunked_forward._arp_reported_first_timing
+        if diagnose_first and x.device.type == "cuda":
+            torch.cuda.synchronize(x.device)
+            LOGGER.info(
+                "ARP first block reached feed-forward input (%s)",
+                _cuda_memory_summary(torch, x.device),
+            )
         if is_quantized_in and is_quantized_out:
+            dequant_start = time.perf_counter()
             weight_in, bias_in = project_in.cast_bias_weight(x)
             weight_out, bias_out = project_out.cast_bias_weight(x)
+            if diagnose_first and x.device.type == "cuda":
+                torch.cuda.synchronize(x.device)
+                LOGGER.info(
+                    "ARP first feed-forward GGUF dequantization completed in %.2fs (%s)",
+                    time.perf_counter() - dequant_start,
+                    _cuda_memory_summary(torch, x.device),
+                )
             middle_layers = tuple(network[1:-1])
 
             def run_chunk(chunk):
@@ -144,7 +184,18 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
                 return current_forward(self, chunk)
 
         first_count = min(chunk_tokens, token_count)
+        first_chunk_start = time.perf_counter()
         first = run_chunk(x.narrow(-2, 0, first_count))
+        if diagnose_first and x.device.type == "cuda":
+            torch.cuda.synchronize(x.device)
+            LOGGER.info(
+                "ARP first feed-forward chunk completed in %.2fs (%d/%d tokens; %s)",
+                time.perf_counter() - first_chunk_start,
+                first_count,
+                token_count,
+                _cuda_memory_summary(torch, x.device),
+            )
+            chunked_forward._arp_reported_first_timing = True
         output_shape = list(x.shape)
         output_shape[-1] = first.shape[-1]
         output = torch.empty(output_shape, device=first.device, dtype=first.dtype)
@@ -160,6 +211,7 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
 
     chunked_forward._arp_chunked_feed_forward = True
     chunked_forward._arp_reported_gguf_reuse = False
+    chunked_forward._arp_reported_first_timing = False
     feed_forward.forward = chunked_forward
     LOGGER.info("ARP exact-semantics chunked LTX feed-forward enabled (%d tokens)", chunk_tokens)
     return True
@@ -371,6 +423,7 @@ def install_sparse_guide_attention_patch() -> bool:
         guide_start = guide_mask.guide_start
         tracked_end = guide_start + guide_mask.tracked_count
         out = torch.empty_like(q)
+        query_chunk_tokens = _attention_query_chunk_tokens()
 
         # The mask used by LTX guide conditioning is separable: noisy query
         # rows add one scalar bias per guide key group, while soft guide query
@@ -385,28 +438,41 @@ def install_sparse_guide_attention_patch() -> bool:
             except Exception:
                 use_partitioned_xformers = False
 
-        if use_partitioned_xformers and not sparse_attention_with_guide_mask._arp_reported_partitioned:
+        diagnose_first = (
+            use_partitioned_xformers
+            and not sparse_attention_with_guide_mask._arp_reported_partitioned
+        )
+        if diagnose_first and q.device.type == "cuda":
+            # Separate Q/K/V projection and RoPE work from the attention timing.
+            torch.cuda.synchronize(q.device)
+        attention_start = time.perf_counter()
+        if diagnose_first:
             LOGGER.info(
                 "ARP exact partitioned xFormers guide attention: %d total, %d generated, "
-                "%d full-guide, %d soft-guide tokens, %d key partitions",
+                "%d full-guide, %d soft-guide tokens, %d key partitions, %d-query chunks (%s)",
                 q.shape[1],
                 guide_start,
                 guide_mask.full_query_indices.numel(),
                 guide_mask.soft_query_indices.numel(),
                 len(guide_mask.noisy_partitions),
+                query_chunk_tokens,
+                _cuda_memory_summary(torch, q.device),
             )
-            sparse_attention_with_guide_mask._arp_reported_partitioned = True
 
         if guide_start > 0:
             if use_partitioned_xformers:
-                noisy_out = _xformers_partitioned_attention(
-                    torch,
-                    q[:, :guide_start, :],
-                    k,
-                    v,
-                    heads,
-                    guide_mask.noisy_partitions,
-                )
+                for query_start in range(0, guide_start, query_chunk_tokens):
+                    query_count = min(query_chunk_tokens, guide_start - query_start)
+                    noisy_out = _xformers_partitioned_attention(
+                        torch,
+                        q.narrow(1, query_start, query_count),
+                        k,
+                        v,
+                        heads,
+                        guide_mask.noisy_partitions,
+                    )
+                    out.narrow(1, query_start, query_count).copy_(noisy_out)
+                    del noisy_out
             else:
                 noisy_out = masked_attention(
                     q[:, :guide_start, :],
@@ -418,53 +484,74 @@ def install_sparse_guide_attention_patch() -> bool:
                     transformer_options=transformer_options,
                     low_precision_attention=False,
                 )
-            out[:, :guide_start, :] = noisy_out
+                out[:, :guide_start, :] = noisy_out
+                del noisy_out
 
         if guide_mask.full_query_indices.numel():
             if guide_mask.full_query_slice is not None:
                 full_start, full_count = guide_mask.full_query_slice
-                full_q = q.narrow(1, full_start, full_count)
+                for relative_start in range(0, full_count, query_chunk_tokens):
+                    query_count = min(query_chunk_tokens, full_count - relative_start)
+                    query_start = full_start + relative_start
+                    full_out = unmasked_attention(
+                        q.narrow(1, query_start, query_count),
+                        k,
+                        v,
+                        heads,
+                        attn_precision=attn_precision,
+                        transformer_options=transformer_options,
+                    )
+                    out.narrow(1, query_start, query_count).copy_(full_out)
+                    del full_out
             else:
                 full_q = q.index_select(1, guide_mask.full_query_indices)
-            full_out = unmasked_attention(
-                full_q,
-                k,
-                v,
-                heads,
-                attn_precision=attn_precision,
-                transformer_options=transformer_options,
-            )
-            if guide_mask.full_query_slice is not None:
-                out.narrow(1, full_start, full_count).copy_(full_out)
-            else:
-                out.index_copy_(1, guide_mask.full_query_indices, full_out)
-
-        if guide_mask.soft_query_indices.numel():
-            if guide_mask.soft_query_slice is not None:
-                soft_start, soft_count = guide_mask.soft_query_slice
-                soft_q = q.narrow(1, soft_start, soft_count)
-            else:
-                soft_q = q.index_select(1, guide_mask.soft_query_indices)
-            if use_partitioned_xformers:
-                if guide_mask.soft_query_slice is not None:
-                    soft_bias = guide_mask.tracked_log_weights.narrow(
-                        0, soft_start - guide_start, soft_count
-                    )
-                else:
-                    soft_relative = guide_mask.soft_query_indices - guide_start
-                    soft_bias = guide_mask.tracked_log_weights.index_select(0, soft_relative)
-                soft_out = _xformers_partitioned_attention(
-                    torch,
-                    soft_q,
+                full_out = unmasked_attention(
+                    full_q,
                     k,
                     v,
                     heads,
-                    [
-                        (0, guide_start, soft_bias),
-                        (guide_start, k.shape[1] - guide_start, 0.0),
-                    ],
+                    attn_precision=attn_precision,
+                    transformer_options=transformer_options,
                 )
+                out.index_copy_(1, guide_mask.full_query_indices, full_out)
+                del full_q, full_out
+
+        if guide_mask.soft_query_indices.numel():
+            if use_partitioned_xformers and guide_mask.soft_query_slice is not None:
+                soft_start, soft_count = guide_mask.soft_query_slice
+                for relative_start in range(0, soft_count, query_chunk_tokens):
+                    query_count = min(query_chunk_tokens, soft_count - relative_start)
+                    query_start = soft_start + relative_start
+                    soft_bias = guide_mask.tracked_log_weights.narrow(
+                        0,
+                        query_start - guide_start,
+                        query_count,
+                    )
+                    soft_out = _xformers_partitioned_attention(
+                        torch,
+                        q.narrow(1, query_start, query_count),
+                        k,
+                        v,
+                        heads,
+                        [
+                            (0, guide_start, soft_bias),
+                            (guide_start, k.shape[1] - guide_start, 0.0),
+                        ],
+                    )
+                    out.narrow(1, query_start, query_count).copy_(soft_out)
+                    del soft_out
+            elif use_partitioned_xformers:
+                soft_relative = guide_mask.soft_query_indices - guide_start
+                soft_q = q.index_select(1, guide_mask.soft_query_indices)
+                soft_bias = guide_mask.tracked_log_weights.index_select(0, soft_relative)
+                soft_out = _xformers_partitioned_attention(
+                    torch, soft_q, k, v, heads,
+                    [(0, guide_start, soft_bias), (guide_start, k.shape[1] - guide_start, 0.0)],
+                )
+                out.index_copy_(1, guide_mask.soft_query_indices, soft_out)
+                del soft_q, soft_out
             else:
+                soft_q = q.index_select(1, guide_mask.soft_query_indices)
                 soft_out = masked_attention(
                     soft_q,
                     k,
@@ -475,20 +562,28 @@ def install_sparse_guide_attention_patch() -> bool:
                     transformer_options=transformer_options,
                     low_precision_attention=False,
                 )
-            if guide_mask.soft_query_slice is not None:
-                out.narrow(1, soft_start, soft_count).copy_(soft_out)
-            else:
                 out.index_copy_(1, guide_mask.soft_query_indices, soft_out)
+                del soft_q, soft_out
 
         if tracked_end < q.shape[1]:
-            out[:, tracked_end:, :] = unmasked_attention(
-                q[:, tracked_end:, :],
-                k,
-                v,
-                heads,
-                attn_precision=attn_precision,
-                transformer_options=transformer_options,
+            for query_start in range(tracked_end, q.shape[1], query_chunk_tokens):
+                query_count = min(query_chunk_tokens, q.shape[1] - query_start)
+                tail_out = unmasked_attention(
+                    q.narrow(1, query_start, query_count), k, v, heads,
+                    attn_precision=attn_precision,
+                    transformer_options=transformer_options,
+                )
+                out.narrow(1, query_start, query_count).copy_(tail_out)
+                del tail_out
+        if diagnose_first:
+            if q.device.type == "cuda":
+                torch.cuda.synchronize(q.device)
+            LOGGER.info(
+                "ARP first exact guide self-attention completed in %.2fs (%s)",
+                time.perf_counter() - attention_start,
+                _cuda_memory_summary(torch, q.device),
             )
+            sparse_attention_with_guide_mask._arp_reported_partitioned = True
         return out
 
     sparse_attention_with_guide_mask._arp_reported_partitioned = False
