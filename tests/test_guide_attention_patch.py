@@ -34,7 +34,20 @@ class SparseGuideAttentionTests(unittest.TestCase):
                 scores = scores + mask.squeeze(1)
             return torch.matmul(torch.softmax(scores, dim=-1), v)
 
-        attention = types.SimpleNamespace(optimized_attention=reference_attention)
+        attention_calls: list[tuple[str, bool]] = []
+
+        def unmasked_attention(*args, **kwargs):
+            attention_calls.append(("unmasked", kwargs.get("mask") is not None))
+            return reference_attention(*args, **kwargs)
+
+        def masked_attention(*args, **kwargs):
+            attention_calls.append(("masked", kwargs.get("mask") is not None))
+            return reference_attention(*args, **kwargs)
+
+        attention = types.SimpleNamespace(
+            optimized_attention=unmasked_attention,
+            attention_pytorch=masked_attention,
+        )
         ldm.modules = types.SimpleNamespace(attention=attention)
         ldm.lightricks = lightricks
         lightricks.model = model
@@ -143,6 +156,10 @@ class SparseGuideAttentionTests(unittest.TestCase):
         expected = reference_attention(q, k, v, 1, mask=dense_mask)
         actual = model._attention_with_guide_mask(q, k, v, 1, guide_mask, None, {})
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        self.assertEqual(
+            attention_calls,
+            [("masked", True), ("unmasked", False), ("masked", True), ("unmasked", False)],
+        )
 
 
 if __name__ == "__main__":

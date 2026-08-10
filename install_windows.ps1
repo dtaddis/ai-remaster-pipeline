@@ -1101,6 +1101,11 @@ Invoke-Step 'Create ai-remaster-pipeline venv' {
 
 Invoke-Step 'Install PyTorch CUDA and ComfyUI requirements' {
     Ensure-PyTorch-Cuda
+    # The exact-semantics LTX guide patch routes only genuinely unmasked rows
+    # through xFormers. 0.0.35 uses PyTorch's stable ABI and the official
+    # CUDA wheel index, so it remains compatible with the managed Torch 2.10+
+    # runtime without replacing Torch itself.
+    Invoke-External -Command @($PipelinePython, '-m', 'pip', 'install', 'xformers==0.0.35', '--index-url', $TorchIndexUrl)
     Install-RequirementsIfPresent (Join-Path $ComfyDir 'requirements.txt')
     Install-Pip @('huggingface_hub[cli]', 'opencv-contrib-python', 'imageio-ffmpeg', 'pillow', 'numpy', 'numba')
 }

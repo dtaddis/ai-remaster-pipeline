@@ -19,7 +19,7 @@ import os
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 4096
+DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 8192
 
 
 def _feed_forward_chunk_tokens() -> int:
@@ -172,13 +172,22 @@ def install_sparse_guide_attention_patch() -> bool:
         q, k, v, heads, guide_mask, attn_precision, transformer_options
     ):
         """Evaluate noisy, full-guide, and soft-guide queries with their exact masks."""
-        optimized_attention = ltx_model.comfy.ldm.modules.attention.optimized_attention
+        attention_module = ltx_model.comfy.ldm.modules.attention
+        unmasked_attention = attention_module.optimized_attention
+        # xFormers expands even a broadcast (1, 1, 1, K) tensor mask to
+        # (1, 1, Q, K), which defeats this patch and can allocate many GB.
+        # PyTorch SDPA keeps these masks broadcast and selects cuDNN attention
+        # on the managed Windows runtime. Reserve xFormers for the genuinely
+        # unmasked rows where it is faster at long-video sequence lengths.
+        masked_attention = getattr(
+            attention_module, "attention_pytorch", unmasked_attention
+        )
         guide_start = guide_mask.guide_start
         tracked_end = guide_start + guide_mask.tracked_count
         out = torch.empty_like(q)
 
         if guide_start > 0:
-            noisy_out = optimized_attention(
+            noisy_out = masked_attention(
                 q[:, :guide_start, :],
                 k,
                 v,
@@ -191,7 +200,7 @@ def install_sparse_guide_attention_patch() -> bool:
             out[:, :guide_start, :] = noisy_out
 
         if guide_mask.full_query_indices.numel():
-            full_out = optimized_attention(
+            full_out = unmasked_attention(
                 q.index_select(1, guide_mask.full_query_indices),
                 k,
                 v,
@@ -202,7 +211,7 @@ def install_sparse_guide_attention_patch() -> bool:
             out.index_copy_(1, guide_mask.full_query_indices, full_out)
 
         if guide_mask.soft_query_indices.numel():
-            soft_out = optimized_attention(
+            soft_out = masked_attention(
                 q.index_select(1, guide_mask.soft_query_indices),
                 k,
                 v,
@@ -215,7 +224,7 @@ def install_sparse_guide_attention_patch() -> bool:
             out.index_copy_(1, guide_mask.soft_query_indices, soft_out)
 
         if tracked_end < q.shape[1]:
-            out[:, tracked_end:, :] = optimized_attention(
+            out[:, tracked_end:, :] = unmasked_attention(
                 q[:, tracked_end:, :],
                 k,
                 v,
