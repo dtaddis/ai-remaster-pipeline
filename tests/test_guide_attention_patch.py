@@ -31,7 +31,10 @@ class SparseGuideAttentionTests(unittest.TestCase):
                     setattr(self, attribute, object())
 
         diffusion_model = types.SimpleNamespace(transformer_blocks=[Block(), Block()])
-        shared_model = types.SimpleNamespace(diffusion_model=diffusion_model)
+        shared_model = types.SimpleNamespace(
+            diffusion_model=diffusion_model,
+            memory_usage_factor=0.077,
+        )
 
         class Patcher:
             def __init__(self):
@@ -54,6 +57,10 @@ class SparseGuideAttentionTests(unittest.TestCase):
 
         self.assertIsNot(pruned, original)
         self.assertEqual(pruned.size, 0)
+        self.assertEqual(
+            pruned.model.memory_usage_factor,
+            patch_module.DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR,
+        )
         self.assertIn("diffusion_model.transformer_blocks.0.attn1.weight", pruned.patches)
         self.assertNotIn("diffusion_model.transformer_blocks.0.audio_ff.weight", pruned.patches)
         for block in diffusion_model.transformer_blocks:

@@ -15,6 +15,8 @@ A collection of powerful custom nodes that extend ComfyUI's capabilities for the
 
 > ARP's video-only outpainting workflow also asks the IC-LoRA loader to remove the LTXAV transformer's unused audio self-attention, cross-attention, and feed-forward modules before model loading. The Q4 GGUF contains about 3.24 GiB of these block weights even when the audio latent is empty. Source audio is remuxed after video diffusion, so removing them changes neither video execution nor delivered audio.
 
+> ComfyUI 0.30 assigns LTXAV a placeholder activation-memory factor of `0.077`, which can fully load the pruned model and oversubscribe a 24 GiB GPU by several GiB on long guided clips. ARP's video-only loader raises this clone's factor to `13`, making ComfyUI retain only the weights that fit beside the real guided activation set. `ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR` can override the factor for other GPU sizes.
+
 LTX-2 is built into ComfyUI core ([see it here](https://github.com/comfyanonymous/ComfyUI/tree/master/comfy/ldm/lightricks)), making it readily accessible to all ComfyUI users. This repository hosts additional nodes and workflows to help you get the most out of LTX-2's advanced features.
 
 **To learn more about LTX-2** See the [main LTX-2 repository](https://github.com/Lightricks/LTX-2) for model details and additional resources.

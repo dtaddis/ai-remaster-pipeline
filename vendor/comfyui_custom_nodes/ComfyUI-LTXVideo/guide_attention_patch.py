@@ -22,6 +22,7 @@ import time
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 4096
 DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS = 4096
+DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR = 13.0
 MAX_PARTITIONED_ATTENTION_RUNS = 32
 _LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
     "audio_attn1",
@@ -46,6 +47,31 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
     if getattr(diffusion_model, "_arp_video_only_audio_pruned", False):
         pruned.size = 0
         return pruned
+
+    # ComfyUI 0.30's LTXAV config uses a placeholder memory_usage_factor of
+    # 0.077, versus roughly 11 for the same-width LTXV model. That causes its
+    # model manager to reserve only ~100 MiB for activations and fully load the
+    # model, even though a full-length IC-LoRA guide plus keyframes needs about
+    # 17 GiB of working memory. The CUDA async allocator then oversubscribes a
+    # 24 GiB card by many GiB and silently pages through system RAM.
+    #
+    # Raise the estimate only on ARP's explicitly video-only clone. At the
+    # observed 481-frame geometry, 13 leaves roughly 5-6 GiB of transformer
+    # weights resident and about 2 GiB of physical headroom for transient work.
+    try:
+        configured_factor = float(
+            os.environ.get(
+                "ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR",
+                DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR,
+            )
+        )
+    except (TypeError, ValueError):
+        configured_factor = DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR
+    base_model = getattr(pruned, "model", None)
+    base_model.memory_usage_factor = max(
+        float(getattr(base_model, "memory_usage_factor", 0.0)),
+        configured_factor,
+    )
 
     removed = 0
     for block in blocks:
@@ -75,8 +101,10 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
     # smaller module tree before deciding how much of the GGUF fits in VRAM.
     pruned.size = 0
     LOGGER.info(
-        "ARP video-only LTXAV model removed %d unused audio transformer modules",
+        "ARP video-only LTXAV model removed %d unused audio transformer modules; "
+        "activation memory factor %.2f",
         removed,
+        base_model.memory_usage_factor,
     )
     return pruned
 
