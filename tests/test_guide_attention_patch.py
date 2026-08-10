@@ -62,7 +62,7 @@ class SparseGuideAttentionTests(unittest.TestCase):
             for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
                 self.assertFalse(hasattr(block, attribute))
 
-    def test_full_strength_rows_are_unmasked_without_changing_results(self) -> None:
+    def test_partitioned_xformers_preserves_exact_guide_mask_results(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None
         patch_module = importlib.util.module_from_spec(spec)
@@ -88,6 +88,21 @@ class SparseGuideAttentionTests(unittest.TestCase):
         def masked_attention(*args, **kwargs):
             attention_calls.append(("masked", kwargs.get("mask") is not None))
             return reference_attention(*args, **kwargs)
+
+        partition_calls: list[int] = []
+
+        xformers = types.ModuleType("xformers")
+        xformers_ops = types.ModuleType("xformers.ops")
+
+        def partition_attention(q, k, v):
+            partition_calls.append(k.shape[1])
+            scores = torch.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(q.shape[-1])
+            lse = torch.logsumexp(scores, dim=-1)
+            out = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v)
+            return out, lse
+
+        xformers_ops.memory_efficient_attention_forward_requires_grad = partition_attention
+        xformers.ops = xformers_ops
 
         attention = types.SimpleNamespace(
             optimized_attention=unmasked_attention,
@@ -155,6 +170,8 @@ class SparseGuideAttentionTests(unittest.TestCase):
             "comfy.ldm": ldm,
             "comfy.ldm.lightricks": lightricks,
             "comfy.ldm.lightricks.model": model,
+            "xformers": xformers,
+            "xformers.ops": xformers_ops,
         }
         with (
             mock.patch.dict(sys.modules, fake_modules),
@@ -199,12 +216,47 @@ class SparseGuideAttentionTests(unittest.TestCase):
         dense_mask[:, :, 3:7, :3] = log_weights.view(1, 1, -1, 1)
 
         expected = reference_attention(q, k, v, 1, mask=dense_mask)
-        actual = model._attention_with_guide_mask(q, k, v, 1, guide_mask, None, {})
+        with mock.patch.dict(
+            sys.modules,
+            {"xformers": xformers, "xformers.ops": xformers_ops},
+        ):
+            actual = model._attention_with_guide_mask(q, k, v, 1, guide_mask, None, {})
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
         self.assertEqual(
             attention_calls,
-            [("masked", True), ("unmasked", False), ("masked", True), ("unmasked", False)],
+            [("unmasked", False), ("unmasked", False)],
         )
+        self.assertEqual(partition_calls, [5, 1, 1, 3, 5])
+
+        # Arbitrary spatial masks can produce many short weight runs. They
+        # retain the broadcast-safe PyTorch fallback instead of launching an
+        # excessive number of xFormers partitions.
+        attention_calls.clear()
+        partition_calls.clear()
+        spatial_weights = torch.tensor(
+            [[0.5 if index % 2 else 0.75 for index in range(34)]],
+            dtype=torch.float32,
+        )
+        spatial_mask = model.GuideAttentionMask(40, 2, 34, spatial_weights)
+        self.assertGreater(
+            len(spatial_mask.noisy_partitions),
+            patch_module.MAX_PARTITIONED_ATTENTION_RUNS,
+        )
+        q2 = torch.randn((1, 40, 4), generator=generator)
+        k2 = torch.randn((1, 40, 4), generator=generator)
+        v2 = torch.randn((1, 40, 4), generator=generator)
+        dense2 = torch.zeros((1, 1, 40, 40), dtype=torch.float32)
+        log2 = spatial_weights.log()
+        dense2[:, :, :2, 2:36] = log2.view(1, 1, 1, -1)
+        dense2[:, :, 2:36, :2] = log2.view(1, 1, -1, 1)
+        expected2 = reference_attention(q2, k2, v2, 1, mask=dense2)
+        actual2 = model._attention_with_guide_mask(q2, k2, v2, 1, spatial_mask, None, {})
+        self.assertTrue(torch.allclose(actual2, expected2, atol=1e-6, rtol=1e-6))
+        self.assertEqual(
+            attention_calls,
+            [("masked", True), ("masked", True), ("unmasked", False)],
+        )
+        self.assertEqual(partition_calls, [])
 
 
 if __name__ == "__main__":
