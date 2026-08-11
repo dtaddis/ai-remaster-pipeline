@@ -1309,20 +1309,31 @@ class GuiSmokeTests(unittest.TestCase):
         import cv2
         import numpy as np
 
-        frame = np.zeros((32, 64, 3), dtype=np.uint8)
-        frame[:, 16:48] = 5
-        capture = mock.Mock()
-        capture.get.return_value = 1
-        capture.read.return_value = (True, frame)
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             root = Path(tmp_text)
             prepared = root / "prepared.mp4"
             prepared.write_bytes(b"prepared")
+            outpaint_video.signature_path(prepared).write_text(
+                json.dumps({
+                    "tool": "prepare_outpaint_input.py",
+                    "source_width": 32,
+                    "source_height": 32,
+                    "target_width": 64,
+                    "target_height": 32,
+                    "delivery_width": 64,
+                    "delivery_height": 32,
+                    "crop_left": 0,
+                    "crop_right": 0,
+                    "crop_top": 0,
+                    "crop_bottom": 0,
+                }),
+                encoding="utf-8",
+            )
             args = argparse.Namespace(force=True)
             with (
                 mock.patch.object(outpaint_video, "ROOT", root),
                 mock.patch.object(outpaint_video, "file_fingerprint", return_value={"size": 8, "mtime_ns": 1, "sha256": "test"}),
-                mock.patch.object(cv2, "VideoCapture", return_value=capture),
+                mock.patch.object(cv2, "VideoCapture", side_effect=AssertionError("pixel detection is forbidden")),
             ):
                 mask_path = outpaint_video.official_mask_image(prepared, args, 64, 32)
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -1332,7 +1343,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(mask[:, 16:48] == 0))
         self.assertTrue(np.all(mask[:, 48:] == 255))
 
-    def test_outpaint_generation_mask_only_grows_thin_edge_bands_to_one_latent_cell(self) -> None:
+    def test_outpaint_generation_mask_uses_requested_overlap_for_thin_trim_bands(self) -> None:
         import cv2
         import numpy as np
 
@@ -1348,10 +1359,10 @@ class GuiSmokeTests(unittest.TestCase):
             exact_after = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
 
         self.assertTrue(np.array_equal(exact_after, exact))
-        self.assertTrue(np.all(generation[:32] == 255))
-        self.assertTrue(np.all(generation[32:672, :161] == 255))
-        self.assertTrue(np.all(generation[32:672, 161:1119] == 0))
-        self.assertTrue(np.all(generation[672:] == 255))
+        self.assertTrue(np.all(generation[:68] == 255))
+        self.assertTrue(np.all(generation[68:636, :161] == 255))
+        self.assertTrue(np.all(generation[68:636, 161:1119] == 0))
+        self.assertTrue(np.all(generation[636:] == 255))
 
     def test_ltx_laplacian_blend_keeps_fully_masked_thin_bands_exact(self) -> None:
         import importlib

@@ -518,12 +518,10 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     """Build one geometric mask frame; the LTX nodes broadcast it across the clip."""
     target = ROOT / ".cache" / "outpaint_masks" / f"{safe_stem(prepared.name)}_official_mask.png"
     sig = {
-        "version": 2,
+        "version": 3,
         "tool": "outpaint_video.py/official_mask",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
-        "threshold": 3,
-        "content_axis_fraction": 0.035,
     }
     if not args.force and resumable_output(target, sig, width=width, height=height):
         return target
@@ -533,24 +531,10 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
 
     rectangle = prepared_source_rectangle(prepared, width, height)
     if rectangle is None:
-        cap = cv2.VideoCapture(str(prepared))
-        frame_count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
-        combined_content = np.zeros((height, width), dtype=bool)
-        for frame_index in np.linspace(0, frame_count - 1, min(12, frame_count), dtype=int):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-            if frame.shape[1] != width or frame.shape[0] != height:
-                cap.release()
-                raise RuntimeError(f"Prepared outpaint mask geometry changed: expected {width}x{height}, got {frame.shape[1]}x{frame.shape[0]}")
-            combined_content |= np.any(frame > 3, axis=2)
-        cap.release()
-        content_columns = np.flatnonzero(combined_content.mean(axis=0) >= 0.035)
-        content_rows = np.flatnonzero(combined_content.mean(axis=1) >= 0.035)
-        if not content_columns.size or not content_rows.size:
-            raise RuntimeError("Could not locate the protected source rectangle in the prepared outpaint canvas.")
-        rectangle = (int(content_columns[0]), int(content_rows[0]), int(content_columns[-1]) + 1, int(content_rows[-1]) + 1)
+        raise RuntimeError(
+            "Could not recover trim/expansion geometry from the prepared outpaint signature. "
+            "Rebuild the prepared input; protected-blacks mode never infers masks from pixel values."
+        )
 
     left, top, right, bottom = rectangle
     mask = np.full((height, width), 255, dtype=np.uint8)
@@ -566,17 +550,19 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
 
 
 def generation_mask_image(exact_mask: Path, args) -> Path:
-    """Grow only sub-latent-cell edge bands for LTX conditioning.
+    """Give sub-latent-cell trim bands enough inward generation workspace.
 
-    A fixed dilation is counterproductive for a very thin top or bottom trim: it hides a
-    large strip of the nearest source context from the IC-LoRA.  Instead, make each requested
-    edge band at least one LTX spatial cell wide and leave already-large aspect-ratio padding
-    alone.  The exact mask is still used by the final blend.
+    Wide aspect-ratio padding already gives LTX ample generation space. A very thin top or
+    bottom trim does not: merely growing it to one 32px latent cell left the decoded outer
+    rows mostly black in real output. Extend only those thin bands beneath protected source
+    pixels by the configured overlap, while always preserving at least one latent cell of
+    source context. The exact mask is still used by the final blend, so no extra source pixels
+    are replaced in the delivered image.
     """
     target = exact_mask.with_name(f"{exact_mask.stem}_generation.png")
     overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 64)))
     sig = {
-        "version": 1,
+        "version": 2,
         "tool": "outpaint_video.py/generation_mask",
         "exact_mask": root_relative(exact_mask),
         "exact_mask_fingerprint": file_fingerprint(exact_mask),
@@ -604,15 +590,31 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     top = int(protected_rows[0])
     bottom = int(protected_rows[-1]) + 1
 
-    def inward_growth(band_width: int) -> int:
+    protected_width = right - left
+    protected_height = bottom - top
+
+    def inward_growth(band_width: int, protected_extent: int, opposite_band_width: int) -> int:
         if band_width <= 0 or band_width >= LTX_SPATIAL_MASK_CELL:
             return 0
-        return min(overlap_limit, LTX_SPATIAL_MASK_CELL - band_width)
+        opposite_growth = (
+            overlap_limit
+            if 0 < opposite_band_width < LTX_SPATIAL_MASK_CELL
+            else 0
+        )
+        available = max(
+            0,
+            protected_extent - LTX_SPATIAL_MASK_CELL - opposite_growth,
+        )
+        return min(overlap_limit, available)
 
-    generation_left = min(right - 1, left + inward_growth(left))
-    generation_right = max(generation_left + 1, right - inward_growth(width - right))
-    generation_top = min(bottom - 1, top + inward_growth(top))
-    generation_bottom = max(generation_top + 1, bottom - inward_growth(height - bottom))
+    left_growth = inward_growth(left, protected_width, width - right)
+    right_growth = inward_growth(width - right, protected_width, left)
+    top_growth = inward_growth(top, protected_height, height - bottom)
+    bottom_growth = inward_growth(height - bottom, protected_height, top)
+    generation_left = min(right - 1, left + left_growth)
+    generation_right = max(generation_left + 1, right - right_growth)
+    generation_top = min(bottom - 1, top + top_growth)
+    generation_bottom = max(generation_top + 1, bottom - bottom_growth)
 
     generation = np.full_like(exact, 255)
     generation[generation_top:generation_bottom, generation_left:generation_right] = 0
@@ -1291,7 +1293,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v6",
+        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v7",
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "chunk_seconds": args.chunk_seconds,
