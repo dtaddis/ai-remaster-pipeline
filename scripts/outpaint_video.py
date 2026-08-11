@@ -224,7 +224,6 @@ def copy_guide_image_to_comfy_input(
     comfy_dir: Path,
     canvas_width: int = 0,
     canvas_height: int = 0,
-    source_frame: "np.ndarray | None" = None,
 ) -> str:
     """Copy a guide image to ComfyUI's input folder, stretched to exactly the LTX canvas size.
 
@@ -488,7 +487,10 @@ def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[
         return None
     try:
         sig = json.loads(sig_path.read_text(encoding="utf-8-sig"))
-        if sig.get("tool") != "prepare_outpaint_input.py":
+        if (
+            sig.get("tool") != "prepare_outpaint_input.py"
+            or sig.get("geometry") != "crop_then_fit_v1"
+        ):
             return None
         target_width = int(sig["target_width"])
         target_height = int(sig["target_height"])
@@ -518,7 +520,7 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     """Build one geometric mask frame; the LTX nodes broadcast it across the clip."""
     target = ROOT / ".cache" / "outpaint_masks" / f"{safe_stem(prepared.name)}_official_mask.png"
     sig = {
-        "version": 3,
+        "version": 4,
         "tool": "outpaint_video.py/official_mask",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -537,6 +539,13 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
         )
 
     left, top, right, bottom = rectangle
+    horizontal_bands = left > 0 or right < width
+    vertical_bands = top > 0 or bottom < height
+    if horizontal_bands and vertical_bands:
+        raise RuntimeError(
+            "Prepared outpaint geometry produced borders on both axes; expected one "
+            "pillarbox or letterbox after crop-first fitting. Rebuild the prepared input."
+        )
     mask = np.full((height, width), 255, dtype=np.uint8)
     mask[top:bottom, left:right] = 0
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -550,19 +559,15 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
 
 
 def generation_mask_image(exact_mask: Path, args) -> Path:
-    """Give sub-latent-cell trim bands enough inward generation workspace.
+    """Extend a geometric pillarbox/letterbox mask beneath protected source pixels.
 
-    Wide aspect-ratio padding already gives LTX ample generation space. A very thin top or
-    bottom trim does not: merely growing it to one 32px latent cell left the decoded outer
-    rows mostly black in real output. Extend only those thin bands beneath protected source
-    pixels by the configured overlap, while always preserving at least one latent cell of
-    source context. The exact mask is still used by the final blend, so no extra source pixels
-    are replaced in the delivered image.
+    The exact delivery mask stays unchanged. The generation-only mask adds the configured
+    context overlap on the same axis and preserves at least one 32px source cell.
     """
     target = exact_mask.with_name(f"{exact_mask.stem}_generation.png")
     overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 64)))
     sig = {
-        "version": 2,
+        "version": 3,
         "tool": "outpaint_video.py/generation_mask",
         "exact_mask": root_relative(exact_mask),
         "exact_mask_fingerprint": file_fingerprint(exact_mask),
@@ -589,32 +594,26 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     right = int(protected_columns[-1]) + 1
     top = int(protected_rows[0])
     bottom = int(protected_rows[-1]) + 1
-
-    protected_width = right - left
-    protected_height = bottom - top
-
-    def inward_growth(band_width: int, protected_extent: int, opposite_band_width: int) -> int:
-        if band_width <= 0 or band_width >= LTX_SPATIAL_MASK_CELL:
-            return 0
-        opposite_growth = (
-            overlap_limit
-            if 0 < opposite_band_width < LTX_SPATIAL_MASK_CELL
-            else 0
+    horizontal_bands = left > 0 or right < width
+    vertical_bands = top > 0 or bottom < height
+    if horizontal_bands and vertical_bands:
+        raise RuntimeError(
+            "Exact outpaint mask has borders on both axes; expected one pillarbox "
+            "or letterbox from crop-first geometry."
         )
-        available = max(
-            0,
-            protected_extent - LTX_SPATIAL_MASK_CELL - opposite_growth,
-        )
-        return min(overlap_limit, available)
 
-    left_growth = inward_growth(left, protected_width, width - right)
-    right_growth = inward_growth(width - right, protected_width, left)
-    top_growth = inward_growth(top, protected_height, height - bottom)
-    bottom_growth = inward_growth(height - bottom, protected_height, top)
-    generation_left = min(right - 1, left + left_growth)
-    generation_right = max(generation_left + 1, right - right_growth)
-    generation_top = min(bottom - 1, top + top_growth)
-    generation_bottom = max(generation_top + 1, bottom - bottom_growth)
+    def generation_bounds(start: int, end: int, extent: int) -> tuple[int, int]:
+        before = start > 0
+        after = end < extent
+        edge_count = int(before) + int(after)
+        if not edge_count:
+            return start, end
+        available_per_edge = max(0, (end - start - LTX_SPATIAL_MASK_CELL) // edge_count)
+        growth = min(overlap_limit, available_per_edge)
+        return start + (growth if before else 0), end - (growth if after else 0)
+
+    generation_left, generation_right = generation_bounds(left, right, width)
+    generation_top, generation_bottom = generation_bounds(top, bottom, height)
 
     generation = np.full_like(exact, 255)
     generation[generation_top:generation_bottom, generation_left:generation_right] = 0
@@ -979,7 +978,6 @@ def _patch_extra_guides(
     extra_guides: "list[dict]",
     canvas_width: int,
     canvas_height: int,
-    source_frame: "Any",
     num_pixel_frames: int = 0,
 ) -> None:
     """Chain one LTXVAddGuideAdvanced node per extra guide frame.
@@ -1033,7 +1031,7 @@ def _patch_extra_guides(
         image_path = gf["image"]
 
         image_name = copy_guide_image_to_comfy_input(
-            image_path, comfy_dir, canvas_width, canvas_height, source_frame=source_frame
+            image_path, comfy_dir, canvas_width, canvas_height
         )
 
         add_or_replace_node(workflow, {
@@ -1120,21 +1118,8 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             canvas_height,
         )
         patch_video_only_sampling(workflow)
-    source_frame: "np.ndarray | None" = None
     if guide_image and guide_image.exists():
-        # Extract the first frame of the prepared video to use as source fill for guide black bands.
-        try:
-            import cv2 as _cv2
-            import numpy as _np
-            _cap = _cv2.VideoCapture(str(prepared))
-            _ok, _frame = _cap.read()
-            _cap.release()
-            if _ok and _frame is not None:
-                source_frame = _frame
-        except Exception as _e:
-            print(f"Warning: could not extract source frame for guide compositing: {_e}", flush=True)
-
-        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame)
+        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
         # Official v0.9 uses node 5088; the legacy workflow used 5019.
         for bypass_id in ("5088", "5019"):
             try:
@@ -1244,7 +1229,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # Extra guide frames via LTXVAddGuideAdvanced — inserted after GGUF patching so the VAE
     # source is already resolved.  Each guide is chained off the previous one.
     if extra_guides:
-        _patch_extra_guides(workflow, args, extra_guides, canvas_width, canvas_height, source_frame, int(prepared_info.get("frames") or 0))
+        _patch_extra_guides(workflow, args, extra_guides, canvas_width, canvas_height, int(prepared_info.get("frames") or 0))
 
     return workflow_to_prompt(workflow, args.output_node_id)
 
@@ -1293,7 +1278,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "gguf_model": args.gguf_model,
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "single_stage_full_resolution_geometry_mask_video_only_v7",
+        "outpaint_pipeline": "crop_first_pillarbox_letterbox_video_only_v1",
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "chunk_seconds": args.chunk_seconds,

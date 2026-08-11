@@ -33,10 +33,6 @@ class SourcePlacement:
     y: int
     width: int
     height: int
-    full_x: int
-    full_y: int
-    full_width: int
-    full_height: int
 
 
 def source_placement(
@@ -48,32 +44,30 @@ def source_placement(
     reference_width: int | None = None,
     reference_height: int | None = None,
 ) -> SourcePlacement:
+    """Crop first, then fit the remaining frame into the requested canvas.
+
+    Trimmed pixels are discarded geometry, never outpaint targets. The cropped
+    frame is centered and scaled as one complete image, so the remaining mask is
+    always a simple pillarbox, letterbox, or empty border.
+    """
     reference_width = int(reference_width or target_width)
     reference_height = int(reference_height or target_height)
-    left, _right, top, _bottom, crop_width, crop_height = crop_box(source_width, source_height, *crops)
-    full_width, full_height = fit_size(source_width, source_height, reference_width, reference_height)
-    full_x = (reference_width - full_width) // 2
-    full_y = (reference_height - full_height) // 2
-
-    crop_x = full_x + int(round(left * full_width / source_width))
-    crop_y = full_y + int(round(top * full_height / source_height))
-    crop_end_x = full_x + int(round((left + crop_width) * full_width / source_width))
-    crop_end_y = full_y + int(round((top + crop_height) * full_height / source_height))
+    _left, _right, _top, _bottom, crop_width, crop_height = crop_box(
+        source_width, source_height, *crops
+    )
+    placed_width, placed_height = fit_size(
+        crop_width,
+        crop_height,
+        reference_width,
+        reference_height,
+    )
 
     if (reference_width, reference_height) != (target_width, target_height):
         scale_x = target_width / reference_width
         scale_y = target_height / reference_height
-        full_x = int(round(full_x * scale_x))
-        full_y = int(round(full_y * scale_y))
-        full_width = max(2, even(full_width * scale_x))
-        full_height = max(2, even(full_height * scale_y))
-        crop_x = int(round(crop_x * scale_x))
-        crop_y = int(round(crop_y * scale_y))
-        crop_end_x = int(round(crop_end_x * scale_x))
-        crop_end_y = int(round(crop_end_y * scale_y))
+        placed_width = min(target_width, max(2, even(placed_width * scale_x)))
+        placed_height = min(target_height, max(2, even(placed_height * scale_y)))
 
-    placed_width = max(2, crop_end_x - crop_x)
-    placed_height = max(2, crop_end_y - crop_y)
-    placed_width = placed_width if placed_width % 2 == 0 else placed_width - 1
-    placed_height = placed_height if placed_height % 2 == 0 else placed_height - 1
-    return SourcePlacement(crop_x, crop_y, placed_width, placed_height, full_x, full_y, full_width, full_height)
+    x = (target_width - placed_width) // 2
+    y = (target_height - placed_height) // 2
+    return SourcePlacement(x, y, placed_width, placed_height)

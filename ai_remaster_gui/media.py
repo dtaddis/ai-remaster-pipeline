@@ -18,7 +18,7 @@ from .process_utils import format_duration
 from .project_io import source_analysis_key, source_signature
 
 SOURCE_PREVIEW_COUNT = 3
-ASPECT_PREVIEW_STYLE_VERSION = 5
+ASPECT_PREVIEW_STYLE_VERSION = 6
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -271,12 +271,12 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
     left, right, top, bottom = crops
     crop_left, _crop_right, crop_top, _crop_bottom, crop_width, crop_height = crop_box(width, height, left, right, top, bottom)
     cropped = image.crop((crop_left, crop_top, crop_left + crop_width, crop_top + crop_height))
-    if width / height < ratio:
-        target_h = height
-        target_w = int(round(height * ratio))
+    if crop_width / crop_height < ratio:
+        target_h = crop_height
+        target_w = int(round(crop_height * ratio))
     else:
-        target_w = width
-        target_h = int(round(width / ratio))
+        target_w = crop_width
+        target_h = int(round(crop_width / ratio))
     placement = source_placement(width, height, target_w, target_h, crops)
     canvas = patterned_canvas(target_w, target_h)
     paste_xy = (placement.x + int(offset_x), placement.y + int(offset_y))
@@ -324,17 +324,17 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
         return ""
     source_w, source_h = dims
     ratio = parse_aspect(aspect)
-    if source_w / source_h < ratio:
-        canvas_h = source_h
-        canvas_w = int(round(source_h * ratio))
+    left, _right, top, _bottom, crop_width, crop_height = crop_box(source_w, source_h, *crops)
+    if crop_width / crop_height < ratio:
+        canvas_h = crop_height
+        canvas_w = int(round(crop_height * ratio))
     else:
-        canvas_w = source_w
-        canvas_h = int(round(source_w / ratio))
+        canvas_w = crop_width
+        canvas_h = int(round(crop_width / ratio))
     scale = min(960 / canvas_w, 540 / canvas_h, 1.0)
     out_w = max(2, even_int(canvas_w * scale))
     out_h = max(2, even_int(canvas_h * scale))
     placement = source_placement(source_w, source_h, canvas_w, canvas_h, crops)
-    left, _right, top, _bottom, crop_width, crop_height = crop_box(source_w, source_h, *crops)
     placed_x = int(round(placement.x * scale))
     placed_y = int(round(placement.y * scale))
     placed_w = max(2, even_int(placement.width * scale))

@@ -53,9 +53,9 @@ class IdentityKeyTests(unittest.TestCase):
         self.assertTrue(name.startswith("Metropolis_outpaint_"))
         self.assertTrue(name.endswith(".mp4"))
 
-    def test_cropped_outputs_use_regeneration_identity(self) -> None:
-        self.assertEqual(self.base()["crop_fill"], 2)
-        self.assertNotIn("crop_fill", self.base(crop=[0, 0, 0, 0]))
+    def test_outputs_use_crop_first_geometry_identity(self) -> None:
+        self.assertEqual(self.base()["geometry"], "crop_then_fit_v1")
+        self.assertEqual(self.base(crop=[0, 0, 0, 0])["geometry"], "crop_then_fit_v1")
 
 
 class FindTests(unittest.TestCase):

@@ -135,12 +135,13 @@ def artifact_path(directory: Path | str, word: str, tag: str, identity: dict[str
 
 def outpaint_identity(source_name: str, aspect: str, work_w: int, work_h: int, crop: Iterable[int], black: bool) -> dict:
     """Identity shared by the whole outpaint family: outpaint output, raw comfy render, prepared
-    canvas, chunk manifest, guide directory and seed guides. Mirrors the tokens the old filename
-    encoded (aspect, work WxH, crop, all-black mode)."""
+    canvas, chunk manifest, guide directory and seed guides. Includes every input that changes
+    the crop-first canvas geometry or masking mode."""
     left, right, top, bottom = ([int(v) for v in crop] + [0, 0, 0, 0])[:4]
     identity = {
-        "v": 1,
+        "v": 2,
         "kind": "outpaint",
+        "geometry": "crop_then_fit_v1",
         "source": safe_stem(source_name),
         "aspect": str(aspect),
         "w": int(work_w),
@@ -148,8 +149,6 @@ def outpaint_identity(source_name: str, aspect: str, work_w: int, work_h: int, c
         "crop": [left, right, top, bottom],
         "black": bool(black),
     }
-    if any((left, right, top, bottom)):
-        identity["crop_fill"] = 2
     return identity
 
 

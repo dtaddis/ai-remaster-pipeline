@@ -118,9 +118,9 @@ class PatchExtraGuidesTests(unittest.TestCase):
     def patch_and_convert(self, extra_guides: list[dict], frames: int = 481) -> dict:
         workflow = json.loads(WORKFLOW.read_text(encoding="utf-8-sig"))
         args = SimpleNamespace(comfy_dir=str(ROOT))
-        stub = lambda guide, comfy_dir, w, h, source_frame=None: f"stub_{Path(str(guide)).stem}.png"  # noqa: E731
+        stub = lambda guide, comfy_dir, w, h: f"stub_{Path(str(guide)).stem}.png"  # noqa: E731
         with mock.patch.object(ov, "copy_guide_image_to_comfy_input", stub), contextlib.redirect_stdout(io.StringIO()):
-            ov._patch_extra_guides(workflow, args, extra_guides, 1280, 704, None, frames)
+            ov._patch_extra_guides(workflow, args, extra_guides, 1280, 704, frames)
         return workflow_to_prompt(workflow, "5228")
 
     def consumers_of(self, prompt: dict, node_id: str, exclude: set[str] = frozenset()) -> set[str]:

@@ -38,7 +38,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 9
+    values['version'] = 10
     return values
 
 
@@ -147,15 +147,19 @@ def source_black_matte_expr(threshold: int, shrink: int) -> str:
     return f"lte({nested_expr('min', samples)},{threshold})"
 
 
-def source_alpha_expr(args, feather: int) -> str:
-    horizontal_alpha = f"if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))"
-    edge_alpha = horizontal_alpha
-    top = max(0, int(getattr(args, "crop_top", 0)))
-    bottom = max(0, int(getattr(args, "crop_bottom", 0)))
-    if top or bottom:
-        top_alpha = f"if(lt(Y,{feather}),255*Y/{feather},255)" if top else "255"
-        bottom_alpha = f"if(gt(Y,H-{feather}),255*(H-Y)/{feather},255)" if bottom else "255"
-        edge_alpha = f"min({horizontal_alpha},min({top_alpha},{bottom_alpha}))"
+def source_alpha_expr(args, feather: int, *, horizontal: bool, vertical: bool) -> str:
+    edge_alphas = []
+    if horizontal:
+        edge_alphas.append(
+            f"if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))"
+        )
+    if vertical:
+        edge_alphas.append(
+            f"if(lt(Y,{feather}),255*Y/{feather},if(gt(Y,H-{feather}),255*(H-Y)/{feather},255))"
+        )
+    edge_alpha = "255" if not edge_alphas else edge_alphas[0]
+    if len(edge_alphas) == 2:
+        edge_alpha = f"min({edge_alphas[0]},{edge_alphas[1]})"
     if not getattr(args, "source_black_transparent", False):
         return edge_alpha
     threshold = max(0, min(255, int(getattr(args, "source_black_threshold", 24))))
@@ -206,10 +210,12 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
         if source_size and base_size:
             crops = tuple(max(0, int(getattr(args, key))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
             placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
+            feather_horizontal = placement.x > 0 or placement.x + placement.width < base_size[0]
+            feather_vertical = placement.y > 0 or placement.y + placement.height < base_size[1]
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}scale={placement.width}:{placement.height}:flags=lanczos,setsar=1[src]',
-                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
+                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather, horizontal=feather_horizontal, vertical=feather_vertical)}'[srcm]",
                 f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]',
             ]
         else:
@@ -217,7 +223,7 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
                 '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
-                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
+                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather, horizontal=True, vertical=True)}'[srcm]",
                 '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
             ]
     else:

@@ -795,7 +795,7 @@ class GuiSmokeTests(unittest.TestCase):
         producer = outpaint_video.default_output(app.resolve_video_source("input/My Source.mp4"), "16:9", 480, args)
         self.assertEqual(Path(output).name, producer.name)
 
-    def test_outpaint_source_crop_preserves_original_source_scale(self) -> None:
+    def test_outpaint_source_crop_is_fitted_as_the_complete_source(self) -> None:
         args = argparse.Namespace(
             delivery_width=1280,
             delivery_height=720,
@@ -809,12 +809,12 @@ class GuiSmokeTests(unittest.TestCase):
         )
         info = {"width": 1440, "height": 1080, "fps": 24.0}
 
-        self.assertEqual(prepare_outpaint_input.source_placement_size(args, info, 1280, 704), (960, 360, 960, 352))
+        self.assertEqual(prepare_outpaint_input.source_placement_size(args, info, 1280, 704), (1280, 480, 1280, 470))
 
         filter_text = prepare_outpaint_input.build_filter(args, info, 1280, 704)
 
         self.assertIn("trim=start_frame=0,setpts=N/(24.00000000*TB),fps=24.00000000", filter_text)
-        self.assertIn("crop=w=1440:h=540:x=0:y=270,scale=w=960:h=360:flags=lanczos,scale=w=960:h=352:flags=lanczos", filter_text)
+        self.assertIn("crop=w=1440:h=540:x=0:y=270,scale=w=1280:h=480:flags=lanczos,scale=w=1280:h=470:flags=lanczos", filter_text)
         self.assertNotIn("force_original_aspect_ratio=decrease", filter_text)
 
     def test_outpaint_all_black_regions_bypasses_source_lift(self) -> None:
@@ -1316,16 +1316,17 @@ class GuiSmokeTests(unittest.TestCase):
             outpaint_video.signature_path(prepared).write_text(
                 json.dumps({
                     "tool": "prepare_outpaint_input.py",
-                    "source_width": 32,
-                    "source_height": 32,
-                    "target_width": 64,
-                    "target_height": 32,
-                    "delivery_width": 64,
-                    "delivery_height": 32,
-                    "crop_left": 0,
-                    "crop_right": 0,
-                    "crop_top": 0,
-                    "crop_bottom": 0,
+                    "geometry": "crop_then_fit_v1",
+                    "source_width": 1456,
+                    "source_height": 1080,
+                    "target_width": 1280,
+                    "target_height": 704,
+                    "delivery_width": 1280,
+                    "delivery_height": 720,
+                    "crop_left": 10,
+                    "crop_right": 10,
+                    "crop_top": 6,
+                    "crop_bottom": 6,
                 }),
                 encoding="utf-8",
             )
@@ -1335,22 +1336,22 @@ class GuiSmokeTests(unittest.TestCase):
                 mock.patch.object(outpaint_video, "file_fingerprint", return_value={"size": 8, "mtime_ns": 1, "sha256": "test"}),
                 mock.patch.object(cv2, "VideoCapture", side_effect=AssertionError("pixel detection is forbidden")),
             ):
-                mask_path = outpaint_video.official_mask_image(prepared, args, 64, 32)
+                mask_path = outpaint_video.official_mask_image(prepared, args, 1280, 704)
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
 
-        self.assertEqual(mask.shape, (32, 64))
-        self.assertTrue(np.all(mask[:, :16] == 255))
-        self.assertTrue(np.all(mask[:, 16:48] == 0))
-        self.assertTrue(np.all(mask[:, 48:] == 255))
+        self.assertEqual(mask.shape, (704, 1280))
+        self.assertTrue(np.all(mask[:, :156] == 255))
+        self.assertTrue(np.all(mask[:, 156:1124] == 0))
+        self.assertTrue(np.all(mask[:, 1124:] == 255))
 
-    def test_outpaint_generation_mask_uses_requested_overlap_for_thin_trim_bands(self) -> None:
+    def test_outpaint_generation_mask_adds_overlap_only_to_pillarbox(self) -> None:
         import cv2
         import numpy as np
 
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             exact_path = Path(tmp_text) / "exact.png"
             exact = np.full((704, 1280), 255, dtype=np.uint8)
-            exact[4:700, 161:1119] = 0
+            exact[:, 156:1124] = 0
             self.assertTrue(cv2.imwrite(str(exact_path), exact))
             args = argparse.Namespace(force=True, generation_mask_overlap=64)
 
@@ -1359,10 +1360,9 @@ class GuiSmokeTests(unittest.TestCase):
             exact_after = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
 
         self.assertTrue(np.array_equal(exact_after, exact))
-        self.assertTrue(np.all(generation[:68] == 255))
-        self.assertTrue(np.all(generation[68:636, :161] == 255))
-        self.assertTrue(np.all(generation[68:636, 161:1119] == 0))
-        self.assertTrue(np.all(generation[636:] == 255))
+        self.assertTrue(np.all(generation[:, :220] == 255))
+        self.assertTrue(np.all(generation[:, 220:1060] == 0))
+        self.assertTrue(np.all(generation[:, 1060:] == 255))
 
     def test_ltx_laplacian_blend_keeps_fully_masked_thin_bands_exact(self) -> None:
         import importlib

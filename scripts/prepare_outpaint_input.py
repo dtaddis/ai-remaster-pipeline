@@ -81,8 +81,9 @@ def source_placement_size(args, info: dict, target_width: int, target_height: in
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 9,
+        'version': 10,
         'tool': 'prepare_outpaint_input.py',
+        'geometry': 'crop_then_fit_v1',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
         'source_width': info['width'],
@@ -118,13 +119,10 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     # at 0.334s instead of 8/23.976 (0.333667s). Sampling by those rounded timestamps randomly
     # picks the previous frame at cuts; frame-index timing keeps the outpaint canvas aligned.
     #
-    # Two-step scaling when delivery dimensions differ from target (model-safe) dimensions:
-    #   Step 1 - scale the cropped source by the same factor the uncropped source would use
-    #            to fit DELIVERY dimensions. Cropping therefore removes pixels; it does not
-    #            promote the crop to become the new full-size source.
-    #   Step 2 - squish the delivery placement proportionally into the model-safe canvas.
-    #            This preserves the existing LTX workaround without forcing cropped sources
-    #            to fill the axis they no longer occupy.
+    # Crop first and treat the remaining frame as the complete source. Fit that
+    # post-trim geometry into the delivery canvas, then map it proportionally
+    # into the model-safe canvas. This leaves exactly one simple pillarbox or
+    # letterbox for LTX; removed trim pixels never become generation bands.
     delivery_w = int(args.delivery_width or target_width)
     delivery_h = int(args.delivery_height or target_height)
     crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
@@ -193,7 +191,7 @@ def replace_with_retry(partial: Path, output: Path, attempts: int = 60, delay: f
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Prepare a source clip for LTX IC-LoRA outpainting by lifting source blacks and padding exact-black 16:9 margins.')
+    parser = argparse.ArgumentParser(description='Crop a source clip, then fit it into an exact-black LTX outpainting canvas.')
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
     parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
     parser.add_argument('--target-aspect', default='16:9')
