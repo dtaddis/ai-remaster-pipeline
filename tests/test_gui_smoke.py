@@ -997,6 +997,7 @@ class GuiSmokeTests(unittest.TestCase):
                     "comfy_managed_by_arp": "true",
                 }),
                 mock.patch.object(lifecycle, "discover_comfy_instances", return_value=[]),
+                mock.patch.object(lifecycle, "ensure_bindable_managed_comfy_endpoint", side_effect=lambda value: value),
                 mock.patch.object(lifecycle.subprocess, "Popen", side_effect=fake_popen),
                 mock.patch.object(lifecycle.threading.Thread, "start", lambda _self: None),
             ):
@@ -1013,6 +1014,30 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertTrue(kwargs["creationflags"] & subprocess.CREATE_NEW_CONSOLE)
             self.assertTrue(log_path.exists())
             self.assertIn("Starting ComfyUI:", log_path.read_text(encoding="utf-8"))
+
+    def test_managed_comfy_moves_from_an_unbindable_port_and_persists_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            config_path = Path(tmp_text) / ".ai_remaster_config.json"
+            config_path.write_text(json.dumps({"keep": "value"}), encoding="utf-8")
+            active = {
+                "comfy_url": "http://127.0.0.1:8188",
+                "comfy_host": "127.0.0.1",
+                "comfy_port": "8188",
+                "comfy_managed_by_arp": "true",
+            }
+
+            with (
+                mock.patch.object(lifecycle, "CONFIG_FILE", config_path),
+                mock.patch.object(lifecycle, "port_can_bind", side_effect=lambda _host, port: port == 8797),
+            ):
+                updated = lifecycle.ensure_bindable_managed_comfy_endpoint(active)
+
+            stored = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(updated["comfy_port"], "8797")
+        self.assertEqual(updated["comfy_url"], "http://127.0.0.1:8797")
+        self.assertEqual(stored["keep"], "value")
+        self.assertEqual(stored["comfy_port"], "8797")
 
     def test_stage_comfy_gate_waits_for_existing_launch(self) -> None:
         class FakeProcess:

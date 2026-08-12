@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .comfy import comfy_busy_message, comfy_is_running, comfy_queue, discover_comfy_instances
 from .config import CONFIG_FILE, ROOT, current_config
@@ -16,6 +19,67 @@ from .http_handler import Handler
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 COMFY_STARTUP_LOG = ROOT / "output" / "logs" / "comfyui-startup.log"
+
+
+def port_can_bind(host: str, port: int) -> bool:
+    """Return whether a fresh local server can bind this endpoint now."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def persist_comfy_endpoint(config: dict[str, str], host: str, port: int) -> dict[str, str]:
+    """Persist a managed ComfyUI endpoint without discarding installer settings."""
+    updated = dict(config)
+    parsed = urlparse(updated.get("comfy_url", "http://127.0.0.1:8188"))
+    scheme = parsed.scheme or "http"
+    updated["comfy_host"] = host
+    updated["comfy_port"] = str(port)
+    updated["comfy_url"] = f"{scheme}://{host}:{port}"
+    stored: dict[str, object] = {}
+    if CONFIG_FILE.exists():
+        try:
+            loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                stored.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+    stored.update(updated)
+    CONFIG_FILE.write_text(json.dumps(stored, indent=2) + "\n", encoding="utf-8")
+    return updated
+
+
+def ensure_bindable_managed_comfy_endpoint(config: dict[str, str]) -> dict[str, str]:
+    """Move ARP-managed ComfyUI away from occupied or Windows-reserved ports.
+
+    Hyper-V/WSL can reserve large dynamic port ranges after an update. A bind
+    probe catches both those exclusions and ordinary port conflicts without
+    encoding any Windows-specific range assumptions.
+    """
+    if str(config.get("comfy_managed_by_arp", "true")).lower() != "true":
+        return config
+    host = config.get("comfy_host", "127.0.0.1")
+    if host not in {"127.0.0.1", "localhost"}:
+        return config
+    try:
+        configured_port = int(config.get("comfy_port", "8188"))
+    except (TypeError, ValueError):
+        configured_port = 8188
+    if port_can_bind(host, configured_port):
+        return config
+
+    for candidate in range(8188, 9000):
+        if candidate != configured_port and port_can_bind(host, candidate):
+            updated = persist_comfy_endpoint(config, host, candidate)
+            startup_log(
+                f"ComfyUI port {configured_port} is unavailable or reserved; "
+                f"ARP will use {updated['comfy_url']} instead."
+            )
+            return updated
+    raise RuntimeError("ARP could not find a bindable local port for managed ComfyUI.")
 
 
 def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
@@ -47,6 +111,7 @@ def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
     if not start_comfy_if_needed(monitor=False):
         message = comfy_startup_failure_message(url, stage_title)
         return False, message
+    url = current_config().get("comfy_url", url)
     if wait_for_comfy_ready(url, STARTED_COMFY_PROCESS, float(os.environ.get("AI_REMASTER_COMFY_START_TIMEOUT", "180"))):
         return True, ""
     message = comfy_startup_failure_message(url, stage_title)
@@ -134,6 +199,8 @@ def start_comfy_if_needed(monitor: bool = True) -> bool:
         else:
             startup_log(f"ComfyUI appears to be running at {instances[0]}, but ARP is configured for {url}. Close it or update .ai_remaster_config.json.")
             return False
+    config = ensure_bindable_managed_comfy_endpoint(config)
+    url = config.get("comfy_url", url)
     comfy_dir = Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     if str(config.get("comfy_managed_by_arp", "true")).lower() != "true":
         startup_log("Using an external ComfyUI checkout. ARP can start it, but install_windows.bat will not update ComfyUI core for this path.")
