@@ -109,6 +109,7 @@ async function saveOutpaintChunk(index) {
 function outpaintChunkForm(index) {
   const customCheckbox = document.getElementById(`chunkCustom_${index}`);
   const autoStartGuideCheckbox = document.getElementById(`chunkAutoStartGuide_${index}`);
+  const offsetOverrideCheckbox = document.getElementById(`chunkOffsetOverride_${index}`);
   return {
     index,
     seed: document.getElementById(`chunkSeed_${index}`).value,
@@ -116,6 +117,7 @@ function outpaintChunkForm(index) {
     custom_seconds: outpaintChunkCustomSeconds(index),
     offset_x: document.getElementById(`chunkOffset_x_${index}`)?.value || '0',
     offset_y: document.getElementById(`chunkOffset_y_${index}`)?.value || '0',
+    offset_override: !!(offsetOverrideCheckbox && offsetOverrideCheckbox.checked),
     auto_start_guide: autoStartGuideCheckbox ? !!autoStartGuideCheckbox.checked : true,
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
     negative_suffix: document.getElementById(`chunkNegative_${index}`).value,

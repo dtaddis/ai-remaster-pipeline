@@ -75,6 +75,10 @@ const FIELD_DESCRIPTIONS = {
     'How strongly the complete input video controls LTX. 1.0 is the safe default and preserves the source most exactly, but can also preserve scratches. Lower values give Dearchive more freedom to repaint damage; very low values can change faces, hands, fine motion, or period detail.',
   'cleanup.lora_strength':
     'How strongly Dearchive rewrites the archive footage. 1.0 is the model author\'s workflow default.',
+  'outpaint.offset_x':
+    'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
+  'outpaint.offset_y':
+    'Shift the source vertically for the whole video before outpainting. Positive values move it down; negative values move it up. Chunks inherit this unless overridden.',
   'colour.processing_height':
     'Downscale frames before they are sent to ComfyUI. Source keeps the original resolution; 1080p is a practical first stop for 4K material.',
   'colour.use_half_resolution':

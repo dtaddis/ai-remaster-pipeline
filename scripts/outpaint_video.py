@@ -1281,6 +1281,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
+        "default_offset_x": int(getattr(args, "offset_x", 0)),
+        "default_offset_y": int(getattr(args, "offset_y", 0)),
         "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
         "chunk_manifest_fingerprint": file_fingerprint(chunk_manifest) if chunk_manifest and chunk_manifest.exists() else None,
     }
@@ -1375,6 +1377,29 @@ def auto_start_guide_enabled(row: dict[str, str]) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def chunk_offset_mode(row: dict[str, str]) -> str:
+    mode = str(row.get("offset_mode", "")).strip().lower()
+    if mode in {"inherit", "custom"}:
+        return mode
+    try:
+        has_legacy_offset = bool(int(float(row.get("offset_x", "0") or 0)) or int(float(row.get("offset_y", "0") or 0)))
+    except ValueError:
+        has_legacy_offset = False
+    return "custom" if has_legacy_offset else "inherit"
+
+
+def resolve_chunk_offsets(row: dict[str, str], default_x: int = 0, default_y: int = 0) -> tuple[str, int, int]:
+    mode = chunk_offset_mode(row)
+    if mode == "inherit":
+        return mode, int(default_x), int(default_y)
+    try:
+        offset_x = int(float(row.get("offset_x", "0") or 0))
+        offset_y = int(float(row.get("offset_y", "0") or 0))
+    except ValueError:
+        offset_x = offset_y = 0
+    return mode, offset_x, offset_y
+
+
 def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
@@ -1384,6 +1409,7 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "start_seconds",
         "end_seconds",
         "custom_seconds",
+        "offset_mode",
         "offset_x",
         "offset_y",
         "seed",
@@ -1443,13 +1469,12 @@ def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: f
     return ranges
 
 
-def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: float, chunk_dir: Path, default_seed: int) -> dict[int, dict[str, str]]:
+def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: float, chunk_dir: Path, default_seed: int, default_offset_x: int = 0, default_offset_y: int = 0) -> dict[int, dict[str, str]]:
     existing = read_chunk_manifest(path)
     rows: list[dict[str, str]] = []
     for chunk_index, start_frame, end_frame in ranges:
         row = dict(existing.get(chunk_index, {}))
-        offset_x = int(float(row.get("offset_x", "0") or 0))
-        offset_y = int(float(row.get("offset_y", "0") or 0))
+        offset_mode, offset_x, offset_y = resolve_chunk_offsets(row, default_offset_x, default_offset_y)
         offset_slug = "" if not (offset_x or offset_y) else f"_ox{offset_x:+d}_oy{offset_y:+d}"
         row.update(
             {
@@ -1462,6 +1487,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
                 "raw_path": root_relative(chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"),
             }
         )
+        row["offset_mode"] = offset_mode
         row["offset_x"] = str(offset_x)
         row["offset_y"] = str(offset_y)
         if not row.get("seed"):
@@ -1779,6 +1805,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-right", type=int, default=0)
     parser.add_argument("--crop-top", type=int, default=0)
     parser.add_argument("--crop-bottom", type=int, default=0)
+    parser.add_argument("--offset-x", type=int, default=0, help="Default horizontal source offset inherited by outpaint chunks.")
+    parser.add_argument("--offset-y", type=int, default=0, help="Default vertical source offset inherited by outpaint chunks.")
     parser.add_argument("--chunk-seconds", type=float, default=20.0, help="Outpaint in chunks of roughly this many seconds. Use 0 to send the full clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated between neighbouring chunks before stitching.")
     parser.add_argument("--chunk-manifest", help="CSV storing per-chunk seed, prompt, and guide image overrides.")
@@ -1938,7 +1966,15 @@ def main() -> int:
         prepared_info = probe_video(prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
         ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
-        chunk_overrides = sync_chunk_manifest(chunk_manifest, ranges, float(prepared_info["fps"]), chunk_dir, args.seed)
+        chunk_overrides = sync_chunk_manifest(
+            chunk_manifest,
+            ranges,
+            float(prepared_info["fps"]),
+            chunk_dir,
+            args.seed,
+            args.offset_x,
+            args.offset_y,
+        )
         print(f"Outpaint chunk manifest: {chunk_manifest}", flush=True)
         if args.seed_qwen_guides:
             chunk_overrides = apply_qwen_seed_guides(args, prepared, ranges, chunk_manifest)

@@ -92,6 +92,7 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
         "start_seconds",
         "end_seconds",
         "custom_seconds",
+        "offset_mode",
         "offset_x",
         "offset_y",
         "seed",

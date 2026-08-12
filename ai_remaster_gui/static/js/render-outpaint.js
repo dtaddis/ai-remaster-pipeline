@@ -491,20 +491,31 @@ function chunkStillStrip(row, prefix, canAnchor) {
 
 function chunkOffsetControls(row) {
   const idx = row.index;
+  const custom = String(row.offset_mode || 'inherit').toLowerCase() === 'custom';
+  const disabled = custom ? '' : 'disabled';
   return `
     <div class="chunk-offsets">
+      <label class="chunk-offset-mode"><input id="chunkOffsetOverride_${idx}" type="checkbox" ${custom ? 'checked' : ''} onchange="toggleChunkOffsetOverride(${idx})"> Override whole-video offset</label>
       <label>Offset X</label>
-      ${chunkOffsetControl(idx, 'x', row.offset_x || '0')}
+      ${chunkOffsetControl(idx, 'x', row.offset_x || '0', disabled)}
       <label>Offset Y</label>
-      ${chunkOffsetControl(idx, 'y', row.offset_y || '0')}
+      ${chunkOffsetControl(idx, 'y', row.offset_y || '0', disabled)}
     </div>
   `;
 }
 
-function chunkOffsetControl(idx, axis, value) {
+function chunkOffsetControl(idx, axis, value, disabled = '') {
   return `
-    <input id="chunkOffset_${axis}_${idx}" class="pixel-input chunk-offset-input" type="number" step="1" value="${esc(value)}">
+    <input id="chunkOffset_${axis}_${idx}" class="pixel-input chunk-offset-input" type="number" step="1" value="${esc(value)}" ${disabled}>
   `;
+}
+
+function toggleChunkOffsetOverride(idx) {
+  const enabled = !!document.getElementById(`chunkOffsetOverride_${idx}`)?.checked;
+  ['x', 'y'].forEach(axis => {
+    const input = document.getElementById(`chunkOffset_${axis}_${idx}`);
+    if (input) input.disabled = !enabled;
+  });
 }
 
 function chunkStillFigure(row, path, label, position, canAnchor) {
@@ -629,7 +640,9 @@ function hydratePendingGuidePreviews() {
 }
 
 function drawOutpaint(st, s, expected, sp) {
-  const mainFields = st.fields.filter(f => !f[0].startsWith('crop_'));
+  const offsetKeys = new Set(['offset_x', 'offset_y']);
+  const mainFields = st.fields.filter(f => !f[0].startsWith('crop_') && !offsetKeys.has(f[0]));
+  const offsetFields = st.fields.filter(f => offsetKeys.has(f[0]));
   const cropFields = st.fields.filter(f => f[0].startsWith('crop_'));
 
   document.getElementById('app').innerHTML = `
@@ -640,6 +653,11 @@ function drawOutpaint(st, s, expected, sp) {
         <div id="outpaintProgress">${progressHtml(sp.percent, sp.label)}</div>
         ${mainFields.map(f => fieldHtml(st, f)).join('')}
         ${outpaintOverlapWarning(s)}
+        <h3>Whole-video offset</h3>
+        <p class="shot-empty">Shift the source inside the expanded frame. Every chunk inherits these values unless its override is enabled below.</p>
+        <div class="editor-controls">
+          ${offsetFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
+        </div>
         <h3>Source Crop</h3>
         <div class="crop-head">
           <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>

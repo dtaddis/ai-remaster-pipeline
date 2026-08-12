@@ -436,10 +436,10 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/export-media":
             self._send_result("Media export", lambda: {**export_media_file(str(data.get("path", "")))})
         elif parsed.path == "/api/outpaint-chunk":
-            self._send_result("Outpaint chunk save", lambda: update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True)) or {"state": state.APP.state("outpaint")})
+            self._send_result("Outpaint chunk save", lambda: update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True), data.get("offset_override", None)) or {"state": state.APP.state("outpaint")})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             self._send_action("Outpaint chunk regeneration", lambda: (
-                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True)),
+                update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True), data.get("offset_override", None)),
                 state.APP.run_outpaint_chunk(int(data.get("index", 0))),
             )[1], view="outpaint")
         elif parsed.path == "/api/outpaint-anchor":

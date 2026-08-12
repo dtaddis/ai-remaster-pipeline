@@ -1519,6 +1519,15 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("--prompt") + 1], "outpaint with restrained natural edges")
 
+    def test_outpaint_command_uses_whole_video_offsets(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({"offset_x": "-14", "offset_y": "23"})
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--offset-x") + 1], "-14")
+        self.assertEqual(command[command.index("--offset-y") + 1], "23")
+
     def test_outpaint_command_falls_back_to_activation_prompt_when_global_prompt_blank(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
         app.APP.settings["outpaint"].update(
@@ -1587,6 +1596,31 @@ class GuiSmokeTests(unittest.TestCase):
 
             self.assertIn("_ox+12_oy-4", rows[0]["prepared_path"])
             self.assertIn("_ox+12_oy-4", rows[0]["raw_path"])
+
+    def test_outpaint_manifest_sync_inherits_global_offsets_and_preserves_legacy_overrides(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            outpaint_video.write_chunk_manifest(
+                manifest,
+                [
+                    {"chunk_index": "0", "start_frame": "0", "end_frame": "10", "seed": "42"},
+                    {"chunk_index": "1", "start_frame": "8", "end_frame": "18", "seed": "43", "offset_x": "12", "offset_y": "-4"},
+                ],
+            )
+
+            rows = outpaint_video.sync_chunk_manifest(
+                manifest,
+                [(0, 0, 10), (1, 8, 18)],
+                24.0,
+                folder,
+                42,
+                default_offset_x=-6,
+                default_offset_y=9,
+            )
+
+            self.assertEqual((rows[0]["offset_mode"], rows[0]["offset_x"], rows[0]["offset_y"]), ("inherit", "-6", "9"))
+            self.assertEqual((rows[1]["offset_mode"], rows[1]["offset_x"], rows[1]["offset_y"]), ("custom", "12", "-4"))
 
     def test_outpaint_auto_start_guide_defaults_on_and_can_be_disabled(self) -> None:
         self.assertTrue(outpaint_video.auto_start_guide_enabled({}))
@@ -1823,8 +1857,24 @@ class GuiSmokeTests(unittest.TestCase):
                 app.update_outpaint_chunk(0, seed="42", prompt_suffix="", offset_x="-11", offset_y="7")
 
             stored = app.read_outpaint_chunk_rows(manifest)[0]
+            self.assertEqual(stored["offset_mode"], "custom")
             self.assertEqual(stored["offset_x"], "-11")
             self.assertEqual(stored["offset_y"], "7")
+
+    def test_outpaint_chunk_can_return_to_whole_video_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "chunks.csv"
+            rows = [{"chunk_index": "0", "start_frame": "0", "end_frame": "120", "seed": "42", "offset_mode": "custom", "offset_x": "4", "offset_y": "5"}]
+            app.write_outpaint_chunk_rows(manifest, rows)
+
+            with (
+                mock.patch.object(server, "outpaint_chunks_state", return_value={"manifest": str(manifest)}),
+                mock.patch.dict(app.APP.settings["outpaint"], {"offset_x": "-8", "offset_y": "17"}, clear=False),
+            ):
+                app.update_outpaint_chunk(0, seed="42", prompt_suffix="", offset_x="4", offset_y="5", offset_override=False)
+
+            stored = app.read_outpaint_chunk_rows(manifest)[0]
+            self.assertEqual((stored["offset_mode"], stored["offset_x"], stored["offset_y"]), ("inherit", "-8", "17"))
 
     def test_outpaint_chunk_preview_passes_chunk_offsets(self) -> None:
         settings = {"outpaint": {"target_aspect": "16:9"}}

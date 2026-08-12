@@ -1177,6 +1177,8 @@ class PipelineApp:
         add(["--source", source_text])
         add(["--target-aspect", values.get("target_aspect", "16:9")])
         add(["--target-height", str(resolved_outpaint_height(source_text, values.get("target_height", "720")))])
+        add(["--offset-x", str(outpaint_offset_value(values.get("offset_x", "0")))])
+        add(["--offset-y", str(outpaint_offset_value(values.get("offset_y", "0")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add(["--generation-mask-overlap", values.get("generation_mask_overlap", "64")])
@@ -2184,6 +2186,31 @@ def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
     return "" if not (offset_x or offset_y) else f"_ox{offset_x:+d}_oy{offset_y:+d}"
 
 
+def outpaint_offset_value(value: str) -> int:
+    try:
+        return int(float(value or 0))
+    except ValueError:
+        return 0
+
+
+def outpaint_chunk_offset_mode(row: dict[str, str]) -> str:
+    mode = str(row.get("offset_mode", "")).strip().lower()
+    if mode in {"inherit", "custom"}:
+        return mode
+    return "custom" if outpaint_offset_value(row.get("offset_x", "0")) or outpaint_offset_value(row.get("offset_y", "0")) else "inherit"
+
+
+def apply_outpaint_chunk_offsets(row: dict[str, str], default_x: int, default_y: int) -> None:
+    mode = outpaint_chunk_offset_mode(row)
+    row["offset_mode"] = mode
+    if mode == "inherit":
+        row["offset_x"] = str(default_x)
+        row["offset_y"] = str(default_y)
+    else:
+        row["offset_x"] = str(outpaint_offset_value(row.get("offset_x", "0")))
+        row["offset_y"] = str(outpaint_offset_value(row.get("offset_y", "0")))
+
+
 def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
@@ -2286,12 +2313,13 @@ def outpaint_chunks_state(settings: dict) -> dict:
     ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)
     global_prompt = values.get("prompt") or OUTPAINT_PROMPT
     global_negative = values.get("negative_prompt", "")
+    default_offset_x = outpaint_offset_value(values.get("offset_x", "0"))
+    default_offset_y = outpaint_offset_value(values.get("offset_y", "0"))
     rows = []
     manifest_needs_write = len(ranges) != len(existing)
     for index, start_frame, end_frame in ranges:
         row = dict(existing.get(index, {}))
-        row.setdefault("offset_x", "0")
-        row.setdefault("offset_y", "0")
+        apply_outpaint_chunk_offsets(row, default_offset_x, default_offset_y)
         offset_slug = outpaint_chunk_offset_slug(row)
         prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
         raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
@@ -2467,7 +2495,7 @@ def redact_command_for_log(cmd: list[str]) -> str:
     return " ".join(redacted)
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0", auto_start_guide=None) -> None:
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0", auto_start_guide=None, offset_override=None) -> None:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -2479,8 +2507,16 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
     row["prompt_suffix"] = prompt_suffix
     row["negative_suffix"] = negative_suffix
-    row["offset_x"] = str(int(float(offset_x or 0)))
-    row["offset_y"] = str(int(float(offset_y or 0)))
+    if offset_override is None:
+        offset_override = bool(outpaint_offset_value(offset_x) or outpaint_offset_value(offset_y))
+    row["offset_mode"] = "custom" if _truthy_payload_value(offset_override) else "inherit"
+    if row["offset_mode"] == "custom":
+        row["offset_x"] = str(outpaint_offset_value(offset_x))
+        row["offset_y"] = str(outpaint_offset_value(offset_y))
+    else:
+        values = APP.settings.get("outpaint", {})
+        row["offset_x"] = str(outpaint_offset_value(values.get("offset_x", "0")))
+        row["offset_y"] = str(outpaint_offset_value(values.get("offset_y", "0")))
     if auto_start_guide is None:
         auto_start_guide = row.get("auto_start_guide", "true")
     row["auto_start_guide"] = "true" if _truthy_payload_value(auto_start_guide) else "false"
