@@ -34,6 +34,17 @@ The app is still alpha software, but the goal is simple: you should be able to r
 - Internet access is required during installation for Python packages, ComfyUI, FFmpeg, and optional model downloads.
 - ComfyUI is required as the AI backend. The installer can clone it for you, or you can point ARP at an existing ComfyUI checkout.
 
+#### Hardware And Storage Planning
+
+ARP is a large, compute-intensive workflow. These are planning figures rather than hard limits because memory use and render time depend heavily on the enabled stages, working resolution, chunk length, and model settings:
+
+- **GPU:** 16 GB of NVIDIA VRAM is a practical floor for conservative settings and lower working resolutions. **24 GB is recommended** and is the basis for defaults such as 720p AI DeScratch. 48 GB or more gives useful headroom for higher resolutions, longer chunks, and less aggressive tiling.
+- **System RAM:** 32 GB is a practical minimum; **64 GB is recommended**, particularly when large model components are offloaded from the GPU.
+- **Installation and models:** allow roughly 15 GB for the Python/ComfyUI runtime before models, and about **85-100 GB** for the main video, image, and LoRA model set. Models are downloaded only when a stage needs them, so a partial workflow uses less.
+- **Free disk space:** start with at least **150 GB free** for installation and the main models. **250 GB or more is recommended** when running complete projects. The Hugging Face download cache can temporarily retain another copy of large model files, and intermediate videos can consume tens or hundreds of gigabytes depending on source length, resolution, and enabled stages.
+
+AI processing is normally much slower than the source running time, and resolution alone is not enough to predict it reliably. Benchmark the intended settings on a representative 10-30 second section, multiply that stage's elapsed time by the ratio of full duration to test duration, then allow additional time for review and regenerated chunks. Short tests may take minutes to hours; a feature-length, multi-stage restoration can take days to months. Moving from 720p to 1080p can increase both time and memory use substantially.
+
 ### Windows
 
 Run:
