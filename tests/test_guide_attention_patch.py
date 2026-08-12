@@ -29,6 +29,7 @@ class SparseGuideAttentionTests(unittest.TestCase):
                 self.ff = object()
                 for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
                     setattr(self, attribute, object())
+                    setattr(self, f"{attribute}_comfy_model_dtype", torch.bfloat16)
 
         diffusion_model = types.SimpleNamespace(transformer_blocks=[Block(), Block()])
         shared_model = types.SimpleNamespace(
@@ -68,11 +69,48 @@ class SparseGuideAttentionTests(unittest.TestCase):
             self.assertTrue(hasattr(block, "ff"))
             for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
                 self.assertFalse(hasattr(block, attribute))
+                self.assertFalse(hasattr(block, f"{attribute}_comfy_model_dtype"))
         # The cached/shared source model remains structurally intact for a
         # later non-ARP or audio-capable workflow.
         for block in diffusion_model.transformer_blocks:
             for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
                 self.assertTrue(hasattr(block, attribute))
+                self.assertTrue(hasattr(block, f"{attribute}_comfy_model_dtype"))
+
+    def test_video_only_pruning_rejects_unknown_registered_audio_state(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_video_only_guard_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        class Block:
+            def __init__(self):
+                self.attn1 = object()
+                self.ff = object()
+                self._modules = {"future_audio_branch": object()}
+                self._parameters = {}
+                self._buffers = {}
+                for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+                    setattr(self, attribute, object())
+
+        shared_model = types.SimpleNamespace(
+            diffusion_model=types.SimpleNamespace(transformer_blocks=[Block()]),
+            memory_usage_factor=0.077,
+        )
+        patcher = types.SimpleNamespace(
+            model=shared_model,
+            size=1,
+            patches={},
+            clone=lambda: types.SimpleNamespace(
+                model=shared_model,
+                size=1,
+                patches={},
+            ),
+        )
+        with self.assertRaisesRegex(
+            patch_module.ARPLTXCompatibilityError, "future_audio_branch"
+        ):
+            patch_module.prune_ltxav_audio_transformer_blocks(patcher)
 
     def test_partitioned_xformers_preserves_exact_guide_mask_results(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)

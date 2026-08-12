@@ -128,15 +128,25 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
             if hasattr(block, attribute):
                 delattr(block, attribute)
                 removed += 1
+            # ComfyUI records the original dtype of every parameter/buffer as
+            # ordinary Python metadata during model loading. Removing the
+            # registered tensor does not automatically remove that harmless
+            # companion value, so clean it up explicitly as part of pruning.
+            dtype_metadata = f"{attribute}_comfy_model_dtype"
+            if hasattr(block, dtype_metadata):
+                delattr(block, dtype_metadata)
 
-        registries = []
+        # Unknown executable/model state is meaningful only when it remains in
+        # a torch module registry. Plain ``*_comfy_model_dtype`` attributes are
+        # bookkeeping, not weights or branches, and must not trip this guard.
+        registered_names: set[str] = set()
         for registry_name in ("_modules", "_parameters", "_buffers"):
             registry = getattr(block, registry_name, None)
             if isinstance(registry, dict):
-                registries.extend(registry)
+                registered_names.update(registry)
         residual_audio = sorted(
             name
-            for name in set(vars(block)) | set(registries)
+            for name in registered_names
             if any(marker in name.lower() for marker in ("audio", "a2v", "v2a"))
         )
         if residual_audio:
