@@ -12,7 +12,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from comfy_api import extract_output_files, ensure_node_types, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
+from comfy_api import ensure_arp_ltx_compatible, extract_output_files, ensure_node_types, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
 from common import (
     QWEN_IMAGE_EDIT_MODEL,
     ROOT,
@@ -41,6 +41,11 @@ from dependency_manager import (
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
 from outpaint_geometry import source_placement
+from ltx_outpaint_workflow_adapter import (
+    ADAPTER_ID as LTX_WORKFLOW_ADAPTER,
+    is_official_outpaint_template,
+    validate_official_outpaint_workflow,
+)
 from qwen_seed_guides import DEFAULT_SEED_PROMPT, seed_guides
 import artifact_ids as aid
 
@@ -844,16 +849,6 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     set_input_link(workflow, "3159", "image", guide_link)
 
 
-def is_official_outpaint_template(workflow: dict[str, Any]) -> bool:
-    try:
-        node_by_id(workflow, "5266")
-        node_by_id(workflow, "5226")
-        node_by_id(workflow, "5114")
-        return True
-    except KeyError:
-        return False
-
-
 # The LTX example workflow is a frontend graph with stable-but-opaque node IDs.
 # Keep ARP's edits explicit here so model/backend assumptions remain auditable.
 def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
@@ -1109,6 +1104,7 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
     if is_official_outpaint_template(workflow):
+        validate_official_outpaint_workflow(workflow)
         patch_official_masked_graph(
             workflow,
             args,
@@ -1238,7 +1234,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 36,
+        "version": 37,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1279,6 +1275,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "video_vae": args.video_vae,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
         "outpaint_pipeline": "crop_first_pillarbox_letterbox_video_only_v1",
+        "ltx_runtime_adapter": getattr(args, "ltx_runtime_adapter", "unchecked"),
+        "ltx_workflow_adapter": LTX_WORKFLOW_ADAPTER,
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
         "chunk_seconds": args.chunk_seconds,
@@ -1881,6 +1879,12 @@ def main() -> int:
         if args.model_backend == "gguf":
             required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
+        compatibility = ensure_arp_ltx_compatible(args.comfy_url)
+        args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
+        print(
+            f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}",
+            flush=True,
+        )
 
     prepare_command = [
         sys.executable,

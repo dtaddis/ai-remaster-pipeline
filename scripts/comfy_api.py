@@ -57,6 +57,27 @@ def object_info(comfy_url: str) -> dict[str, Any]:
     return http_json('GET', f"{comfy_url.rstrip('/')}/object_info", timeout=30)
 
 
+def ensure_arp_ltx_compatible(comfy_url: str) -> dict[str, Any]:
+    """Fail before model loading when the live ARP/LTX adapter is incompatible."""
+
+    endpoint = f"{comfy_url.rstrip('/')}/arp/ltx-compatibility"
+    try:
+        report = http_json('GET', endpoint, timeout=30)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The live ComfyUI server does not expose ARP's LTX compatibility "
+            "preflight. Re-run install_windows.bat, fully restart the ARP-managed "
+            f"ComfyUI server at {comfy_url}, and retry. Details: {exc}"
+        ) from exc
+    if not report.get("compatible"):
+        detail = report.get("error") or "the installed ComfyUI/LTX internals are unsupported"
+        raise RuntimeError(
+            "ARP's outpainting adapter is not compatible with the live ComfyUI "
+            f"installation: {detail}"
+        )
+    return report
+
+
 def package_defines_node(comfy_dir: Path | None, package: str, node_type: str) -> bool:
     if comfy_dir is None:
         return False
@@ -107,7 +128,7 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
         raise RuntimeError(
             f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing from the live server: {details}. "
             f"The configured ComfyUI folder already contains those node definitions ({package_paths}), so that custom-node package either failed to import or the server at {comfy_url} is an older/stale ComfyUI process that was not restarted after install. "
-            f"Fully close every ComfyUI window/process using port 8188, then start ComfyUI from ARP again so it loads: {comfy_dir}. "
+            f"Fully close the ComfyUI process serving {comfy_url}, then start ComfyUI from ARP again so it loads: {comfy_dir}. "
             f"If it still fails after a restart, the ComfyUI console import error for the package(s) is the root cause to fix: {packages}."
         )
     raise RuntimeError(

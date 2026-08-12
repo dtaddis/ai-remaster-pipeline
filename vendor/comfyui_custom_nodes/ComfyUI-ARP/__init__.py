@@ -9,17 +9,33 @@ from __future__ import annotations
 
 import logging
 
+from aiohttp import web
 import comfy.sd
 import comfy.utils
 import folder_paths
+from server import PromptServer
 
 from .ltx_video_only_patch import (
     install_sparse_guide_attention_patch,
+    ltx_runtime_capabilities,
     prune_ltxav_audio_transformer_blocks,
 )
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@PromptServer.instance.routes.get("/arp/ltx-compatibility")
+async def arp_ltx_compatibility(_request):
+    """Report whether this live Comfy/LTX combination supports ARP's adapter."""
+
+    try:
+        return web.json_response(ltx_runtime_capabilities())
+    except Exception as exc:
+        LOGGER.exception("ARP LTX compatibility preflight failed")
+        return web.json_response(
+            {"compatible": False, "adapter": "none", "error": str(exc)}
+        )
 
 
 class ARPLTXVideoOnlyICLoRALoader:
@@ -71,10 +87,9 @@ class ARPLTXVideoOnlyICLoRALoader:
             model_lora, _ = comfy.sd.load_lora_for_models(
                 model, None, lora, strength_model, 0
             )
-        return (
-            prune_ltxav_audio_transformer_blocks(model_lora),
-            latent_downscale_factor,
-        )
+        video_only_model = prune_ltxav_audio_transformer_blocks(model_lora)
+        install_sparse_guide_attention_patch(video_only_model)
+        return video_only_model, latent_downscale_factor
 
 
 NODE_CLASS_MAPPINGS = {

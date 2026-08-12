@@ -76,6 +76,20 @@ class ComfyOutputTests(unittest.TestCase):
                         comfy,
                     )
 
+    def test_arp_ltx_compatibility_returns_adapter_report(self) -> None:
+        report = {"compatible": True, "adapter": "model_scoped_ltx_guide_v1"}
+        with mock.patch.object(comfy_api, "http_json", return_value=report):
+            self.assertEqual(
+                comfy_api.ensure_arp_ltx_compatible("http://127.0.0.1:8797"),
+                report,
+            )
+
+    def test_arp_ltx_compatibility_propagates_actionable_failure(self) -> None:
+        report = {"compatible": False, "adapter": "none", "error": "signature changed"}
+        with mock.patch.object(comfy_api, "http_json", return_value=report):
+            with self.assertRaisesRegex(RuntimeError, "signature changed"):
+                comfy_api.ensure_arp_ltx_compatible("http://127.0.0.1:8797")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ import inspect
 import logging
 import os
 import time
+import types
 
 
 LOGGER = logging.getLogger(__name__)
@@ -61,9 +62,24 @@ def _video_only_model_structure(base_model):
     if hasattr(blocks, "_modules"):
         private_blocks = _copy_module_structure(blocks)
         for index, block in enumerate(blocks):
-            private_blocks._modules[str(index)] = _copy_module_structure(block)
+            private_block = _copy_module_structure(block)
+            # These are the only video modules whose forward methods ARP
+            # specializes. Privatizing them keeps every override on this model
+            # clone instead of mutating ComfyUI's global classes.
+            for attribute in ("attn1", "ff"):
+                child = getattr(block, attribute, None)
+                if child is not None:
+                    setattr(private_block, attribute, _copy_module_structure(child))
+            private_blocks._modules[str(index)] = private_block
     else:
-        private_blocks = [_copy_module_structure(block) for block in blocks]
+        private_blocks = []
+        for block in blocks:
+            private_block = _copy_module_structure(block)
+            for attribute in ("attn1", "ff"):
+                child = getattr(block, attribute, None)
+                if child is not None:
+                    setattr(private_block, attribute, _copy_module_structure(child))
+            private_blocks.append(private_block)
     setattr(private_diffusion, "transformer_blocks", private_blocks)
     setattr(private_base, "diffusion_model", private_diffusion)
     return private_base, private_diffusion, private_blocks
@@ -90,19 +106,21 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
     # Raise the estimate only on ARP's explicitly video-only clone. At the
     # observed 481-frame geometry, 13 leaves roughly 5-6 GiB of transformer
     # weights resident and about 2 GiB of physical headroom for transient work.
+    current_factor = float(getattr(base_model, "memory_usage_factor", 0.0))
+    configured_text = os.environ.get("ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR")
     try:
-        configured_factor = float(
-            os.environ.get(
-                "ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR",
-                DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR,
-            )
+        configured_factor = (
+            float(configured_text)
+            if configured_text is not None
+            else DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR
         )
     except (TypeError, ValueError):
         configured_factor = DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR
-    base_model.memory_usage_factor = max(
-        float(getattr(base_model, "memory_usage_factor", 0.0)),
-        configured_factor,
-    )
+    # Prefer a future upstream LTXAV estimate once it is no longer an obvious
+    # placeholder. The ARP policy only substitutes for today's sub-1 value,
+    # unless the user explicitly requests a larger hardware-specific reserve.
+    if current_factor < 1.0 or configured_text is not None:
+        base_model.memory_usage_factor = max(current_factor, configured_factor)
 
     removed = 0
     for block in blocks:
@@ -110,6 +128,22 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
             if hasattr(block, attribute):
                 delattr(block, attribute)
                 removed += 1
+
+        registries = []
+        for registry_name in ("_modules", "_parameters", "_buffers"):
+            registry = getattr(block, registry_name, None)
+            if isinstance(registry, dict):
+                registries.extend(registry)
+        residual_audio = sorted(
+            name
+            for name in set(vars(block)) | set(registries)
+            if any(marker in name.lower() for marker in ("audio", "a2v", "v2a"))
+        )
+        if residual_audio:
+            raise ARPLTXCompatibilityError(
+                "ComfyUI's LTXAV block contains unrecognized audio-only state: "
+                f"{', '.join(residual_audio)}. Update ARP before rendering."
+            )
 
     if removed == 0:
         raise ValueError("ARP video-only mode found no LTXAV audio transformer modules")
@@ -173,18 +207,12 @@ def _cuda_memory_summary(torch, device) -> str:
     )
 
 
-def _install_chunked_feed_forward(torch, ltx_model) -> bool:
-    """Bound LTX MLP activation memory by slicing its independent token axis."""
-    feed_forward = getattr(ltx_model, "FeedForward", None)
-    if feed_forward is None:
-        raise ARPLTXCompatibilityError(
-            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
-            "the LTX FeedForward class is missing. Update ARP before rendering."
-        )
+def _install_chunked_feed_forward(torch, feed_forward, diagnostics: dict[str, bool]) -> None:
+    """Bound one model clone's MLP memory without changing ComfyUI's class."""
+    if getattr(feed_forward, "_arp_chunked_feed_forward", False):
+        return
 
     current_forward = feed_forward.forward
-    if getattr(current_forward, "_arp_chunked_feed_forward", False):
-        return True
 
     chunk_tokens = _feed_forward_chunk_tokens()
 
@@ -194,7 +222,7 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
         # sequence_length x (4 * hidden_size) GELU allocation.
         token_count = x.shape[-2]
         if torch.is_grad_enabled() or token_count <= chunk_tokens:
-            return current_forward(self, x)
+            return current_forward(x)
 
         # ComfyUI-GGUF normally dequantizes a Linear's weight inside every
         # forward call. Calling the complete MLP once per token slice would
@@ -210,14 +238,19 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
         is_quantized_out = callable(
             getattr(project_out, "is_ggml_quantized", None)
         ) and project_out.is_ggml_quantized()
-        diagnose_first = not chunked_forward._arp_reported_first_timing
+        diagnose_first = not diagnostics["first_timing"]
         if diagnose_first and x.device.type == "cuda":
             torch.cuda.synchronize(x.device)
             LOGGER.info(
                 "ARP first block reached feed-forward input (%s)",
                 _cuda_memory_summary(torch, x.device),
             )
-        if is_quantized_in and is_quantized_out:
+        known_gelu_projection = (
+            network is not None
+            and len(network) >= 2
+            and type(network[0]).__name__ == "GELU_approx"
+        )
+        if is_quantized_in and is_quantized_out and known_gelu_projection:
             dequant_start = time.perf_counter()
             weight_in, bias_in = project_in.cast_bias_weight(x)
             weight_out, bias_out = project_out.cast_bias_weight(x)
@@ -237,12 +270,18 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
                     hidden = layer(hidden)
                 return torch.nn.functional.linear(hidden, weight_out, bias_out)
 
-            if not chunked_forward._arp_reported_gguf_reuse:
+            if not diagnostics["gguf_reuse"]:
                 LOGGER.info("ARP chunked LTX feed-forward is reusing dequantized GGUF weights")
-                chunked_forward._arp_reported_gguf_reuse = True
+                diagnostics["gguf_reuse"] = True
         else:
+            if is_quantized_in and is_quantized_out and not diagnostics.get("gguf_fallback"):
+                LOGGER.warning(
+                    "ARP found a newer LTX feed-forward layout; preserving upstream "
+                    "semantics with slower per-chunk GGUF dequantization"
+                )
+                diagnostics["gguf_fallback"] = True
             def run_chunk(chunk):
-                return current_forward(self, chunk)
+                return current_forward(chunk)
 
         first_count = min(chunk_tokens, token_count)
         first_chunk_start = time.perf_counter()
@@ -256,7 +295,7 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
                 token_count,
                 _cuda_memory_summary(torch, x.device),
             )
-            chunked_forward._arp_reported_first_timing = True
+            diagnostics["first_timing"] = True
         output_shape = list(x.shape)
         output_shape[-1] = first.shape[-1]
         output = torch.empty(output_shape, device=first.device, dtype=first.dtype)
@@ -270,12 +309,8 @@ def _install_chunked_feed_forward(torch, ltx_model) -> bool:
             del chunk
         return output
 
-    chunked_forward._arp_chunked_feed_forward = True
-    chunked_forward._arp_reported_gguf_reuse = False
-    chunked_forward._arp_reported_first_timing = False
-    feed_forward.forward = chunked_forward
-    LOGGER.info("ARP exact-semantics chunked LTX feed-forward enabled (%d tokens)", chunk_tokens)
-    return True
+    feed_forward.forward = types.MethodType(chunked_forward, feed_forward)
+    feed_forward._arp_chunked_feed_forward = True
 
 
 def _constant_runs(torch, values):
@@ -395,8 +430,14 @@ def _require_parameters(callable_object, required: set[str], label: str) -> None
         )
 
 
-def install_sparse_guide_attention_patch() -> bool:
-    """Lazily patch LTX guide execution, failing closed on incompatible internals."""
+def install_sparse_guide_attention_patch(model_patcher=None):
+    """Validate the runtime and optimize only an ARP-owned model clone.
+
+    Passing ``None`` performs the loader's cheap compatibility preflight. A
+    model patcher must already have private diffusion/block containers (as
+    produced by :func:`prune_ltxav_audio_transformer_blocks`) before the
+    instance-local execution overrides are attached.
+    """
     try:
         import torch
         import comfy.ldm.lightricks.model as ltx_model
@@ -441,19 +482,36 @@ def install_sparse_guide_attention_patch() -> bool:
             "The installed xFormers build lacks the attention API required by ARP. "
             "Re-run the ARP installer before rendering."
         )
-    if getattr(current_mask, "_arp_sparse_full_strength_rows", False):
-        return _install_chunked_feed_forward(torch, ltx_model)
+    cross_attention = getattr(ltx_model, "CrossAttention", None)
+    if cross_attention is None:
+        raise ARPLTXCompatibilityError(
+            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            "the LTX CrossAttention class is missing. Update ARP before rendering."
+        )
+    _require_parameters(
+        cross_attention.forward,
+        {"self", "x", "context", "mask", "pe", "k_pe", "transformer_options"},
+        "ComfyUI LTX cross-attention",
+    )
+    if model_patcher is None:
+        return True
 
-    class SparseGuideAttentionMask:
+    diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
+    blocks = getattr(diffusion_model, "transformer_blocks", None)
+    if diffusion_model is None or blocks is None:
+        raise ARPLTXCompatibilityError(
+            "ARP video-only execution requires a private LTX diffusion model clone."
+        )
+    if getattr(diffusion_model, "_arp_model_scoped_execution", False):
+        return model_patcher
+
+    class SparseGuideAttentionMask(current_mask):
         """Masks noisy queries plus only the soft-strength guide query rows."""
 
         _arp_sparse_full_strength_rows = True
         __slots__ = (
-            "guide_start",
-            "tracked_count",
             "tracked_log_weights",
             "noisy_partitions",
-            "noisy_mask",
             "full_query_indices",
             "full_query_slice",
             "soft_query_indices",
@@ -700,7 +758,152 @@ def install_sparse_guide_attention_patch() -> bool:
 
     sparse_attention_with_guide_mask._arp_reported_partitioned = False
 
-    ltx_model.GuideAttentionMask = SparseGuideAttentionMask
-    ltx_model._attention_with_guide_mask = sparse_attention_with_guide_mask
-    LOGGER.info("ARP lazily enabled exact-semantics LTX guide attention")
-    return _install_chunked_feed_forward(torch, ltx_model)
+    original_builder = getattr(type(diffusion_model), "_build_guide_self_attention_mask", None)
+    if original_builder is None:
+        raise ARPLTXCompatibilityError(
+            "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+            "the guide-mask builder is missing. Update ARP before rendering."
+        )
+    _require_parameters(
+        original_builder,
+        {"self", "x", "transformer_options", "merged_args"},
+        "ComfyUI LTX guide-mask builder",
+    )
+
+    def build_sparse_guide_mask(self, x, transformer_options, merged_args):
+        original_mask = original_builder(self, x, transformer_options, merged_args)
+        if original_mask is None or isinstance(original_mask, SparseGuideAttentionMask):
+            return original_mask
+        try:
+            guide_start = int(original_mask.guide_start)
+            tracked_count = int(original_mask.tracked_count)
+            total_tokens = int(original_mask.noisy_mask.shape[-1])
+            tracked_logs = original_mask.noisy_mask[
+                0, 0, 0, guide_start:guide_start + tracked_count
+            ]
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ARPLTXCompatibilityError(
+                "ComfyUI returned an unsupported LTX guide-mask structure. "
+                "Update ARP before rendering."
+            ) from exc
+        # exp(finfo.min) is exactly zero; every other entry recovers the
+        # original scalar guide strength without rounding soft guides to one.
+        tracked_weights = tracked_logs.exp().reshape(1, -1)
+        return SparseGuideAttentionMask(
+            total_tokens, guide_start, tracked_count, tracked_weights
+        )
+
+    diffusion_model._build_guide_self_attention_mask = types.MethodType(
+        build_sparse_guide_mask,
+        diffusion_model,
+    )
+
+    def install_model_scoped_attention(attention) -> None:
+        if getattr(attention, "_arp_sparse_guide_attention", False):
+            return
+        original_forward = attention.forward
+        required_attributes = (
+            "to_q", "to_k", "to_v", "q_norm", "k_norm", "heads",
+            "attn_precision", "to_gate_logits", "dim_head", "to_out",
+        )
+        missing = [name for name in required_attributes if not hasattr(attention, name)]
+        if missing:
+            raise ARPLTXCompatibilityError(
+                "ARP's video-only LTX patch is incompatible with this ComfyUI update: "
+                f"cross-attention is missing {', '.join(missing)}. Update ARP before rendering."
+            )
+
+        def model_scoped_forward(
+            self,
+            x,
+            context=None,
+            mask=None,
+            pe=None,
+            k_pe=None,
+            transformer_options=None,
+        ):
+            options = transformer_options or {}
+            if not isinstance(mask, SparseGuideAttentionMask):
+                return original_forward(
+                    x,
+                    context=context,
+                    mask=mask,
+                    pe=pe,
+                    k_pe=k_pe,
+                    transformer_options=options,
+                )
+
+            q = self.to_q(x)
+            active_context = x if context is None else context
+            k = self.to_k(active_context)
+            v = self.to_v(active_context)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if pe is not None:
+                if k_pe is None and q.shape == k.shape:
+                    q, k = ltx_model.apply_rotary_emb_qk(q, k, pe)
+                else:
+                    q = ltx_model.apply_rotary_emb(q, pe)
+                    k = ltx_model.apply_rotary_emb(k, pe if k_pe is None else k_pe)
+
+            out = sparse_attention_with_guide_mask(
+                q,
+                k,
+                v,
+                self.heads,
+                mask,
+                attn_precision=self.attn_precision,
+                transformer_options=options,
+            )
+            if self.to_gate_logits is not None:
+                gate_logits = self.to_gate_logits(x)
+                batch, tokens, _ = out.shape
+                out = out.view(batch, tokens, self.heads, self.dim_head)
+                gates = 2.0 * torch.sigmoid(gate_logits)
+                out = (out * gates.unsqueeze(-1)).view(
+                    batch, tokens, self.heads * self.dim_head
+                )
+            return self.to_out(out)
+
+        attention.forward = types.MethodType(model_scoped_forward, attention)
+        attention._arp_sparse_guide_attention = True
+
+    diagnostics = {
+        "gguf_reuse": False,
+        "gguf_fallback": False,
+        "first_timing": False,
+    }
+    patched_blocks = 0
+    for block in blocks:
+        attention = getattr(block, "attn1", None)
+        feed_forward = getattr(block, "ff", None)
+        if attention is None or feed_forward is None:
+            raise ARPLTXCompatibilityError(
+                "ARP's video-only LTX patch found a transformer block without "
+                "video self-attention or feed-forward modules. Update ARP before rendering."
+            )
+        install_model_scoped_attention(attention)
+        _install_chunked_feed_forward(torch, feed_forward, diagnostics)
+        patched_blocks += 1
+
+    diffusion_model._arp_model_scoped_execution = True
+    LOGGER.info(
+        "ARP enabled model-scoped exact guide attention and chunked feed-forward "
+        "on %d LTX blocks",
+        patched_blocks,
+    )
+    return model_patcher
+
+
+def ltx_runtime_capabilities() -> dict[str, object]:
+    """Validate the live Comfy/LTX internals without loading model weights."""
+
+    install_sparse_guide_attention_patch()
+    return {
+        "compatible": True,
+        "adapter": "model_scoped_ltx_guide_v1",
+        "global_comfy_mutation": False,
+        "exact_soft_guide_weights": True,
+        "chunked_feed_forward": True,
+        "video_only_audio_pruning": True,
+    }

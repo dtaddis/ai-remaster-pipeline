@@ -126,8 +126,20 @@ class SparseGuideAttentionTests(unittest.TestCase):
         comfy.ldm = ldm
         model.comfy = comfy
         class OriginalGuideAttentionMask:
+            __slots__ = ("guide_start", "tracked_count", "noisy_mask", "tracked_mask")
+
             def __init__(self, total_tokens, guide_start, tracked_count, tracked_weights):
-                pass
+                flat = tracked_weights.reshape(-1)
+                finfo = torch.finfo(flat.dtype)
+                positive = flat > 0
+                logs = torch.full_like(flat, finfo.min)
+                logs[positive] = flat[positive].log()
+                self.guide_start = guide_start
+                self.tracked_count = tracked_count
+                self.noisy_mask = torch.zeros((1, 1, 1, total_tokens), dtype=flat.dtype)
+                self.noisy_mask[:, :, :, guide_start:guide_start + tracked_count] = logs.view(1, 1, 1, -1)
+                self.tracked_mask = torch.zeros((1, 1, tracked_count, total_tokens), dtype=flat.dtype)
+                self.tracked_mask[:, :, :, :guide_start] = logs.view(1, 1, -1, 1)
 
         model.GuideAttentionMask = OriginalGuideAttentionMask
         def original_attention(q, k, v, heads, guide_mask, attn_precision, transformer_options):
@@ -153,7 +165,7 @@ class SparseGuideAttentionTests(unittest.TestCase):
                 weight, bias = self.cast_bias_weight(x)
                 return torch.nn.functional.linear(x, weight, bias)
 
-        class FakeGelu:
+        class GELU_approx:
             def __init__(self, projection):
                 self.proj = projection
 
@@ -169,7 +181,7 @@ class SparseGuideAttentionTests(unittest.TestCase):
                     weight_out = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8) / 80
                     bias_out = torch.arange(4, dtype=torch.float32) / 40
                     self.net = [
-                        FakeGelu(FakeQuantizedLinear(weight_in, bias_in)),
+                        GELU_approx(FakeQuantizedLinear(weight_in, bias_in)),
                         torch.nn.Identity(),
                         FakeQuantizedLinear(weight_out, bias_out),
                     ]
@@ -184,6 +196,66 @@ class SparseGuideAttentionTests(unittest.TestCase):
 
         model.FeedForward = FakeFeedForward
 
+        class FakeCrossAttention:
+            def __init__(self):
+                self.to_q = torch.nn.Identity()
+                self.to_k = torch.nn.Identity()
+                self.to_v = torch.nn.Identity()
+                self.q_norm = torch.nn.Identity()
+                self.k_norm = torch.nn.Identity()
+                self.heads = 1
+                self.attn_precision = None
+                self.to_gate_logits = None
+                self.dim_head = 4
+                self.to_out = torch.nn.Identity()
+
+            def forward(
+                self, x, context=None, mask=None, pe=None, k_pe=None,
+                transformer_options=None,
+            ):
+                active_context = x if context is None else context
+                return reference_attention(x, active_context, active_context, 1, mask=mask)
+
+        model.CrossAttention = FakeCrossAttention
+        model.apply_rotary_emb_qk = lambda q, k, _pe: (q, k)
+        model.apply_rotary_emb = lambda value, _pe: value
+
+        class FakeBlock:
+            def __init__(self, quantized=False):
+                self.attn1 = FakeCrossAttention()
+                self.ff = FakeFeedForward(quantized=quantized)
+                for attribute in patch_module._LTXAV_AUDIO_BLOCK_ATTRIBUTES:
+                    setattr(self, attribute, object())
+
+        class FakeDiffusion:
+            def __init__(self):
+                self.transformer_blocks = [FakeBlock(quantized=True), FakeBlock()]
+
+            def _build_guide_self_attention_mask(self, x, transformer_options, merged_args):
+                weights = merged_args["weights"]
+                guide_start = int(merged_args["guide_start"])
+                return OriginalGuideAttentionMask(
+                    x.shape[1], guide_start, weights.numel(), weights
+                )
+
+        shared_model = types.SimpleNamespace(
+            diffusion_model=FakeDiffusion(),
+            memory_usage_factor=0.077,
+        )
+
+        class Patcher:
+            def __init__(self):
+                self.model = shared_model
+                self.size = 123
+                self.patches = {}
+
+            def clone(self):
+                clone = Patcher.__new__(Patcher)
+                clone.model = self.model
+                clone.size = self.size
+                clone.patches = self.patches.copy()
+                return clone
+
         fake_modules = {
             "comfy": comfy,
             "comfy.ldm": ldm,
@@ -196,37 +268,44 @@ class SparseGuideAttentionTests(unittest.TestCase):
             mock.patch.dict(sys.modules, fake_modules),
             mock.patch.dict(os.environ, {"ARP_LTX_FF_CHUNK_TOKENS": "256"}),
         ):
-            quantized_ff = model.FeedForward(quantized=True)
+            original_patcher = Patcher()
+            quantized_ff = original_patcher.model.diffusion_model.transformer_blocks[0].ff
             quantized_input = torch.arange(600 * 4, dtype=torch.float32).reshape(1, 600, 4) / 100
             with torch.inference_mode():
                 quantized_expected = quantized_ff.forward(quantized_input)
             quantized_ff.net[0].proj.cast_calls = 0
             quantized_ff.net[2].cast_calls = 0
             self.assertTrue(patch_module.install_sparse_guide_attention_patch())
+            video_only = patch_module.prune_ltxav_audio_transformer_blocks(original_patcher)
+            patched = patch_module.install_sparse_guide_attention_patch(video_only)
 
+        patched_diffusion = patched.model.diffusion_model
+        patched_quantized_ff = patched_diffusion.transformer_blocks[0].ff
         with torch.inference_mode():
-            quantized_actual = quantized_ff.forward(quantized_input)
+            quantized_actual = patched_quantized_ff.forward(quantized_input)
         self.assertTrue(torch.equal(quantized_actual, quantized_expected))
         self.assertEqual(quantized_ff.net[0].proj.cast_calls, 1)
         self.assertEqual(quantized_ff.net[2].cast_calls, 1)
+        self.assertIs(model.GuideAttentionMask, OriginalGuideAttentionMask)
+        self.assertIs(model._attention_with_guide_mask, original_attention)
+        self.assertFalse(hasattr(quantized_ff, "_arp_chunked_feed_forward"))
 
         ff_input = torch.arange(600 * 4, dtype=torch.float32).reshape(1, 600, 4) / 100
         with torch.inference_mode():
-            ff_actual = model.FeedForward().forward(ff_input)
+            ff_actual = patched_diffusion.transformer_blocks[1].ff.forward(ff_input)
         self.assertTrue(torch.equal(ff_actual, ff_input.square() + 0.25))
         self.assertEqual(feed_forward_calls, [256, 256, 88])
 
         weights = torch.tensor([[1.0, 1.0, 0.95, 0.0]], dtype=torch.float32)
-        guide_mask = model.GuideAttentionMask(8, 3, 4, weights)
+        generator = torch.Generator().manual_seed(42)
+        q = torch.randn((1, 8, 4), generator=generator)
+        guide_mask = patched_diffusion._build_guide_self_attention_mask(
+            q, {}, {"weights": weights, "guide_start": 3}
+        )
         self.assertEqual(guide_mask.full_query_indices.tolist(), [3, 4])
         self.assertEqual(guide_mask.soft_query_indices.tolist(), [5, 6])
         self.assertEqual(guide_mask.soft_mask.numel(), 2 * 8)
         self.assertAlmostEqual(float(guide_mask.tracked_log_weights[2]), math.log(0.95), places=6)
-
-        generator = torch.Generator().manual_seed(42)
-        q = torch.randn((1, 8, 4), generator=generator)
-        k = torch.randn((1, 8, 4), generator=generator)
-        v = torch.randn((1, 8, 4), generator=generator)
 
         log_weights = torch.full_like(weights.reshape(-1), torch.finfo(torch.float32).min)
         positive = weights.reshape(-1) > 0
@@ -235,12 +314,14 @@ class SparseGuideAttentionTests(unittest.TestCase):
         dense_mask[:, :, :3, 3:7] = log_weights.view(1, 1, 1, -1)
         dense_mask[:, :, 3:7, :3] = log_weights.view(1, 1, -1, 1)
 
-        expected = reference_attention(q, k, v, 1, mask=dense_mask)
+        expected = reference_attention(q, q, q, 1, mask=dense_mask)
         with mock.patch.dict(
             sys.modules,
             {"xformers": xformers, "xformers.ops": xformers_ops},
         ):
-            actual = model._attention_with_guide_mask(q, k, v, 1, guide_mask, None, {})
+            actual = patched_diffusion.transformer_blocks[0].attn1.forward(
+                q, mask=guide_mask
+            )
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
         self.assertEqual(
             attention_calls,
@@ -257,20 +338,22 @@ class SparseGuideAttentionTests(unittest.TestCase):
             [[0.5 if index % 2 else 0.75 for index in range(34)]],
             dtype=torch.float32,
         )
-        spatial_mask = model.GuideAttentionMask(40, 2, 34, spatial_weights)
+        q2 = torch.randn((1, 40, 4), generator=generator)
+        spatial_mask = patched_diffusion._build_guide_self_attention_mask(
+            q2, {}, {"weights": spatial_weights, "guide_start": 2}
+        )
         self.assertGreater(
             len(spatial_mask.noisy_partitions),
             patch_module.MAX_PARTITIONED_ATTENTION_RUNS,
         )
-        q2 = torch.randn((1, 40, 4), generator=generator)
-        k2 = torch.randn((1, 40, 4), generator=generator)
-        v2 = torch.randn((1, 40, 4), generator=generator)
         dense2 = torch.zeros((1, 1, 40, 40), dtype=torch.float32)
         log2 = spatial_weights.log()
         dense2[:, :, :2, 2:36] = log2.view(1, 1, 1, -1)
         dense2[:, :, 2:36, :2] = log2.view(1, 1, -1, 1)
-        expected2 = reference_attention(q2, k2, v2, 1, mask=dense2)
-        actual2 = model._attention_with_guide_mask(q2, k2, v2, 1, spatial_mask, None, {})
+        expected2 = reference_attention(q2, q2, q2, 1, mask=dense2)
+        actual2 = patched_diffusion.transformer_blocks[0].attn1.forward(
+            q2, mask=spatial_mask
+        )
         self.assertTrue(torch.allclose(actual2, expected2, atol=1e-6, rtol=1e-6))
         self.assertEqual(
             attention_calls,
