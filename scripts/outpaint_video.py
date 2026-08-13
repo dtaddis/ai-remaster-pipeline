@@ -1059,7 +1059,7 @@ def _patch_extra_guides(
             "widgets_values": {
                 "frame_idx": frame_idx,
                 "strength": strength,
-                "crf": 18,
+                "crf": 12,
                 "blur_radius": 0,
                 "interpolation": "lanczos",
                 "crop": "disabled",
@@ -1614,7 +1614,9 @@ def apply_qwen_seed_guides(args, prepared: Path, ranges: list[tuple[int, int, in
 def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool, offset_x: int = 0, offset_y: int = 0, prepared_fingerprint: dict[str, Any] | None = None) -> None:
     has_audio = video_has_audio(ffmpeg, prepared)
     if chunk_path.exists() and not force and (prepared_fingerprint is None or split_matches_source(chunk_path, prepared_fingerprint)):
-        if not has_audio or video_has_audio(ffmpeg, chunk_path):
+        # Chunks always carry an audio track now (real or synthesized silence),
+        # so only skip regeneration if the existing chunk already has one.
+        if video_has_audio(ffmpeg, chunk_path):
             return
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
     partial = chunk_path.with_suffix(chunk_path.suffix + ".partial" + chunk_path.suffix)
@@ -1643,11 +1645,17 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
         filters = f"[0:v]{vf}[v];[0:a:0]atrim=start={start_seconds:.8f}:end={end_seconds:.8f},asetpts=PTS-STARTPTS[a]"
         command.extend(["-filter_complex", filters, "-map", "[v]", "-map", "[a]"])
     else:
-        command.extend(["-vf", vf, "-an"])
+        # Source has no audio stream, but downstream A/V-model ComfyUI nodes
+        # (e.g. VHS_LoadVideo feeding an LTX audio/video workflow) evaluate the
+        # audio output regardless and fail on a truly audio-less file. Synthesize
+        # a silent track instead of "-an" so the chunk always has an audio stream.
+        command.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+        filters = f"[0:v]{vf}[v]"
+        command.extend(["-filter_complex", filters, "-map", "[v]", "-map", "1:a:0", "-shortest"])
     command.extend(["-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast"])
-    if has_audio:
-        # Normalize WebM/Opus and other source codecs to a broadly supported chunk codec.
-        command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+    # Normalize WebM/Opus and other source codecs (and the synthesized silent
+    # track) to a broadly supported chunk codec.
+    command.extend(["-c:a", "aac", "-b:a", "192k"])
     command.append(str(partial))
     subprocess.run(command, check=True)
     replace_unless_identical(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
@@ -1715,7 +1723,7 @@ def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context
             "-crf",
             "12",
             "-preset",
-            "veryfast",
+            "slow",
             str(partial),
         ],
         check=True,
@@ -1812,9 +1820,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-manifest", help="CSV storing per-chunk seed, prompt, and guide image overrides.")
     parser.add_argument("--only-chunk", type=int, help="Regenerate only one outpaint chunk, then restitch from existing chunks.")
     parser.add_argument("--model-backend", choices=["gguf", "checkpoint"], default="gguf")
-    parser.add_argument("--gguf-model", default="LTX-2.3-distilled-Q4_K_M.gguf")
+    parser.add_argument("--gguf-model", default="qwen-image-edit-2511-Q4_K_M.gguf")
     parser.add_argument("--video-vae", default="LTX23_video_vae_bf16.safetensors")
-    parser.add_argument("--text-encoder", default="gemma_3_12B_it_fp8_scaled.safetensors")
+    parser.add_argument("--text-encoder", default="gemma_3_12B_it_int8_convrot.safetensors")
     parser.add_argument("--text-encoder-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
     parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")
     parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=64, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
@@ -1853,7 +1861,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-qwen-guides", action="store_true", help="Before rendering, detect shot changes and auto-add a Qwen-outpainted guide frame at each one.")
     parser.add_argument("--qwen-workflow", default=str(ROOT / "workflows" / "qwen_image_edit" / "Image Edit (Qwen 2511).json"))
     parser.add_argument("--qwen-masked-workflow", default=str(ROOT / "workflows" / "qwen_image_edit" / "Image Edit Inpaint (Qwen 2511).json"))
-    parser.add_argument("--qwen-model-backend", default="gguf")
+    parser.add_argument("--qwen-model-backend", default="safetensors")
     parser.add_argument("--qwen-gguf-model", default=QWEN_IMAGE_EDIT_MODEL)
     parser.add_argument("--qwen-prompt", default=DEFAULT_SEED_PROMPT, help="Prompt sent to Qwen Image Edit for each seed guide frame.")
     parser.add_argument("--qwen-load-image-node-id", default="auto")
