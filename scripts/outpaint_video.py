@@ -570,7 +570,7 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     context overlap on the same axis and preserves at least one 32px source cell.
     """
     target = exact_mask.with_name(f"{exact_mask.stem}_generation.png")
-    overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 64)))
+    overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 8)))
     sig = {
         "version": 3,
         "tool": "outpaint_video.py/generation_mask",
@@ -722,7 +722,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
 
         # Dynamic masks can contain arbitrary black regions, so there is no single source
         # rectangle from which to size individual edge bands. Retain bounded dilation here.
-        generation_overlap = max(0, int(getattr(args, "generation_mask_overlap", 64)))
+        generation_overlap = max(0, int(getattr(args, "generation_mask_overlap", 8)))
         remaining_overlap = generation_overlap
         dilation_index = 0
         first_dilation_link: int | None = None
@@ -823,7 +823,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     set_input_link(workflow, "5358", "mask", mask_link)
     patch_link(workflow, exact_mask_link, mask_source_id, 0, 5266, 2, "MASK")
     set_input_link(workflow, "5266", "mask", exact_mask_link)
-    set_widget(node_by_id(workflow, "5266"), "1", int(getattr(args, "mask_blend_dilation", 5)))
+    set_widget(node_by_id(workflow, "5266"), "1", int(getattr(args, "mask_blend_dilation", 2)))
 
     # Never use the green-sentinel conditioning image as the protected side of
     # the final blend. The official template does that safely only while its
@@ -1277,8 +1277,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "outpaint_pipeline": "crop_first_pillarbox_letterbox_video_only_v1",
         "ltx_runtime_adapter": getattr(args, "ltx_runtime_adapter", "unchecked"),
         "ltx_workflow_adapter": LTX_WORKFLOW_ADAPTER,
-        "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 64)),
-        "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 5)),
+        "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 8)),
+        "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 2)),
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
         "default_offset_x": int(getattr(args, "offset_x", 0)),
@@ -1817,8 +1817,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-encoder", default="gemma_3_12B_it_fp8_scaled.safetensors")
     parser.add_argument("--text-encoder-checkpoint", default="ltx-2.3-22b-dev-fp8.safetensors")
     parser.add_argument("--text-encoder-device", choices=["cpu", "default"], default="cpu", help="Keep the large prompt encoder off the GPU; CPU is slower only while encoding the prompt and leaves more VRAM for video sampling.")
-    parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=64, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
-    parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=5, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
+    parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=8, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
+    parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=2, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
     parser.add_argument("--black-mask-threshold", type=int, choices=range(0, 65), default=12, metavar="0-64", help="Maximum source level treated as black in dynamic all-black-region masks. Raise only when encoded bars are not truly zero.")
     # Internal workflow value, deliberately not exposed as a model selector.
     parser.set_defaults(outpaint_lora=DEFAULT_OUTPAINT_LORA)

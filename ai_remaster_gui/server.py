@@ -1181,8 +1181,8 @@ class PipelineApp:
         add(["--offset-y", str(outpaint_offset_value(values.get("offset_y", "0")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
-        add(["--generation-mask-overlap", values.get("generation_mask_overlap", "64")])
-        add(["--mask-blend-dilation", values.get("mask_blend_dilation", "5")])
+        add(["--generation-mask-overlap", values.get("generation_mask_overlap", "8")])
+        add(["--mask-blend-dilation", values.get("mask_blend_dilation", "2")])
         add(["--black-mask-threshold", values.get("black_mask_threshold", "12")])
         add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
         if values.get("negative_prompt"):

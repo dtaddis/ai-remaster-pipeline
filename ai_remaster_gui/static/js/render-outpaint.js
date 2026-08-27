@@ -653,19 +653,6 @@ function drawOutpaint(st, s, expected, sp) {
         <div id="outpaintProgress">${progressHtml(sp.percent, sp.label)}</div>
         ${mainFields.map(f => fieldHtml(st, f)).join('')}
         ${outpaintOverlapWarning(s)}
-        <h3>Whole-video offset</h3>
-        <p class="shot-empty">Shift the source inside the expanded frame. Every chunk inherits these values unless its override is enabled below.</p>
-        <div class="editor-controls">
-          ${offsetFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
-        </div>
-        <h3>Source Crop</h3>
-        <div class="crop-head">
-          <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>
-          <button type="button" onclick="autoCropOutpaint()">Auto Crop</button>
-        </div>
-        <div class="editor-controls">
-          ${cropFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
-        </div>
         ${stageCheckboxes(s)}
         <div class="actions">
           <button class="primary" data-outpaint-disable-running="true" onclick="runStage('outpaint')" ${state.running ? 'disabled' : ''}>Run Outpainting</button>
@@ -673,7 +660,30 @@ function drawOutpaint(st, s, expected, sp) {
         </div>
         <div class="command" id="cmd"></div>
       </section>
-      <section class="card preview compact">${aspectPreviewHtml(st)}</section>
+      <section class="card preview compact outpaint-composition">
+        ${aspectPreviewHtml(st)}
+        <div class="outpaint-composition-controls">
+          <section class="composition-control-group">
+            <div class="crop-head">
+              <div>
+                <h3>Source Crop</h3>
+                <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>
+              </div>
+              <button type="button" onclick="autoCropOutpaint()">Auto Crop</button>
+            </div>
+            <div class="editor-controls composition-crop-fields">
+              ${cropFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
+            </div>
+          </section>
+          <section class="composition-control-group">
+            <h3>Whole-video offset</h3>
+            <p class="shot-empty">Shift the cropped source inside the expanded frame. Chunks inherit these values unless overridden below.</p>
+            <div class="editor-controls composition-offset-fields">
+              ${offsetFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}
+            </div>
+          </section>
+        </div>
+      </section>
     </div>
     <section class="card chunk-section">
       <h2>Outpaint Chunks</h2>

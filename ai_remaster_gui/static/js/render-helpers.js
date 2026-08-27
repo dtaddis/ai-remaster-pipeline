@@ -130,8 +130,53 @@ const FIELD_DESCRIPTIONS = {
     'Warm-up frames repeated before each chunk and trimmed afterwards. Raise to 16-24 if chunk starts look unstable or faces flip identity mid-scene.',
 };
 
+const OUTPAINT_FIELD_TOOLTIPS = {
+  target_aspect:
+    'Shape of the expanded canvas. The cropped source is fitted inside it and LTX generates the new pillarbox or letterbox regions.',
+  target_height:
+    'Requested delivery height. Source keeps the source height; numbered choices set a new height. LTX may render at a nearby model-safe multiple of 32 before Recomposition scales to the requested size.',
+  offset_x:
+    'Shift the fitted source horizontally before outpainting. Positive values move it right and create more room on the left; negative values move it left. Chunks inherit this unless overridden.',
+  offset_y:
+    'Shift the fitted source vertically before outpainting. Positive values move it down and create more room above; negative values move it up. Chunks inherit this unless overridden.',
+  chunk_seconds:
+    'Approximate duration sent to LTX in each job. Longer chunks improve continuity and create fewer joins but use more VRAM; 0 sends the whole clip at once.',
+  overlap_frames:
+    'Frames repeated between neighbouring LTX chunks to give each join temporal context. They are trimmed during stitching, so they do not lengthen the finished video.',
+  generation_mask_overlap:
+    'Extend the generation mask this many pixels beneath the protected source edge. A small overlap helps the mask survive LTX spatial compression; too much can make edge objects get regenerated, changed, or omitted. Default: 8.',
+  mask_blend_dilation:
+    'How far the Laplacian seam blend reaches into the protected source when the generated plate is assembled. Higher values soften a hard join but can create halos or ghosting. Default: 2.',
+  seed_qwen_guides:
+    'Generate a Qwen-outpainted guide frame at every detected shot change before LTX renders. Use this when LTX returns the original black bars. It is slower, but helps stubborn shots begin from an already-filled frame.',
+  outpaint_all_black_regions:
+    'Treat every near-black region as an outpaint target instead of protecting black pixels inside the source. Useful for mixed-size footage or changing bars, but it can also replace genuine shadows, silhouettes, or black objects.',
+  black_mask_threshold:
+    'Maximum pixel brightness treated as black when Outpaint all black regions is enabled. Raise it only when encoded bars are dark grey rather than true black; higher values risk selecting real picture detail.',
+  prompt:
+    'Instruction used for every LTX outpaint chunk. Keep the word "outpaint" in it so the IC-LoRA activates; add scene, period, lighting, or style guidance when the generated sides need direction.',
+  negative_prompt:
+    'Details and failure modes LTX should avoid in every chunk. Chunk-specific negative text is appended to this global list.',
+  crop_left:
+    'Permanently discard this many pixels from the source left edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
+  crop_right:
+    'Permanently discard this many pixels from the source right edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
+  crop_top:
+    'Permanently discard this many pixels from the source top edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
+  crop_bottom:
+    'Permanently discard this many pixels from the source bottom edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
+};
+
 function fieldDescription(stageKey, key) {
   return FIELD_DESCRIPTIONS[`${stageKey}.${key}`] || FIELD_DESCRIPTIONS[key] || '';
+}
+
+function fieldTooltip(stageKey, key) {
+  return stageKey === 'outpaint' ? (OUTPAINT_FIELD_TOOLTIPS[key] || '') : '';
+}
+
+function tooltipTitle(tooltip) {
+  return tooltip ? ` title="${esc(tooltip)}"` : '';
 }
 
 function fieldHelpHtml(help) {
@@ -142,18 +187,20 @@ function fieldHtml(st, field) {
   const [key, label, kind, defaultValue] = field;
   const value = settings(st.key)[key] ?? defaultValue ?? '';
   const help = fieldDescription(st.key, key);
+  const tooltip = fieldTooltip(st.key, key);
+  const title = tooltipTitle(tooltip);
 
-  if (kind.startsWith('select:')) return selectFieldHtml(key, label, kind, value) + fieldHelpHtml(help);
-  if (kind.startsWith('range:')) return rangeFieldHtml(key, label, kind, value) + fieldHelpHtml(help);
-  if (kind === 'checkbox') return checkboxFieldHtml(key, label, value, help);
+  if (kind.startsWith('select:')) return selectFieldHtml(key, label, kind, value, tooltip) + fieldHelpHtml(help);
+  if (kind.startsWith('range:')) return rangeFieldHtml(key, label, kind, value, tooltip) + fieldHelpHtml(help);
+  if (kind === 'checkbox') return checkboxFieldHtml(key, label, value, help, tooltip);
 
   const input = `
-    <input data-field="${key}" data-kind="${kind}" type="${kind === 'number' ? 'number' : 'text'}" step="any" value="${esc(value)}">
+    <input data-field="${key}" data-kind="${kind}" type="${kind === 'number' ? 'number' : 'text'}" step="any" value="${esc(value)}"${title}>
   `;
 
   if (['file', 'folder', 'save'].includes(kind)) {
     return `
-      <label>${label}</label>
+      <label${title}>${label}</label>
       <div class="field-row">
         ${input}
         <button type="button" onclick="browseField('${st.key}','${key}','${kind}')">Browse</button>
@@ -162,14 +209,15 @@ function fieldHtml(st, field) {
     `;
   }
 
-  return `<label>${label}</label>${input}${fieldHelpHtml(help)}`;
+  return `<label${title}>${label}</label>${input}${fieldHelpHtml(help)}`;
 }
 
-function selectFieldHtml(key, label, kind, value) {
+function selectFieldHtml(key, label, kind, value, tooltip = '') {
   const options = kind.slice(7).split('|')
     .map(option => `<option value="${esc(option)}" ${value === option ? 'selected' : ''}>${esc(selectOptionLabel(key, option))}</option>`)
     .join('');
-  return `<label>${label}</label><select data-field="${key}">${options}</select>`;
+  const title = tooltipTitle(tooltip);
+  return `<label${title}>${label}</label><select data-field="${key}"${title}>${options}</select>`;
 }
 
 function selectOptionLabel(key, option) {
@@ -205,10 +253,11 @@ function rangeDisplayValue(key, value) {
   return shown + (RANGE_FIELD_UNITS[key] || '');
 }
 
-function rangeFieldHtml(key, label, kind, value) {
+function rangeFieldHtml(key, label, kind, value, tooltip = '') {
   const [min, max, step] = kind.slice(6).split('|');
   const hasNudge = RANGE_NUDGE_FIELDS.has(key);
   const nudgeAmount = step || '1';
+  const title = tooltipTitle(tooltip);
   const controls = hasNudge ? `
     <div class="pixel-nudge-row">
       <button type="button" onclick="nudgeRangeField('${key}',-1)">-${esc(nudgeAmount)}</button>
@@ -226,7 +275,7 @@ function rangeFieldHtml(key, label, kind, value) {
     </div>
   ` : '';
   return `
-    <label>${label}: <span id="${key}Value">${esc(rangeDisplayValue(key, value))}</span></label>
+    <label${title}>${label}: <span id="${key}Value">${esc(rangeDisplayValue(key, value))}</span></label>
     <input
       id="${key}Range"
       data-field="${key}"
@@ -237,6 +286,7 @@ function rangeFieldHtml(key, label, kind, value) {
       step="${esc(step || '1')}"
       value="${esc(value)}"
       oninput="setRangeFieldValue('${key}',this.value,false)"
+      ${title}
     >
     ${controls}
   `;
@@ -252,8 +302,8 @@ const CHECKBOX_DESCRIPTIONS = {
     "Don't expand the canvas, just paint over all pure black areas. Use this when the region to be extended changes, e.g. you have mixed-size footage in your clip.",
 };
 
-function checkboxFieldHtml(key, label, value, help = '') {
-  const description = CHECKBOX_DESCRIPTIONS[key];
+function checkboxFieldHtml(key, label, value, help = '', tooltip = '') {
+  const description = tooltip || CHECKBOX_DESCRIPTIONS[key];
   if (description) {
     return `
       <label class="checkbox-feature" title="${esc(description)}">
