@@ -557,7 +557,7 @@ function stabilizationComparisonHtml(comparison) {
   const before = comparison.source || '';
   const after = comparison.exists === 'true' ? comparison.output : '';
   if (!before || comparison.source_exists !== 'true') {
-    return '<p class="shot-empty">Choose source material on the Overview page, then run any enabled Clean Up phase.</p>';
+    return '<p class="shot-empty">Choose available source material on the Overview page. If Clean Up is enabled, run it before Stabilization.</p>';
   }
   if (!after) {
     return `

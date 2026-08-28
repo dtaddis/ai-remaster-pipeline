@@ -246,7 +246,7 @@ function updateOverviewSectionControlsFromState() {
 }
 
 function hasMediaOnPage() {
-  return ['cleanup', 'outpaint', 'colour', 'recomp', 'audio', 'upscale', 'output'].includes(active)
+  return ['cleanup', 'stabilize', 'outpaint', 'colour', 'recomp', 'audio', 'upscale', 'output'].includes(active)
     ? document.querySelectorAll('video').length > 0
     : false;
 }
@@ -259,7 +259,7 @@ function shouldPreserveInteractiveDom(mediaActive) {
 
   // Normal polling must not recreate video elements while the user is inspecting
   // chunk, shot, or recomposition previews. A manual Refresh still redraws.
-  return ['cleanup', 'outpaint', 'colour', 'recomp', 'audio', 'upscale', 'output'].includes(active);
+  return ['cleanup', 'stabilize', 'outpaint', 'colour', 'recomp', 'audio', 'upscale', 'output'].includes(active);
 }
 
 function outpaintVisualSignature() {

@@ -1956,18 +1956,38 @@ class PipelineApp:
     def stabilization_comparison_state(self) -> dict[str, str]:
         source = self.cleaned_source_for_downstream()
         output = self.stabilization_output() if source else ""
-        exists = bool(source and output and resolve(source).exists() and resolve(output).exists())
         source_preview = source
         global_settings = self.settings.get("global", {})
-        if source == pipeline_source_text(self.settings) and global_settings.get("source_sequence_preview"):
-            source_preview = global_settings["source_sequence_preview"]
+        global_source = global_settings.get("source", "")
+        source_available = bool(source and resolve(source).exists())
+
+        # A selected source section is created lazily when the stage starts. Before that happens,
+        # skipping Clean Up must still leave something useful in the Stabilization viewer. Show
+        # the original source (or the browser-friendly image-sequence preview) until the trimmed
+        # H.264 section exists. The actual stabilization command continues to target the section.
+        if not source_available and not self.cleanup_enabled() and global_source and resolve(global_source).exists():
+            source = global_source
+            source_preview = global_settings.get("source_sequence_preview", "") or global_source
+            source_available = bool(source_preview and resolve(source_preview).exists())
+        elif (
+            source_available
+            and global_source
+            and resolve(source) == resolve(global_source)
+            and global_settings.get("source_sequence_preview")
+        ):
+            candidate = global_settings["source_sequence_preview"]
+            if resolve(candidate).exists():
+                source_preview = candidate
+
+        preview_available = bool(source_preview and resolve(source_preview).exists())
+        exists = bool(preview_available and output and resolve(output).exists())
         preview = stabilization_preview_for(output) if output else ""
         return {
             "source": source_preview,
             "master_source": source,
             "output": preview if preview and resolve(preview).exists() else output,
             "master_output": output,
-            "source_exists": "true" if source and resolve(source).exists() else "false",
+            "source_exists": "true" if preview_available else "false",
             "exists": "true" if exists and (not preview or resolve(preview).exists()) else "false",
             "title": "Stabilization Comparison",
         }

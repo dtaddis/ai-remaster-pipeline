@@ -167,6 +167,21 @@ class GuiSmokeTests(unittest.TestCase):
             ["cleanup", "stabilize", "outpaint", "shots", "references", "colour", "recomp"],
         )
 
+    def test_stabilization_uses_source_directly_when_cleanup_is_disabled(self) -> None:
+        app.APP.settings["global"].update(
+            {
+                "source": "input/example.mp4",
+                "cleanup": "false",
+                "stabilize": "true",
+                "section_start": "0",
+                "section_end": "",
+            }
+        )
+
+        command = app.APP.command_for("stabilize")
+
+        self.assertEqual(command[command.index("--source") + 1], "input/example.mp4")
+
     def test_stabilization_output_name_matches_gui_and_producer(self) -> None:
         source = app.resolve_video_source("input/example.mp4")
         values = app.APP.settings["stabilize"]
@@ -269,6 +284,36 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(comparison["output"], app.rel(output))
         self.assertEqual(comparison["source_exists"], "true")
         self.assertEqual(comparison["exists"], "true")
+
+    def test_stabilization_viewer_falls_back_to_source_when_cleanup_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "sequence-master.mkv"
+            preview = folder / "sequence-preview.mp4"
+            source.write_bytes(b"master")
+            preview.write_bytes(b"preview")
+            app.APP.settings["global"].update(
+                {
+                    "source": app.rel(source),
+                    "source_sequence_preview": app.rel(preview),
+                    "cleanup": "false",
+                    "stabilize": "true",
+                    "section_start": "1",
+                    "section_end": "2",
+                }
+            )
+
+            comparison = app.APP.stabilization_comparison_state()
+
+        self.assertEqual(comparison["source"], app.rel(preview))
+        self.assertEqual(comparison["master_source"], app.rel(source))
+        self.assertEqual(comparison["source_exists"], "true")
+        self.assertEqual(comparison["exists"], "false")
+
+    def test_stabilization_page_preserves_its_video_during_polling(self) -> None:
+        core = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "core.js").read_text(encoding="utf-8")
+
+        self.assertEqual(core.count("['cleanup', 'stabilize', 'outpaint'"), 2)
 
     def test_cleanup_page_wires_the_shared_before_after_player(self) -> None:
         helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
