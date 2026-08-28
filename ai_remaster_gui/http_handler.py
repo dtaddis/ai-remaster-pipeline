@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from . import state
 from .cache import delete_cache_category, delete_cache_file
 from .config import STATIC_DIR
-from .file_dialogs import browse_path
+from .file_dialogs import browse_path, browse_source_paths
 from .manifests import update_manifest_row
 from .media import (
     aspect_preview_at_for_settings,
@@ -489,12 +489,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_result("Browse", lambda: {"path": browse_path(str(data.get("kind", "file")), str(data.get("current", "")))})
         elif parsed.path == "/api/browse-global-source":
             def browse_global_source() -> dict:
-                selected = browse_path("file", str(data.get("current", "")))
-                if selected:
-                    state.APP.update_settings("global", {"source": selected})
-                return {"path": selected, "state": state.APP.state("global")}
+                selected = browse_source_paths(str(data.get("current", "")))
+                result = state.APP.select_source_paths(selected, str(data.get("fps", "24")))
+                return {**result, "state": state.APP.state("global")}
 
             self._send_result("Browse", browse_global_source)
+        elif parsed.path == "/api/source-sequence-fps":
+            self._send_result(
+                "Image-sequence frame rate",
+                lambda: {**state.APP.update_source_sequence_fps(str(data.get("fps", "24"))), "state": state.APP.state("global")},
+            )
         elif parsed.path == "/api/overview-clear":
             state.APP.clear_overview()
             self.send_json({"ok": True, "state": state.APP.state("global")})

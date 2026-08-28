@@ -116,7 +116,21 @@ def qwen_masked_workflow_for(values: dict[str, str], config: dict[str, str]) -> 
 
 def base_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
-    defaults["global"] = {"source": "", "cleanup": "false", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false", "section_start": "0", "section_end": "", "last_browse_dir": ""}
+    defaults["global"] = {
+        "source": "",
+        "source_images": "",
+        "source_sequence_fps": "24",
+        "source_sequence_preview": "",
+        "cleanup": "false",
+        "stabilize": "false",
+        "expand_outpaint": "true",
+        "colorize": "true",
+        "upscale": "false",
+        "add_soundtrack": "false",
+        "section_start": "0",
+        "section_end": "",
+        "last_browse_dir": "",
+    }
     return defaults
 
 

@@ -216,6 +216,32 @@ def cleanup_identity(
     return identity
 
 
+def stabilize_identity(
+    source_name: str,
+    *,
+    smoothing: int = 12,
+    max_shift: int = 48,
+    max_angle: float = 3.0,
+    zoom: float = 3.0,
+    shot_threshold: float = 0.075,
+    min_shot_seconds: float = 1.0,
+    encoder: str = "ffv1",
+) -> dict:
+    """Identity for scene-aware, geometry-preserving stabilization."""
+    return {
+        "v": 1,
+        "kind": "stabilize",
+        "source": safe_stem(source_name),
+        "smoothing": int(smoothing),
+        "max_shift": int(max_shift),
+        "max_angle": float(max_angle),
+        "zoom": float(zoom),
+        "shot_threshold": float(shot_threshold),
+        "min_shot_seconds": float(min_shot_seconds),
+        "encoder": str(encoder),
+    }
+
+
 def shots_identity(outpaint_stem: str) -> dict:
     """Shot manifest is keyed on the outpainted video only, so it stays stable and user-editable
     across detection-parameter tweaks (threshold etc. live in the resume sig, not the identity)."""

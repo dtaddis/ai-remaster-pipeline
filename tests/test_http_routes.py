@@ -49,7 +49,7 @@ EXPECTED_POST_ROUTES = {
     "/api/guide-frame-remove", "/api/guide-frame-save", "/api/guide-frame-upload",
     "/api/guide-frame-clear", "/api/guide-frame-generate", "/api/guide-frame-edit-preview",
     "/api/guide-frame-edit-accept", "/api/guide-frame-edit-revert", "/api/guide-paint-save",
-    "/api/browse", "/api/browse-global-source", "/api/overview-clear", "/api/project-save",
+    "/api/browse", "/api/browse-global-source", "/api/source-sequence-fps", "/api/overview-clear", "/api/project-save",
     "/api/project-load", "/api/cache-delete",
 }
 

@@ -70,7 +70,6 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
         ${shotCards(key)}
       </section>
     </div>
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields(key);

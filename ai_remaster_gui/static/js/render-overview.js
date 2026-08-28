@@ -2,11 +2,12 @@ function drawGlobal() {
   const global = state.settings.global || {};
   const source = global.source || '';
   const cleanup = global.cleanup === 'true';
+  const stabilize = global.stabilize === 'true';
   const expandOutpaint = global.expand_outpaint !== 'false';
   const colorize = global.colorize !== 'false';
   const upscale = global.upscale === 'true';
   const soundtrack = global.add_soundtrack === 'true';
-  const noProcessing = !cleanup && !expandOutpaint && !colorize && !upscale && !soundtrack;
+  const noProcessing = !cleanup && !stabilize && !expandOutpaint && !colorize && !upscale && !soundtrack;
   const analysis = state.source_analysis || {};
   const sourceTone = source && !analysis.ready
     ? (analysis.message || 'Analyzing source material')
@@ -28,22 +29,22 @@ function drawGlobal() {
         </div>
       </div>
       <img class="hero-logo" src="/media?path=assets/branding/arp-logo-wide.png" alt="ARP - AI Remaster Pipeline">
-      ${overviewSourcePicker(source)}
+      ${overviewSourcePicker(source, global)}
       ${sourceAnalysisHtml(analysis)}
-      ${overviewSectionPicker(global, source)}
-      ${workflowPickerHtml(cleanup, expandOutpaint, colorize, upscale, soundtrack, sourceTone)}
+      ${overviewSectionPicker(global, source, state.source_playback || source)}
+      ${workflowPickerHtml(cleanup, stabilize, expandOutpaint, colorize, upscale, soundtrack, sourceTone)}
       ${noProcessing ? '<div class="inline-warning"><strong>No processing stages selected.</strong> Choose at least one workflow step, otherwise Run Whole Remaster has nothing to do.</div>' : ''}
       <div id="overviewFilmstrip">${overviewFilmstripInner()}</div>
       <div id="overviewSourceInfo">${sourceInfoHtml(state.source_info || {})}</div>
       <div id="overviewPipelineProgress">${progressHtml(progress.percent, progress.label)}</div>
       ${overviewActions()}
       <div id="overviewProgressTable">${overviewProgressTable()}</div>
-      ${runLogHtml()}
     </section>
   `;
 
   document.getElementById('globalSource').addEventListener('change', saveGlobal);
   document.getElementById('globalCleanup').addEventListener('change', saveGlobalPipelineOptions);
+  document.getElementById('globalStabilize').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalExpandOutpaint').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalColorize').addEventListener('change', saveGlobalPipelineOptions);
   document.getElementById('globalUpscale').addEventListener('change', saveGlobalPipelineOptions);
@@ -51,7 +52,7 @@ function drawGlobal() {
   bindOverviewSectionControls();
 }
 
-function workflowPickerHtml(cleanup, expandOutpaint, colorize, upscale, soundtrack, sourceTone) {
+function workflowPickerHtml(cleanup, stabilize, expandOutpaint, colorize, upscale, soundtrack, sourceTone) {
   return `
     <div class="workflow-list">
       ${workflowOptionHtml({
@@ -60,6 +61,13 @@ function workflowPickerHtml(cleanup, expandOutpaint, colorize, upscale, soundtra
         icon: 'cleanup',
         title: 'Clean Up',
         body: 'Run optional DeVignette and masked ProPainter AI DeScratch, then optionally use the LTX 2.3 Dearchive LoRA before any framing or colour work. Output keeps the source frame rate and resolution.',
+      })}
+      ${workflowOptionHtml({
+        id: 'globalStabilize',
+        checked: stabilize,
+        icon: 'stabilize',
+        title: 'Stabilize',
+        body: 'Remove gate weave, frame jitter, and unwanted rotation per shot before outpainting and colour propagation. Shot cuts reset motion tracking.',
       })}
       ${workflowOptionHtml({
         id: 'globalExpandOutpaint',
@@ -119,13 +127,25 @@ function sourceAnalysisHtml(analysis) {
   `;
 }
 
-function overviewSourcePicker(source) {
+function overviewSourcePicker(source, global) {
+  const sequence = state.source_sequence || {};
+  const sequenceFps = sequence.fps || global.source_sequence_fps || '24';
+  const shortName = value => String(value || '').split(/[\\/]/).pop();
+  const sequenceSummary = sequence.count
+    ? `<p class="source-sequence-summary"><strong>${sequence.count} images</strong> (${esc((sequence.formats || []).join(', '))}), naturally sorted from <span title="${esc(sequence.first || '')}">${esc(shortName(sequence.first))}</span> to <span title="${esc(sequence.last || '')}">${esc(shortName(sequence.last))}</span>.</p>`
+    : '';
   return `
     <label>Source material</label>
     <div class="field-row">
       <input id="globalSource" value="${esc(source)}">
-      <button type="button" onclick="browseGlobalSource()">Browse</button>
+      <button type="button" onclick="browseGlobalSource()">Browse…</button>
     </div>
+    <div class="source-sequence-controls">
+      <label for="globalSequenceFps">Image sequence FPS</label>
+      <input id="globalSequenceFps" type="number" min="1" max="240" step="0.001" value="${esc(sequenceFps)}" ${sequence.count ? 'onchange="saveSourceSequenceFps()"' : ''}>
+      <span>Select one video, or multiple PNG, BMP, JPG, DPX, TIFF, or WebP images.</span>
+    </div>
+    ${sequenceSummary}
   `;
 }
 
@@ -141,7 +161,7 @@ function overviewFilmstripInner() {
   return thumbs ? `<div class="filmstrip">${thumbs}</div>` : '';
 }
 
-function overviewSectionPicker(global, source) {
+function overviewSectionPicker(global, source, playbackSource) {
   const start = Number(global.section_start || 0);
   const duration = parseDuration((state.source_info && state.source_info.duration) || '0');
   const end = Number(global.section_end || duration || 0);
@@ -151,7 +171,7 @@ function overviewSectionPicker(global, source) {
   const frameStep = (1 / fps).toFixed(6);
   return `
     <div class="section-picker">
-      ${source ? `<video id="sourceSectionVideo" class="section-video" src="${media(source)}" controls preload="metadata"></video>` : ''}
+      ${source ? `<video id="sourceSectionVideo" class="section-video" src="${media(playbackSource)}" controls preload="metadata"></video>` : ''}
       <div class="editor-controls">
         <div>
           <label>Start: <span id="sectionStartLabel">${formatSeconds(start)}</span></label>

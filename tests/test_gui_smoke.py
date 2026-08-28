@@ -36,6 +36,7 @@ import openai_generate_reference  # noqa: E402
 import outpaint_video  # noqa: E402
 import prepare_outpaint_input  # noqa: E402
 import qwen_colorize_references  # noqa: E402
+import stabilize_video  # noqa: E402
 import upscale_video  # noqa: E402
 
 from ai_remaster_gui import app
@@ -102,6 +103,7 @@ class GuiSmokeTests(unittest.TestCase):
         self._populate_full_pipeline_settings()
         expected = {
             "cleanup": "cleanup_video.py",
+            "stabilize": "stabilize_video.py",
             "outpaint": "outpaint_video.py",
             "shots": "generate_references.py",
             "references": "qwen_colorize_references.py",
@@ -146,6 +148,48 @@ class GuiSmokeTests(unittest.TestCase):
             [stage.key for stage in app.APP.active_stages()],
             ["cleanup", "outpaint", "shots", "references", "colour", "recomp"],
         )
+
+    def test_stabilization_runs_after_cleanup_and_before_outpainting(self) -> None:
+        app.APP.settings["global"].update(
+            {
+                "source": "input/example.mp4",
+                "cleanup": "true",
+                "stabilize": "true",
+                "expand_outpaint": "true",
+                "colorize": "true",
+                "upscale": "false",
+                "add_soundtrack": "false",
+            }
+        )
+
+        self.assertEqual(
+            [stage.key for stage in app.APP.active_stages()],
+            ["cleanup", "stabilize", "outpaint", "shots", "references", "colour", "recomp"],
+        )
+
+    def test_stabilization_output_name_matches_gui_and_producer(self) -> None:
+        source = app.resolve_video_source("input/example.mp4")
+        values = app.APP.settings["stabilize"]
+        args = stabilize_video.build_parser().parse_args(["--source", str(source)])
+
+        self.assertEqual(app.stabilize_output_for(str(source), values), app.rel(stabilize_video.default_output(source, args)))
+
+    def test_finished_stabilization_routes_to_outpaint(self) -> None:
+        app.APP.settings["global"].update(
+            {"source": "input/example.mp4", "cleanup": "false", "stabilize": "true", "expand_outpaint": "true", "colorize": "false"}
+        )
+        stabilized = app.stabilize_output_for("input/example.mp4", app.APP.settings["stabilize"])
+        stabilized_path = app.resolve(stabilized)
+        stabilized_path.parent.mkdir(parents=True, exist_ok=True)
+        stabilized_path.write_bytes(b"placeholder")
+        try:
+            app.APP.hydrate_stage_inputs("stabilize")
+            command = app.APP.command_for("outpaint")
+        finally:
+            stabilized_path.unlink(missing_ok=True)
+
+        self.assertEqual(command[command.index("--source") + 1], stabilized)
+        self.assertEqual(app.APP.settings["recomp"]["source"], stabilized)
 
     def test_cleanup_output_name_matches_gui_and_producer(self) -> None:
         source = app.resolve_video_source("input/example.mp4")
@@ -2816,6 +2860,35 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(loaded["global"]["source"], "input/example.mp4")
         self.assertIn("schema_version", app.project_payload(app.APP.settings))
 
+    def test_legacy_video_project_does_not_inherit_active_image_sequence(self) -> None:
+        active = copy.deepcopy(app.APP.settings)
+        active["global"].update({
+            "source": "intermediate/source_sequences/berlin.mkv",
+            "source_images": json.dumps(["G:/Berlin/frame_0001.dpx", "G:/Berlin/frame_0002.dpx"]),
+            "source_sequence_preview": "intermediate/source_sequences/berlin_preview.mp4",
+            "source_sequence_fps": "18",
+        })
+        active["references"]["openai_api_key"] = "sk-machine-local"
+        legacy_project = {
+            "schema_version": 2,
+            "settings": {
+                "global": {
+                    "source": "G:/Hiroshima/Hiroshima.mov",
+                    "colorize": "true",
+                    "upscale": "true",
+                }
+            },
+        }
+
+        with mock.patch.object(project_io, "load_settings", return_value=active):
+            loaded = project_io.load_project_payload(legacy_project)
+
+        self.assertEqual(loaded["global"]["source"], "G:/Hiroshima/Hiroshima.mov")
+        self.assertEqual(loaded["global"]["source_images"], "")
+        self.assertEqual(loaded["global"]["source_sequence_preview"], "")
+        self.assertEqual(loaded["global"]["source_sequence_fps"], "24")
+        self.assertEqual(loaded["references"]["openai_api_key"], "sk-machine-local")
+
     def test_project_bundle_includes_reference_assets_without_openai_key(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -3689,6 +3762,24 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("--outpainted", command)
         self.assertEqual(command[command.index("--source") + 1], "input/example.mp4")
         self.assertEqual(command[command.index("--colorized") + 1], "intermediate/outpainted_colorized/example_color.mp4")
+
+    def test_recomposition_command_passes_reference_luminance_controls(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "colorize": "true"})
+        app.APP.settings["recomp"].update(
+            {
+                "source": "input/example.mp4",
+                "colorized_video": "intermediate/outpainted_colorized/example_color.mp4",
+                "manifest": "manifests/references/example_shots.csv",
+                "reference_luminance_match": "true",
+                "reference_luminance_strength": "76",
+            }
+        )
+
+        command = app.APP.command_for("recomp")
+
+        self.assertEqual(command[command.index("--manifest") + 1], "manifests/references/example_shots.csv")
+        self.assertIn("--reference-luminance-match", command)
+        self.assertEqual(command[command.index("--reference-luminance-strength") + 1], "76")
 
     def test_no_overview_steps_selected_leaves_only_output_tab(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "false", "section_start": "0", "section_end": ""})

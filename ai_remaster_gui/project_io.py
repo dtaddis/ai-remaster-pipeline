@@ -10,7 +10,7 @@ from .config import IMAGE_EXTS, ROOT, VIDEO_EXTS
 from . import state
 from .manifests import read_manifest, read_outpaint_chunk_rows
 from .paths import resolve, resolve_video_source, safe_stem
-from .runtime_settings import load_settings
+from .runtime_settings import default_settings, load_settings
 
 PROJECT_SCHEMA_VERSION = 2
 PROJECT_JSON_NAME = "project.json"
@@ -84,7 +84,14 @@ def load_project_payload(data: dict) -> dict[str, dict[str, str]]:
     settings = data.get("settings")
     if not isinstance(settings, dict):
         raise RuntimeError("Project file does not contain settings.")
-    loaded = load_settings()
+    # A project must hydrate from clean defaults, not from the settings of the project that is
+    # currently open.  In particular, projects saved before image-sequence support do not contain
+    # source_images/source_sequence_preview; inheriting those fields could make their conventional
+    # video source get replaced by the previously-open sequence during restore_image_sequence_source.
+    # Keep only machine-local secrets which are deliberately excluded from project bundles.
+    current = load_settings()
+    loaded = default_settings(include_newest_source=False)
+    loaded["references"]["openai_api_key"] = current.get("references", {}).get("openai_api_key", "")
     for stage, values in settings.items():
         if stage in loaded and isinstance(values, dict):
             loaded[stage].update({str(key): str(value) for key, value in values.items()})

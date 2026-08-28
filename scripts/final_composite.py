@@ -8,6 +8,7 @@ from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
 from outpaint_geometry import source_placement
+from reference_luminance import ffmpeg_curve, identity_curve, reference_luminance_plan
 
 
 def find_ffmpeg(explicit: str | None):
@@ -38,7 +39,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 10
+    values['version'] = 11
     return values
 
 
@@ -193,7 +194,34 @@ def temperature_balance(value: float) -> tuple[float, float]:
     return (strength, 0.0) if delta < 0 else (0.0, strength)
 
 
-def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None):
+def append_reference_luminance_filter(filters: list[str], input_label: str, plan: list[dict], fps: float) -> str:
+    spans = [item for item in plan if item.get('end_frame') is None or int(item['end_frame']) > int(item['start_frame'])]
+    if not spans:
+        return input_label
+    if len(spans) == 1 and int(spans[0].get('start_frame', 0)) == 0 and spans[0].get('end_frame') is None:
+        curve = spans[0].get('curve') or [[0.0, 0.0], [1.0, 1.0]]
+        if identity_curve(curve):
+            return input_label
+        filters.append(f"[{input_label}]curves=all='{ffmpeg_curve(curve)}'[lumamerged]")
+        return 'lumamerged'
+
+    split_labels = ''.join(f'[lumasrc{index}]' for index in range(len(spans)))
+    filters.append(f'[{input_label}]split={len(spans)}{split_labels}')
+    output_labels = []
+    for index, item in enumerate(spans):
+        start = max(0, int(item.get('start_frame', 0)))
+        end = item.get('end_frame')
+        trim = f'trim=start_frame={start}' + (f':end_frame={max(start + 1, int(end))}' if end is not None else '')
+        curve = item.get('curve') or [[0.0, 0.0], [1.0, 1.0]]
+        tone = '' if identity_curve(curve) else f",curves=all='{ffmpeg_curve(curve)}'"
+        filters.append(f'[lumasrc{index}]{trim},setpts=PTS-STARTPTS{tone}[lumaseg{index}]')
+        output_labels.append(f'[lumaseg{index}]')
+    filters.append(''.join(output_labels) + f'concat=n={len(output_labels)}:v=1:a=0[lumaconcat]')
+    filters.append(f'[lumaconcat]setpts=N/({fps:.8f}*TB),fps=fps={fps:.8f}[lumamerged]')
+    return 'lumamerged'
+
+
+def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
     color_opacity = max(0.0, min(1.0, normalized_percent(args.color_opacity, 1.0)))
@@ -230,10 +258,11 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
         filters = [
             f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1,format=yuv444p[merged]',
         ]
+    base_label = append_reference_luminance_filter(filters, 'merged', luminance_plan or [], fps) if has_color else 'merged'
     if has_color:
         red, blue = temperature_balance(args.temperature)
         filters.append(f'[{color_input}:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}[col0]')
-        filters.append('[col0][merged]scale2ref=w=iw:h=ih[colscaled][mergedref]')
+        filters.append(f'[col0][{base_label}]scale2ref=w=iw:h=ih[colscaled][mergedref]')
         filters.append(f'[colscaled]eq=saturation={sat}:brightness=0:contrast=1,colorbalance=rs={red:.4f}:bs={blue:.4f},format=yuv444p[colfmt]')
         filters.append('[mergedref]format=yuv444p[basefmt]')
         if color_opacity < 1.0:
@@ -243,7 +272,11 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             color_source = 'colfmt'
         filters.append(f'[basefmt]extractplanes=y,setsar=1[basey];[{color_source}]extractplanes=u+v[colu0][colv0]')
         filters.append('[colu0]setsar=1[colu];[colv0]setsar=1[colv]')
-        filters.append('[basey][colu][colv]mergeplanes=0x001020:yuv444p,setsar=1,format=yuv420p[vout]')
+        final_frame = max((int(item['end_frame']) for item in (luminance_plan or []) if item.get('end_frame') is not None), default=0)
+        output_label = 'vouttimed' if final_frame else 'vout'
+        filters.append(f'[basey][colu][colv]mergeplanes=0x001020:yuv444p,setsar=1,format=yuv420p[{output_label}]')
+        if final_frame:
+            filters.append(f'[{output_label}]trim=end_frame={final_frame},setpts=N/({fps_text}*TB),fps=fps={fps_text}[vout]')
     else:
         filters.append('[merged]copy[vout]')
     return ';'.join(filters)
@@ -261,6 +294,15 @@ def run(args):
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = probe_fps(ffmpeg, source)
+    luminance_plan = []
+    if colorized and args.reference_luminance_match:
+        if args.manifest:
+            manifest = resolve_path(args.manifest)
+            luminance_plan = reference_luminance_plan(manifest, fps, args.reference_luminance_strength)
+            matched = sum(1 for item in luminance_plan if item.get('matched'))
+            print(f'Reference luminance matching: {matched}/{len(luminance_plan)} shot span(s), strength {args.reference_luminance_strength:g}%')
+        else:
+            print('Reference luminance matching requested without a manifest; using original source luminance.')
     source_size = probe_dimensions(ffmpeg, source)
     base_size = None
     if outpainted:
@@ -274,7 +316,7 @@ def run(args):
         audio_input = '0:a?'
     if colorized:
         cmd += ['-i', str(colorized)]
-    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
+    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
     cmd += ['-c:a', 'copy', str(partial)]
@@ -308,6 +350,9 @@ def build_parser():
     parser.add_argument('--saturation', type=float, default=82.0, help='Color layer saturation. Values above 4 are treated as percentages.')
     parser.add_argument('--temperature', type=float, default=6500.0, help='Color temperature in Kelvin. 6500 is neutral; lower warms, higher cools.')
     parser.add_argument('--color-opacity', type=float, default=100.0, help='Color layer opacity. Values above 4 are treated as percentages.')
+    parser.add_argument('--manifest', help='Shot manifest containing source_reference and color_reference pairs.')
+    parser.add_argument('--reference-luminance-match', action=argparse.BooleanOptionalAction, default=True, help='Match each shot luminance to its colour reference using one stable tonal curve per shot.')
+    parser.add_argument('--reference-luminance-strength', type=float, default=70.0, help='Strength of the shot-level reference luminance curve, from 0 to 100 percent.')
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
     parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')

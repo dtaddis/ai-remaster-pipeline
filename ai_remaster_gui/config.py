@@ -18,7 +18,7 @@ MEDIA_CLIP_DIR = ROOT / ".cache" / "media_clips"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+IMAGE_EXTS = {".png", ".bmp", ".jpg", ".jpeg", ".dpx", ".webp", ".tif", ".tiff"}
 TEXT_EXTS = {".csv", ".json", ".txt", ".log", ".md"}
 
 REFERENCE_PROMPT = "Colorize this image."

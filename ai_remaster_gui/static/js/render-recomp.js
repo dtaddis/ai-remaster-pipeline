@@ -16,6 +16,7 @@ function drawRecomp() {
         ${recompLayerSummary(s)}
         ${recompPathFields(st)}
         <h3>Blend Parameters</h3>
+        ${referenceLuminanceStatusHtml()}
         ${recompControlFields(st)}
         ${shotOutputList(expected, null)}
         ${stageCheckboxes(s)}
@@ -32,7 +33,6 @@ function drawRecomp() {
         ${recompTimelineHtml()}
       </section>
     </div>
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields('recomp');
@@ -82,6 +82,8 @@ function recompControlFields(st) {
     'saturation',
     'temperature',
     'color_opacity',
+    'reference_luminance_match',
+    'reference_luminance_strength',
     'encoder',
   ];
   return `
@@ -89,6 +91,18 @@ function recompControlFields(st) {
       ${controls.map(key => `<div>${fieldHtml(st, st.fields.find(f => f[0] === key))}</div>`).join('')}
     </div>
   `;
+}
+
+function referenceLuminanceStatusHtml() {
+  const s = settings('recomp');
+  if (s.reference_luminance_match === 'false') {
+    return '<p class="shot-empty">Reference luminance matching is off; the original monochrome luminance will be retained exactly.</p>';
+  }
+  const analysis = state.reference_luminance || {};
+  if (analysis.error) return `<p class="warning">Reference luminance analysis: ${esc(analysis.error)}</p>`;
+  const count = Number(analysis.matched_shots || 0);
+  if (!count) return '<p class="shot-empty">Reference luminance matching will activate when the shot manifest contains approved colour references.</p>';
+  return `<p class="shot-empty">${count} shot${count === 1 ? '' : 's'} matched. Each shot uses one fixed tonal curve to prevent exposure flicker.</p>`;
 }
 
 function recompLayerToggles() {
@@ -163,7 +177,6 @@ function drawUpscale() {
       </section>
     </div>
     ${upscaleShotBreakdownHtml(s)}
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields('upscale');
@@ -607,7 +620,7 @@ function drawAccurateColorComposite(canvas, mainVideo, colorVideo, scratch, scra
   scratchCtx.clearRect(0, 0, width, height);
   scratchCtx.drawImage(colorVideo, 0, 0, width, height);
   const color = scratchCtx.getImageData(0, 0, width, height);
-  applyColorComposite(base.data, color.data, settings('recomp'));
+  applyColorComposite(base.data, color.data, settings('recomp'), referenceLuminanceCurveAt(activeMain.currentTime || 0));
   ctx.putImageData(base, 0, 0);
 }
 
@@ -638,7 +651,29 @@ function drawSourceLayerToContext(ctx, sourceVideo, width, height) {
   ctx.drawImage(temp, 0, 0);
 }
 
-function applyColorComposite(base, color, s) {
+function referenceLuminanceCurveAt(seconds) {
+  if (settings('recomp').reference_luminance_match === 'false') return null;
+  const plan = (state.reference_luminance && state.reference_luminance.plan) || [];
+  const item = plan.find(span => seconds >= Number(span.start_seconds || 0)
+    && (span.end_seconds == null || seconds < Number(span.end_seconds)));
+  return item && item.curve ? item.curve : null;
+}
+
+function remapReferenceLuminance(value, curve) {
+  if (!curve || curve.length < 2) return value;
+  const normalized = Math.max(0, Math.min(1, value / 255));
+  for (let i = 1; i < curve.length; i += 1) {
+    const left = curve[i - 1];
+    const right = curve[i];
+    if (normalized > Number(right[0]) && i < curve.length - 1) continue;
+    const width = Math.max(0.000001, Number(right[0]) - Number(left[0]));
+    const amount = Math.max(0, Math.min(1, (normalized - Number(left[0])) / width));
+    return 255 * (Number(left[1]) + (Number(right[1]) - Number(left[1])) * amount);
+  }
+  return value;
+}
+
+function applyColorComposite(base, color, s, luminanceCurve = null) {
   const saturation = normalizedPercent(s.saturation || 100, 1);
   const opacity = Math.max(0, Math.min(1, normalizedPercent(s.color_opacity || 100, 1)));
   const [redBalance, blueBalance] = kelvinBalance(s.temperature || 6500);
@@ -656,7 +691,8 @@ function applyColorComposite(base, color, s) {
     cr = br * (1 - opacity) + cr * opacity;
     cg = bg * (1 - opacity) + cg * opacity;
     cb = bb * (1 - opacity) + cb * opacity;
-    const y = 0.299 * br + 0.587 * bg + 0.114 * bb;
+    const sourceY = 0.299 * br + 0.587 * bg + 0.114 * bb;
+    const y = remapReferenceLuminance(sourceY, luminanceCurve);
     const u = -0.168736 * cr - 0.331264 * cg + 0.5 * cb + 128;
     const v = 0.5 * cr - 0.418688 * cg - 0.081312 * cb + 128;
     base[i] = clampByte(y + 1.402 * (v - 128));

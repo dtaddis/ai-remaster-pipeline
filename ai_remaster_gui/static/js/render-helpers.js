@@ -75,6 +75,20 @@ const FIELD_DESCRIPTIONS = {
     'How strongly the complete input video controls LTX. 1.0 is the safe default and preserves the source most exactly, but can also preserve scratches. Lower values give Dearchive more freedom to repaint damage; very low values can change faces, hands, fine motion, or period detail.',
   'cleanup.lora_strength':
     'How strongly Dearchive rewrites the archive footage. 1.0 is the model author\'s workflow default.',
+  'stabilize.smoothing':
+    'Radius of the low-pass camera path in frames. 12 removes short gate-weave impulses while retaining deliberate pans; higher values produce a calmer camera path but can over-smooth intentional movement.',
+  'stabilize.max_shift':
+    'Caps horizontal and vertical correction at this many source pixels. Use 0 for no cap. The default prevents a bad match from making a very large jump.',
+  'stabilize.max_angle':
+    'Caps rotational correction in degrees. Use 0 for no cap. Three degrees is enough for the stronger weave measured in the Berlin test without allowing extreme rotations.',
+  'stabilize.zoom':
+    'Fixed safety crop used to hide transformed edges. Larger values reduce edge exposure but discard more of the frame. ARP deliberately avoids automatic zoom so the framing cannot pulse or unexpectedly crop far beyond this value.',
+  'stabilize.shot_threshold':
+    'Uses the same visual shot detector as Reference Generation. Lower values detect subtler cuts and dissolves; values that are too low can split energetic camera movement into false shots.',
+  'stabilize.min_shot_seconds':
+    'Prevents closely spaced detections from creating tiny stabilization spans. Tracking and camera smoothing restart at every accepted boundary.',
+  'stabilize.encoder':
+    'FFV1 is mathematically lossless and recommended for pipeline intermediates. ProRes HQ is larger and visually lossless, but more convenient in editing applications.',
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.offset_y':
@@ -89,6 +103,10 @@ const FIELD_DESCRIPTIONS = {
     'Color layer saturation as a percentage before chroma is blended onto the luminance of the base composite.',
   'recomp.color_opacity':
     'How strongly the colorized chroma layer contributes, as a percentage.',
+  'recomp.reference_luminance_match':
+    'Derive one stable tonal curve for each shot by comparing its original black-and-white reference with its approved colour reference. This brings the moving result closer to the reference lighting without frame-by-frame exposure flicker.',
+  'recomp.reference_luminance_strength':
+    'Blend between the original film luminance and the colour-reference luminance. 70% retains most source shadow detail while giving the references a clear influence; 100% applies the complete bounded curve.',
   'recomp.feather_pixels':
     'Only used when an outpainted video is present. It softens the original source edge over the generated sides.',
   'upscale.flashvsr_mode':
@@ -441,6 +459,7 @@ function drawStage(st) {
   const sp = stageProgress(st.key);
 
   if (st.key === 'cleanup') return drawCleanup(st, s, expected, sp);
+  if (st.key === 'stabilize') return drawStabilization(st, s, expected, sp);
   if (st.key === 'outpaint') return drawOutpaint(st, s, expected, sp);
 
   document.getElementById('app').innerHTML = `
@@ -469,7 +488,6 @@ function drawStage(st) {
         ${preview(selectedFile)}
       </section>
     </div>
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields(st.key);
@@ -499,12 +517,67 @@ function drawCleanup(st, s, expected, sp) {
         ${cleanupComparisonHtml(comparison)}
       </section>
     </div>
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields('cleanup');
   bindCleanupComparison();
   showCommand('cleanup');
+}
+
+function drawStabilization(st, s, expected, sp) {
+  const comparison = state.stabilization_comparison || {};
+  document.getElementById('app').innerHTML = `
+    <div class="editor-page">
+      <section class="card">
+        <h2>${st.title}</h2>
+        <p>${st.description}</p>
+        ${progressHtml(sp.percent, sp.label)}
+        ${st.fields.map(f => fieldHtml(st, f)).join('')}
+        ${shotOutputList(expected, null)}
+        ${stageCheckboxes(s)}
+        <div class="actions">
+          <button class="primary" onclick="runStage('stabilize')" ${state.running ? 'disabled' : ''}>Run Stabilization</button>
+          <button class="warn" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
+        </div>
+        <div class="command" id="cmd"></div>
+      </section>
+      <section class="card editor-viewer">
+        <h2>${esc(comparison.title || 'Stabilization Comparison')}</h2>
+        ${stabilizationComparisonHtml(comparison)}
+      </section>
+    </div>
+  `;
+
+  bindStageFields('stabilize');
+  bindVideoComparison('stabilizationCompareSlider');
+  showCommand('stabilize');
+}
+
+function stabilizationComparisonHtml(comparison) {
+  const before = comparison.source || '';
+  const after = comparison.exists === 'true' ? comparison.output : '';
+  if (!before || comparison.source_exists !== 'true') {
+    return '<p class="shot-empty">Choose source material on the Overview page, then run any enabled Clean Up phase.</p>';
+  }
+  if (!after) {
+    return `
+      <video src="${media(before)}" controls preload="metadata"></video>
+      <p class="shot-empty">The synchronized before/after comparison will appear here when Stabilization finishes.</p>
+    `;
+  }
+  return `
+    <div class="comparison-player">
+      <video class="compare-before" src="${media(before)}" controls preload="metadata"></video>
+      <video class="compare-after" src="${media(after)}" muted preload="metadata"></video>
+      <div class="compare-after-mask" style="width:50%"></div>
+      <div class="compare-handle" style="left:50%"></div>
+    </div>
+    <input id="stabilizationCompareSlider" class="compare-slider" type="range" min="0" max="100" value="50" aria-label="Stabilization before after split">
+    <div class="source-info">
+      <div><span>Before master</span><strong>${esc(comparison.master_source || before)}</strong></div>
+      <div><span>After master</span><strong>${esc(comparison.master_output || after)}</strong></div>
+    </div>
+  `;
 }
 
 function cleanupLicenseWarning(s) {
@@ -668,16 +741,6 @@ function restoreScrollState(snap) {
 function isEditingField() {
   const el = document.activeElement;
   return !!(el && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
-}
-
-function runLogHtml() {
-  return `
-    <div class="log-heading">
-      <h3>Run Log</h3>
-      <button type="button" onclick="copyRunLog()">Copy Log</button>
-    </div>
-    <pre class="log" data-run-log="true">${logHtml(state.log)}</pre>
-  `;
 }
 
 function logHtml(text) {

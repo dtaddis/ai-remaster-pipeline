@@ -111,9 +111,12 @@ from .file_dialogs import (
     browse_path_macos,
     browse_path_windows,
     browse_path_zenity,
+    browse_source_paths,
     parse_duration,
     remember_browse_dir,
 )
+from .console_log import ConsoleLog
+from .image_sequences import parse_image_paths, prepare_image_sequence, sequence_state
 from .lifecycle import (
     create_server,
     ensure_comfy_available_for_stage,
@@ -207,6 +210,7 @@ OUTPAINT_LORA_DESTINATION = f"models/loras/{DEFAULT_OUTPAINT_LORA}"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
+import reference_luminance as reference_luma  # noqa: E402
 from model_paths import resolve_comfy_model_path  # noqa: E402
 
 from . import state  # shared singleton registry; sibling modules read state.APP
@@ -373,7 +377,7 @@ class PipelineApp:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.project_path: Path | None = None
-        self.log: list[str] = []
+        self.log: list[str] = ConsoleLog()
         self.process: subprocess.Popen[str] | None = None
         self.quitting = False
         self.running_stage = ""
@@ -387,7 +391,32 @@ class PipelineApp:
         self.source_analysis_results: dict[str, dict] = {}
         self.source_analysis_threads: set[str] = set()
 
+    def restore_image_sequence_source(self) -> None:
+        global_settings = self.settings.setdefault("global", {})
+        image_paths = parse_image_paths(global_settings.get("source_images", ""))
+        if image_paths and all(path.is_file() for path in image_paths):
+            ffmpeg = local_tool("ffmpeg")
+            if ffmpeg:
+                try:
+                    sequence = prepare_image_sequence(
+                        image_paths,
+                        global_settings.get("source_sequence_fps", "24"),
+                        ffmpeg,
+                        progress=self.console_progress,
+                    )
+                    global_settings.update(
+                        {
+                            "source": sequence["source"],
+                            "source_images": sequence["images_json"],
+                            "source_sequence_fps": sequence["fps"],
+                            "source_sequence_preview": sequence["playback"],
+                        }
+                    )
+                except Exception as exc:
+                    self.log.append(f"Could not restore image-sequence source: {exc}")
+
     def normalize_loaded_source_state(self) -> None:
+        self.restore_image_sequence_source()
         source_text = self.settings.get("global", {}).get("source", "")
         if source_text:
             source = resolve_video_source(source_text)
@@ -403,6 +432,9 @@ class PipelineApp:
     def cleanup_enabled(self) -> bool:
         return is_true(self.settings.get("global", {}), "cleanup")
 
+    def stabilize_enabled(self) -> bool:
+        return is_true(self.settings.get("global", {}), "stabilize")
+
     def outpaint_enabled(self) -> bool:
         return is_true(self.settings.get("global", {}), "expand_outpaint", "true")
 
@@ -417,6 +449,8 @@ class PipelineApp:
         stages: list[Stage] = []
         if self.cleanup_enabled():
             stages.append(by_key["cleanup"])
+        if self.stabilize_enabled():
+            stages.append(by_key["stabilize"])
         if self.outpaint_enabled():
             stages.append(by_key["outpaint"])
         if self.colorize_enabled():
@@ -444,15 +478,46 @@ class PipelineApp:
         """Expected immediate output of Clean Up, or the selected source when it is disabled."""
         return self.cleanup_output() if self.cleanup_enabled() else pipeline_source_text(self.settings)
 
+    def stabilization_output(self) -> str:
+        source = self.cleaned_source_for_downstream()
+        return stabilize_output_for(source, self.settings.get("stabilize", {})) if source else ""
+
+    def stabilized_source_for_downstream(self) -> str:
+        """Expected stabilized output, or the cleaned/selected source when stabilization is off."""
+        return self.stabilization_output() if self.stabilize_enabled() else self.cleaned_source_for_downstream()
+
     def outpaint_source_for(self) -> str:
-        return self.cleaned_source_for_downstream()
+        return self.stabilized_source_for_downstream()
 
     def recomposition_base_input(self) -> str:
         values = self.settings.get("recomp", {})
-        return values.get("outpainted_video", "") or values.get("source", "") or self.cleaned_source_for_downstream()
+        return values.get("outpainted_video", "") or values.get("source", "") or self.stabilized_source_for_downstream()
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
+
+    def console_progress(self, percent: int | float, label: str) -> None:
+        reporter = getattr(self.log, "progress", None)
+        if reporter:
+            reporter(percent, label)
+
+    def child_process_kwargs(self) -> dict:
+        """Pipe every worker line back to ARP promptly while keeping one process tree stoppable."""
+        child_env = os.environ.copy()
+        child_env["PYTHONUNBUFFERED"] = "1"
+        kwargs: dict = {
+            "cwd": ROOT,
+            "text": True,
+            "bufsize": 1,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "env": child_env,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        return kwargs
 
     def files_for(self, stage: Stage) -> list[dict[str, str | int]]:
         exts = VIDEO_EXTS | IMAGE_EXTS | TEXT_EXTS
@@ -561,7 +626,27 @@ class PipelineApp:
         install_percent = int(install_status["percent"]) if install_status else None
         percent = min(90, 5 + int(elapsed / 60 * 20))
         label = "Running"
-        if self.running_stage_key == "outpaint":
+        if self.running_stage_key == "stabilize":
+            label = "Analysing shot motion"
+            total = first_int_after(log_text, "detected ")
+            current = 0
+            for line in log_text.splitlines():
+                if not line.startswith("Shot ") or ": stabilizing" not in line:
+                    continue
+                try:
+                    current = max(current, int(line.split("Shot ", 1)[1].split(":", 1)[0]))
+                except (IndexError, ValueError):
+                    pass
+            if total and current:
+                percent = max(percent, min(90, 15 + int(((current - 0.5) / total) * 75)))
+                label = f"Stabilizing shot {current}/{total}"
+            if "joining stabilized shots" in lower:
+                percent, label = max(percent, 94), "Joining stabilized shots"
+            if "restoring source audio" in lower:
+                percent, label = max(percent, 97), "Restoring source audio"
+            if "wrote stabilized video" in lower or "reuse stabilized video" in lower:
+                percent, label = 100, "Stabilized video ready"
+        elif self.running_stage_key == "outpaint":
             chunk = outpaint_chunk_progress(log_text)
             milestones = [
                 ("checking model", 8, "Checking models"),
@@ -754,10 +839,14 @@ class PipelineApp:
                 "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
                 "existing_outputs": {stage.key: self.existing_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
                 "cleanup_comparison": self.cleanup_comparison_state(),
+                "stabilization_comparison": self.stabilization_comparison_state(),
+                "reference_luminance": {"enabled": False, "plan": [], "matched_shots": 0},
                 "upscale_preview": self.upscale_preview_state(),
                 "output_selection": self.output_selection_state(),
                 "source_previews": source_media["previews"],
                 "source_info": source_media["info"],
+                "source_sequence": sequence_state(settings_snapshot),
+                "source_playback": settings_snapshot.get("global", {}).get("source_sequence_preview", "") or source_text,
                 "source_section": section,
                 "project_path": str(self.project_path) if self.project_path else "",
                 "source_monochrome": source_media["monochrome"],
@@ -782,11 +871,33 @@ class PipelineApp:
                 settings_snapshot,
                 generate_previews=generate_shot_previews if view != "upscale" else False,
             )
+        if view == "recomp":
+            values = settings_snapshot.get("recomp", {})
+            manifest_text = values.get("manifest", "")
+            enabled = is_true(values, "reference_luminance_match", "true")
+            plan = []
+            error = ""
+            if enabled and manifest_text:
+                try:
+                    manifest = resolve(manifest_text)
+                    strength = float(values.get("reference_luminance_strength", "70") or 70)
+                    plan = reference_luma.reference_luminance_plan(manifest, manifest_fps(manifest), strength)
+                except Exception as exc:
+                    error = str(exc)
+            payload["reference_luminance"] = {
+                "enabled": enabled,
+                "plan": plan,
+                "matched_shots": sum(1 for item in plan if item.get("matched")),
+                "error": error,
+            }
         return payload
 
     def update_settings(self, stage: str, values: dict[str, str]) -> None:
         previous_source = self.settings.get("global", {}).get("source", "") if stage == "global" else ""
         if stage == "global" and "source" in values:
+            if str(values.get("source", "")) != previous_source and "source_images" not in values:
+                values = dict(values)
+                values.update({"source_images": "", "source_sequence_preview": ""})
             source = resolve_video_source(str(values.get("source", "")))
             if source.exists() and str(source) != str(values.get("source", "")):
                 values = dict(values)
@@ -814,7 +925,7 @@ class PipelineApp:
             self.log.append(f"Loading source material: {values.get('source')}")
             self.clear_derived_stage_inputs()
             self.hydrate_stage_inputs("global")
-        elif stage == "global" and ({"cleanup", "colorize", "expand_outpaint", "upscale"} & set(values)):
+        elif stage == "global" and ({"cleanup", "stabilize", "colorize", "expand_outpaint", "upscale"} & set(values)):
             self.hydrate_stage_inputs("global")
         elif stage == "colour" and "method" in values:
             if values.get("method") in {"deepexemplar", "colormnet"}:
@@ -829,6 +940,45 @@ class PipelineApp:
             self.settings.setdefault("references", {}).setdefault("manifest", manifest)
             self.settings.setdefault("colour", {}).setdefault("manifest", manifest)
         self.save()
+
+    def select_source_paths(self, selected: list[str], fps: str = "24") -> dict:
+        if not selected:
+            return {"path": "", "paths": []}
+        paths = [resolve(path) for path in selected]
+        videos = [path for path in paths if path.suffix.lower() in VIDEO_EXTS]
+        images = [path for path in paths if path.suffix.lower() in IMAGE_EXTS]
+        if len(paths) == 1 and len(videos) == 1:
+            self.update_settings(
+                "global",
+                {"source": rel(videos[0]), "source_images": "", "source_sequence_preview": ""},
+            )
+            return {"path": self.settings["global"]["source"], "paths": [rel(videos[0])], "kind": "video"}
+        if len(images) != len(paths):
+            raise RuntimeError("Choose one video, or select only image files for an image sequence.")
+        ffmpeg = local_tool("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("Run install_windows.bat to install local FFmpeg for image-sequence sources.")
+        self.log.append(f"Importing {len(images)} selected images as a source sequence at {fps} fps.")
+        sequence = prepare_image_sequence(images, fps, ffmpeg, progress=self.console_progress)
+        self.update_settings(
+            "global",
+            {
+                "source": sequence["source"],
+                "source_images": sequence["images_json"],
+                "source_sequence_fps": sequence["fps"],
+                "source_sequence_preview": sequence["playback"],
+            },
+        )
+        self.log.append(
+            f"Imported {sequence['count']} image frames ({', '.join(sequence['formats'])}) as: {sequence['source']}"
+        )
+        return {"path": sequence["source"], "paths": sequence["images"], "kind": "images", "sequence": sequence}
+
+    def update_source_sequence_fps(self, fps: str) -> dict:
+        images = parse_image_paths(self.settings.get("global", {}).get("source_images", ""))
+        if not images:
+            raise RuntimeError("The current source is not an image sequence.")
+        return self.select_source_paths([str(path) for path in images], fps)
 
     def source_media_state(self, source_text: str) -> dict:
         signature = source_signature(source_text)
@@ -878,6 +1028,8 @@ class PipelineApp:
             current = dict(self.source_analysis_status.get(key, {}))
             current.update({"ready": ready, "percent": percent, "message": message})
             self.source_analysis_status[key] = current
+        if message and not ready:
+            self.console_progress(percent, message)
 
     def analyze_source_media(self, signature: tuple[str, int, int], key: str) -> None:
         source = Path(signature[0])
@@ -952,6 +1104,7 @@ class PipelineApp:
             self.project_path = path
         else:
             path = self.project_path
+        self.log.append(f"Saving ARP project: {path}")
         write_project_file(path, self.settings)
         self.log.append(f"Saved ARP project: {path}")
         return {"path": str(path)}
@@ -961,9 +1114,11 @@ class PipelineApp:
         if not selected:
             return {"path": ""}
         path = resolve(selected)
+        self.log.append(f"Loading ARP project: {path}")
         loaded = read_project_file(path)
         self.settings = loaded
         self.project_path = path
+        self.restore_image_sequence_source()
         self.hydrate_stage_inputs("")
         self.save()
         self.log.append(f"Loaded ARP project: {path}")
@@ -972,6 +1127,7 @@ class PipelineApp:
     def clear_derived_stage_inputs(self) -> None:
         for stage_key, keys in {
             "cleanup": ("output",),
+            "stabilize": ("input_video", "output"),
             "outpaint": ("source", "output", "outpainted_video", "manifest", "colorized_video"),
             "shots": ("outpainted_video", "manifest", "colorized_video"),
             "references": ("manifest", "outpainted_video", "colorized_video"),
@@ -990,10 +1146,21 @@ class PipelineApp:
         clean_expected = resolve(clean_expected_text) if clean_expected_text else None
         clean_ready = bool(clean_expected and clean_expected.exists())
         self.settings.setdefault("cleanup", {})["output"] = clean_expected_text
-        upstream_text = (
+        cleaned_text = (
             rel(clean_expected) if self.cleanup_enabled() and clean_ready
             else "" if self.cleanup_enabled()
             else pipeline_source_text(self.settings)
+        )
+        stabilization_expected_text = self.stabilization_output()
+        stabilization_expected = resolve(stabilization_expected_text) if stabilization_expected_text else None
+        stabilization_ready = bool(stabilization_expected and stabilization_expected.exists())
+        stabilize_settings = self.settings.setdefault("stabilize", {})
+        stabilize_settings["input_video"] = cleaned_text
+        stabilize_settings["output"] = stabilization_expected_text
+        upstream_text = (
+            rel(stabilization_expected) if self.stabilize_enabled() and stabilization_ready
+            else "" if self.stabilize_enabled()
+            else cleaned_text
         )
 
         if not self.outpaint_enabled():
@@ -1086,6 +1253,11 @@ class PipelineApp:
                 return []
             output = self.cleanup_output()
             return [output] if output else []
+        if stage_key == "stabilize":
+            if not self.stabilize_enabled():
+                return []
+            output = self.stabilization_output()
+            return [output] if output else []
         if stage_key == "outpaint":
             if not self.outpaint_enabled():
                 return []
@@ -1123,6 +1295,7 @@ class PipelineApp:
     def _stage_command_builders(self) -> dict:
         return {
             "cleanup": self._cleanup_command,
+            "stabilize": self._stabilize_command,
             "outpaint": self._outpaint_command,
             "shots": self._shots_command,
             "references": self._references_command,
@@ -1168,6 +1341,24 @@ class PipelineApp:
             ),
         )
         cmd.extend(["--comfy-dir", comfy_dir_for(config), "--comfy-url", comfy_url_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+        return cmd
+
+    def _stabilize_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        source = self.cleaned_source_for_downstream()
+        output = stabilize_output_for(source, values) if source else ""
+        cmd = [sys.executable, "-u", str(SCRIPTS / "stabilize_video.py"), "--source", source, "--output", output]
+        add_value_args(
+            cmd,
+            values,
+            ("smoothing", "max_shift", "max_angle", "zoom", "shot_threshold", "min_shot_seconds", "encoder"),
+        )
+        shot_manifest = (
+            self.settings.get("colour", {}).get("manifest", "")
+            or self.settings.get("references", {}).get("manifest", "")
+            or self.settings.get("shots", {}).get("manifest", "")
+        )
+        if shot_manifest and resolve(shot_manifest).is_file():
+            cmd.extend(["--shot-manifest", shot_manifest])
         return cmd
 
     def _outpaint_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
@@ -1301,6 +1492,10 @@ class PipelineApp:
         add(["--source", values.get("source", ""), "--output", output])
         if self.colorize_enabled() and values.get("colorized_video"):
             add(["--colorized", values["colorized_video"]])
+            if values.get("manifest"):
+                add(["--manifest", values["manifest"]])
+            add_bool_flags(cmd, values, ("reference_luminance_match",), default="true")
+            add(["--reference-luminance-strength", values.get("reference_luminance_strength", "70")])
         if outpainted:
             add(["--feather-pixels", values.get("feather_pixels", "80")])
         add(["--saturation", values.get("saturation", "82"), "--temperature", values.get("temperature", "6500"), "--color-opacity", values.get("color_opacity", "100"), "--encoder", values.get("encoder", "h264")])
@@ -1365,6 +1560,8 @@ class PipelineApp:
             return False, "ARP is shutting down."
         if stage_key == "cleanup" and not self.cleanup_enabled():
             return False, "Clean Up is disabled on the Overview tab."
+        if stage_key == "stabilize" and not self.stabilize_enabled():
+            return False, "Stabilization is disabled on the Overview tab."
         if stage_key == "outpaint" and not self.outpaint_enabled():
             return False, "Expand using Outpainting is disabled on the Overview tab."
         if stage_key in COLORIZE_STAGE_KEYS and not self.colorize_enabled():
@@ -1380,6 +1577,10 @@ class PipelineApp:
             clean_output = self.cleanup_output()
             if not clean_output or not resolve(clean_output).exists():
                 return False, "Run Clean Up first so this phase has its upstream video."
+        if stage_key not in {"cleanup", "stabilize"} and self.stabilize_enabled():
+            stabilized_output = self.stabilization_output()
+            if not stabilized_output or not resolve(stabilized_output).exists():
+                return False, "Run Stabilization first so this phase has its upstream video."
         if stage_key == "outpaint":
             ok, message = outpaint_browser_handoff()
             if not ok:
@@ -1411,7 +1612,7 @@ class PipelineApp:
         ):
             return False, "Select at least one Clean Up operation: AI DeScratch, DeVignette, or Dearchive."
         missing = [key for key in stage.required if not values.get(key)]
-        if stage_key in {"cleanup", "outpaint"} and not self.settings.get("global", {}).get("source"):
+        if stage_key in {"cleanup", "stabilize", "outpaint"} and not self.settings.get("global", {}).get("source"):
             missing = ["source material on the Global tab"]
         if stage_key == "recomp":
             if self.outpaint_enabled() and not values.get("outpainted_video"):
@@ -1448,12 +1649,7 @@ class PipelineApp:
             self.run_started_at = time.time()
             cmd = self.command_for(stage_key)
             self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            self.process = subprocess.Popen(cmd, **kwargs)
+            self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(stage.title)
             threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
         return True, "Started " + stage.title
@@ -1477,12 +1673,7 @@ class PipelineApp:
             cmd = self.command_for("outpaint")
             cmd.extend(["--only-chunk", str(index), "--force"])
             self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            self.process = subprocess.Popen(cmd, **kwargs)
+            self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(f"Outpainting chunk {index + 1}")
             threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
         return True, f"Started outpaint chunk {index + 1}"
@@ -1511,13 +1702,8 @@ class PipelineApp:
             label = "OpenAI" if provider == "openai" else "Qwen"
             self.log.append(f"Regenerating colour reference with {label} for shot {index + 1}: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Reference Generation")
             except Exception as exc:
                 self.running_stage = ""
@@ -1549,13 +1735,8 @@ class PipelineApp:
             mode = "masked" if mask_data else "unmasked"
             self.log.append(f"Generating {mode} reference edit preview for shot {index + 1}: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Reference Editing")
             except Exception as exc:
                 self.running_stage = ""
@@ -1585,13 +1766,8 @@ class PipelineApp:
             self.run_started_at = time.time()
             self.log.append(f"Generating Qwen end guide frame for chunk {index + 1}: {output_rel}")
             self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Guide Frame Editing")
             except Exception as exc:
                 self.running_stage = ""
@@ -1624,13 +1800,8 @@ class PipelineApp:
             self.run_started_at = time.time()
             self.log.append(f"Generating Qwen guide frame for chunk {index + 1}: {output_rel}")
             self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Guide Frame Generation")
             except Exception as exc:
                 self.running_stage = ""
@@ -1663,13 +1834,8 @@ class PipelineApp:
             self.run_started_at = time.time()
             self.log.append(f"Generating Qwen guide (chunk {chunk_index + 1}, guide {guide_index}, frame_idx={frame_idx}): {output_rel}")
             self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("End Guide Generation")
             except Exception as exc:
                 self.running_stage = ""
@@ -1694,7 +1860,7 @@ class PipelineApp:
         if self.outpaint_enabled() or self.colorize_enabled():
             recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
             return recomposed
-        return self.cleaned_source_for_downstream()
+        return self.stabilized_source_for_downstream()
 
     def upscale_command(self, values: dict[str, str], source: str, output: str) -> list[str]:
         config = current_config()
@@ -1787,6 +1953,25 @@ class PipelineApp:
             "title": "Clean Up Comparison",
         }
 
+    def stabilization_comparison_state(self) -> dict[str, str]:
+        source = self.cleaned_source_for_downstream()
+        output = self.stabilization_output() if source else ""
+        exists = bool(source and output and resolve(source).exists() and resolve(output).exists())
+        source_preview = source
+        global_settings = self.settings.get("global", {})
+        if source == pipeline_source_text(self.settings) and global_settings.get("source_sequence_preview"):
+            source_preview = global_settings["source_sequence_preview"]
+        preview = stabilization_preview_for(output) if output else ""
+        return {
+            "source": source_preview,
+            "master_source": source,
+            "output": preview if preview and resolve(preview).exists() else output,
+            "master_output": output,
+            "source_exists": "true" if source and resolve(source).exists() else "false",
+            "exists": "true" if exists and (not preview or resolve(preview).exists()) else "false",
+            "title": "Stabilization Comparison",
+        }
+
     def output_selection_state(self) -> dict[str, str]:
         upscale = self.settings.get("upscale", {})
         upscale_output = upscale_output_for(self.upscale_input_for() or upscale.get("input_video"), upscale) or upscale.get("output")
@@ -1796,12 +1981,15 @@ class PipelineApp:
         soundtrack_source = self.soundtrack_source_for()
         soundtrack_output = soundtrack_output_for(soundtrack_source, self.settings.get("audio", {})) if (self.soundtrack_enabled() and soundtrack_source) else ""
         cleanup_output = self.cleanup_output() if self.cleanup_enabled() else ""
+        stabilization_output = self.stabilization_output() if self.stabilize_enabled() else ""
         if upscale_output and resolve(upscale_output).exists():
             return {"path": upscale_output, "kind": "upscaled", "label": "Upscaled output"}
         if soundtrack_output and resolve(soundtrack_output).exists():
             return {"path": soundtrack_output, "kind": "soundtrack", "label": "Soundtrack output"}
         if recomposed and resolve(recomposed).exists():
             return {"path": recomposed, "kind": "recomposed", "label": "Recomposed output"}
+        if stabilization_output and resolve(stabilization_output).exists():
+            return {"path": stabilization_output, "kind": "stabilized", "label": "Stabilized output"}
         if cleanup_output and resolve(cleanup_output).exists():
             return {"path": cleanup_output, "kind": "cleanup", "label": "Clean Up output"}
         if self.upscale_enabled() and upscale_output:
@@ -1810,6 +1998,8 @@ class PipelineApp:
             return {"path": soundtrack_output, "kind": "soundtrack_pending", "label": "Pending soundtrack output"}
         if recomposed:
             return {"path": recomposed, "kind": "recomposed_pending", "label": "Pending recomposed output"}
+        if stabilization_output:
+            return {"path": stabilization_output, "kind": "stabilized_pending", "label": "Pending stabilized output"}
         if cleanup_output:
             return {"path": cleanup_output, "kind": "cleanup_pending", "label": "Pending Clean Up output"}
         return {"path": "", "kind": "", "label": ""}
@@ -1843,13 +2033,8 @@ class PipelineApp:
             self.save()
             self.log.append(f"Generating upscale preview: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Upscale Preview")
             except Exception as exc:
                 self.running_stage = ""
@@ -1892,13 +2077,8 @@ class PipelineApp:
             mode = "masked" if mask_data else "unmasked"
             self.log.append(f"Generating {mode} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}")
             self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
             try:
-                self.process = subprocess.Popen(cmd, **kwargs)
+                self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
                 keep_awake("Guide Edit Preview")
             except Exception as exc:
                 self.running_stage = ""
@@ -1919,10 +2099,14 @@ class PipelineApp:
     def _collect_output_guide_edit(self, output: Path, source: Path) -> None:
         """Collect a guide edit preview and normalize the Qwen result to the editor image size."""
         assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            with self.lock:
-                self.log.append(line.rstrip())
-        code = self.process.wait()
+        stop_progress, reporter = self._start_console_progress_reporter()
+        try:
+            for line in self.process.stdout:
+                with self.lock:
+                    self.log.append(line.rstrip())
+            code = self.process.wait()
+        finally:
+            self._stop_console_progress_reporter(stop_progress, reporter)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
             release_keep_awake()
@@ -1943,10 +2127,14 @@ class PipelineApp:
     def _collect_output_guide(self, output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
         """Like _collect_output but composites the guide in-place after a successful Qwen run."""
         assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            with self.lock:
-                self.log.append(line.rstrip())
-        code = self.process.wait()
+        stop_progress, reporter = self._start_console_progress_reporter()
+        try:
+            for line in self.process.stdout:
+                with self.lock:
+                    self.log.append(line.rstrip())
+            code = self.process.wait()
+        finally:
+            self._stop_console_progress_reporter(stop_progress, reporter)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
             release_keep_awake()
@@ -1987,10 +2175,14 @@ class PipelineApp:
 
     def _collect_output(self, stage_key: str) -> None:
         assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            with self.lock:
-                self.log.append(line.rstrip())
-        code = self.process.wait()
+        stop_progress, reporter = self._start_console_progress_reporter()
+        try:
+            for line in self.process.stdout:
+                with self.lock:
+                    self.log.append(line.rstrip())
+            code = self.process.wait()
+        finally:
+            self._stop_console_progress_reporter(stop_progress, reporter)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
             release_keep_awake()
@@ -2003,6 +2195,26 @@ class PipelineApp:
                 self.hydrate_stage_inputs(stage_key)
             elif code == 0 and stage_key == "upscale_preview":
                 self.log.append("Upscale preview ready.")
+
+    def _report_console_progress(self, stop: threading.Event) -> None:
+        """Keep one useful status line moving while a child process is otherwise quiet."""
+        while not stop.wait(1.0):
+            progress = self.estimate_running_progress()
+            if progress:
+                self.console_progress(progress.get("percent", 0), progress.get("label", "Running"))
+
+    def _start_console_progress_reporter(self) -> tuple[threading.Event, threading.Thread]:
+        stop = threading.Event()
+        reporter = threading.Thread(target=self._report_console_progress, args=(stop,), daemon=True)
+        reporter.start()
+        return stop, reporter
+
+    def _stop_console_progress_reporter(self, stop: threading.Event, reporter: threading.Thread) -> None:
+        stop.set()
+        reporter.join(timeout=1)
+        finish = getattr(self.log, "finish_progress", None)
+        if finish:
+            finish()
 
     def stop(self) -> None:
         with self.lock:
@@ -2074,6 +2286,42 @@ def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
         dearchive=is_true(values, "dearchive", "true"),
     )
     return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4"))
+
+
+def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
+    if not source_text:
+        return ""
+    source = resolve_video_source(source_text)
+    try:
+        smoothing = int(float(values.get("smoothing", "12") or 12))
+        max_shift = int(float(values.get("max_shift", "48") or 48))
+        max_angle = float(values.get("max_angle", "3.0") or 3.0)
+        zoom = float(values.get("zoom", "3.0") or 3.0)
+        shot_threshold = float(values.get("shot_threshold", "0.075") or 0.075)
+        min_shot_seconds = float(values.get("min_shot_seconds", "1.0") or 1.0)
+    except ValueError:
+        smoothing, max_shift, max_angle, zoom = 12, 48, 3.0, 3.0
+        shot_threshold, min_shot_seconds = 0.075, 1.0
+    encoder = values.get("encoder", "ffv1") or "ffv1"
+    identity = aid.stabilize_identity(
+        source.name,
+        smoothing=smoothing,
+        max_shift=max_shift,
+        max_angle=max_angle,
+        zoom=zoom,
+        shot_threshold=shot_threshold,
+        min_shot_seconds=min_shot_seconds,
+        encoder=encoder,
+    )
+    extension = "mov" if encoder == "prores" else "mkv"
+    return rel(ROOT / "intermediate" / "stabilized" / aid.artifact_name(aid.source_word(source.name), "stabilized", identity, extension))
+
+
+def stabilization_preview_for(output_text: str) -> str:
+    if not output_text:
+        return ""
+    output = resolve(output_text)
+    return rel(output.with_name(output.stem + "_preview.mp4"))
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:

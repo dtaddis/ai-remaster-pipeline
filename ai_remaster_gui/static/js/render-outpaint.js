@@ -690,7 +690,6 @@ function drawOutpaint(st, s, expected, sp) {
       <p class="shot-empty">Chunks are the fixed video segments sent to LTX. They are separate from shot detection and can be regenerated individually.</p>
       ${outpaintChunkCards()}
     </section>
-    <section class="card" style="margin-top:16px">${runLogHtml()}</section>
   `;
 
   bindStageFields('outpaint');

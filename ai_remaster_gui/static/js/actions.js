@@ -1030,13 +1030,13 @@ async function pollReferencePreview(path) {
   }
   const elapsed = Date.now() - referenceEditor.previewPollStartedAt;
   if (result && result.ok && !result.running && elapsed > 5000) {
-    if (preview) preview.innerHTML = '<p class="shot-empty">Qwen finished, but ARP could not find the preview image. Check the run log for details.</p>';
+    if (preview) preview.innerHTML = '<p class="shot-empty">Qwen finished, but ARP could not find the preview image. Check the ARP command-prompt console for details.</p>';
     if (status) status.textContent = 'Preview image was not found after Qwen finished.';
     refresh(true);
     return;
   }
   if (elapsed > 20 * 60 * 1000) {
-    if (preview) preview.innerHTML = '<p class="shot-empty">Still waiting for the preview image. Check ComfyUI and the run log.</p>';
+    if (preview) preview.innerHTML = '<p class="shot-empty">Still waiting for the preview image. Check ComfyUI and the ARP command-prompt console.</p>';
     if (status) status.textContent = 'Still waiting for Qwen preview.';
     return;
   }
@@ -1500,6 +1500,7 @@ async function saveGlobalPipelineOptions() {
     stage: 'global',
     values: {
       cleanup: String(document.getElementById('globalCleanup').checked),
+      stabilize: String(document.getElementById('globalStabilize').checked),
       expand_outpaint: String(document.getElementById('globalExpandOutpaint').checked),
       colorize: String(document.getElementById('globalColorize').checked),
       upscale: String(document.getElementById('globalUpscale').checked),
@@ -1583,10 +1584,23 @@ async function markSourceSection(edge) {
 
 async function browseGlobalSource() {
   const el = document.getElementById('globalSource');
-  const result = await postJson('/api/browse-global-source', { current: el.value });
+  const fps = document.getElementById('globalSequenceFps')?.value || '24';
+  const result = await postJson('/api/browse-global-source', { current: el.value, fps });
   if (!result.ok) return alert(result.error || 'Browse failed');
 
   if (!result.path) return await refresh(true);
+
+  selected = {};
+  state = result.state;
+  pruneSelected();
+  draw();
+  lastRenderSignature = renderSignature();
+}
+
+async function saveSourceSequenceFps() {
+  const fps = document.getElementById('globalSequenceFps')?.value || '24';
+  const result = await postJson('/api/source-sequence-fps', { fps });
+  if (!result.ok) return alert(result.error || 'Could not change the image-sequence frame rate');
 
   selected = {};
   state = result.state;

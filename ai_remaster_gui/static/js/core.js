@@ -106,6 +106,8 @@ function renderSignature() {
     expected_outputs: state.expected_outputs,
     existing_outputs: state.existing_outputs,
     cleanup_comparison: state.cleanup_comparison,
+    stabilization_comparison: state.stabilization_comparison,
+    reference_luminance: state.reference_luminance,
     upscale_preview: state.upscale_preview,
     output_selection: state.output_selection,
     source_previews: state.source_previews,
@@ -334,7 +336,7 @@ function showErrorPopup(excerpt) {
           <strong>ARP Noticed An Error</strong>
           <button type="button" onclick="closeErrorPopup()">Close</button>
         </div>
-        <p class="shot-empty">A new error appeared in the run log. The stage may need attention before continuing.</p>
+        <p class="shot-empty">A new error appeared in the ARP command-prompt console. The stage may need attention before continuing.</p>
         <pre id="logErrorExcerpt" class="log error-popup-log"></pre>
         <div class="actions">
           <button class="primary" type="button" onclick="copyRunLog()">Copy Log</button>

@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import os
+import json
 from pathlib import Path
 
 from . import state
@@ -34,6 +35,20 @@ def browse_path(kind: str, current: str = "") -> str:
     else:
         selected = browse_path_linux(kind, initial)
     remember_browse_dir(selected)
+    return selected
+
+
+def browse_source_paths(current: str = "") -> list[str]:
+    """Choose one video or one-or-more still images for the global source."""
+    initial = browse_initial_path("file", current)
+    if os.name == "nt":
+        selected = browse_source_paths_windows(initial)
+    elif sys.platform == "darwin":
+        selected = browse_source_paths_macos(initial)
+    else:
+        selected = browse_source_paths_linux(initial)
+    if selected:
+        remember_browse_dir(selected[0])
     return selected
 
 def browse_initial_path(kind: str, current: str = "") -> Path:
@@ -147,6 +162,55 @@ $dialog.Filter = '{filter_text}'
         state.APP.log.append("Browse cancelled.")
     return rel(Path(selected)) if selected else ""
 
+
+def browse_source_paths_windows(initial: Path) -> list[str]:
+    initial_dir = initial if initial.is_dir() else initial.parent
+    initial_text = str(initial_dir).replace("'", "''")
+    initial_file = "" if initial.is_dir() else initial.name.replace("'", "''")
+    script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.WindowState = 'Minimized'
+$owner.Add_Shown({{ $owner.Hide() }})
+$owner.Show()
+$owner.Activate()
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.InitialDirectory = '{initial_text}'
+$dialog.FileName = '{initial_file}'
+$dialog.Multiselect = $true
+$dialog.Filter = 'Video or image files (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.bmp;*.jpg;*.jpeg;*.dpx;*.webp;*.tif;*.tiff)|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.png;*.bmp;*.jpg;*.jpeg;*.dpx;*.webp;*.tif;*.tiff|All files (*.*)|*.*'
+try {{
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {{
+        [Console]::Out.Write(($dialog.FileNames | ConvertTo-Json -Compress))
+    }}
+}} finally {{
+    $owner.Dispose()
+}}
+"""
+    if state.APP is not None:
+        state.APP.log.append(f"Opening Windows source browse dialog: {initial_dir}")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Windows file dialog failed.").strip())
+    if not result.stdout.strip():
+        if state.APP is not None:
+            state.APP.log.append("Browse cancelled.")
+        return []
+    decoded = json.loads(result.stdout)
+    paths = decoded if isinstance(decoded, list) else [decoded]
+    selected = [rel(Path(path)) for path in paths]
+    if state.APP is not None:
+        state.APP.log.append(f"Browse selected {len(selected)} source item(s).")
+    return selected
+
 def browse_path_macos(kind: str, initial: Path) -> str:
     initial_dir = initial if initial.is_dir() else initial.parent
     initial_script = applescript_quote(str(initial_dir))
@@ -171,6 +235,29 @@ def browse_path_macos(kind: str, initial: Path) -> str:
         state.APP.log.append("Browse cancelled.")
     return rel(Path(selected)) if selected else ""
 
+
+def browse_source_paths_macos(initial: Path) -> list[str]:
+    initial_dir = initial if initial.is_dir() else initial.parent
+    initial_script = applescript_quote(str(initial_dir))
+    script = f'''set chosen to choose file with prompt "Choose a video or image sequence" default location POSIX file {initial_script} with multiple selections allowed
+set output to ""
+repeat with itemPath in chosen
+    set output to output & POSIX path of itemPath & linefeed
+end repeat
+output'''
+    result = subprocess.run(["osascript", "-e", script], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "User canceled" in stderr or "(-128)" in stderr:
+            if state.APP is not None:
+                state.APP.log.append("Browse cancelled.")
+            return []
+        raise RuntimeError(stderr or "macOS file dialog failed.")
+    selected = [rel(Path(line.strip())) for line in result.stdout.splitlines() if line.strip()]
+    if selected and state.APP is not None:
+        state.APP.log.append(f"Browse selected {len(selected)} source item(s).")
+    return selected
+
 def applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -180,6 +267,33 @@ def browse_path_linux(kind: str, initial: Path) -> str:
     if shutil.which("kdialog"):
         return browse_path_kdialog(kind, initial)
     raise RuntimeError("No native file picker found. Install zenity or kdialog, or paste the path into the field.")
+
+
+def browse_source_paths_linux(initial: Path) -> list[str]:
+    initial_dir = initial if initial.is_dir() else initial.parent
+    if shutil.which("zenity"):
+        command = [
+            "zenity", "--file-selection", "--multiple", "--separator=\n",
+            f"--filename={str(initial_dir) + os.sep}",
+            "--file-filter=Video and images | *.mp4 *.mov *.mkv *.avi *.webm *.m4v *.png *.bmp *.jpg *.jpeg *.dpx *.webp *.tif *.tiff",
+        ]
+    elif shutil.which("kdialog"):
+        command = [
+            "kdialog", "--getopenfilename", str(initial_dir),
+            "Video and images (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.png *.bmp *.jpg *.jpeg *.dpx *.webp *.tif *.tiff)",
+            "--multiple", "--separate-output",
+        ]
+    else:
+        raise RuntimeError("No native file picker found. Install zenity or kdialog, or paste a video path into the field.")
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        if state.APP is not None:
+            state.APP.log.append("Browse cancelled.")
+        return []
+    selected = [rel(Path(line.strip())) for line in result.stdout.splitlines() if line.strip()]
+    if selected and state.APP is not None:
+        state.APP.log.append(f"Browse selected {len(selected)} source item(s).")
+    return selected
 
 def browse_path_zenity(kind: str, initial: Path) -> str:
     save_kind = kind in {"save", "save_image", "project_save"}

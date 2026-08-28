@@ -119,10 +119,11 @@ def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
     return False, message
 
 def startup_log(message: str) -> None:
-    print(message)
     app = globals().get("APP")
     if app is not None:
         app.log.append(message)
+    else:
+        print(message, flush=True)
 
 def comfy_startup_log_path() -> Path:
     return COMFY_STARTUP_LOG

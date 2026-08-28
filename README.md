@@ -6,7 +6,7 @@
 
 ARP is a local GUI app for remastering public-domain or properly licensed film material with ComfyUI-powered AI tools.
 
-It is built around an old-film workflow: choose source material, optionally clean archive damage, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
+It is built around an old-film workflow: choose source material, optionally clean archive damage and stabilize gate weave per shot, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
 
 The app is still alpha software, but the goal is simple: you should be able to run the whole remaster from the GUI, then inspect and adjust each stage when the AI needs a little human steering.
 
@@ -135,9 +135,9 @@ Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
 ## Basic Workflow
 
 1. Open the Overview tab.
-2. Choose your source material with Browse.
+2. Choose your source material with Browse. Select one video, or select a numbered image sequence (PNG, BMP, JPG/JPEG, DPX, TIFF, or WebP). Set **Image sequence FPS** before browsing, or change it afterward to rebuild the sequence timing. Image sequences are sorted naturally by filename, converted to a 10-bit lossless FFV1 working master, and given a browser-playable preview automatically.
 3. Check the preview frames, duration, resolution, frame rate, codecs, and color/monochrome guess.
-4. Enable Clean Up when the source needs archive restoration; it defaults off. Inside the phase, select any combination of AI DeScratch, DeVignette, and Dearchive. Leave Colorize enabled for black-and-white sources, or turn it off if you only want cleanup/outpainting.
+4. Enable Clean Up when the source needs archive restoration, and Stabilize when it has gate weave, jitter, or unwanted frame rotation; both default off. Inside Clean Up, select any combination of AI DeScratch, DeVignette, and Dearchive. Leave Colorize enabled for black-and-white sources, or turn it off if you only want cleanup/stabilization/outpainting.
 5. Click Run Whole Remaster for a first pass.
 6. Use the stage tabs to inspect or rerun individual phases.
 
@@ -160,6 +160,10 @@ The order is DeVignette, AI DeScratch, then Dearchive. AI DeScratch defaults to 
 DeVignette defaults to **Auto (prefer GPU)**. ARP uses its installed PyTorch CUDA stack directly and processes frames in adaptive batches when an NVIDIA GPU is available; otherwise it logs the reason and falls back to OpenCV/NumPy on the CPU. The log reports the selected processor, GPU name, batch size, sampled-frame analysis time, frames per second, elapsed time, and ETA.
 
 When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps); the UI accepts 2 to 20 seconds and rounds the requested duration at the source frame rate to the nearest LTX-valid `8n + 1` frame count. **Source Fidelity** controls the strength of the complete input-video IC-LoRA guide. Its safe default of `1.0` preserves the source most exactly, while lower values let Dearchive repaint more damage at increasing risk of changes to faces, hands, motion, and fine period detail. Every combination returns a video with the source resolution, sample aspect ratio, frame rate, frame count, and audio. The passes preserve colour; aspect-ratio expansion and delivery scaling happen only in later phases.
+
+### Stabilization
+
+Optional and off by default. Stabilization uses FFmpeg's two-pass libvidstab filters to estimate and correct translation and rotation. ARP first detects shot boundaries with the same detector used by Reference Generation, then analyses every shot independently so cuts and dissolves are not interpreted as camera movement. An existing user-reviewed shot manifest takes precedence when available. Smoothing, maximum translation/rotation, fixed safety zoom, and shot sensitivity are adjustable; ARP does not use automatic zoom, so framing cannot pulse or silently crop much more than requested. FFV1 is the default mathematically lossless intermediate; ProRes HQ is available for editing workflows. Stabilization runs after Clean Up and before Outpainting or Colorization.
 
 ### Outpainting
 
@@ -198,6 +202,8 @@ Because Dearchive can introduce colour of its own, ARP converts extracted source
 ### Recomposition
 
 Preview and tune the final blend: outpainted video at the bottom, original source in the center with feathered edges, and the colorized layer contributing chroma on top.
+
+**Reference luminance matching** compares each approved colour reference with its original black-and-white reference and derives a bounded tonal curve for that shot. The compositor applies one fixed curve across the entire shot before adding colour chroma, which brings the moving lighting and contrast closer to the reference without introducing frame-by-frame exposure flicker. It defaults to 70% strength so source shadow and highlight detail remain protected; disable it to retain the original monochrome luminance exactly.
 
 ![Recomposition tab](assets/screenshots/walkthrough/arp-walkthrough-recomposition.jpg)
 
@@ -245,6 +251,7 @@ Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON f
 ```text
 input/                                   Optional source clips
 intermediate/cleaned/                    Geometry-preserving Clean Up outputs
+intermediate/stabilized/                 Lossless, scene-aware stabilization outputs
 intermediate/outpaint_prepared/          Expanded/lifted clips prepared for LTX
 intermediate/outpainted/                 Widescreen/outpainted clips
 intermediate/outpainted_references/      Per-shot black-and-white reference stills
@@ -267,7 +274,7 @@ The GUI is also designed around deterministic intermediate paths. When one stage
 
 ## Direct Script Use
 
-The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `cleanup_video.bat`, `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
+The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `cleanup_video.bat`, `stabilize_video.bat`, `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
 
 Those scripts are what the GUI calls internally, and the GUI shows the equivalent command before running a stage.
 

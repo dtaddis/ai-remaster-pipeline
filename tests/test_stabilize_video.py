@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import stabilize_video  # noqa: E402
+from common import find_ffmpeg  # noqa: E402
+
+
+class StabilizeVideoTests(unittest.TestCase):
+    def test_scene_ranges_are_preserved_in_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            source = Path(tmp_text) / "source.mp4"
+            source.write_bytes(b"fixture")
+            args = stabilize_video.build_parser().parse_args(["--source", str(source)])
+            signature = stabilize_video.output_signature(source, args, [(0, 12), (12, 24)])
+
+        self.assertEqual(signature["shots"], [[0, 12], [12, 24]])
+        self.assertEqual(signature["identity"]["kind"], "stabilize")
+
+    def test_smoothing_is_capped_for_short_shots(self) -> None:
+        args = stabilize_video.build_parser().parse_args(["--source", "source.mp4", "--smoothing", "30"])
+        commands = []
+        with tempfile.TemporaryDirectory() as tmp_text, mock.patch.object(stabilize_video, "run", side_effect=lambda command, **kwargs: commands.append(command)):
+            stabilize_video.stabilize_shot(
+                "ffmpeg", Path("source.mp4"), Path(tmp_text), 0, 0, 9, 24.0, args, "yuv420p"
+            )
+
+        transform_command = commands[1]
+        filter_graph = transform_command[transform_command.index("-vf") + 1]
+        self.assertIn("smoothing=4", filter_graph)
+        self.assertIn("maxangle=0.05235988", filter_graph)
+
+    def test_user_reviewed_manifest_provides_exact_contiguous_shots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            manifest.write_text(
+                "# source_video=source.mkv\n"
+                "enabled,start_frame,end_frame,selected_frame,end,source_reference,color_reference,prompt,fade_to_next,crossfade_seconds\n"
+                "true,0,76,34,00:00:03.167,a.png,b.png,,,\n"
+                "true,76,148,108,00:00:06.167,c.png,d.png,,,\n"
+                "true,148,294,220,00:00:12.250,e.png,f.png,,,\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(stabilize_video.manifest_shot_ranges(manifest, 294), [(0, 76), (76, 148), (148, 294)])
+
+    def test_end_to_end_keeps_exact_frame_count_and_writes_lossless_output(self) -> None:
+        ffmpeg = find_ffmpeg()
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            output = folder / "stabilized.mkv"
+            subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc2=size=160x96:rate=12:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+                ],
+                check=True,
+            )
+            args = stabilize_video.build_parser().parse_args(
+                ["--source", str(source), "--output", str(output), "--smoothing", "3", "--zoom", "1"]
+            )
+            info = SimpleNamespace(width=160, height=96, fps=12.0, frame_count=24)
+            with mock.patch.object(stabilize_video, "detect_shot_ranges", return_value=(info, [(0, 12), (12, 24)])):
+                self.assertEqual(stabilize_video.main_with_args(args), 0)
+
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=codec_name,nb_read_frames", "-of", "json", str(output)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stream = json.loads(result.stdout)["streams"][0]
+            self.assertEqual(stream["codec_name"], "ffv1")
+            self.assertEqual(int(stream["nb_read_frames"]), 24)
+            self.assertTrue(output.with_suffix(output.suffix + ".sig.json").is_file())
+            preview = stabilize_video.browser_preview_path(output)
+            preview_result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "json", str(preview)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(json.loads(preview_result.stdout)["streams"][0]["codec_name"], "h264")
+
+
+if __name__ == "__main__":
+    unittest.main()

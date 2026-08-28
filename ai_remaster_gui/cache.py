@@ -39,6 +39,15 @@ def cache_categories() -> tuple[dict, ...]:
             ),
         },
         {
+            "key": "stabilize",
+            "title": "Stabilization",
+            "description": "Temporary per-shot transforms and lossless stabilized source videos.",
+            "folders": (
+                ROOT / ".cache" / "stabilize",
+                ROOT / "intermediate" / "stabilized",
+            ),
+        },
+        {
             "key": "outpaint",
             "title": "Outpainting",
             "description": "Prepared inputs, per-chunk LTX renders, and stitched outpainted videos.",
