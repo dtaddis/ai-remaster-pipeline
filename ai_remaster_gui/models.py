@@ -60,13 +60,14 @@ STAGES = (
     Stage(
         "stabilize",
         "Stabilization",
-        "Remove per-shot gate weave, frame jitter, and unwanted rotation before framing and colour work. Camera analysis resets at detected cuts and uses lossless intermediates.",
+        "Remove gate weave, frame jitter, and unwanted rotation before framing and colour work. It can reset camera analysis at real cuts or track one continuous camera move.",
         ("intermediate/stabilized",),
         (
             ("smoothing", "Smoothing radius (frames)", "range:1|60|1", "12"),
             ("max_shift", "Maximum translation (px; 0 = unlimited)", "range:0|200|1", "48"),
             ("max_angle", "Maximum rotation (degrees; 0 = unlimited)", "range:0|10|0.1", "3.0"),
             ("zoom", "Fixed safety zoom (%)", "range:0|10|0.1", "3.0"),
+            ("scene_aware", "Reset stabilization at detected cuts", "checkbox", "true"),
             ("shot_threshold", "Shot detection threshold", "range:0.01|0.5|0.005", "0.075"),
             ("min_shot_seconds", "Minimum shot length (seconds)", "number", "1.0"),
             ("encoder", "Lossless intermediate", "select:ffv1|prores", "ffv1"),
@@ -81,6 +82,8 @@ STAGES = (
         (
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
             ("target_height", "Output height", "select:source|480|544|576|720|768|1080", "source"),
+            ("outpaint_model", "Outpaint model", "select:official|ltx25|oumoumad", "official"),
+            ("generation_fps", "LTX 2.5 generation FPS", "select:24-fast|24|source", "24-fast"),
             ("offset_x", "Horizontal offset (px)", "number", "0"),
             ("offset_y", "Vertical offset (px)", "number", "0"),
             ("chunk_seconds", "Chunk seconds", "number", "20"),

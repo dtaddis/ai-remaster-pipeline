@@ -22,6 +22,15 @@ from .sam_masks import sam2_mask_for_image
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
+from reference_sets import (  # noqa: E402
+    EXTRA_REFERENCES_FIELD,
+    additional_references,
+    append_reference_item,
+    encode_additional_references,
+    reference_items,
+    remove_reference_item,
+    update_reference_item,
+)
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -55,7 +64,7 @@ def color_reference_outputs(manifest_text: str) -> list[str]:
     if not manifest.is_file():
         return []
     rows = read_manifest(manifest)
-    return [row.get("color_reference", "") for row in rows if row.get("color_reference")]
+    return [item.get("color_reference", "") for row in rows for item in reference_items(row) if item.get("color_reference")]
 
 def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = True) -> dict[str, object]:
     shots_manifest = manifest_for_outpainted(settings.get("shots", {}).get("outpainted_video", ""))
@@ -107,6 +116,23 @@ def shot_rows(
         selected = (selected_frame / fps) if selected_frame is not None else selected_seconds_from_reference(row.get("source_reference", "")) or ((start + end) / 2 if end > start else start)
         selected = max(start, min(end, selected))
         color_reference = row.get("color_reference", "")
+        item_references = []
+        for reference_index, reference in enumerate(reference_items(row)):
+            reference_frame = optional_int(reference.get("selected_frame"))
+            reference_seconds = (reference_frame / fps) if reference_frame is not None else selected
+            reference_seconds = max(start, min(end, reference_seconds))
+            item_color = reference.get("color_reference", "")
+            item_references.append({
+                "reference_index": reference_index,
+                "selected_frame": reference_frame if reference_frame is not None else int(round(reference_seconds * fps)),
+                "selected_time": round(reference_seconds, 3),
+                "selected_label": format_timecode(reference_seconds),
+                "source_reference": reference.get("source_reference", ""),
+                "color_reference": item_color,
+                "source_reference_mtime": file_mtime(reference.get("source_reference", "")),
+                "color_reference_mtime": file_mtime(item_color),
+                "prompt": reference.get("prompt", ""),
+            })
         color_reference_versions = reference_edit_versions(manifest_text, index)
         item = {
                 "index": index,
@@ -140,6 +166,8 @@ def shot_rows(
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "upscale_strength": row.get("upscale_strength", ""),
                 "prompt": row.get("prompt", ""),
+                "reference_items": item_references,
+                "reference_count": len(item_references),
             }
         if include_previews and (preview_index_set is None or index in preview_index_set):
             last_frame = max(start_frame, end_frame_exclusive - 1)
@@ -171,16 +199,17 @@ def recent_color_references(rows: list[dict[str, str]], row_index: int, limit: i
     previous: list[tuple[int, str]] = []
     later: list[tuple[int, str]] = []
     for index, row in enumerate(rows):
-        if index == row_index:
-            continue
-        candidate = row.get("color_reference", "")
-        if not candidate or not resolve(candidate).is_file():
-            continue
-        item = (abs(index - row_index), candidate)
-        if index < row_index:
-            previous.append(item)
-        else:
-            later.append(item)
+        for reference_index, reference in enumerate(reference_items(row)):
+            if index == row_index and reference_index == 0:
+                continue
+            candidate = reference.get("color_reference", "")
+            if not candidate or not resolve(candidate).is_file():
+                continue
+            item = (abs(index - row_index), candidate)
+            if index <= row_index:
+                previous.append(item)
+            else:
+                later.append(item)
     ordered = [path for _distance, path in sorted(previous, key=lambda item: item[0])]
     ordered.extend(path for _distance, path in sorted(later, key=lambda item: item[0]))
     return ordered[:limit]
@@ -467,14 +496,24 @@ def color_reference_for_source(source_reference: str) -> str:
     except ValueError:
         return rel(source.with_name(source.stem + "_color" + source.suffix))
 
-def delete_color_reference(manifest_text: str, index: int) -> dict[str, str]:
+def _write_reference_row(manifest: Path, source_video: str, fieldnames: list[str], rows: list[dict[str, str]], index: int) -> None:
+    for key in rows[index]:
+        if key not in fieldnames:
+            fieldnames.append(key)
+    write_manifest_details(manifest, source_video, fieldnames, rows)
+
+
+def delete_color_reference(manifest_text: str, index: int, reference_index: int = 0) -> dict[str, str]:
     manifest = resolve(manifest_text)
-    _source_video, _fields, rows = read_manifest_details(manifest)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
     if index < 0 or index >= len(rows):
         raise IndexError(f"Manifest row {index} is out of range.")
-    target = rows[index].get("color_reference", "")
+    items = reference_items(rows[index])
+    if reference_index < 0 or reference_index >= len(items):
+        raise IndexError(f"Reference {reference_index + 1} is out of range.")
+    target = items[reference_index].get("color_reference", "")
     if not target:
-        raise RuntimeError("Manifest row does not have a color_reference path.")
+        raise RuntimeError("Reference does not have a color_reference path.")
     path = resolve(target)
     sig = path.with_suffix(path.suffix + ".sig.json")
     deleted = []
@@ -482,18 +521,24 @@ def delete_color_reference(manifest_text: str, index: int) -> dict[str, str]:
         if item.exists() and item.is_file():
             item.unlink()
             deleted.append(rel(item))
-    state.APP.log.append(f"Deleted colour reference for shot {index + 1}: {target}")
+    update_reference_item(rows[index], reference_index, {"color_reference": target})
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    state.APP.log.append(f"Deleted colour reference {reference_index + 1} for shot {index + 1}: {target}")
     return {"deleted": ", ".join(deleted), "color_reference": target}
 
-def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, str]:
+def install_custom_color_reference(manifest_text: str, index: int, reference_index: int = 0) -> dict[str, str]:
     manifest = resolve(manifest_text)
-    _source, _fields, rows = read_manifest_details(manifest)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
     if index < 0 or index >= len(rows):
         raise IndexError("Shot index out of range.")
+    items = reference_items(rows[index])
+    if reference_index < 0 or reference_index >= len(items):
+        raise IndexError(f"Reference {reference_index + 1} is out of range.")
+    item = items[reference_index]
 
-    selected = browse_path("file", rows[index].get("color_reference", "") or rows[index].get("source_reference", ""))
+    selected = browse_path("file", item.get("color_reference", "") or item.get("source_reference", ""))
     if not selected:
-        return {"selected": "", "color_reference": rows[index].get("color_reference", "")}
+        return {"selected": "", "color_reference": item.get("color_reference", "")}
 
     source = resolve(selected)
     if source.suffix.lower() not in IMAGE_EXTS:
@@ -501,29 +546,37 @@ def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, 
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(source)
 
-    current_target = rows[index].get("color_reference", "")
+    current_target = item.get("color_reference", "")
     if current_target:
         target_base = resolve(current_target)
         target = target_base.with_suffix(source.suffix.lower())
-    elif rows[index].get("source_reference"):
-        target = resolve(color_reference_for_source(rows[index]["source_reference"])).with_suffix(source.suffix.lower())
+    elif item.get("source_reference"):
+        target = resolve(color_reference_for_source(item["source_reference"])).with_suffix(source.suffix.lower())
     else:
-        target = ROOT / "intermediate" / "outpainted_references_color" / "custom" / f"shot_{index + 1:04d}{source.suffix.lower()}"
+        target = ROOT / "intermediate" / "outpainted_references_color" / "custom" / f"shot_{index + 1:04d}_ref_{reference_index + 1:02d}{source.suffix.lower()}"
 
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
-    update_manifest_row(manifest, index, {"color_reference": rel(target)})
-    state.APP.log.append(f"Installed custom color reference for shot {index + 1}: {rel(target)}")
+    update_reference_item(rows[index], reference_index, {"color_reference": rel(target)})
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    state.APP.log.append(f"Installed custom color reference {reference_index + 1} for shot {index + 1}: {rel(target)}")
     return {"selected": selected, "color_reference": rel(target)}
 
-def extract_reference_frame(manifest_text: str, index: int, seconds: float, frame: int | None = None) -> dict[str, str]:
+def extract_reference_frame(manifest_text: str, index: int, seconds: float, frame: int | None = None, reference_index: int = 0, append: bool = False) -> dict[str, str]:
     manifest = resolve(manifest_text)
-    source_video, _fields, rows = read_manifest_details(manifest)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
     if not source_video:
         raise RuntimeError("Manifest does not record a source_video, so ARP cannot rescrub this shot.")
     if index < 0 or index >= len(rows):
         raise IndexError(f"Manifest row {index} is out of range.")
-    old_reference = rows[index].get("source_reference", "")
+    items = reference_items(rows[index])
+    if append:
+        reference_index = len(items)
+        old_reference = items[0].get("source_reference", "")
+    elif reference_index < 0 or reference_index >= len(items):
+        raise IndexError(f"Reference {reference_index + 1} is out of range.")
+    else:
+        old_reference = items[reference_index].get("source_reference", "")
     if old_reference:
         folder = resolve(old_reference).parent
     else:
@@ -544,13 +597,34 @@ def extract_reference_frame(manifest_text: str, index: int, seconds: float, fram
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
     new_color = color_reference_for_source(rel(new_source))
-    update_manifest_row(manifest, index, {
+    values = {
         "source_reference": rel(new_source),
         "color_reference": new_color,
         "selected_frame": str(selected_frame),
-    })
-    state.APP.log.append(f"Updated shot {index + 1} reference frame to {format_timecode(seconds)}: {rel(new_source)}")
-    return {"source_reference": rel(new_source), "color_reference": new_color, "selected_frame": str(selected_frame)}
+    }
+    if append:
+        append_reference_item(rows[index], values)
+    else:
+        update_reference_item(rows[index], reference_index, values)
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    verb = "Added" if append else "Updated"
+    state.APP.log.append(f"{verb} shot {index + 1} reference {reference_index + 1} at {format_timecode(seconds)}: {rel(new_source)}")
+    return {**values, "reference_index": str(reference_index)}
+
+
+def add_reference_frame(manifest_text: str, index: int, seconds: float, frame: int | None = None) -> dict[str, str]:
+    return extract_reference_frame(manifest_text, index, seconds, frame, append=True)
+
+
+def remove_additional_reference(manifest_text: str, index: int, reference_index: int) -> dict[str, str]:
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    removed = remove_reference_item(rows[index], reference_index)
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    state.APP.log.append(f"Removed reference {reference_index + 1} from shot {index + 1}.")
+    return {"removed_source_reference": removed.get("source_reference", ""), "reference_index": str(reference_index)}
 
 def preview_reference_frame(manifest_text: str, index: int, seconds: float, frame: int | None = None) -> str:
     manifest = resolve(manifest_text)
@@ -598,20 +672,26 @@ def cached_preview_reference_frame_path(source: Path | None, target_dir: Path | 
         return ""
     return ""
 
-def reference_row_io(manifest_text: str, index: int) -> tuple[Path, dict[str, str], str, str]:
+def reference_row_io(manifest_text: str, index: int, reference_index: int = 0) -> tuple[Path, dict[str, str], str, str]:
     manifest = resolve(manifest_text)
     _source_video, _fields, rows = read_manifest_details(manifest)
     if index < 0 or index >= len(rows):
         raise IndexError(f"Manifest row {index} is out of range.")
     row = rows[index]
-    source = row.get("source_reference", "")
-    output = row.get("color_reference", "")
+    items = reference_items(row)
+    if reference_index < 0 or reference_index >= len(items):
+        raise IndexError(f"Reference {reference_index + 1} is out of range.")
+    reference = items[reference_index]
+    source = reference.get("source_reference", "")
+    output = reference.get("color_reference", "")
     if not source or not output:
-        raise RuntimeError("Manifest row must have source_reference and color_reference.")
-    return manifest, row, source, output
+        raise RuntimeError("Reference must have source_reference and color_reference.")
+    effective_row = dict(row)
+    effective_row.update(reference)
+    return manifest, effective_row, source, output
 
-def reference_regeneration_command(manifest_text: str, index: int) -> tuple[list[str], str]:
-    _manifest, row, source, output = reference_row_io(manifest_text, index)
+def reference_regeneration_command(manifest_text: str, index: int, reference_index: int = 0) -> tuple[list[str], str]:
+    _manifest, row, source, output = reference_row_io(manifest_text, index, reference_index)
     values = state.APP.settings.get("references", {})
     config = current_config()
     workflow = qwen_workflow_for(values, config)
@@ -653,8 +733,8 @@ def reference_regeneration_command(manifest_text: str, index: int) -> tuple[list
         cmd.extend(["--add-prompt", row["prompt"]])
     return cmd, output
 
-def openai_reference_regeneration_command(manifest_text: str, index: int) -> tuple[list[str], str]:
-    manifest, _row, _source, output = reference_row_io(manifest_text, index)
+def openai_reference_regeneration_command(manifest_text: str, index: int, reference_index: int = 0) -> tuple[list[str], str]:
+    manifest, _row, _source, output = reference_row_io(manifest_text, index, reference_index)
     values = state.APP.settings.get("references", {})
     token = values.get("openai_api_key", "").strip()
     if not token:
@@ -667,6 +747,8 @@ def openai_reference_regeneration_command(manifest_text: str, index: int) -> tup
         rel(manifest),
         "--row-index",
         str(index),
+        "--reference-index",
+        str(reference_index),
         "--api-key",
         token,
         "--model",
@@ -685,8 +767,8 @@ def openai_reference_regeneration_command(manifest_text: str, index: int) -> tup
     cmd.append("--force")
     return cmd, output
 
-def regenerate_reference_image(manifest_text: str, index: int) -> dict[str, str]:
-    cmd, output = reference_regeneration_command(manifest_text, index)
+def regenerate_reference_image(manifest_text: str, index: int, reference_index: int = 0) -> dict[str, str]:
+    cmd, output = reference_regeneration_command(manifest_text, index, reference_index)
     state.APP.log.append("> " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in result.stdout.splitlines():
@@ -736,6 +818,14 @@ def merge_manifest_shots(manifest_text: str, index: int) -> dict[str, str]:
     rows[index]["end"] = rows[index + 1].get("end", rows[index].get("end", ""))
     ensure_frame_fields(fieldnames)
     set_row_span(rows[index], spans[index][0], spans[index + 1][1], fps)
+    merged_references = additional_references(rows[index])
+    merged_references.extend(
+        item for item in reference_items(rows[index + 1])
+        if item.get("source_reference") or item.get("color_reference")
+    )
+    rows[index][EXTRA_REFERENCES_FIELD] = encode_additional_references(merged_references)
+    if EXTRA_REFERENCES_FIELD not in fieldnames:
+        fieldnames.append(EXTRA_REFERENCES_FIELD)
     rows[index]["fade_to_next"] = rows[index + 1].get("fade_to_next", "")
     rows[index]["crossfade_seconds"] = rows[index + 1].get("crossfade_seconds", "")
     removed = rows.pop(index + 1)
@@ -749,7 +839,7 @@ def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = 
     if index < 0 or index >= len(rows):
         raise IndexError(f"Manifest row {index} is out of range.")
 
-    for key in ("enabled", "end", "source_reference", "color_reference", "prompt", "fade_to_next", "crossfade_seconds"):
+    for key in ("enabled", "end", "source_reference", "color_reference", "prompt", "fade_to_next", "crossfade_seconds", EXTRA_REFERENCES_FIELD):
         if key not in fieldnames:
             fieldnames.append(key)
 
@@ -778,11 +868,13 @@ def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = 
     first["color_reference"] = ""
     first["fade_to_next"] = "false"
     first["crossfade_seconds"] = ""
+    first[EXTRA_REFERENCES_FIELD] = ""
     second["start_frame"] = str(split_frame)
     second["end_frame"] = str(end_frame)
     second["end"] = rows[index].get("end", "")
     second["source_reference"] = ""
     second["color_reference"] = ""
+    second[EXTRA_REFERENCES_FIELD] = ""
     rows[index] = first
     rows.insert(index + 1, second)
     write_manifest_details(manifest, source_video, fieldnames, rows)

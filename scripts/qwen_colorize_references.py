@@ -13,6 +13,7 @@ from typing import Any
 from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, widget_fallback_inputs, workflow_to_prompt, http_json
 from common import QWEN_IMAGE_EDIT_MODEL, ROOT, copy_to_comfy_input, file_fingerprint, load_local_config, newest_output, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
+from reference_sets import expanded_reference_rows
 
 DEFAULT_PROMPT = (
     'Colorize this image. Preserve the drawing and composition. '
@@ -534,7 +535,8 @@ def main_with_args(args: argparse.Namespace) -> int:
     manifest = resolve_path(args.manifest)
     workflow_path = resolve_path(args.workflow)
     comfy_dir = resolve_path(args.comfy_dir)
-    _, rows = read_manifest(manifest)
+    _, shot_rows = read_manifest(manifest)
+    rows = expanded_reference_rows(shot_rows)
     if args.limit is not None:
         rows = rows[:args.limit]
     print(f'Manifest: {manifest}')

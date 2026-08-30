@@ -83,6 +83,8 @@ const FIELD_DESCRIPTIONS = {
     'Caps rotational correction in degrees. Use 0 for no cap. Three degrees is enough for the stronger weave measured in the Berlin test without allowing extreme rotations.',
   'stabilize.zoom':
     'Fixed safety crop used to hide transformed edges. Larger values reduce edge exposure but discard more of the frame. ARP deliberately avoids automatic zoom so the framing cannot pulse or unexpectedly crop far beyond this value.',
+  'stabilize.scene_aware':
+    'Restart tracking at detected cuts. Turn this off for one continuous pan or tracking shot; otherwise a false cut can reset the transform and create a visible jump.',
   'stabilize.shot_threshold':
     'Uses the same visual shot detector as Reference Generation. Lower values detect subtler cuts and dissolves; values that are too low can split energetic camera movement into false shots.',
   'stabilize.min_shot_seconds':
@@ -91,6 +93,10 @@ const FIELD_DESCRIPTIONS = {
     'FFV1 is mathematically lossless and recommended for pipeline intermediates. ProRes HQ is larger and visually lossless, but more convenient in editing applications.',
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
+  'outpaint.outpaint_model':
+    'LTX 2.5 uses Lightricks\' newer two-stage model with a memory-conscious Q4_K_M transformer, Q5 text encoder, latent upscaler, and exact source blend. Official is the prior LTX 2.3 v0.9 graph. Oumoumad is the earlier pure-black IC-LoRA with legacy tone-lift conditioning.',
+  'outpaint.generation_fps':
+    'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
     'Shift the source vertically for the whole video before outpainting. Positive values move it down; negative values move it up. Chunks inherit this unless overridden.',
   'colour.processing_height':
@@ -239,6 +245,12 @@ function selectFieldHtml(key, label, kind, value, tooltip = '') {
 }
 
 function selectOptionLabel(key, option) {
+  if (key === 'outpaint_model' && option === 'official') return 'LTX 2.3 (official)';
+  if (key === 'outpaint_model' && option === 'ltx25') return 'LTX 2.5 (two-stage)';
+  if (key === 'outpaint_model' && option === 'oumoumad') return 'LTX 2.3 (Oumoumad LoRA)';
+  if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
+  if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
+  if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
   if (key === 'repair_device' && option === 'auto') return 'Auto (prefer GPU)';
   if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';
   if (key === 'repair_device' && option === 'cpu') return 'CPU';

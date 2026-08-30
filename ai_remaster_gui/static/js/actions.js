@@ -1285,7 +1285,7 @@ function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, datas
   }, 250);
 }
 
-async function regenerateReference(manifest, index) {
+async function regenerateReference(manifest, index, referenceIndex = 0) {
   const provider = settings('references').method || 'qwen';
   if (provider === 'openai' && !((settings('references').openai_api_key || '').trim())) {
     alert('Add your OpenAI API key in Settings before generating with OpenAI.');
@@ -1295,7 +1295,7 @@ async function regenerateReference(manifest, index) {
     return;
   }
   const snap = captureScrollState();
-  const result = await postJson('/api/reference-regenerate', { manifest, index });
+  const result = await postJson('/api/reference-regenerate', { manifest, index, reference_index: referenceIndex });
   if (!result.ok) return alert(result.error || 'Could not regenerate reference');
 
   await refreshReferenceRowFromState(result.state, index);
@@ -1303,20 +1303,20 @@ async function regenerateReference(manifest, index) {
   setTimeout(refresh, 1000);
 }
 
-async function deleteReference(manifest, index) {
+async function deleteReference(manifest, index, referenceIndex = 0) {
   if (!confirm('Delete this color reference? It will be regenerated next time you run Reference Generation.')) return;
 
   const snap = captureScrollState();
-  const result = await postJson('/api/reference-delete', { manifest, index });
+  const result = await postJson('/api/reference-delete', { manifest, index, reference_index: referenceIndex });
   if (!result.ok) return alert(result.error || 'Could not delete reference');
 
   await refreshReferenceRowFromState(result.state, index);
   restoreScrollState(snap);
 }
 
-async function chooseCustomReference(manifest, index) {
+async function chooseCustomReference(manifest, index, referenceIndex = 0) {
   const snap = captureScrollState();
-  const result = await postJson('/api/reference-custom', { manifest, index });
+  const result = await postJson('/api/reference-custom', { manifest, index, reference_index: referenceIndex });
   if (!result.ok) return alert(result.error || 'Could not install custom reference');
   if (!result.selected) return;
 
@@ -1595,6 +1595,25 @@ async function browseGlobalSource() {
   pruneSelected();
   draw();
   lastRenderSignature = renderSignature();
+}
+
+async function addReferenceAtCurrentFrame(manifest, index, time, frame = null) {
+  const snap = captureScrollState();
+  const payload = { manifest, index, time };
+  if (frame !== null && frame !== undefined && Number.isFinite(Number(frame))) payload.frame = Math.max(0, Math.round(Number(frame)));
+  const result = await postJson('/api/reference-add', payload);
+  if (!result.ok) return alert(result.error || 'Could not add reference keyframe');
+  await refreshReferenceRowFromState(result.state, index);
+  restoreScrollState(snap);
+}
+
+async function removeAdditionalReference(manifest, index, referenceIndex) {
+  if (!confirm('Remove this additional reference keyframe from the shot? Generated image files will be left in the project cache.')) return;
+  const snap = captureScrollState();
+  const result = await postJson('/api/reference-remove', { manifest, index, reference_index: referenceIndex });
+  if (!result.ok) return alert(result.error || 'Could not remove reference keyframe');
+  await refreshReferenceRowFromState(result.state, index);
+  restoreScrollState(snap);
 }
 
 async function saveSourceSequenceFps() {

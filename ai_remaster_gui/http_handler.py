@@ -36,11 +36,13 @@ from .outpaint_guides import (
 from .paths import resolve, resolve_served
 from .references import (
     accept_reference_edit,
+    add_reference_frame,
     delete_color_reference,
     extract_reference_frame,
     install_custom_color_reference,
     merge_manifest_shots,
     preview_reference_frame,
+    remove_additional_reference,
     revert_reference_edit,
     sam_reference_mask,
     save_reference_paint,
@@ -352,6 +354,7 @@ class Handler(BaseHTTPRequestHandler):
                     int(data.get("index", 0)),
                     float(data.get("time", 0)),
                     int(data.get("frame")) if data.get("frame") is not None and str(data.get("frame")).strip() != "" else None,
+                    int(data.get("reference_index", 0)),
                 ),
                 "state": state.APP.state("references"),
             })
@@ -396,11 +399,20 @@ class Handler(BaseHTTPRequestHandler):
                 return {"strength": raw, "state": state.APP.state("upscale")}
             self._send_result("Shot upscale strength update", update_upscale_strength)
         elif parsed.path == "/api/reference-regenerate":
-            self._send_action("Reference regeneration", lambda: state.APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("provider", "qwen"))))
+            self._send_action("Reference regeneration", lambda: state.APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("provider", "qwen")), int(data.get("reference_index", 0))))
+        elif parsed.path == "/api/reference-add":
+            self._send_result("Reference add", lambda: {**add_reference_frame(
+                str(data.get("manifest", "")),
+                int(data.get("index", 0)),
+                float(data.get("time", 0)),
+                int(data.get("frame")) if data.get("frame") is not None and str(data.get("frame")).strip() != "" else None,
+            ), "state": state.APP.state("references")})
+        elif parsed.path == "/api/reference-remove":
+            self._send_result("Reference remove", lambda: {**remove_additional_reference(str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0))), "state": state.APP.state("references")})
         elif parsed.path == "/api/reference-delete":
-            self._send_result("Reference delete", lambda: {**delete_color_reference(str(data.get("manifest", "")), int(data.get("index", 0))), "state": state.APP.state()})
+            self._send_result("Reference delete", lambda: {**delete_color_reference(str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0))), "state": state.APP.state()})
         elif parsed.path == "/api/reference-custom":
-            self._send_result("Custom reference install", lambda: {**install_custom_color_reference(str(data.get("manifest", "")), int(data.get("index", 0))), "state": state.APP.state()})
+            self._send_result("Custom reference install", lambda: {**install_custom_color_reference(str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0))), "state": state.APP.state()})
         elif parsed.path == "/api/reference-mask-sam":
             self._send_result("Reference smart mask", lambda: {**sam_reference_mask(
                 str(data.get("manifest", "")),

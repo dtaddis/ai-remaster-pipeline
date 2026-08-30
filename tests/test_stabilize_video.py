@@ -53,6 +53,37 @@ class StabilizeVideoTests(unittest.TestCase):
             )
             self.assertEqual(stabilize_video.manifest_shot_ranges(manifest, 294), [(0, 76), (76, 148), (148, 294)])
 
+    def test_stabilization_detector_disables_pan_sensitive_long_window_heuristics(self) -> None:
+        info = SimpleNamespace(width=1280, height=704, fps=16.0, frame_count=294)
+        with (
+            mock.patch.object(stabilize_video, "probe_video", return_value=info),
+            mock.patch.object(stabilize_video, "sample_video", return_value=[object()]),
+            mock.patch.object(stabilize_video, "detect_shots", return_value=[]) as detect,
+        ):
+            _info, ranges = stabilize_video.detect_shot_ranges(Path("continuous-pan.mp4"), 0.075, 1.0)
+
+        detector_args = detect.call_args.args[2]
+        self.assertEqual(detector_args.anchor_threshold, 0.0)
+        self.assertEqual(detector_args.dissolve_threshold, 0.0)
+        self.assertEqual(ranges, [(0, 294)])
+
+    def test_single_shot_mode_bypasses_cut_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            source = Path(tmp_text) / "continuous-pan.mp4"
+            source.write_bytes(b"fixture")
+            args = stabilize_video.build_parser().parse_args([
+                "--source", str(source), "--single-shot", "--dry-run",
+            ])
+            info = SimpleNamespace(width=1280, height=704, fps=16.0, frame_count=294)
+            with (
+                mock.patch.object(stabilize_video, "probe_video", return_value=info),
+                mock.patch.object(stabilize_video, "detect_shot_ranges") as detect,
+            ):
+                self.assertEqual(stabilize_video.main_with_args(args), 0)
+
+            detect.assert_not_called()
+            self.assertFalse(stabilize_video.stabilization_identity(source, args)["scene_aware"])
+
     def test_end_to_end_keeps_exact_frame_count_and_writes_lossless_output(self) -> None:
         ffmpeg = find_ffmpeg()
         ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))

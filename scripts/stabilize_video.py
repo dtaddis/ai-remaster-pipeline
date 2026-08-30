@@ -40,6 +40,7 @@ def stabilization_identity(source: Path, args: argparse.Namespace) -> dict[str, 
         zoom=float(args.zoom),
         shot_threshold=float(args.shot_threshold),
         min_shot_seconds=float(args.min_shot_seconds),
+        scene_aware=not bool(args.single_shot),
         encoder=str(args.encoder),
     )
 
@@ -73,6 +74,11 @@ def detect_shot_ranges(source: Path, shot_threshold: float, min_shot_seconds: fl
     detector_args.shot_threshold = clamp(float(shot_threshold), 0.001, 2.0)
     detector_args.min_shot_seconds = max(0.1, float(min_shot_seconds))
     detector_args.sample_seconds = 0.0
+    # Stabilization needs only genuine discontinuous cuts. The reference detector's
+    # long-window dissolve and anchor heuristics deliberately react to accumulated scene
+    # change, which misclassifies a sustained pan and resets the transform mid-move.
+    detector_args.anchor_threshold = 0.0
+    detector_args.dissolve_threshold = 0.0
     samples = sample_video(source, info, detector_args)
     detected = detect_shots(samples, info, detector_args)
     ranges = [(int(shot.start_frame), int(shot.end_frame)) for shot in detected if shot.end_frame > shot.start_frame]
@@ -256,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--zoom", type=float, default=3.0, help="Fixed safety zoom percentage used to hide transformed edges.")
     parser.add_argument("--shot-threshold", type=float, default=0.075, help="Shot detector sensitivity threshold.")
     parser.add_argument("--min-shot-seconds", type=float, default=1.0, help="Minimum detected shot length.")
+    parser.add_argument("--single-shot", action="store_true", help="Treat the entire clip as one continuous camera move and do not reset stabilization at detected cuts.")
     parser.add_argument("--encoder", choices=("ffv1", "prores"), default="ffv1")
     parser.add_argument("--shot-manifest", type=Path, help="Optional user-reviewed reference manifest whose frame spans override automatic detection.")
     parser.add_argument("--ffmpeg")
@@ -274,9 +281,13 @@ def main_with_args(args: argparse.Namespace) -> int:
     args.zoom = clamp(float(args.zoom), 0.0, 20.0)
     output = resolve_path(args.output) if args.output else default_output(source, args)
 
-    print(f"Analysing shot boundaries: {source}", flush=True)
     manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
-    if manifest and manifest.is_file():
+    if args.single_shot:
+        info = probe_video(source)
+        shots = [(0, int(info.frame_count))]
+        print(f"Continuous-shot mode: tracking all {info.frame_count} frames without transform resets.", flush=True)
+    elif manifest and manifest.is_file():
+        print(f"Analysing shot boundaries: {source}", flush=True)
         info = probe_video(source)
         shots = manifest_shot_ranges(manifest, int(info.frame_count))
         if shots:
@@ -285,6 +296,7 @@ def main_with_args(args: argparse.Namespace) -> int:
             print(f"Shot manifest did not cover the source exactly; falling back to automatic detection: {manifest}", flush=True)
             info, shots = detect_shot_ranges(source, args.shot_threshold, args.min_shot_seconds)
     else:
+        print(f"Analysing shot boundaries: {source}", flush=True)
         info, shots = detect_shot_ranges(source, args.shot_threshold, args.min_shot_seconds)
     signature = output_signature(source, args, shots)
     print(

@@ -82,6 +82,77 @@ class ReferenceScrubTests(unittest.TestCase):
         finally:
             state.APP = previous_app
 
+    def test_additional_reference_round_trips_inside_one_shot(self) -> None:
+        previous_app = state.APP
+        state.APP = SimpleNamespace(log=[], settings={"references": {}})
+        try:
+            with tempfile.TemporaryDirectory(dir=references.ROOT) as tmp_text:
+                folder = Path(tmp_text)
+                source = folder / "source.mp4"
+                source.write_bytes(b"video placeholder")
+                primary = folder / "primary.png"
+                primary.write_bytes(b"primary")
+                manifest = folder / "shots.csv"
+                write_manifest_details(
+                    manifest,
+                    references.rel(source),
+                    ["start_frame", "end_frame", "selected_frame", "source_reference", "color_reference"],
+                    [{
+                        "start_frame": "0",
+                        "end_frame": "100",
+                        "selected_frame": "20",
+                        "source_reference": references.rel(primary),
+                        "color_reference": references.rel(primary),
+                    }],
+                )
+
+                fake_result = SimpleNamespace(returncode=0, stderr="", stdout="")
+                with (
+                    mock.patch.object(references, "local_tool", return_value="ffmpeg"),
+                    mock.patch.object(references, "manifest_fps", return_value=25.0),
+                    mock.patch.object(references.subprocess, "run", return_value=fake_result),
+                ):
+                    added = references.add_reference_frame(references.rel(manifest), 0, 2.4, frame=60)
+
+                row = read_manifest(manifest)[0]
+                items = references.reference_items(row)
+                self.assertEqual(added["reference_index"], "1")
+                self.assertEqual([item["selected_frame"] for item in items], ["20", "60"])
+                view = references.shot_rows(references.rel(manifest))[0]
+                self.assertEqual(view["reference_count"], 2)
+                self.assertEqual(view["reference_items"][1]["selected_frame"], 60)
+
+                references.remove_additional_reference(references.rel(manifest), 0, 1)
+                self.assertEqual(len(references.reference_items(read_manifest(manifest)[0])), 1)
+        finally:
+            state.APP = previous_app
+
+    def test_merging_shots_preserves_the_following_shot_as_a_keyframe(self) -> None:
+        previous_app = state.APP
+        state.APP = SimpleNamespace(log=[], settings={"references": {}})
+        try:
+            with tempfile.TemporaryDirectory(dir=references.ROOT) as tmp_text:
+                manifest = Path(tmp_text) / "shots.csv"
+                write_manifest_details(
+                    manifest,
+                    "source.mp4",
+                    ["start_frame", "end_frame", "selected_frame", "end", "source_reference", "color_reference"],
+                    [
+                        {"start_frame": "0", "end_frame": "50", "selected_frame": "20", "end": "00:00:02.000", "source_reference": "a.png", "color_reference": "a_color.png"},
+                        {"start_frame": "50", "end_frame": "100", "selected_frame": "70", "end": "00:00:04.000", "source_reference": "b.png", "color_reference": "b_color.png"},
+                    ],
+                )
+                with mock.patch.object(references, "manifest_fps", return_value=25.0):
+                    references.merge_manifest_shots(references.rel(manifest), 0)
+
+                rows = read_manifest(manifest)
+                self.assertEqual(len(rows), 1)
+                items = references.reference_items(rows[0])
+                self.assertEqual([item["selected_frame"] for item in items], ["20", "70"])
+                self.assertEqual([item["color_reference"] for item in items], ["a_color.png", "b_color.png"])
+        finally:
+            state.APP = previous_app
+
     def test_preview_reference_frame_can_use_exact_frame(self) -> None:
         with tempfile.TemporaryDirectory(dir=references.ROOT) as tmp_text:
             folder = Path(tmp_text)

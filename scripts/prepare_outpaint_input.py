@@ -81,7 +81,7 @@ def source_placement_size(args, info: dict, target_width: int, target_height: in
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 10,
+        'version': 11,
         'tool': 'prepare_outpaint_input.py',
         'geometry': 'crop_then_fit_v1',
         'source': root_relative(source),
@@ -97,8 +97,9 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
         'crop_right': max(0, int(args.crop_right)),
         'crop_top': max(0, int(args.crop_top)),
         'crop_bottom': max(0, int(args.crop_bottom)),
-        'black_lift': args.black_lift,
-        'gamma': args.gamma,
+        'legacy_black_mask': bool(getattr(args, 'legacy_black_mask', False)),
+        'black_lift': args.black_lift if getattr(args, 'legacy_black_mask', False) else 0.0,
+        'gamma': args.gamma if getattr(args, 'legacy_black_mask', False) else 1.0,
         'outpaint_all_black_regions': bool(getattr(args, 'outpaint_all_black_regions', False)),
         'encoder': args.encoder,
         'crf': args.crf,
@@ -107,13 +108,7 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
 
 
 def build_filter(args, info: dict, target_width: int, target_height: int) -> str:
-    lift = max(0.0, min(0.25, args.black_lift))
-    gamma = max(0.1, args.gamma)
     left, _right, top, _bottom, crop_width, crop_height = crop_values(args, info)
-    # By default the source image is lifted away from exact 0 before padding. The synthetic
-    # margins stay exact black. In all-black-regions mode, source blacks are left alone so
-    # embedded matte bars/black restoration gaps can be treated like outpaintable padding.
-    lut = f"r=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):g=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):b=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma}))"
     # Rebuild timestamps from decoded frame numbers before any frame-rate conversion. Some MKV
     # sources expose 23.976 fps frames on a millisecond time base, so frame 8 can be timestamped
     # at 0.334s instead of 8/23.976 (0.333667s). Sampling by those rounded timestamps randomly
@@ -134,7 +129,10 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     if (delivery_source_w, delivery_source_h) != (target_source_w, target_source_h):
         scale_steps += f",scale=w={target_source_w}:h={target_source_h}:flags=lanczos"
     source_filters = f"[0:v]trim=start_frame=0,setpts=N/({info['fps']:.8f}*TB),fps={info['fps']:.8f},crop=w={crop_width}:h={crop_height}:x={left}:y={top},{scale_steps},setsar=1,format=rgb24"
-    if not getattr(args, 'outpaint_all_black_regions', False):
+    if getattr(args, 'legacy_black_mask', False):
+        lift = max(0.0, min(0.25, args.black_lift))
+        gamma = max(0.1, args.gamma)
+        lut = f"r=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):g=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):b=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma}))"
         source_filters += f",lutrgb={lut}"
     source_filters += "[src]"
     return ';'.join([
@@ -193,7 +191,7 @@ def replace_with_retry(partial: Path, output: Path, attempts: int = 60, delay: f
 def build_parser():
     parser = argparse.ArgumentParser(description='Crop a source clip, then fit it into an exact-black LTX outpainting canvas.')
     parser.add_argument('--source', required=True, help='Input 4:3 or source-aspect clip.')
-    parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared/<stem>_<size>_lifted.mp4')
+    parser.add_argument('--output', help='Prepared clip to write. Defaults to intermediate/outpaint_prepared.')
     parser.add_argument('--target-aspect', default='16:9')
     parser.add_argument('--target-width', type=int, help='Output width (model-safe, e.g. 1280). Defaults to target-height * target-aspect.')
     parser.add_argument('--target-height', type=int, help='Output height (model-safe, e.g. 704). Defaults to the source height.')
@@ -203,8 +201,10 @@ def build_parser():
     parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-top', type=int, default=0, help='Pixels to crop from the source before padding.')
     parser.add_argument('--crop-bottom', type=int, default=0, help='Pixels to crop from the source before padding.')
-    parser.add_argument('--black-lift', type=float, default=0.018, help='Raise source pixels away from pure black before padding. 0.018 is about 5/255.')
-    parser.add_argument('--gamma', type=float, default=1.06, help='Additional source gamma lift before padding. Values above 1 brighten shadows.')
+    # Retained as ignored compatibility arguments for old wrapper commands and saved logs.
+    parser.add_argument('--black-lift', type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument('--gamma', type=float, default=1.0, help=argparse.SUPPRESS)
+    parser.add_argument('--legacy-black-mask', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--outpaint-all-black-regions', action='store_true', help='Do not lift source blacks. Pure black regions inside the source can be outpainted like padded margins.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
@@ -253,7 +253,8 @@ def main():
     ]
     print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}", flush=True)
     mode = 'all black regions' if args.outpaint_all_black_regions else 'protected source blacks'
-    print(f'Prepared canvas: {target_width}x{target_height}, crop LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, black_lift={args.black_lift}, gamma={args.gamma}, mode={mode}', flush=True)
+    conditioning = f'legacy black mask (lift={args.black_lift}, gamma={args.gamma})' if args.legacy_black_mask else 'explicit mask (no tone lift)'
+    print(f'Prepared canvas: {target_width}x{target_height}, crop LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, mode={mode}, {conditioning}', flush=True)
     print(' '.join(command), flush=True)
     if args.dry_run:
         return 0

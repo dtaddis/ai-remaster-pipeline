@@ -1,18 +1,18 @@
-﻿# LTX Outpainting Prep And Restore
+# LTX Outpainting Preparation
 
-The LTX 2.3 outpainting IC-LoRA only treats pure black pixels as the region to fill. That creates a nasty edge case: real black pixels inside the original movie can be interpreted as outpaint mask.
+ARP's current LTX 2.3 outpainting workflow supplies the official IC-LoRA with an explicit, frame-aligned mask. Real black pixels inside the original movie are therefore protected by geometry rather than inferred from pixel brightness.
 
-Source crop values deliberately create additional pure-black outpaint regions on those same edges. The remaining source keeps the scale and position it had before cropping, so cropping 20 pixels from each side and 10 pixels from the top and bottom asks LTX to regenerate those borders as well as any extra canvas required by the target aspect ratio.
+Source crop values deliberately create additional outpaint regions on those same edges. The remaining source is cropped first and then fitted as one complete image into the requested canvas.
 
-The pipeline handles this with a reversible-ish lift:
+The pipeline now:
 
-1. Lift the source movie image away from pure black.
-2. Place that lifted source in the centre of a 16:9 canvas.
-3. Leave only the new left/right margins as exact black.
-4. Run LTX outpainting in ComfyUI.
-5. Apply the inverse lift to the outpainted result.
+1. Crops and fits the unmodified source into the requested canvas.
+2. Builds an exact geometric generation mask for the added margins and requested crop borders.
+3. Runs the official LTX IC-LoRA masked workflow.
+4. Uses the untouched prepared source for the protected centre of the final Laplacian blend.
+5. Applies only a modest detail recovery to generated regions during finalization.
 
-It is technically a black-floor lift plus optional gamma lift. Pure gamma alone does not protect exact black because `0` stays `0`.
+There is no black-floor lift or gamma-restore pass. Those belonged to the older brightness-inferred masking path and could darken the generated margins differently from the centre.
 
 ## Run The Full Outpainting Stage
 
@@ -24,37 +24,39 @@ outpaint_video.bat ^
   --target-aspect 16:9
 ```
 
-This prepares the input, queues the bundled ComfyUI workflow from `workflows/outpaint_ltx/outpaint_LTX-IC.json`, copies the raw ComfyUI render, and restores the black/gamma lift into `intermediate/outpainted`.
+This prepares the input, queues the bundled ComfyUI workflow from `workflows/outpaint_ltx/outpaint_LTX-IC.json`, copies the raw ComfyUI render, and finalizes it into `intermediate/outpainted`.
+
+To use the optional LTX 2.5 two-stage workflow at its recommended cadence:
+
+```bat
+outpaint_video.bat ^
+  --source input\movie_4x3.mp4 ^
+  --target-aspect 16:9 ^
+  --ltx-version 2.5 ^
+  --generation-fps 24
+```
+
+ARP uses the Q4_K_M distilled transformer on 24 GB GPUs and motion-interpolates lower-rate input without changing duration. LTX 2.5 retains the official 2.3 in/outpainting IC-LoRA and adds its official latent two-stage upscaler.
 
 ## Prepare The Comfy Input Manually
 
 ```bat
 prepare_outpaint_input.bat ^
   --source input\movie_4x3.mp4 ^
-  --output intermediate\outpaint_prepared\movie_16x9_lifted.mp4 ^
-  --target-aspect 16:9 ^
-  --black-lift 0.018 ^
-  --gamma 1.06
+  --output intermediate\outpaint_prepared\movie_16x9.mp4 ^
+  --target-aspect 16:9
 ```
-
-The default `--black-lift 0.018` is about 5 code values in 8-bit video. It is enough to protect black clothing, shadows, titles, and fades from being seen as mask, while keeping the side margins exactly black.
 
 ## Run LTX Outpainting
 
-Use the prepared clip as the ComfyUI input. The IC-LoRA should see only the side margins as pure black and fill those regions.
+Use the prepared clip and ARP's generated mask as the ComfyUI inputs. The IC-LoRA fills only the requested mask regions.
 
-## Restore The Render
+## Finalize The Render
 
 ```bat
 finalize_outpaint_output.bat ^
   --source path\to\comfy_outpaint_render.mp4 ^
-  --output intermediate\outpainted\movie_16x9_outpainted.mp4 ^
-  --black-lift 0.018 ^
-  --gamma 1.06
+  --output intermediate\outpainted\movie_16x9_outpainted.mp4
 ```
 
-Use the same `--black-lift` and `--gamma` values as the prep step. The restore is global, so it also slightly darkens the generated side material. In practice this helps the generated edges sit closer to the original centre image.
-
-## Alternatives
-
-A more elaborate workflow could use an explicit mask instead of pure-black detection. If your ComfyUI graph supports an explicit mask input for the outpaint LoRA, that is cleaner. This prep/restore method exists because it works with simple IC-LoRA workflows that infer the mask from black pixels.
+Finalization preserves the render's tone. When the protected source rectangle is known, a restrained edge-only sharpening pass reduces the model's softness without sharpening or altering the original centre.

@@ -28,33 +28,75 @@ def encoder_args(args):
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
 
 
+def source_rectangle(args, info: dict) -> tuple[int, int, int, int] | None:
+    values = (args.source_x, args.source_y, args.source_width, args.source_height)
+    if any(value is None for value in values):
+        return None
+    x, y, width, height = (int(value) for value in values)
+    frame_width, frame_height = int(info['width']), int(info['height'])
+    x = max(0, min(frame_width - 1, x))
+    y = max(0, min(frame_height - 1, y))
+    width = max(1, min(frame_width - x, width))
+    height = max(1, min(frame_height - y, height))
+    return x, y, width, height
+
+
 def inverse_filter(args, info: dict) -> str:
-    lift = max(0.0, min(0.25, args.black_lift))
-    gamma = max(0.1, args.gamma)
     target_width = int(args.target_width or info["width"])
     target_height = int(args.target_height or info["height"])
     scale = ""
     if target_width != int(info["width"]) or target_height != int(info["height"]):
         scale = f",scale={target_width}:{target_height}:flags=lanczos"
     monochrome = ",hue=s=0" if args.monochrome else ""
-    if args.skip_restore:
-        return f'[0:v]format=yuv420p{monochrome}{scale}[v]'
-    expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
-    return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}'{monochrome},format=yuv420p{scale}[v]"
+    rectangle = source_rectangle(args, info)
+    restore_tone = bool(args.restore_tone and not args.skip_restore)
+    if rectangle is None:
+        if restore_tone:
+            lift = max(0.0, min(0.25, args.black_lift))
+            gamma = max(0.1, args.gamma)
+            expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
+            return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}'{monochrome},format=yuv420p{scale}[v]"
+        return f"[0:v]format=yuv420p{monochrome}{scale}[v]"
+
+    x, y, width, height = rectangle
+    right, bottom = x + width - 1, y + height - 1
+    feather = max(0.0, min(64.0, float(args.edge_feather)))
+    sharpen = max(0.0, min(1.5, float(args.edge_sharpen)))
+    blur = f',gblur=sigma={feather:.4f}' if feather else ''
+    sharpen_filter = f'unsharp=5:5:{sharpen:.4f}:5:5:0.0' if sharpen else 'null'
+    if restore_tone:
+        lift = max(0.0, min(0.25, args.black_lift))
+        gamma = max(0.1, args.gamma)
+        expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
+        centre_filter = f"lutrgb=r='{expr}':g='{expr}':b='{expr}'"
+    else:
+        centre_filter = 'null'
+    mask_expr = f"if(between(X\\,{x}\\,{right})*between(Y\\,{y}\\,{bottom})\\,255\\,0)"
+    return (
+        '[0:v]format=rgb24,split=3[raw][original][maskbase];'
+        f'[raw]{sharpen_filter}[generated];'
+        f'[original]{centre_filter}[centre];'
+        f"[maskbase]format=gray,geq=lum='{mask_expr}'{blur}[sourcemask];"
+        f'[generated][centre][sourcemask]maskedmerge{monochrome},format=yuv420p{scale}[v]'
+    )
 
 
-def signature(args, source: Path) -> dict:
+def signature(args, source: Path, info: dict) -> dict:
     return {
-        'version': 6,
+        'version': 8,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
-        'black_lift': args.black_lift,
-        'gamma': args.gamma,
         'skip_restore': args.skip_restore,
+        'restore_tone': args.restore_tone,
+        'black_lift': args.black_lift if args.restore_tone else 0.0,
+        'gamma': args.gamma if args.restore_tone else 1.0,
         'monochrome': args.monochrome,
         'target_width': args.target_width,
         'target_height': args.target_height,
+        'source_rectangle': source_rectangle(args, info),
+        'edge_feather': args.edge_feather,
+        'edge_sharpen': args.edge_sharpen,
         'encoder': args.encoder,
         'crf': args.crf,
         'preset': args.preset,
@@ -83,15 +125,22 @@ def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: f
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Restore the black/gamma lift after an LTX IC-LoRA outpaint render.')
+    parser = argparse.ArgumentParser(description='Finish an LTX IC-LoRA outpaint render without changing its source tonality.')
     parser.add_argument('--source', required=True, help='ComfyUI/LTX outpainted render made from prepare_outpaint_input.py output.')
     parser.add_argument('--output', help='Restored clip to write. Defaults to intermediate/outpainted/<stem>_restored.mp4')
-    parser.add_argument('--black-lift', type=float, default=0.018, help='Must match prepare_outpaint_input.py.')
-    parser.add_argument('--gamma', type=float, default=1.06, help='Must match prepare_outpaint_input.py.')
-    parser.add_argument('--skip-restore', action='store_true', help='Only remux/re-encode. Useful for comparisons.')
+    parser.add_argument('--black-lift', type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument('--gamma', type=float, default=1.0, help=argparse.SUPPRESS)
+    parser.add_argument('--skip-restore', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--restore-tone', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--monochrome', action='store_true', help='Remove residual chroma from monochrome-source outpainting.')
     parser.add_argument('--target-width', type=int, help='Scale the restored clip to this delivery width.')
     parser.add_argument('--target-height', type=int, help='Scale the restored clip to this delivery height.')
+    parser.add_argument('--source-x', type=int, help='Left edge of the protected source region in the rendered canvas.')
+    parser.add_argument('--source-y', type=int, help='Top edge of the protected source region in the rendered canvas.')
+    parser.add_argument('--source-width', type=int, help='Width of the protected source region in the rendered canvas.')
+    parser.add_argument('--source-height', type=int, help='Height of the protected source region in the rendered canvas.')
+    parser.add_argument('--edge-feather', type=float, default=6.0, help='Soft transition, in pixels, between restored source and generated outpaint.')
+    parser.add_argument('--edge-sharpen', type=float, default=0.35, help='Modest unsharp amount applied only to generated outpaint regions; 0 disables it.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
     parser.add_argument('--preset', default='medium')
@@ -110,7 +159,7 @@ def main():
     info = video_info(source)
     target_width = int(args.target_width or info["width"])
     target_height = int(args.target_height or info["height"])
-    sig = signature(args, source)
+    sig = signature(args, source, info)
     if not args.force and resumable_output(output, sig, width=target_width, height=target_height):
         print(f'Reuse restored outpaint: {output}')
         return 0

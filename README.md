@@ -171,7 +171,9 @@ Set the target aspect ratio, output height, chunk length, overlap frames, and so
 
 Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
 
-Outpainting uses Lightricks' official LTX 2.3 v0.9 in/outpainting IC-LoRA. ARP derives a frame-aligned binary mask from the prepared canvas and runs one eight-step generation pass at the full model-safe canvas resolution. **Generation mask overlap** expands only the mask seen by LTX beneath protected source pixels, preventing very thin requested bands from surviving as the green inpaint sentinel after spatial compression. The final Laplacian composite uses the exact requested crop mask and the untouched prepared source—not the green conditioning image—so the hidden overlap cannot leak into the result. Pure-white mask pixels are selected at full resolution after the pyramid boundary blend, ensuring even a very thin top or bottom strip is taken from the generated image. **Mask seam blend** adjusts only the surrounding boundary transition. ARP intentionally bypasses the example workflow's half-resolution draft, Lanczos enlargement, and second sampler. The model is gated on Hugging Face: access must first be accepted in the browser for the same individual account used by ARP. The GUI opens that page on first use; authenticate with `hf auth login --force` (or `HF_TOKEN`) if the saved token still receives a 403.
+The model selector offers the established official LTX 2.3 v0.9 graph, its legacy Oumoumad variant, and optional LTX 2.5 two-stage outpainting. LTX 2.5 uses a Q4_K_M distilled transformer, separately offloaded Q5 text encoder, convolutional VAE, and official latent upscaler to fit a 24 GB GPU with useful activation headroom. Its recommended 24 fps mode motion-interpolates lower-rate archival material without changing duration; source cadence remains available when interpolation is undesirable.
+
+ARP derives a frame-aligned binary mask from the prepared canvas. **Generation mask overlap** expands only the mask seen by LTX beneath protected source pixels, preventing very thin requested bands from surviving as the green inpaint sentinel after spatial compression. The final Laplacian composite uses the exact requested crop mask and the untouched prepared source—not the green conditioning image—so the hidden overlap cannot leak into the result. Pure-white mask pixels are selected at full resolution after the pyramid boundary blend, ensuring even a very thin top or bottom strip is taken from the generated image. **Mask seam blend** adjusts only the surrounding boundary transition. The models are gated on Hugging Face: access must first be accepted in the browser for the same individual account used by ARP. Authenticate with `hf auth login --force` (or `HF_TOKEN`) if the saved token still receives a 403.
 
 Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point.
 
@@ -187,13 +189,13 @@ Review the detected shots, inspect start/middle/end frames, merge shots that sho
 
 ### Reference Generation
 
-Pick the reference time inside each shot, regenerate individual Qwen color references, delete references you do not like, and add short per-shot prompt notes.
+Pick the primary reference time inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, scrub to another useful frame and choose **Add Reference**. Additional reference keyframes remain part of the same shot rather than creating artificial cuts.
 
 ![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg)
 
 ### Colorization
 
-Review each shot's color reference alongside the corresponding colorized video segment. This stage uses the generated references to guide video colorization.
+Review each shot's colour references alongside the corresponding colourized video segment. ColorMNet consumes all keyframes for a shot in one continuous run: the primary reference seeds the shot, and later references are injected into the same temporal memory at their selected frames. Deep Exemplar currently uses the primary reference only.
 
 Because Dearchive can introduce colour of its own, ARP converts extracted source stills and the video stream back to neutral grayscale before reference generation and before Deep Exemplar/ColorMNet. The generated colour reference stays in colour and guides the selected model as usual.
 

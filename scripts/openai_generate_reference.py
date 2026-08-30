@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from common import ROOT, resolve_path
+from reference_sets import expanded_reference_rows, reference_items
 
 DEFAULT_MODEL = "gpt-image-2"
 BOUNDARY = "----arp-openai-image-edit"
@@ -175,15 +176,25 @@ def nearby_reference_images(rows: list[dict[str, str]], row_index: int, count: i
 
 def generate_manifest(args: argparse.Namespace) -> None:
     manifest = resolve_path(args.manifest)
-    rows = read_manifest(manifest, enabled_only=args.row_index is None)
+    shot_rows = read_manifest(manifest, enabled_only=args.row_index is None)
     if args.row_index is not None:
-        if args.row_index < 0 or args.row_index >= len(rows):
+        if args.row_index < 0 or args.row_index >= len(shot_rows):
             raise IndexError(f"Manifest row {args.row_index} is out of range.")
-        selected_rows = [(args.row_index, rows[args.row_index])]
-    elif args.limit is not None:
+        items = reference_items(shot_rows[args.row_index])
+        if args.reference_index < 0 or args.reference_index >= len(items):
+            raise IndexError(f"Reference {args.reference_index + 1} is out of range for manifest row {args.row_index}.")
+        rows = expanded_reference_rows(shot_rows)
+        selected_index = next(
+            index for index, row in enumerate(rows)
+            if row.get("_shot_index") == str(args.row_index) and row.get("_reference_index") == str(args.reference_index)
+        )
+        selected_rows = [(selected_index, rows[selected_index])]
+    else:
+        rows = expanded_reference_rows(shot_rows)
+    if args.row_index is None and args.limit is not None:
         rows = rows[: args.limit]
         selected_rows = list(enumerate(rows))
-    else:
+    elif args.row_index is None:
         selected_rows = list(enumerate(rows))
     print(f"Manifest: {manifest}", flush=True)
     print(f"Rows: {len(selected_rows)}", flush=True)
@@ -215,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--row-index", type=int)
+    parser.add_argument("--reference-index", type=int, default=0)
     parser.add_argument("--reference-count", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no-normalize-to-source-size", action="store_true")

@@ -40,7 +40,7 @@ EXPECTED_POST_ROUTES = {
     "/api/settings", "/api/run", "/api/upscale-preview", "/api/stop", "/api/quit",
     "/api/shot-scrub", "/api/shot-prompt", "/api/shot-enabled", "/api/shot-merge",
     "/api/shot-split", "/api/shot-boundary", "/api/shot-fade", "/api/shot-upscale-strength", "/api/reference-regenerate",
-    "/api/reference-delete", "/api/reference-custom", "/api/reference-mask-sam",
+    "/api/reference-add", "/api/reference-remove", "/api/reference-delete", "/api/reference-custom", "/api/reference-mask-sam",
     "/api/guide-frame-mask-sam", "/api/reference-edit-preview", "/api/reference-edit-accept",
     "/api/reference-edit-revert", "/api/reference-paint-save", "/api/export-media",
     "/api/outpaint-chunk", "/api/outpaint-chunk-regenerate", "/api/outpaint-anchor",

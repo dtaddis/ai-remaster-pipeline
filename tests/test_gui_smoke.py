@@ -70,6 +70,8 @@ class GuiSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         app.APP.settings = copy.deepcopy(self._pristine_settings)
+        with app.APP.source_analysis_lock:
+            app.APP.source_tone_default_keys.clear()
         # Default the soundtrack phase off so stage-order / upscale-chaining tests are not
         # affected by whatever add_soundtrack happens to be in the loaded settings.
         app.APP.settings.setdefault("global", {})["add_soundtrack"] = "false"
@@ -188,6 +190,18 @@ class GuiSmokeTests(unittest.TestCase):
         args = stabilize_video.build_parser().parse_args(["--source", str(source)])
 
         self.assertEqual(app.stabilize_output_for(str(source), values), app.rel(stabilize_video.default_output(source, args)))
+
+    def test_continuous_stabilization_adds_single_shot_flag_and_changes_output_identity(self) -> None:
+        values = dict(app.APP.settings["stabilize"])
+        scene_output = app.stabilize_output_for("input/example.mp4", values)
+        values["scene_aware"] = "false"
+        continuous_output = app.stabilize_output_for("input/example.mp4", values)
+        app.APP.settings["stabilize"].update(values)
+
+        command = app.APP.command_for("stabilize")
+
+        self.assertIn("--single-shot", command)
+        self.assertNotEqual(scene_output, continuous_output)
 
     def test_finished_stabilization_routes_to_outpaint(self) -> None:
         app.APP.settings["global"].update(
@@ -755,6 +769,34 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertEqual(prompt["3"]["class_type"], expected_node)
                 self.assertEqual(prompt["3"]["inputs"]["video_frames"], ["1", 0])
 
+    def test_colormnet_prompt_rejects_unpacked_multi_reference_batch(self) -> None:
+        args = colorize_video.build_parser().parse_args(["--manifest", "shots.csv", "--method", "colormnet"])
+        with self.assertRaisesRegex(RuntimeError, "pack multiple references"):
+            colorize_video.build_prompt(
+                "arp_colorize/guarded_gray.mp4", ["reference_1.png", "reference_2.png"],
+                0, 240, 640, 360, 24.0, args, "test/output",
+            )
+
+    def test_colormnet_reference_atlas_is_one_canvas_with_every_reference(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            references = []
+            for index, colour in enumerate(((255, 0, 0), (0, 255, 0), (0, 0, 255))):
+                reference = folder / f"reference_{index}.png"
+                Image.new("RGB", (160, 90), colour).save(reference)
+                references.append(reference)
+
+            atlas = colorize_video.prepare_reference_atlas(references, 640, 360)
+            with Image.open(atlas) as atlas_image:
+                size = atlas_image.size
+                colours = atlas_image.convert("RGB").getcolors(maxcolors=640 * 360)
+
+        self.assertEqual(size, (640, 360))
+        present = {colour for _count, colour in (colours or [])}
+        self.assertTrue({(255, 0, 0), (0, 255, 0), (0, 0, 255)} <= present)
+
     def test_source_resolver_accepts_ascii_pipe_for_full_width_pipe_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             folder = Path(tmp_text)
@@ -906,7 +948,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("crop=w=1440:h=540:x=0:y=270,scale=w=1280:h=480:flags=lanczos,scale=w=1280:h=470:flags=lanczos", filter_text)
         self.assertNotIn("force_original_aspect_ratio=decrease", filter_text)
 
-    def test_outpaint_all_black_regions_bypasses_source_lift(self) -> None:
+    def test_outpaint_all_black_regions_uses_explicit_mask_without_source_lift(self) -> None:
         args = argparse.Namespace(
             delivery_width=1280,
             delivery_height=720,
@@ -925,7 +967,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("lutrgb=", filter_text)
         self.assertIn("color=c=black:s=1280x704", filter_text)
 
-    def test_standard_outpaint_preparation_lifts_source_but_keeps_padding_pure_black(self) -> None:
+    def test_standard_outpaint_preparation_keeps_source_tone_unchanged(self) -> None:
         args = argparse.Namespace(
             delivery_width=1280,
             delivery_height=720,
@@ -942,9 +984,27 @@ class GuiSmokeTests(unittest.TestCase):
         filter_text = prepare_outpaint_input.build_filter(args, info, 1280, 704)
 
         self.assertIn("color=c=black:s=1280x704", filter_text)
+        self.assertNotIn("lutrgb=", filter_text)
+
+    def test_oumoumad_preparation_uses_legacy_source_lift(self) -> None:
+        args = argparse.Namespace(
+            delivery_width=1280,
+            delivery_height=720,
+            crop_left=0,
+            crop_right=0,
+            crop_top=0,
+            crop_bottom=0,
+            black_lift=0.018,
+            gamma=1.06,
+            legacy_black_mask=True,
+            outpaint_all_black_regions=False,
+        )
+        info = {"width": 960, "height": 720, "fps": 24.0}
+
+        filter_text = prepare_outpaint_input.build_filter(args, info, 1280, 704)
+
         self.assertIn("lutrgb=", filter_text)
-        self.assertIn("0.018", filter_text)
-        self.assertIn("1/1.06", filter_text)
+        self.assertIn("color=c=black:s=1280x704", filter_text)
 
     def test_prepare_outpaint_partial_output_paths_are_per_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -1245,6 +1305,86 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(sum(node["class_type"] == "SamplerCustomAdvanced" for node in prompt.values()), 2)
         self.assertEqual(sum(node["class_type"] == "LTXVLaplacianPyramidBlend" for node in prompt.values()), 2)
 
+    def test_bundled_ltx25_template_patches_to_local_quantized_models(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-2.5.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--comfy-dir", str(app.ROOT),
+            "--ltx-version", "2.5", "--dry-run",
+        ])
+
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint_ltx25/prepared.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint_ltx25/frame.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "exact-mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 1280, "height": 704, "frames": 49, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint_ltx25/test",
+                "preserve the archival street scene", args.negative_prompt, 42,
+            )
+
+        classes = [node["class_type"] for node in prompt.values()]
+        self.assertIn("UnetLoaderGGUF", classes)
+        self.assertEqual(classes.count("UnetLoaderGGUF"), 1)
+        self.assertEqual(classes.count("CLIPLoaderGGUF"), 1)
+        self.assertNotIn("ImagePadForOutpaintTargetSize", classes)
+        self.assertNotIn("OpenAIDalle3", classes)
+        self.assertNotIn("GeminiImage2Node", classes)
+        self.assertEqual(sum(node.get("inputs", {}).get("unet_name") == outpaint_video.LTX25_GGUF_MODEL for node in prompt.values()), 1)
+        self.assertEqual(sum(node.get("inputs", {}).get("clip_name") == outpaint_video.LTX25_TEXT_ENCODER for node in prompt.values()), 1)
+        self.assertEqual(prompt["9013"]["inputs"]["images"], ["9069", 0])
+        self.assertEqual(prompt["9066"]["inputs"]["input"], ["9056", 0])
+        self.assertEqual(prompt["9067"]["inputs"]["input"], ["9191", 0])
+        self.assertEqual(prompt["9191"]["inputs"]["image"], ["9190", 0])
+
+    def test_ltx25_frame_rate_preparation_adds_silence_for_archival_video(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            prepared = Path(tmp_text) / "prepared.mp4"
+            prepared.write_bytes(b"video")
+            with (
+                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 33}, {"frames": 49}]),
+                mock.patch.object(outpaint_video, "video_has_audio", return_value=False),
+                mock.patch.object(outpaint_video, "resumable_output", return_value=False),
+                mock.patch.object(outpaint_video.subprocess, "run") as run,
+                mock.patch.object(outpaint_video, "replace_with_retry"),
+            ):
+                output = outpaint_video.prepare_ltx25_frame_rate("ffmpeg", prepared, "24")
+
+        command = run.call_args.args[0]
+        self.assertEqual(output.name, "prepared_ltx25_24fps.mp4")
+        self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", command)
+        self.assertIn("minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,tpad=stop_mode=clone:stop_duration=1", command)
+        self.assertEqual(command[command.index("-frames:v") + 1], "49")
+        self.assertIn("-shortest", command)
+
+    def test_ltx25_fast_frame_rate_retimes_only_existing_frames(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            prepared = Path(tmp_text) / "prepared.mp4"
+            prepared.write_bytes(b"video")
+            with (
+                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 294}, {"frames": 289}]),
+                mock.patch.object(outpaint_video, "video_has_audio", return_value=False),
+                mock.patch.object(outpaint_video, "resumable_output", return_value=False),
+                mock.patch.object(outpaint_video.subprocess, "run") as run,
+                mock.patch.object(outpaint_video, "replace_with_retry"),
+            ):
+                output = outpaint_video.prepare_ltx25_frame_rate("ffmpeg", prepared, "24-fast")
+
+        command = run.call_args.args[0]
+        self.assertEqual(output.name, "prepared_ltx25_24_fastfps.mp4")
+        self.assertIn("trim=end_frame=289,setpts=N/(24*TB),fps=24", command)
+        self.assertNotIn("minterpolate", " ".join(command))
+        self.assertEqual(command[command.index("-frames:v") + 1], "289")
+        self.assertEqual(command[command.index("-r") + 1], "24.00000000")
+
+    def test_outpaint_chunk_lengths_follow_ltx_8n_plus_1_rule(self) -> None:
+        self.assertEqual(outpaint_video.ltx_valid_frame_count(2.0, 24.0), 49)
+        self.assertEqual(outpaint_video.ltx_valid_frame_count(4.04, 24.0), 97)
+        ranges = outpaint_video.chunk_ranges_from_manifest(100, 24.0, 2.0, 8, {})
+        self.assertEqual(ranges, [(0, 0, 49), (1, 41, 90), (2, 75, 100)])
+        self.assertTrue(all((end - start) % 8 == 1 for _, start, end in ranges))
+
     def test_outpaint_prompt_sent_to_ic_lora_guide_combines_global_and_chunk_suffix(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
         args = outpaint_video.build_parser().parse_args(
@@ -1332,7 +1472,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertNotIn(audio_diffusion_node, prompt)
         self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9101", 0])
         self.assertEqual(prompt["5266"]["inputs"]["image_b"], ["5168", 0])
-        self.assertEqual(prompt["5266"]["inputs"]["mask_low_res_dilation"], 5)
+        self.assertEqual(prompt["5266"]["inputs"]["mask_low_res_dilation"], 2)
         self.assertEqual(prompt["5227"]["inputs"]["images"], ["5266", 0])
         self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
         self.assertEqual(sum(node["class_type"] == "SamplerCustomAdvanced" for node in prompt.values()), 1)
@@ -1359,6 +1499,34 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
         for audio_diffusion_node in ("5382", "5383", "5385", "5386", "5389", "5390", "9110"):
             self.assertNotIn(audio_diffusion_node, prompt)
+
+    def test_oumoumad_outpaint_uses_legacy_black_guide_without_official_masks(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4",
+            "--comfy-dir", str(app.ROOT),
+            "--outpaint-lora", outpaint_video.OUMOUMAD_OUTPAINT_LORA,
+            "--dry-run",
+        ])
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "official_mask_image") as official_mask,
+            mock.patch.object(outpaint_video, "generation_mask_image") as generation_mask,
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                args.prompt, args.negative_prompt, 42,
+            )
+
+        official_mask.assert_not_called()
+        generation_mask.assert_not_called()
+        self.assertEqual(prompt["5114"]["class_type"], "LTXAddVideoICLoRAGuide")
+        self.assertEqual(prompt["5114"]["inputs"]["image"], ["5168", 0])
+        self.assertEqual(prompt["5227"]["inputs"]["images"], ["4851", 0])
+        self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
+        self.assertNotIn("9100", prompt)
 
     def test_outpaint_extra_guides_remain_in_video_only_sampler_chain(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1390,7 +1558,32 @@ class GuiSmokeTests(unittest.TestCase):
         args = finalize_outpaint_output.build_parser().parse_args(["--source", "input.mp4", "--monochrome"])
         filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 1280, "height": 704})
 
-        self.assertIn(",hue=s=0,", filter_graph)
+        self.assertIn("hue=s=0", filter_graph)
+
+    def test_outpaint_finish_preserves_source_tone_and_sharpens_generated_edges(self) -> None:
+        args = finalize_outpaint_output.build_parser().parse_args([
+            "--source", "input.mp4", "--source-x", "168", "--source-y", "0",
+            "--source-width", "944", "--source-height", "704",
+        ])
+
+        filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 1280, "height": 704})
+
+        self.assertIn("[generated][centre][sourcemask]maskedmerge", filter_graph)
+        self.assertIn("unsharp=5:5:0.3500", filter_graph)
+        self.assertIn("between(X\\,168\\,1111)", filter_graph)
+        self.assertNotIn("lutrgb", filter_graph)
+
+    def test_oumoumad_finish_restores_only_protected_centre_tone(self) -> None:
+        args = finalize_outpaint_output.build_parser().parse_args([
+            "--source", "input.mp4", "--restore-tone", "--black-lift", "0.018", "--gamma", "1.06",
+            "--source-x", "168", "--source-y", "0", "--source-width", "944", "--source-height", "704",
+        ])
+
+        filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 1280, "height": 704})
+
+        self.assertIn("[original]lutrgb=", filter_graph)
+        self.assertIn("[generated][centre][sourcemask]maskedmerge", filter_graph)
+        self.assertNotIn("[raw]lutrgb=", filter_graph)
 
     def test_outpaint_all_black_mode_reuses_source_frames_for_dynamic_mask(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1415,7 +1608,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["9101"]["class_type"], "ThresholdMask")
         self.assertAlmostEqual(prompt["9101"]["inputs"]["value"], 17 / 255)
         self.assertEqual(prompt["9102"]["class_type"], "InvertMask")
-        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9105", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9103", 0])
         self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9102", 0])
         self.assertEqual(prompt["5266"]["inputs"]["image_b"], ["5168", 0])
 
@@ -1457,6 +1650,46 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(mask[:, :156] == 255))
         self.assertTrue(np.all(mask[:, 156:1124] == 0))
         self.assertTrue(np.all(mask[:, 1124:] == 255))
+
+    def test_ltx25_chunk_recovers_geometry_through_frame_rate_intermediate(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            prepared = root / "prepared.mp4"
+            prepared.write_bytes(b"prepared")
+            outpaint_video.signature_path(prepared).write_text(
+                json.dumps({
+                    "tool": "prepare_outpaint_input.py",
+                    "geometry": "crop_then_fit_v1",
+                    "source_width": 4096,
+                    "source_height": 3112,
+                    "target_width": 1280,
+                    "target_height": 704,
+                    "delivery_width": 1280,
+                    "delivery_height": 720,
+                    "crop_left": 10,
+                    "crop_right": 10,
+                    "crop_top": 0,
+                    "crop_bottom": 0,
+                }),
+                encoding="utf-8",
+            )
+            converted = root / "prepared_ltx25_24fps.mp4"
+            converted.write_bytes(b"converted")
+            outpaint_video.signature_path(converted).write_text(
+                json.dumps({"tool": "outpaint_video.py/ltx25_fps", "source": str(prepared)}),
+                encoding="utf-8",
+            )
+            chunk = root / "prepared_0000_000000_000097.mp4"
+            chunk.write_bytes(b"chunk")
+            outpaint_video.split_sidecar_path(chunk).write_text(
+                json.dumps({"source": str(converted), "offset_x": 0, "offset_y": 0}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(outpaint_video, "ROOT", root):
+                rectangle = outpaint_video.prepared_source_rectangle(chunk, 1280, 704)
+
+        self.assertEqual(rectangle, (168, 0, 1112, 704))
 
     def test_outpaint_generation_mask_adds_overlap_only_to_pillarbox(self) -> None:
         import cv2
@@ -1543,8 +1776,15 @@ class GuiSmokeTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            frame_result = subprocess.run(
+                [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1", str(chunk)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
         self.assertEqual(result.stdout.strip(), "aac")
+        self.assertEqual(frame_result.stdout.strip(), "8")
 
     def test_qwen_seed_guides_do_not_overwrite_existing_set_guides(self) -> None:
         args = argparse.Namespace(
@@ -1607,6 +1847,27 @@ class GuiSmokeTests(unittest.TestCase):
         command = app.APP.command_for("outpaint")
 
         self.assertEqual(command[command.index("--prompt") + 1], "outpaint with restrained natural edges")
+
+    def test_outpaint_command_selects_oumoumad_lora(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"]["outpaint_model"] = "oumoumad"
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(
+            command[command.index("--outpaint-lora") + 1],
+            outpaint_video.OUMOUMAD_OUTPAINT_LORA,
+        )
+
+    def test_outpaint_command_selects_ltx25_and_generation_fps(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({"outpaint_model": "ltx25", "generation_fps": "24"})
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--ltx-version") + 1], "2.5")
+        self.assertEqual(command[command.index("--generation-fps") + 1], "24")
+        self.assertIn("outpaint25", Path(app.APP.expected_outputs("outpaint")[0]).name)
 
     def test_outpaint_command_uses_whole_video_offsets(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
@@ -1988,6 +2249,80 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(app.outpaint_chunk_preview(settings, 0, "source", "middle"), "preview.jpg")
 
         preview.assert_called_once_with("input/example.mp4", "16:9", 1.5, 13, -5)
+
+    def test_outpaint_source_for_settings_includes_stabilization(self) -> None:
+        settings = {
+            "global": {"source": "input/example.mp4", "cleanup": "false", "stabilize": "true"},
+            "stabilize": {"smoothing": "12"},
+        }
+        with (
+            mock.patch.object(server, "pipeline_source_text", return_value="input/example.mp4"),
+            mock.patch.object(server, "stabilize_output_for", return_value="intermediate/stabilized/example.mkv") as stabilized,
+        ):
+            source = app.outpaint_source_for_settings(settings)
+
+        self.assertEqual(source, "intermediate/stabilized/example.mkv")
+        stabilized.assert_called_once_with("input/example.mp4", settings["stabilize"])
+
+    def test_outpaint_chunk_preview_falls_back_to_finished_render(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            missing_chunk = folder / "missing_chunk.mp4"
+            finished = folder / "finished_outpaint.mp4"
+            finished.write_bytes(b"video")
+            settings = {"outpaint": {"target_aspect": "16:9"}}
+            fake_state = {
+                "rows": [{
+                    "index": 2,
+                    "start": 10.0,
+                    "end": 14.0,
+                    "fps": 24.0,
+                    "raw_path": app.rel(missing_chunk),
+                }]
+            }
+            with (
+                mock.patch.object(server, "outpaint_chunks_state", return_value=fake_state),
+                mock.patch.object(server, "outpaint_source_for_settings", return_value="input/example.mp4"),
+                mock.patch.object(server, "outpaint_render_outputs_for_settings", return_value=[finished]),
+                mock.patch.object(server, "video_metrics", return_value={"fps": 24.0, "duration": 30.0}),
+                mock.patch.object(server, "chunk_frame_preview", return_value="preview.jpg") as preview,
+            ):
+                result = app.outpaint_chunk_preview(settings, 2, "raw", "middle")
+
+        self.assertEqual(result, "preview.jpg")
+        self.assertEqual(preview.call_args.args[0], finished)
+        self.assertEqual(preview.call_args.args[1], 12.0)
+
+    def test_outpaint_chunk_state_surfaces_finished_render_when_chunk_cache_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "stabilized.mkv"
+            finished = folder / "finished_outpaint.mp4"
+            source.write_bytes(b"source")
+            finished.write_bytes(b"finished")
+            finished_mtime = finished.stat().st_mtime_ns
+            settings = {
+                "global": {"source": "input/example.mp4", "stabilize": "true"},
+                "outpaint": {"target_aspect": "16:9", "chunk_seconds": "1", "overlap_frames": "0"},
+            }
+            with (
+                mock.patch.object(server, "ensure_source_section_clip"),
+                mock.patch.object(server, "outpaint_source_for_settings", return_value=app.rel(source)),
+                mock.patch.object(server, "resolve_video_source", return_value=source),
+                mock.patch.object(server, "video_metrics", return_value={"fps": 24.0, "frames": 24}),
+                mock.patch.object(server, "outpaint_chunk_manifest_for", return_value=app.rel(folder / "chunks.csv")),
+                mock.patch.object(server, "outpaint_chunk_dir_for", return_value=folder / "missing-cache"),
+                mock.patch.object(server, "outpaint_render_outputs_for_settings", return_value=[finished]),
+            ):
+                chunk_state = app.outpaint_chunks_state(settings)
+
+        self.assertTrue(chunk_state["rows"][0]["raw_exists"])
+        self.assertEqual(chunk_state["rows"][0]["raw_mtime"], finished_mtime)
+
+    def test_colour_video_wiring_function_is_present_after_static_refactor(self) -> None:
+        shots_js = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-shots.js").read_text(encoding="utf-8")
+
+        self.assertIn("function wireColourShotVideos()", shots_js)
 
 
     def test_outpaint_chunk_state_reports_exact_prompts_sent_to_comfy(self) -> None:
@@ -2893,6 +3228,40 @@ class GuiSmokeTests(unittest.TestCase):
 
             app.APP.apply_detected_source_tone(str(source), False)
             self.assertEqual(app.APP.settings["global"]["colorize"], "false")
+
+    def test_background_source_analysis_preserves_saved_recolorization_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            source = Path(tmp_text) / "already-colour.mp4"
+            source.write_bytes(b"placeholder")
+            signature = (str(source), source.stat().st_size, source.stat().st_mtime_ns)
+            key = app.source_analysis_key(signature)
+            app.APP.settings["global"].update({"source": str(source), "colorize": "true"})
+            with (
+                mock.patch.object(server, "ffprobe_basic_info", return_value={}),
+                mock.patch.object(server, "source_previews_for_analysis", return_value=[]),
+                mock.patch.object(server, "source_monochrome_cached", return_value=False),
+            ):
+                app.APP.analyze_source_media(signature, key)
+
+        self.assertEqual(app.APP.settings["global"]["colorize"], "true")
+
+    def test_background_source_analysis_defaults_new_colour_source_to_no_colorization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            source = Path(tmp_text) / "new-colour.mp4"
+            source.write_bytes(b"placeholder")
+            signature = (str(source), source.stat().st_size, source.stat().st_mtime_ns)
+            key = app.source_analysis_key(signature)
+            app.APP.settings["global"].update({"source": str(source), "colorize": "true"})
+            with app.APP.source_analysis_lock:
+                app.APP.source_tone_default_keys.add(key)
+            with (
+                mock.patch.object(server, "ffprobe_basic_info", return_value={}),
+                mock.patch.object(server, "source_previews_for_analysis", return_value=[]),
+                mock.patch.object(server, "source_monochrome_cached", return_value=False),
+            ):
+                app.APP.analyze_source_media(signature, key)
+
+        self.assertEqual(app.APP.settings["global"]["colorize"], "false")
 
     def test_project_payload_round_trips_settings_with_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -4178,6 +4547,7 @@ class GuiSmokeTests(unittest.TestCase):
             flashvsr_color_fix=True,
             flashvsr_tile_size=512,
             flashvsr_tile_overlap=24,
+            flashvsr_vae_tile_multiplier=1,
             flashvsr_sparse_ratio=2.0,
             flashvsr_kv_ratio=3.0,
             flashvsr_local_range=9,
@@ -4225,7 +4595,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["2"]["inputs"]["model"], "FlashVSR-v1.1")
         self.assertEqual(prompt["2"]["inputs"]["mode"], "tiny")
         self.assertEqual(prompt["2"]["inputs"]["precision"], "fp16")
-        self.assertEqual(prompt["2"]["inputs"]["force_offload"], True)
+        self.assertEqual(prompt["2"]["inputs"]["force_offload"], False)
         self.assertEqual(prompt["3"]["class_type"], "FlashVSRNodeAdv")
         self.assertEqual(prompt["3"]["inputs"]["pipe"], ["2", 0])
         self.assertEqual(prompt["3"]["inputs"]["frames"], ["1", 0])

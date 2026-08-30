@@ -15,6 +15,7 @@ from .config import (
     ASPECT_PREVIEW_DIR,
     CONFIG_FILE,
     DEFAULT_OUTPAINT_LORA,
+    OUMOUMAD_OUTPAINT_LORA,
     FILE_PREVIEW_DIR,
     IMAGE_EXTS,
     MEDIA_CLIP_DIR,
@@ -281,7 +282,9 @@ def outpaint_handoff_marker_path() -> Path:
     return ROOT / ".cache" / "handoffs" / "ltx_2_3_official_outpaint_approval_v2.json"
 
 
-def outpaint_browser_handoff() -> tuple[bool, str]:
+def outpaint_browser_handoff(outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> tuple[bool, str]:
+    if Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA:
+        return True, ""
     comfy_dir = Path(comfy_dir_for(current_config()))
     target = resolve_comfy_model_path(comfy_dir, OUTPAINT_LORA_DESTINATION)
     if target.exists():
@@ -390,6 +393,10 @@ class PipelineApp:
         self.source_analysis_status: dict[str, dict[str, str | int | bool]] = {}
         self.source_analysis_results: dict[str, dict] = {}
         self.source_analysis_threads: set[str] = set()
+        # Tone detection is a convenience default for newly selected material.  A saved
+        # project is authoritative: reopening a colour source must not silently turn off a
+        # deliberately enabled recolourisation pass.
+        self.source_tone_default_keys: set[str] = set()
 
     def restore_image_sequence_source(self) -> None:
         global_settings = self.settings.setdefault("global", {})
@@ -487,7 +494,7 @@ class PipelineApp:
         return self.stabilization_output() if self.stabilize_enabled() else self.cleaned_source_for_downstream()
 
     def outpaint_source_for(self) -> str:
-        return self.stabilized_source_for_downstream()
+        return outpaint_source_for_settings(self.settings)
 
     def recomposition_base_input(self) -> str:
         values = self.settings.get("recomp", {})
@@ -908,6 +915,19 @@ class PipelineApp:
                 values["section_start"] = "0"
                 values["section_end"] = source_duration_text(source) if source.exists() else ""
                 if source.exists():
+                    signature = source_signature(str(source))
+                    if signature is not None and "colorize" not in values:
+                        tone_default: bool | None = None
+                        with self.source_analysis_lock:
+                            tone_key = source_analysis_key(signature)
+                            cached_analysis = self.source_analysis_results.get(tone_key)
+                            if cached_analysis is None:
+                                self.source_tone_default_keys.add(tone_key)
+                            else:
+                                tone_default = bool(cached_analysis.get("monochrome", True))
+                                self.source_tone_default_keys.discard(tone_key)
+                        if tone_default is not None:
+                            values.setdefault("colorize", "true" if tone_default else "false")
                     global_defaults, stage_defaults = source_defaults_for(source)
                     for key, value in global_defaults.items():
                         values.setdefault(key, value)
@@ -920,6 +940,11 @@ class PipelineApp:
                             f"Soundtrack {'on' if global_defaults.get('add_soundtrack') == 'true' else 'off'}",
                         ]
                         self.log.append(f"Applied source-based workflow defaults: {', '.join(labels)}.")
+        if stage == "global" and "colorize" in values and str(values.get("source", "")) == previous_source:
+            signature = source_signature(previous_source)
+            if signature is not None:
+                with self.source_analysis_lock:
+                    self.source_tone_default_keys.discard(source_analysis_key(signature))
         self.settings.setdefault(stage, {}).update({key: str(value) for key, value in values.items()})
         if stage == "global" and {"source", "section_start", "section_end"} & set(values):
             self.log.append(f"Loading source material: {values.get('source')}")
@@ -1046,7 +1071,11 @@ class PipelineApp:
 
             self.set_source_analysis_status(key, 76, "Checking whether the source is black and white")
             monochrome = source_monochrome_cached(*signature)
-            self.apply_detected_source_tone(signature[0], monochrome)
+            with self.source_analysis_lock:
+                apply_tone_default = key in self.source_tone_default_keys
+                self.source_tone_default_keys.discard(key)
+            if apply_tone_default:
+                self.apply_detected_source_tone(signature[0], monochrome)
 
             with self.source_analysis_lock:
                 self.source_analysis_results[key] = {
@@ -1087,6 +1116,8 @@ class PipelineApp:
     def clear_overview(self) -> None:
         last_browse_dir = self.settings.get("global", {}).get("last_browse_dir", "")
         self.settings = default_settings(include_newest_source=False)
+        with self.source_analysis_lock:
+            self.source_tone_default_keys.clear()
         if last_browse_dir:
             self.settings.setdefault("global", {})["last_browse_dir"] = last_browse_dir
         self.log.append("Cleared project settings from the Overview.")
@@ -1118,6 +1149,8 @@ class PipelineApp:
         loaded = read_project_file(path)
         self.settings = loaded
         self.project_path = path
+        with self.source_analysis_lock:
+            self.source_tone_default_keys.clear()
         self.restore_image_sequence_source()
         self.hydrate_stage_inputs("")
         self.save()
@@ -1352,13 +1385,12 @@ class PipelineApp:
             values,
             ("smoothing", "max_shift", "max_angle", "zoom", "shot_threshold", "min_shot_seconds", "encoder"),
         )
-        shot_manifest = (
-            self.settings.get("colour", {}).get("manifest", "")
-            or self.settings.get("references", {}).get("manifest", "")
-            or self.settings.get("shots", {}).get("manifest", "")
-        )
-        if shot_manifest and resolve(shot_manifest).is_file():
-            cmd.extend(["--shot-manifest", shot_manifest])
+        if not is_true(values, "scene_aware", "true"):
+            cmd.append("--single-shot")
+        # Reference rows are colour anchors, not necessarily camera cuts. In particular a
+        # continuous pan may deliberately have several reference sections, so never use that
+        # manifest to reset stabilization. The CLI retains --shot-manifest for an explicitly
+        # authored cut-only manifest.
         return cmd
 
     def _outpaint_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
@@ -1382,6 +1414,11 @@ class PipelineApp:
             add(["--guide-strength", values.get("guide_strength", "0.7")])
         if values.get("guide_end_strength"):
             add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
+        outpaint_lora = OUMOUMAD_OUTPAINT_LORA if values.get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
+        add(["--outpaint-lora", outpaint_lora])
+        if values.get("outpaint_model") == "ltx25":
+            add(["--ltx-version", "2.5"])
+            add(["--generation-fps", values.get("generation_fps", "24-fast")])
         if is_true(values, "outpaint_all_black_regions"):
             add(["--outpaint-all-black-regions"])
         if is_true(values, "seed_qwen_guides"):
@@ -1582,7 +1619,8 @@ class PipelineApp:
             if not stabilized_output or not resolve(stabilized_output).exists():
                 return False, "Run Stabilization first so this phase has its upstream video."
         if stage_key == "outpaint":
-            ok, message = outpaint_browser_handoff()
+            selected_lora = OUMOUMAD_OUTPAINT_LORA if self.settings.get("outpaint", {}).get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
+            ok, message = outpaint_browser_handoff(selected_lora)
             if not ok:
                 return False, message
         if stage_key == "audio":
@@ -1678,7 +1716,7 @@ class PipelineApp:
             threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
         return True, f"Started outpaint chunk {index + 1}"
 
-    def run_reference_regeneration(self, manifest_text: str, index: int, provider: str = "qwen") -> tuple[bool, str]:
+    def run_reference_regeneration(self, manifest_text: str, index: int, provider: str = "qwen", reference_index: int = 0) -> tuple[bool, str]:
         provider = "openai" if (provider == "openai" or self.settings.get("references", {}).get("method") == "openai") else "qwen"
         if provider == "qwen":
             ok, message = ensure_comfy_available_for_stage("Reference Generation")
@@ -1686,9 +1724,9 @@ class PipelineApp:
                 return False, message
         try:
             if provider == "openai":
-                cmd, output = openai_reference_regeneration_command(manifest_text, index)
+                cmd, output = openai_reference_regeneration_command(manifest_text, index, reference_index)
             else:
-                cmd, output = reference_regeneration_command(manifest_text, index)
+                cmd, output = reference_regeneration_command(manifest_text, index, reference_index)
         except Exception as exc:
             return False, str(exc)
         with self.lock:
@@ -1700,7 +1738,7 @@ class PipelineApp:
             self.running_reference_index = index
             self.run_started_at = time.time()
             label = "OpenAI" if provider == "openai" else "Qwen"
-            self.log.append(f"Regenerating colour reference with {label} for shot {index + 1}: {output}")
+            self.log.append(f"Regenerating colour reference {reference_index + 1} with {label} for shot {index + 1}: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
             try:
                 self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
@@ -2323,6 +2361,7 @@ def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
         smoothing, max_shift, max_angle, zoom = 12, 48, 3.0, 3.0
         shot_threshold, min_shot_seconds = 0.075, 1.0
     encoder = values.get("encoder", "ffv1") or "ffv1"
+    scene_aware = is_true(values, "scene_aware", "true")
     identity = aid.stabilize_identity(
         source.name,
         smoothing=smoothing,
@@ -2331,10 +2370,28 @@ def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
         zoom=zoom,
         shot_threshold=shot_threshold,
         min_shot_seconds=min_shot_seconds,
+        scene_aware=scene_aware,
         encoder=encoder,
     )
     extension = "mov" if encoder == "prores" else "mkv"
     return rel(ROOT / "intermediate" / "stabilized" / aid.artifact_name(aid.source_word(source.name), "stabilized", identity, extension))
+
+
+def outpaint_source_for_settings(settings: dict) -> str:
+    """Return the exact upstream video that Outpainting consumes.
+
+    Keep the chunk browser and the stage command on the same source identity.  In
+    particular, a stabilized run has different chunk/output hashes from the
+    original source, so previewing the original source's cache makes completed
+    chunks appear to be missing.
+    """
+    source_text = pipeline_source_text(settings)
+    global_values = settings.get("global", {})
+    if source_text and is_true(global_values, "cleanup"):
+        source_text = cleanup_output_for(source_text, settings.get("cleanup", {}))
+    if source_text and is_true(global_values, "stabilize"):
+        source_text = stabilize_output_for(source_text, settings.get("stabilize", {}))
+    return source_text
 
 
 def stabilization_preview_for(output_text: str) -> str:
@@ -2353,7 +2410,24 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4"))
+    tag = "outpaint25" if values.get("outpaint_model") == "ltx25" else "outpaint"
+    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "mp4"))
+
+
+def outpaint_render_outputs_for_settings(source_text: str, values: dict[str, str]) -> list[Path]:
+    """Finished renders usable when transient per-chunk files were cleared."""
+    if not source_text:
+        return []
+    source = resolve_video_source(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    crop, black = _outpaint_crop_black(values)
+    folder = ROOT / "intermediate" / "outpainted"
+    suffix = "25" if values.get("outpaint_model") == "ltx25" else ""
+    return [
+        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"outpaint{suffix}", "mp4"),
+        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"rawcomfy{suffix}", "mp4"),
+    ]
 
 
 def upscale_target_size(values: dict[str, str]) -> tuple[int, int]:
@@ -2432,7 +2506,8 @@ def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, "chunks")
+    tag = "chunks25" if values.get("outpaint_model") == "ltx25" else "chunks"
+    return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, tag)
 
 
 def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
@@ -2442,7 +2517,8 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
+    tag = "chunks25" if values.get("outpaint_model") == "ltx25" else "chunks"
+    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "csv"))
 
 
 def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
@@ -2501,10 +2577,6 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         str(source),
         "--target-aspect",
         values.get("target_aspect", "16:9"),
-        "--black-lift",
-        str(values.get("black_lift", "0.018") or "0.018"),
-        "--gamma",
-        str(values.get("gamma", "1.06") or "1.06"),
         "--output",
         str(prepared),
         "--crop-left",
@@ -2546,15 +2618,13 @@ def outpaint_chunks_state(settings: dict) -> dict:
     except Exception as exc:
         return {"manifest": "", "rows": [], "error": f"Could not prepare selected source section: {exc}"}
 
-    source_text = (
-        settings.get("cleanup", {}).get("output", "")
-        if is_true(settings.get("global", {}), "cleanup")
-        else pipeline_source_text(settings)
-    )
+    source_text = outpaint_source_for_settings(settings)
     if not source_text:
         return {"manifest": "", "rows": []}
     source = resolve_video_source(source_text)
     if not source.exists():
+        if is_true(settings.get("global", {}), "stabilize"):
+            return {"manifest": "", "rows": [], "error": "Run Stabilization first so Outpainting has its upstream video."}
         if is_true(settings.get("global", {}), "cleanup"):
             return {"manifest": "", "rows": [], "error": "Run Clean Up first so Outpainting has its upstream video."}
         return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
@@ -2618,6 +2688,8 @@ def outpaint_chunks_state(settings: dict) -> dict:
     # unchanged snapshot here can race an Accept request and restore its old guide image.
     if manifest_needs_write:
         write_outpaint_chunk_rows(manifest, rows)
+    finished_outputs = [path for path in outpaint_render_outputs_for_settings(source_text, values) if path.exists()]
+    finished_output = finished_outputs[0] if finished_outputs else None
     view_rows = []
     for row in rows:
         raw = resolve(row["raw_path"])
@@ -2632,6 +2704,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         length_frames = int(row["end_frame"]) - int(row["start_frame"])
         aspect = values.get("target_aspect", "16:9")
         guides = _build_guide_frames_view(row, source_text, aspect, start_seconds, end_seconds, fps, length_frames)
+        raw_preview = raw if raw.exists() else finished_output
         view_rows.append(row | {
             "index": chunk_index,
             "start": float(row["start_seconds"]),
@@ -2642,8 +2715,8 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "max_length_frames": max(1, total_frames - int(row["start_frame"])),
             "start_label": format_timecode(float(row["start_seconds"])),
             "end_label": format_timecode(float(row["end_seconds"])),
-            "raw_exists": raw.exists(),
-            "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
+            "raw_exists": bool(raw_preview),
+            "raw_mtime": int(raw_preview.stat().st_mtime_ns) if raw_preview else 0,
             "prepared_exists": prepared.exists(),
             "guides": guides,
             "auto_start_guide_available": bool(previous_raw and previous_raw.exists()),
@@ -2681,6 +2754,10 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
 
     if kind == "raw":
         raw = resolve(str(row.get("raw_path", "")))
+        raw_is_chunk = raw.exists()
+        if not raw_is_chunk:
+            source_text = outpaint_source_for_settings(settings)
+            raw = next((path for path in outpaint_render_outputs_for_settings(source_text, settings.get("outpaint", {})) if path.exists()), raw)
         if not raw.exists():
             return ""
         raw_fps = fps
@@ -2693,22 +2770,18 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
             raw_fps = fps
             raw_duration = duration
         if position == "start":
-            raw_offset = 0.0
+            raw_offset = 0.0 if raw_is_chunk else start_seconds
         elif position == "end":
-            raw_offset = max(0.0, raw_duration - (1.0 / raw_fps))
+            raw_offset = max(0.0, raw_duration - (1.0 / raw_fps)) if raw_is_chunk else start_seconds + offset
         else:
-            raw_offset = raw_duration / 2
+            raw_offset = raw_duration / 2 if raw_is_chunk else start_seconds + offset
         try:
             raw_identity = f"{raw.stat().st_mtime_ns}_{raw.stat().st_size}"
         except OSError:
             raw_identity = "current"
         return chunk_frame_preview(raw, raw_offset, f"raw_{chunk_index}_{position}_{raw_identity}")
 
-    source_text = (
-        settings.get("cleanup", {}).get("output", "")
-        if is_true(settings.get("global", {}), "cleanup")
-        else pipeline_source_text(settings)
-    )
+    source_text = outpaint_source_for_settings(settings)
     if not source_text:
         return ""
     aspect = settings.get("outpaint", {}).get("target_aspect", "16:9")

@@ -319,10 +319,50 @@ function referenceCard(context) {
       </div>
       <div>
         <label>Color reference</label>
-        ${colorReady ? colorReferenceThumb(manifest, idx, colorUrl, row) : missingImage('Image not present')}
+        ${colorReady ? colorReferenceThumb(manifest, idx, colorUrl, row, 0) : missingImage('Image not present')}
       </div>
       <div>${referencePromptTools(context)}</div>
+      ${additionalReferenceList(manifest, row, idx)}
     </article>
+  `;
+}
+
+function additionalReferenceList(manifest, row, idx) {
+  const items = (row.reference_items || []).slice(1);
+  if (!items.length) return '';
+  return `
+    <div class="additional-reference-list">
+      <label>Additional ColorMNet keyframes</label>
+      <div class="additional-reference-grid">
+        ${items.map(item => additionalReferenceCard(manifest, row, idx, item)).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function additionalReferenceCard(manifest, row, idx, item) {
+  const referenceIndex = Number(item.reference_index || 0);
+  const sourceReady = item.source_reference && item.source_reference_mtime;
+  const colorReady = item.color_reference && item.color_reference_mtime;
+  const sourceUrl = sourceReady ? media(item.source_reference) + '&t=' + item.source_reference_mtime : '';
+  const colorUrl = colorReady ? media(item.color_reference) + '&t=' + item.color_reference_mtime : '';
+  const regenerating = state.running_reference
+    && state.running_reference.index === idx
+    && state.running_reference.manifest === manifest;
+  return `
+    <section class="additional-reference-card">
+      <div class="shot-time">Reference ${referenceIndex + 1} · ${esc(item.selected_label || '')}</div>
+      <div class="additional-reference-images">
+        <div>${sourceReady ? `<img src="${sourceUrl}" alt="B&W keyframe" onclick="openImageModal(this.src,${jsArg('B&W keyframe')})">` : missingImage('B&W frame missing')}</div>
+        <div>${colorReady ? `<img src="${colorUrl}" alt="Colour keyframe" onclick="openImageModal(this.src,${jsArg('Colour keyframe')})">` : missingImage('Colour reference missing')}</div>
+      </div>
+      <div class="shot-tools">
+        <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx},${referenceIndex})">Use Custom Image</button>
+        <button type="button" onclick="regenerateReference('${esc(manifest)}',${idx},${referenceIndex})" ${state.running ? 'disabled' : ''}>${regenerating ? 'Generating...' : 'Generate Reference'}</button>
+        ${colorReady ? `<button type="button" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">Delete Colour</button>` : ''}
+        <button type="button" class="danger" onclick="removeAdditionalReference('${esc(manifest)}',${idx},${referenceIndex})">Remove Keyframe</button>
+      </div>
+    </section>
   `;
 }
 
@@ -393,12 +433,12 @@ function referenceTimeControl(manifest, row, idx, slider, label, img) {
   `;
 }
 
-function colorReferenceThumb(manifest, idx, colorUrl, row) {
+function colorReferenceThumb(manifest, idx, colorUrl, row, referenceIndex = 0) {
   return `
     <div class="thumb-wrap">
       <img src="${colorUrl}" alt="" onclick="openReferenceEditor('${esc(manifest)}',${idx})" title="Open advanced reference editor">
       ${row.color_reference_edited ? '<span class="edit-badge">Edited</span>' : ''}
-      <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference('${esc(manifest)}',${idx})">&#128465;</button>
+      <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">&#128465;</button>
     </div>
   `;
 }
@@ -467,8 +507,28 @@ function wireReferenceTimeControls() {
       <button type="button" onclick="scrubShot('${esc(manifest)}',${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
         Use Frame
       </button>
+      <button type="button" onclick="addReferenceAtCurrentFrame('${esc(manifest)}',${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
+        Add Reference
+      </button>
     `;
   }
+}
+
+function wireColourShotVideos() {
+  if (active !== 'colour') return;
+  document.querySelectorAll('.shot-card video').forEach((video, index) => {
+    try {
+      const url = new URL(video.getAttribute('src'), window.location.href);
+      const hash = url.hash || '';
+      if (!hash.startsWith('#t=')) return;
+      const parts = hash.slice(3).split(',');
+      if (parts.length < 2) return;
+      video.src = mediaClip(url.searchParams.get('path') || '', parts[0], parts[1], 'colour_' + index);
+      video.removeAttribute('data-cued');
+    } catch {
+      // Leave the original source in place if a card has an invalid media URL.
+    }
+  });
 }
 
 function formatSeconds(value) {

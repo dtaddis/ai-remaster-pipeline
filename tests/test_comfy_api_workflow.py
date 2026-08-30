@@ -12,6 +12,45 @@ from comfy_api import workflow_to_prompt  # noqa: E402
 
 
 class WorkflowToPromptTests(unittest.TestCase):
+    def test_flattens_frontend_subgraph_instance_and_exposed_widget(self) -> None:
+        workflow = {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "subgraph-id",
+                    "inputs": [{"name": "amount", "widget": {"name": "amount"}}],
+                    "outputs": [{"name": "value", "links": [10]}],
+                    "widgets_values": [7],
+                },
+                {"id": 2, "type": "Sink", "inputs": [{"name": "value", "link": 10}]},
+            ],
+            "links": [[10, 1, 0, 2, 0, "INT"]],
+            "definitions": {
+                "subgraphs": [{
+                    "id": "subgraph-id",
+                    "name": "Number source",
+                    "inputs": [{"name": "amount"}],
+                    "outputs": [{"name": "value"}],
+                    "nodes": [{
+                        "id": 5,
+                        "type": "PrimitiveInt",
+                        "inputs": [{"name": "value", "link": 20, "widget": {"name": "value"}}],
+                        "widgets_values": [1],
+                    }],
+                    "links": [
+                        {"id": 20, "origin_id": -10, "origin_slot": 0, "target_id": 5, "target_slot": 0, "type": "INT"},
+                        {"id": 21, "origin_id": 5, "origin_slot": 0, "target_id": -20, "target_slot": 0, "type": "INT"},
+                    ],
+                }],
+            },
+        }
+
+        prompt = workflow_to_prompt(workflow, "2")
+
+        source_id = next(node_id for node_id, node in prompt.items() if node["class_type"] == "PrimitiveInt")
+        self.assertEqual(prompt[source_id]["inputs"]["value"], 7)
+        self.assertEqual(prompt["2"]["inputs"]["value"], [source_id, 0])
+
     def test_core_load_video_uses_file_widget_name(self) -> None:
         workflow = {
             "nodes": [{"id": 1, "type": "LoadVideo", "inputs": [], "widgets_values": ["clip.mp4", "image"]}],

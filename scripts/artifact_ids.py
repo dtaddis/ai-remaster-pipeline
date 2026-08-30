@@ -225,11 +225,12 @@ def stabilize_identity(
     zoom: float = 3.0,
     shot_threshold: float = 0.075,
     min_shot_seconds: float = 1.0,
+    scene_aware: bool = True,
     encoder: str = "ffv1",
 ) -> dict:
     """Identity for scene-aware, geometry-preserving stabilization."""
     return {
-        "v": 1,
+        "v": 3,
         "kind": "stabilize",
         "source": safe_stem(source_name),
         "smoothing": int(smoothing),
@@ -238,6 +239,8 @@ def stabilize_identity(
         "zoom": float(zoom),
         "shot_threshold": float(shot_threshold),
         "min_shot_seconds": float(min_shot_seconds),
+        "scene_aware": bool(scene_aware),
+        "cut_detection": "hard_cuts_only_v1",
         "encoder": str(encoder),
     }
 

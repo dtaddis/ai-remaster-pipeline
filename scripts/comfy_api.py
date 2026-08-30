@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import copy
 import json
 import socket
 import time
@@ -252,7 +253,201 @@ def set_widget(node: dict[str, Any], key: str | int, value: Any) -> None:
     widgets[index] = value
 
 
+def flatten_frontend_subgraphs(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Expand ComfyUI frontend subgraph instances into an ordinary workflow."""
+
+    definitions = workflow.get('definitions')
+    subgraphs = definitions.get('subgraphs') if isinstance(definitions, dict) else None
+    if not isinstance(subgraphs, list) or not subgraphs:
+        return workflow
+
+    flat = copy.deepcopy(workflow)
+    subgraph_by_id = {
+        str(item.get('id')): item
+        for item in flat.get('definitions', {}).get('subgraphs', [])
+        if isinstance(item, dict) and item.get('id')
+    }
+    nodes = list(flat.get('nodes') or [])
+
+    def link_dict(link: Any) -> dict[str, Any]:
+        if isinstance(link, dict):
+            return dict(link)
+        return {
+            'id': link[0], 'origin_id': link[1], 'origin_slot': link[2],
+            'target_id': link[3], 'target_slot': link[4],
+            'type': link[5] if len(link) > 5 else '*',
+        }
+
+    links = [link_dict(link) for link in flat.get('links', [])]
+    next_node_id = max((int(node.get('id', 0)) for node in nodes), default=0) + 1
+    next_link_id = max((int(link.get('id', 0)) for link in links), default=0) + 1
+
+    def exposed_widget_values(instance: dict[str, Any]) -> dict[str, Any]:
+        values = instance.get('widgets_values', [])
+        if isinstance(values, dict):
+            return dict(values)
+        sequence = values if isinstance(values, list) else [values]
+        result: dict[str, Any] = {}
+        index = 0
+        for item in instance.get('inputs') or []:
+            if not isinstance(item, dict) or 'widget' not in item:
+                continue
+            if index < len(sequence):
+                result[str(item.get('name', ''))] = sequence[index]
+            index += 1
+        return result
+
+    def set_widget_value(node: dict[str, Any], input_name: str, value: Any) -> None:
+        widget_values = node.get('widgets_values', [])
+        if isinstance(widget_values, dict):
+            widget_values[input_name] = value
+            return
+        values = widget_values if isinstance(widget_values, list) else [widget_values]
+        widget_inputs = [item for item in node.get('inputs') or [] if isinstance(item, dict) and 'widget' in item]
+        target_index = next(
+            (index for index, item in enumerate(widget_inputs) if str(item.get('name')) == input_name),
+            None,
+        )
+        if target_index is None:
+            named = widget_fallback_inputs(str(node.get('type') or ''), values)
+            named[input_name] = value
+            node['widgets_values'] = named
+            return
+        while len(values) <= target_index:
+            values.append(None)
+        values[target_index] = value
+        node['widgets_values'] = values
+
+    while True:
+        instance = next((node for node in nodes if str(node.get('type')) in subgraph_by_id), None)
+        if instance is None:
+            break
+        definition = subgraph_by_id[str(instance['type'])]
+        instance_id = int(instance['id'])
+        interface_inputs = list(definition.get('inputs') or [])
+        interface_outputs = list(definition.get('outputs') or [])
+        instance_widgets = exposed_widget_values(instance)
+        outer_input_links = {
+            int(link['target_slot']): link for link in links
+            if int(link.get('target_id', -1)) == instance_id
+        }
+
+        id_map: dict[int, int] = {}
+        cloned_nodes: list[dict[str, Any]] = []
+        for source_node in definition.get('nodes') or []:
+            source_id = int(source_node['id'])
+            cloned = copy.deepcopy(source_node)
+            cloned['id'] = next_node_id
+            id_map[source_id] = next_node_id
+            next_node_id += 1
+            cloned_nodes.append(cloned)
+
+        output_sources: dict[int, tuple[int, int]] = {}
+        new_links: list[dict[str, Any]] = []
+        cloned_by_id = {int(node['id']): node for node in cloned_nodes}
+        for internal in (link_dict(link) for link in definition.get('links') or []):
+            origin_id = int(internal.get('origin_id', -1))
+            target_id = int(internal.get('target_id', -1))
+            origin_slot = int(internal.get('origin_slot', 0))
+            target_slot = int(internal.get('target_slot', 0))
+            if target_id == -20:
+                output_sources[target_slot] = (id_map[origin_id], origin_slot)
+                continue
+            if origin_id == -10:
+                outer = outer_input_links.get(origin_slot)
+                target_node_id = id_map[target_id]
+                target_node = cloned_by_id[target_node_id]
+                target_inputs = target_node.get('inputs') or []
+                target_item = target_inputs[target_slot] if target_slot < len(target_inputs) else None
+                if outer is not None:
+                    new_links.append({
+                        'id': next_link_id, 'origin_id': int(outer['origin_id']),
+                        'origin_slot': int(outer.get('origin_slot', 0)), 'target_id': target_node_id,
+                        'target_slot': target_slot, 'type': internal.get('type', outer.get('type', '*')),
+                    })
+                    if isinstance(target_item, dict):
+                        target_item['link'] = next_link_id
+                    next_link_id += 1
+                else:
+                    input_name = str(interface_inputs[origin_slot].get('name', '')) if origin_slot < len(interface_inputs) else ''
+                    if input_name in instance_widgets and isinstance(target_item, dict):
+                        target_item['link'] = None
+                        target_item.setdefault('widget', {'name': target_item.get('name', input_name)})
+                        set_widget_value(target_node, str(target_item.get('name', input_name)), instance_widgets[input_name])
+                continue
+            new_links.append({
+                'id': next_link_id, 'origin_id': id_map[origin_id], 'origin_slot': origin_slot,
+                'target_id': id_map[target_id], 'target_slot': target_slot, 'type': internal.get('type', '*'),
+            })
+            target_node = cloned_by_id[id_map[target_id]]
+            target_inputs = target_node.get('inputs') or []
+            if target_slot < len(target_inputs) and isinstance(target_inputs[target_slot], dict):
+                target_inputs[target_slot]['link'] = next_link_id
+            next_link_id += 1
+
+        rewritten_links: list[dict[str, Any]] = []
+        for outer in links:
+            if int(outer.get('target_id', -1)) == instance_id:
+                continue
+            if int(outer.get('origin_id', -1)) == instance_id:
+                slot = int(outer.get('origin_slot', 0))
+                if slot not in output_sources:
+                    label = interface_outputs[slot].get('name', slot) if slot < len(interface_outputs) else slot
+                    raise ValueError(f'Subgraph {definition.get("name", instance["type"])} output {label!r} has no internal source')
+                origin_id, origin_slot = output_sources[slot]
+                outer = dict(outer)
+                outer['origin_id'] = origin_id
+                outer['origin_slot'] = origin_slot
+            rewritten_links.append(outer)
+
+        nodes = [node for node in nodes if int(node.get('id', -1)) != instance_id]
+        nodes.extend(cloned_nodes)
+        links = rewritten_links + new_links
+
+    # A subgraph may expose a combo value through a frontend-only Reroute. When
+    # the instance leaves that input unconnected, inline its widget value into
+    # every downstream executable input; API prompts cannot execute a literal
+    # Reroute node.
+    while True:
+        constant_reroute = next((
+            node for node in nodes
+            if node.get('type') == 'Reroute'
+            and not any(isinstance(item, dict) and item.get('link') is not None for item in node.get('inputs') or [])
+            and node.get('widgets_values') not in (None, [], {})
+            and any(int(link.get('origin_id', -1)) == int(node['id']) for link in links)
+        ), None)
+        if constant_reroute is None:
+            break
+        raw_values = constant_reroute.get('widgets_values')
+        value = next(iter(raw_values.values())) if isinstance(raw_values, dict) else (
+            raw_values[0] if isinstance(raw_values, list) else raw_values
+        )
+        reroute_id = int(constant_reroute['id'])
+        outgoing = [link for link in links if int(link.get('origin_id', -1)) == reroute_id]
+        node_lookup = {int(node['id']): node for node in nodes}
+        for link in outgoing:
+            target = node_lookup[int(link['target_id'])]
+            target_slot = int(link.get('target_slot', 0))
+            target_inputs = target.get('inputs') or []
+            if target_slot >= len(target_inputs) or not isinstance(target_inputs[target_slot], dict):
+                continue
+            target_item = target_inputs[target_slot]
+            target_item['link'] = None
+            target_item.setdefault('widget', {'name': target_item.get('name', '')})
+            set_widget_value(target, str(target_item.get('name', '')), value)
+        links = [link for link in links if int(link.get('origin_id', -1)) != reroute_id]
+
+    flat['nodes'] = nodes
+    flat['links'] = [
+        [link['id'], link['origin_id'], link.get('origin_slot', 0), link['target_id'], link.get('target_slot', 0), link.get('type', '*')]
+        for link in links
+    ]
+    flat.pop('definitions', None)
+    return flat
+
+
 def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[str, Any]:
+    workflow = flatten_frontend_subgraphs(workflow)
     if 'nodes' not in workflow:
         return workflow
     nodes = {str(node['id']): node for node in workflow['nodes'] if int(node.get('mode', 0)) != 4}
@@ -338,6 +533,7 @@ def workflow_to_prompt(workflow: dict[str, Any], output_node_id: str) -> dict[st
                 'PrimitiveInt': ('value',),
                 'PrimitiveFloat': ('value',),
                 'PrimitiveString': ('value',),
+                'PrimitiveStringMultiline': ('value',),
                 'KSamplerSelect': ('sampler_name',),
             }.get(node.get('type'), ())
             for name, value in zip(fallback_names, values):
@@ -405,6 +601,7 @@ def widget_fallback_inputs(class_type: str | None, widget_values: Any) -> dict[s
         'LoadVideo': ('file',),
         'SaveVideo': ('filename_prefix', 'format', 'codec'),
         'CreateVideo': ('fps',),
+        'PrimitiveStringMultiline': ('value',),
         'VAEEncodeTiled': ('tile_size', 'overlap', 'temporal_size', 'temporal_overlap'),
         'LTXVEmptyLatentAudio': ('frames_number', 'frame_rate', 'batch_size'),
         'RandomNoise': ('noise_seed', 'control_after_generate'),

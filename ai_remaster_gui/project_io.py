@@ -115,11 +115,19 @@ def project_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
         seen.add(manifest)
         assets.append(manifest)
         for row in read_manifest(manifest):
-            for field in ("source_reference", "color_reference"):
-                image = resolve(row.get(field, ""))
-                if project_asset_is_bundleable(image) and image not in seen:
-                    seen.add(image)
-                    assets.append(image)
+            reference_values = [row]
+            try:
+                extras = json.loads(row.get("additional_references", "") or "[]")
+                if isinstance(extras, list):
+                    reference_values.extend(item for item in extras if isinstance(item, dict))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            for reference in reference_values:
+                for field in ("source_reference", "color_reference"):
+                    image = resolve(str(reference.get(field, "") or ""))
+                    if project_asset_is_bundleable(image) and image not in seen:
+                        seen.add(image)
+                        assets.append(image)
     # Outpaint chunk manifests and the hand-edited guide frames they reference, so a project
     # keeps the user's manual guide work for safekeeping.
     for asset in outpaint_guide_asset_paths(settings):

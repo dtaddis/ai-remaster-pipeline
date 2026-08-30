@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import artifact_ids as aid
+from reference_sets import reference_items
 from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import (
     ROOT,
@@ -171,6 +175,57 @@ def prepare_processing_reference(reference: Path, width: int, height: int) -> Pa
         return reference
 
 
+def prepare_reference_atlas(references: list[Path], width: int, height: int) -> Path:
+    """Pack multiple exemplars into one batch-safe ColorMNet texture."""
+    if not references:
+        raise RuntimeError("At least one reference image is required.")
+    if len(references) == 1:
+        return prepare_processing_reference(references[0], width, height)
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to pack multiple ColorMNet references.") from exc
+
+    columns = max(1, int(math.ceil(math.sqrt(len(references)))))
+    rows = max(1, int(math.ceil(len(references) / columns)))
+    fingerprints = [file_fingerprint(reference) for reference in references]
+    digest = hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    output = ROOT / ".cache" / "colorize_refs" / f"multi_reference_{digest}_{width}x{height}.png"
+    sig = {
+        "version": 1,
+        "tool": "colorize_video.py",
+        "kind": "multi-reference atlas",
+        "references": [
+            {"source": root_relative(reference), "fingerprint": fingerprint}
+            for reference, fingerprint in zip(references, fingerprints)
+        ],
+        "width": width,
+        "height": height,
+        "columns": columns,
+        "rows": rows,
+    }
+    if resumable_output(output, sig, width=width, height=height):
+        return output
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    canvas = Image.new("RGB", (width, height), (128, 128, 128))
+    for index, reference in enumerate(references):
+        column, row = index % columns, index // columns
+        left, right = (column * width) // columns, ((column + 1) * width) // columns
+        top, bottom = (row * height) // rows, ((row + 1) * height) // rows
+        cell_width, cell_height = max(1, right - left), max(1, bottom - top)
+        with Image.open(reference) as image:
+            fitted = ImageOps.contain(image.convert("RGB"), (cell_width, cell_height), resampling)
+        x = left + (cell_width - fitted.width) // 2
+        y = top + (cell_height - fitted.height) // 2
+        canvas.paste(fitted, (x, y))
+    canvas.save(output, format="PNG")
+    write_signature(output, sig)
+    print(f"Packed {len(references)} ColorMNet references into one {columns}x{rows} texture: {output}", flush=True)
+    return output
+
+
 def copy_reference_to_comfy_input(reference: Path, comfy_dir: Path, width: int | None = None, height: int | None = None) -> str:
     if width and height:
         reference = prepare_processing_reference(reference, width, height)
@@ -199,14 +254,16 @@ def default_output(manifest: Path, manifest_source: str | None, method: str) -> 
 
 
 def reference_signature(row: dict[str, str]) -> dict[str, Any]:
-    ref = row_reference(row)
+    refs = row_references(row)
     return {
         "start": row.get("start", ""),
         "end": row.get("end", ""),
         "start_frame": row.get("start_frame", ""),
         "end_frame": row.get("end_frame", ""),
-        "reference": root_relative(ref),
-        "reference_fingerprint": file_fingerprint(ref),
+        "references": [
+            {"selected_frame": item["selected_frame"], "reference": root_relative(item["path"]), "reference_fingerprint": file_fingerprint(item["path"])}
+            for item in refs
+        ],
         "fade_to_next": row.get("fade_to_next", ""),
         "crossfade_seconds": row.get("crossfade_seconds", ""),
     }
@@ -227,14 +284,16 @@ def row_path_signature(row: dict[str, str], key: str) -> dict[str, Any]:
 
 def shot_input_signature(row: dict[str, str]) -> dict[str, Any]:
     """Everything about a manifest row that can make a cached shot segment stale."""
-    ref = row_reference(row)
+    refs = row_references(row)
     unsigned_row_keys = {"color_reference_previous"}
     return {
         "row": {key: row.get(key, "") for key in sorted(row) if key not in unsigned_row_keys},
         "source_reference": row_path_signature(row, "source_reference"),
         "color_reference": row_path_signature(row, "color_reference"),
-        "reference": root_relative(ref),
-        "reference_fingerprint": file_fingerprint(ref),
+        "references": [
+            {"selected_frame": item["selected_frame"], "reference": root_relative(item["path"]), "reference_fingerprint": file_fingerprint(item["path"])}
+            for item in refs
+        ],
     }
 
 
@@ -244,7 +303,7 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
         "use_torch_compile": args.use_torch_compile,
         "video_format": args.video_format,
         "crf": args.crf,
-        "processing_height": args.processing_height,
+        "processing_height": getattr(args, "processing_height", "source"),
     }
     if args.method == "colormnet":
         settings.update(
@@ -268,7 +327,7 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 8,
+        "version": 9,
         "tool": "colorize_video.py",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "manifest": root_relative(manifest),
@@ -294,9 +353,21 @@ def row_reference(row: dict[str, str]) -> Path:
     return path
 
 
+def row_references(row: dict[str, str]) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    for item in reference_items(row):
+        effective = dict(row)
+        effective.update(item)
+        values.append({
+            "path": row_reference(effective),
+            "selected_frame": optional_int(item.get("selected_frame")),
+        })
+    return values
+
+
 def build_prompt(
     video_name: str,
-    ref_name: str,
+    ref_names: str | list[str],
     start_frame: int,
     frame_count: int,
     width: int,
@@ -305,8 +376,11 @@ def build_prompt(
     args: argparse.Namespace,
     prefix: str,
 ) -> dict[str, Any]:
-    color_node = colorization_node(args, width, height)
-    return {
+    if isinstance(ref_names, str):
+        ref_names = [ref_names]
+    if not ref_names:
+        raise RuntimeError("At least one reference image is required.")
+    prompt: dict[str, Any] = {
         "1": {
             "class_type": "VHS_LoadVideo",
             "inputs": {
@@ -320,8 +394,6 @@ def build_prompt(
                 "format": "None",
             },
         },
-        "2": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
-        "3": color_node,
         "4": {
             "class_type": "VHS_VideoCombine",
             "inputs": {
@@ -338,15 +410,21 @@ def build_prompt(
             },
         },
     }
+    if len(ref_names) != 1:
+        raise RuntimeError("ColorMNet accepts one image batch item; pack multiple references into an atlas first.")
+    prompt["2"] = {"class_type": "LoadImage", "inputs": {"image": ref_names[0]}}
+    prompt["3"] = colorization_node(args, width, height, ["2", 0])
+    return prompt
 
 
-def colorization_node(args: argparse.Namespace, width: int, height: int) -> dict[str, Any]:
+def colorization_node(args: argparse.Namespace, width: int, height: int, reference_input: list[Any] | None = None) -> dict[str, Any]:
+    reference_input = reference_input or ["2", 0]
     if args.method == "colormnet":
         return {
             "class_type": "ColorMNetVideo",
             "inputs": {
                 "video_frames": ["1", 0],
-                "reference_image": ["2", 0],
+                "reference_image": reference_input,
                 "target_width": width,
                 "target_height": height,
                 "memory_mode": args.colormnet_memory_mode,
@@ -361,7 +439,7 @@ def colorization_node(args: argparse.Namespace, width: int, height: int) -> dict
         "class_type": "DeepExColorVideoNode",
         "inputs": {
             "video_frames": ["1", 0],
-            "reference_image": ["2", 0],
+            "reference_image": reference_input,
             "frame_propagate": args.frame_propagate,
             "use_half_resolution": args.use_half_resolution,
             "target_width": width,
@@ -380,7 +458,7 @@ def segment_signature(
     args: argparse.Namespace,
     source_video: Path,
     row: dict[str, str],
-    reference: Path,
+    references: list[dict[str, Any]],
     start_frame: int,
     end_frame: int,
     base_start_frame: int,
@@ -389,16 +467,20 @@ def segment_signature(
     height: int,
     fps: float,
 ) -> dict[str, Any]:
+    if isinstance(references, Path):
+        references = [{"path": references, "selected_frame": optional_int(row.get("selected_frame"))}]
     return {
-        "version": 8,
+        "version": 9,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
         "grayscale_video_input": True,
-        "reference": root_relative(reference),
-        "reference_fingerprint": file_fingerprint(reference),
+        "references": [
+            {"selected_frame": item["selected_frame"], "reference": root_relative(item["path"]), "reference_fingerprint": file_fingerprint(item["path"])}
+            for item in references
+        ],
         "shot_input": shot_input_signature(row),
         "row_start": row.get("start", ""),
         "row_end": row.get("end", ""),
@@ -732,17 +814,29 @@ def run(args: argparse.Namespace) -> int:
         start_frame = item["start"]
         end_frame = item["end"]
         frame_count = max(1, end_frame - start_frame)
-        reference = row_reference(row)
-        ref_name = copy_reference_to_comfy_input(reference, comfy_dir, width, height)
+        references = row_references(row)
+        active_references = references if args.method == "colormnet" else references[:1]
+        if args.method != "colormnet" and len(references) > 1:
+            print(f"Deep Exemplar supports one reference; using reference 1 of {len(references)} for shot {index + 1}.", flush=True)
+        source_reference_indices = [
+            0 if ref_index == 0 else max(1, min(frame_count - 1, int(item["selected_frame"] or start_frame) - start_frame))
+            for ref_index, item in enumerate(active_references)
+        ]
+        if args.method == "colormnet" and len(active_references) > 1:
+            atlas = prepare_reference_atlas([item["path"] for item in active_references], width, height)
+            ref_names = [copy_reference_to_comfy_input(atlas, comfy_dir)]
+        else:
+            ref_names = [copy_reference_to_comfy_input(item["path"], comfy_dir, width, height) for item in active_references]
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
+        chunk_sig = segment_signature(args, source_video, row, active_references, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
             print(f"Reuse colorized segment {index + 1}/{len(rows)}: {chunk}", flush=True)
             chunks.append(chunk)
             continue
         prefix = f"arp_colorize/{method_suffix(args.method)}_{safe_stem(source_video.name)}_segment_{index:04d}_{start_frame:06d}_{end_frame:06d}"
-        print(f"Colorize segment {index + 1}/{len(rows)} with {args.method}: frames {start_frame}-{end_frame} using {ref_name}", flush=True)
-        prompt = build_prompt(video_name, ref_name, start_frame, frame_count, width, height, fps, args, prefix)
+        keyframe_note = ", ".join(str(value + start_frame) for value in source_reference_indices)
+        print(f"Colorize segment {index + 1}/{len(rows)} with {args.method}: frames {start_frame}-{end_frame} using {len(active_references)} reference(s) at source frames {keyframe_note}", flush=True)
+        prompt = build_prompt(video_name, ref_names, start_frame, frame_count, width, height, fps, args, prefix)
         prompt_id = queue_prompt(args.comfy_url, prompt)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
         produced = newest_output(extract_output_files(history, comfy_output_root))

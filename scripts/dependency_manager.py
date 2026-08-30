@@ -58,12 +58,30 @@ LTX_AUDIO_MODELS = [
 
 LTX_BASE_MODELS = [*LTX_VIDEO_MODELS, *LTX_AUDIO_MODELS]
 
+# LTX 2.5's full BF16 pair is roughly 68 GB. Q4_K_M leaves materially more
+# activation headroom on a 24 GB RTX 4090; the text encoder runs separately and
+# can retain Q5_K_M conditioning quality through ComfyUI's offload path.
+LTX25_GGUF_MODEL = "ltx-2.5-22b-distilled-transformer-Q4_K_M.gguf"
+LTX25_TEXT_ENCODER = "gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf"
+LTX25_VIDEO_VAE = "ltx-2.5-video-vae-conv-bf16.safetensors"
+LTX25_AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
+LTX25_LATENT_UPSCALER = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+LTX25_OUTPAINT_MODELS = [
+    HfModel("vantagewithai/LTX-2.5-GGUF", f"distilled/{LTX25_GGUF_MODEL}", f"models/diffusion_models/{LTX25_GGUF_MODEL}"),
+    HfModel("elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF", LTX25_TEXT_ENCODER, f"models/text_encoders/{LTX25_TEXT_ENCODER}"),
+    HfModel("Lightricks/LTX-2.5", f"vae/{LTX25_VIDEO_VAE}", f"models/vae/{LTX25_VIDEO_VAE}"),
+    HfModel("Lightricks/LTX-2.5", f"vae/{LTX25_AUDIO_VAE}", f"models/vae/{LTX25_AUDIO_VAE}"),
+    HfModel("Lightricks/LTX-2.5", f"latent_upscale_models/{LTX25_LATENT_UPSCALER}", f"models/latent_upscale_models/{LTX25_LATENT_UPSCALER}"),
+]
+
 OUTPAINT_LORA_FILES = [
     HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
+    HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
 ]
 OUTPAINT_MODELS = [*LTX_VIDEO_MODELS, *OUTPAINT_LORA_FILES]
 
 DEFAULT_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
+OUMOUMAD_OUTPAINT_LORA = "ltx-2.3-22b-ic-lora-outpaint.safetensors"
 
 OUTPAINT_DISTILLED_LORA_MODELS = [
     HfModel("Lightricks/LTX-2.3", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
@@ -378,11 +396,19 @@ def estimate_downloaded_bytes(cache_root: Path, baseline: dict[Path, int]) -> in
     return best
 
 
-def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False) -> None:
-    models = [*LTX_VIDEO_MODELS, *OUTPAINT_LORA_FILES]
+def ensure_outpaint_models(comfy_dir: Path, include_distilled_lora: bool = False, outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> None:
+    selected_name = Path(str(outpaint_lora).replace("\\", "/")).name
+    selected = next((model for model in OUTPAINT_LORA_FILES if Path(model.destination).name == selected_name), OUTPAINT_LORA_FILES[0])
+    models = [*LTX_VIDEO_MODELS, selected]
     if include_distilled_lora:
         models.extend(OUTPAINT_DISTILLED_LORA_MODELS)
     ensure_hf_models(comfy_dir, models)
+
+
+def ensure_ltx25_outpaint_models(comfy_dir: Path) -> None:
+    # The in/outpainting IC-LoRA remains the official 2.3 v0.9 adapter used by
+    # Lightricks' 2.5 workflow; do not download a redundant or unrelated LoRA.
+    ensure_hf_models(comfy_dir, [*LTX25_OUTPAINT_MODELS, OUTPAINT_LORA_FILES[0]])
 
 
 def ensure_cleanup_models(comfy_dir: Path) -> None:

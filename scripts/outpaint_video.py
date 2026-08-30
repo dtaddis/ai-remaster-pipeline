@@ -35,7 +35,14 @@ from common import (
 )
 from dependency_manager import (
     DEFAULT_OUTPAINT_LORA,
+    LTX25_AUDIO_VAE,
+    LTX25_GGUF_MODEL,
+    LTX25_LATENT_UPSCALER,
+    LTX25_TEXT_ENCODER,
+    LTX25_VIDEO_VAE,
+    OUMOUMAD_OUTPAINT_LORA,
     HuggingFaceAccessError,
+    ensure_ltx25_outpaint_models,
     ensure_outpaint_models,
 )
 from prepare_outpaint_input import default_output as default_prepared_output
@@ -58,6 +65,7 @@ def _crop_black(args: Any | None) -> tuple[list[int], bool]:
 
 
 DEFAULT_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
+LTX25_WORKFLOW = ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-2.5.json"
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 DEFAULT_OUTPAINT_PROMPT = "outpaint"
 MONOCHROME_PROMPT_SUFFIX = "neutral black-and-white monochrome archival film, grayscale only"
@@ -82,6 +90,22 @@ OFFICIAL_OUTPAINT_REQUIRED_NODES = {
     "ThresholdMask": "ComfyUI core",
     "InvertMask": "ComfyUI core",
 }
+LEGACY_OUTPAINT_REQUIRED_NODES = {
+    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+}
+LTX25_OUTPAINT_REQUIRED_NODES = {
+    "CLIPLoaderGGUF": "ComfyUI-GGUF",
+    "UnetLoaderGGUF": "ComfyUI-GGUF",
+    "LTXAddVideoICLoRAGuideAdvanced": "ComfyUI-LTXVideo",
+    "LTXVInpaintPreprocess": "ComfyUI-LTXVideo",
+    "LTXVLaplacianPyramidBlend": "ComfyUI-LTXVideo",
+    "LoadVideo": "ComfyUI core",
+    "SaveVideo": "ComfyUI core",
+}
+
+
+def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
+    return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
     try:
         opened = bool(webbrowser.open(OUTPAINT_ACCESS_URL))
@@ -119,16 +143,20 @@ def crop_slug(args: Any) -> str:
     return crop + mode
 
 
+def outpaint_artifact_tag(args: Any | None, base: str) -> str:
+    return f"{base}25" if getattr(args, "ltx_version", "2.3") == "2.5" else base
+
+
 def default_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4")
+    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "outpaint"), "mp4")
 
 
 def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "rawcomfy", "mp4")
+    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "rawcomfy"), "mp4")
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
@@ -145,6 +173,95 @@ def run_command(command: list[str], dry_run: bool) -> None:
     print(" ".join(command), flush=True)
     if not dry_run:
         subprocess.run(command, check=True)
+
+
+def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool = False) -> Path:
+    """Prepare archival input at LTX 2.5's cadence with a valid silent audio stream."""
+
+    info = probe_video(prepared)
+    source_fps = float(info.get("fps") or 24.0)
+    source_frames = int(info.get("frames") or 0)
+    has_audio = video_has_audio(ffmpeg, prepared)
+    output_fps = source_fps if mode == "source" else 24.0
+    if mode == "24-fast" and source_frames:
+        # Keep only real input frames.  Retime the nearest lower valid 8n+1 count
+        # to 24 fps instead of motion-interpolating or duplicating anything.
+        expected_frames = source_frames - ((source_frames - 1) % 8)
+    else:
+        expected_frames = ltx_valid_frame_count(source_frames / source_fps, output_fps) if source_frames else 0
+    if (mode == "source" or abs(source_fps - 24.0) < 0.01) and has_audio and source_frames == expected_frames:
+        print(f"LTX 2.5 generation cadence: source {source_fps:g} fps", flush=True)
+        return prepared
+    fps_tag = f"{output_fps:g}".replace(".", "p") + ("_fast" if mode == "24-fast" else "")
+    output = prepared.with_name(f"{prepared.stem}_ltx25_{fps_tag}fps.mp4")
+    signature = {
+        "version": 4,
+        "tool": "outpaint_video.py/ltx25_fps",
+        "source": root_relative(prepared),
+        "source_fingerprint": file_fingerprint(prepared),
+        "source_fps": source_fps,
+        "generation_fps": output_fps,
+        "generation_frames": expected_frames,
+        "filter": (
+            "retime-existing-frames"
+            if mode == "24-fast"
+            else "minterpolate-aobmc-bidir-vsbmc"
+            if abs(output_fps - source_fps) >= 0.01
+            else "copy-cadence"
+        ),
+        "audio": "preserve-or-silent-stereo-48khz",
+    }
+    if not force and resumable_output(output, signature):
+        print(f"Reuse LTX 2.5 {output_fps:g} fps prepared input: {output}", flush=True)
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial.mp4")
+    if mode == "24-fast":
+        duration = expected_frames / output_fps if output_fps else 0.0
+        print(
+            f"LTX 2.5 fast cadence: using {expected_frames} untouched source frames at 24 fps "
+            f"({duration:.3f}s); no interpolation or duplicate frames.",
+            flush=True,
+        )
+        video_args = ["-vf", f"trim=end_frame={expected_frames},setpts=N/(24*TB),fps=24"]
+    elif abs(output_fps - source_fps) >= 0.01:
+        print(
+            f"LTX 2.5 is trained around 24 fps; motion-interpolating {source_fps:g} fps to 24 fps "
+            "without changing duration.",
+            flush=True,
+        )
+        video_args = ["-vf", "minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,tpad=stop_mode=clone:stop_duration=1"]
+    else:
+        print(f"Preparing LTX 2.5 input at source cadence {source_fps:g} fps.", flush=True)
+        video_args = ["-vf", "tpad=stop_mode=clone:stop_duration=1"]
+    audio_args = ["-map", "0:v:0"]
+    inputs = ["-i", str(prepared)]
+    if has_audio:
+        audio_args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"]
+        if mode == "24-fast":
+            speed = output_fps / source_fps
+            audio_args += ["-filter:a", f"atempo={speed:.8f},atrim=duration={expected_frames / output_fps:.8f}"]
+    else:
+        # The official two-stage graph encodes audio even for archival silent film.
+        # Supplying silence keeps that graph valid without fabricating audible content.
+        inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        audio_args += ["-map", "1:a:0", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+    subprocess.run([
+        ffmpeg, "-y", *inputs, *audio_args, *video_args,
+        *(["-frames:v", str(expected_frames)] if expected_frames else []),
+        "-r", f"{output_fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "slow", "-crf", "8",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+    ], check=True)
+    replace_with_retry(partial, output, "LTX 2.5 frame-rate preparation")
+    write_signature(output, signature)
+    converted = probe_video(output)
+    print(
+        f"Wrote LTX 2.5 {output_fps:g} fps input: {output} "
+        f"({int(converted.get('frames') or 0)} frames; frame-count rule remainder "
+        f"{int(converted.get('frames') or 0) % 8})",
+        flush=True,
+    )
+    return output
 
 
 def video_has_audio(ffmpeg: str, source: Path) -> bool:
@@ -487,6 +604,21 @@ def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[
         if offset_match:
             offset_x, offset_y = int(offset_match.group(1)), int(offset_match.group(2))
 
+    # LTX 2.5 may insert a duration-preserving 16->24 fps intermediate before
+    # chunking.  That file deliberately inherits the prepared canvas geometry;
+    # follow its provenance back to the original prepare_outpaint_input signature.
+    for _ in range(3):
+        fps_sig_path = signature_path(base_prepared)
+        if not fps_sig_path.exists():
+            break
+        try:
+            fps_sig = json.loads(fps_sig_path.read_text(encoding="utf-8-sig"))
+            if fps_sig.get("tool") != "outpaint_video.py/ltx25_fps":
+                break
+            base_prepared = resolve_path(fps_sig["source"])
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     sig_path = signature_path(base_prepared)
     if not sig_path.exists():
         return None
@@ -651,6 +783,35 @@ def patch_video_only_sampling(workflow: dict[str, Any]) -> None:
     set_input_link(workflow, "5093", "latent_image", sampler_latent_link)
     patch_link(workflow, crop_latent_link, 5093, 1, 5013, 2, "LATENT")
     set_input_link(workflow, "5013", "latent", crop_latent_link)
+
+
+def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path) -> None:
+    """Use oumoumad's original pure-black sentinel conditioning and direct decode."""
+    legacy_guide = node_by_id(workflow, "5114")
+    legacy_guide["type"] = "LTXAddVideoICLoRAGuide"
+    legacy_guide["title"] = "ARP oumoumad pure-black IC-LoRA guide"
+    legacy_guide["inputs"] = [
+        item for item in legacy_guide.get("inputs", []) if item.get("name") != "attention_mask"
+    ]
+    legacy_guide["widgets_values"] = list(legacy_guide.get("widgets_values") or [])[:7]
+
+    # Prepared frames have the legacy source tone lift while synthetic margins remain exact black.
+    patch_link(workflow, 14372, 5168, 0, 5114, 4, "IMAGE")
+    set_input_link(workflow, "5114", "image", 14372)
+    size_link = input_link(workflow, "5054", "image")
+    if size_link is None:
+        raise ValueError("Official outpaint template has no Stage 1 image-size link.")
+    patch_link(workflow, size_link, 5168, 0, 5054, 0, "IMAGE")
+    set_input_link(workflow, "5054", "image", size_link)
+
+    # Oumoumad's graph returns the diffusion result directly rather than restoring the official
+    # inpaint sentinel through the mask compositor.
+    patch_link(workflow, 13934, 4851, 0, 5227, 0, "IMAGE")
+    set_input_link(workflow, "5227", "images", 13934)
+    patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
+    set_input_link(workflow, "5227", "audio", 14433)
+    patch_link(workflow, 19120, 2004, 0, 3159, 1, "IMAGE")
+    set_input_link(workflow, "3159", "image", 19120)
 
 
 def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int) -> None:
@@ -1088,7 +1249,172 @@ def _patch_extra_guides(
     workflow["links"] = [l for l in workflow.get("links", []) if l[0] not in reserved_ids] + new_links_all
 
 
+def set_exposed_subgraph_widget(node: dict[str, Any], name: str, value: Any) -> None:
+    values = node.get("widgets_values", [])
+    if isinstance(values, dict):
+        values[name] = value
+        return
+    values = values if isinstance(values, list) else [values]
+    index = 0
+    for item in node.get("inputs") or []:
+        if not isinstance(item, dict) or "widget" not in item:
+            continue
+        if item.get("name") == name:
+            while len(values) <= index:
+                values.append(None)
+            values[index] = value
+            node["widgets_values"] = values
+            return
+        index += 1
+    raise KeyError(f"Subgraph input widget not found: {name}")
+
+
+def prune_api_prompt(prompt: dict[str, Any], output_node_id: str) -> dict[str, Any]:
+    needed: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in needed or node_id not in prompt:
+            return
+        needed.add(node_id)
+        for value in prompt[node_id].get("inputs", {}).values():
+            if isinstance(value, list) and len(value) == 2 and str(value[0]) in prompt:
+                visit(str(value[0]))
+
+    visit(str(output_node_id))
+    return {node_id: node for node_id, node in prompt.items() if node_id in needed}
+
+
+def patch_ltx25_workflow(
+    args,
+    workflow: dict[str, Any],
+    prepared: Path,
+    comfy_dir: Path,
+    output_prefix: str,
+    prompt_text: str,
+    negative_text: str,
+    seed: int | None,
+    guide_image: Path | None,
+    extra_guides: "list[dict] | None",
+) -> dict[str, Any]:
+    """Patch Lightricks' official two-stage 2.5 outpaint template for ARP."""
+
+    info = probe_video(prepared)
+    width, height = int(info["width"]), int(info["height"])
+    video_name = copy_to_comfy_input(prepared, comfy_dir, "arp_outpaint_ltx25")
+    image_name = (
+        copy_guide_image_to_comfy_input(guide_image, comfy_dir, width, height)
+        if guide_image and guide_image.exists()
+        else copy_reference_frame_to_comfy_input(prepared, comfy_dir)
+    )
+
+    set_widget(node_by_id(workflow, "5368"), "0", video_name)
+    set_widget(node_by_id(workflow, "2004"), "0", image_name)
+    set_widget(node_by_id(workflow, "5404"), "0", prompt_text)
+    set_widget(node_by_id(workflow, "9008"), "0", negative_text)
+    set_widget(node_by_id(workflow, "9009"), "0", width)
+    set_widget(node_by_id(workflow, "9010"), "0", height)
+    set_widget(node_by_id(workflow, "5228"), "0", output_prefix)
+
+    input_parameters = node_by_id(workflow, "5408")
+    set_exposed_subgraph_widget(input_parameters, "use image input", bool(guide_image))
+    set_exposed_subgraph_widget(input_parameters, "Enhance positive prompt", False)
+    set_exposed_subgraph_widget(input_parameters, "Negative prompt", negative_text)
+    set_exposed_subgraph_widget(input_parameters, "target_width", width)
+    set_exposed_subgraph_widget(input_parameters, "target_height", height)
+    set_exposed_subgraph_widget(input_parameters, "ckpt_name", LTX25_GGUF_MODEL)
+
+    load_models = node_by_id(workflow, "5407")
+    for name, value in {
+        "audio_vae": LTX25_AUDIO_VAE,
+        "video_vae": LTX25_VIDEO_VAE,
+        "spacial_latent_upscaler_model": LTX25_LATENT_UPSCALER,
+        "gemma4_e2b_enhancer": LTX25_TEXT_ENCODER,
+        "gemma4_12b_encoder": LTX25_TEXT_ENCODER,
+        "ic_lora": DEFAULT_OUTPAINT_LORA,
+        "unet_name": LTX25_GGUF_MODEL,
+    }.items():
+        set_exposed_subgraph_widget(load_models, name, value)
+
+    prompt = workflow_to_prompt(workflow, args.output_node_id)
+    # ARP has already padded every frame to the requested canvas, so the official
+    # KJNodes padding node must not pad or resize it again.  Its IMAGE output is the
+    # *whole source video*, not the optional one-frame start guide.  Keep the latter
+    # only on the i2v branch.  Supply our explicit geometric mask separately; a plain
+    # LoadImage has an all-zero mask and would silently tell LTX to preserve the black
+    # margins (and reduce GetImageSize's frame count to one).
+    exact_mask = official_mask_image(prepared, args, width, height)
+    generation_mask = generation_mask_image(exact_mask, args)
+    generation_mask_name = copy_to_comfy_input(
+        generation_mask, comfy_dir, "arp_outpaint_generation_mask_ltx25"
+    )
+    prompt["9190"] = {
+        "class_type": "LoadImage",
+        "inputs": {"image": generation_mask_name},
+        "_meta": {"title": "ARP LTX 2.5 broadcast generation mask"},
+    }
+    prompt["9191"] = {
+        "class_type": "ImageToMask",
+        "inputs": {"image": ["9190", 0], "channel": "red"},
+        "_meta": {"title": "ARP LTX 2.5 generation mask channel"},
+    }
+
+    # Bypass ImagePadForOutpaintTargetSize so LTX 2.5 does not require the
+    # otherwise unrelated KJNodes package.  Output slot 0 is the frame sequence;
+    # output slot 1 is the single mask frame that LTXVInpaintPreprocess broadcasts.
+    pad_ids = {node_id for node_id, node in prompt.items() if node.get("class_type") == "ImagePadForOutpaintTargetSize"}
+    for node in prompt.values():
+        for name, value in list(node.get("inputs", {}).items()):
+            if isinstance(value, list) and len(value) == 2 and str(value[0]) in pad_ids:
+                node["inputs"][name] = ["9056", 0] if int(value[1]) == 0 else ["9191", 0]
+    for node_id in pad_ids:
+        prompt.pop(node_id, None)
+    for node in prompt.values():
+        class_type = node.get("class_type")
+        title = str(node.get("_meta", {}).get("title", ""))
+        inputs = node.setdefault("inputs", {})
+        if class_type == "UNETLoader":
+            node["class_type"] = "UnetLoaderGGUF"
+            node["inputs"] = {"unet_name": LTX25_GGUF_MODEL}
+        elif class_type == "CLIPLoader":
+            node["class_type"] = "CLIPLoaderGGUF"
+            node["inputs"] = {"clip_name": LTX25_TEXT_ENCODER, "type": "ltxv"}
+        elif class_type == "VAELoader" and "Audio" in title:
+            inputs["vae_name"] = LTX25_AUDIO_VAE
+        elif class_type == "VAELoader":
+            inputs["vae_name"] = LTX25_VIDEO_VAE
+        elif class_type == "RandomNoise" and seed is not None:
+            inputs["noise_seed"] = int(seed) + (1 if int(inputs.get("noise_seed", 42)) == 43 else 0)
+            inputs["control_after_generate"] = "fixed"
+        elif class_type == "LTXAddVideoICLoRAGuideAdvanced":
+            inputs["strength"] = float(getattr(args, "guide_strength", 0.7)) if guide_image else 1.0
+        elif class_type == "LTXVLaplacianPyramidBlend":
+            inputs["mask_low_res_dilation"] = max(4, int(getattr(args, "mask_blend_dilation", 6)))
+
+    # Keep prompt enhancement and the remote Gemma API out of the executable
+    # dependency graph. The source video is already a strong semantic guide.
+    for node in prompt.values():
+        if node.get("class_type") != "ComfySwitchNode":
+            continue
+        title = str(node.get("_meta", {}).get("title", ""))
+        inputs = node["inputs"]
+        if "prompt source (enhanced or raw)" in title:
+            inputs["switch"] = False
+            inputs["on_true"] = inputs.get("on_false")
+        elif "conditioning source" in title:
+            inputs["switch"] = False
+            inputs["on_true"] = inputs.get("on_false")
+
+    if extra_guides:
+        print("LTX 2.5 uses the reference video plus one optional start guide; additional legacy guide frames are ignored.", flush=True)
+    return prune_api_prompt(prompt, args.output_node_id)
+
+
 def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None) -> dict[str, Any]:
+    if getattr(args, "ltx_version", "2.3") == "2.5":
+        return patch_ltx25_workflow(
+            args, workflow, prepared, comfy_dir, output_prefix,
+            prompt_text, negative_text, seed, guide_image, extra_guides,
+        )
     video_name = copy_to_comfy_input(prepared, comfy_dir, "arp_outpaint")
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
@@ -1105,14 +1431,17 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     canvas_height = int(prepared_info["height"])
     if is_official_outpaint_template(workflow):
         validate_official_outpaint_workflow(workflow)
-        patch_official_masked_graph(
-            workflow,
-            args,
-            prepared,
-            comfy_dir,
-            canvas_width,
-            canvas_height,
-        )
+        if uses_legacy_black_outpaint(args.outpaint_lora):
+            patch_legacy_black_graph(workflow, prepared)
+        else:
+            patch_official_masked_graph(
+                workflow,
+                args,
+                prepared,
+                comfy_dir,
+                canvas_width,
+                canvas_height,
+            )
         patch_video_only_sampling(workflow)
     if guide_image and guide_image.exists():
         image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
@@ -1234,7 +1563,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 37,
+        "version": 38,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1271,12 +1600,26 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "extra_save_node_id": args.extra_save_node_id,
         "output_node_id": args.output_node_id,
         "model_backend": args.model_backend,
-        "gguf_model": args.gguf_model,
-        "video_vae": args.video_vae,
+        "ltx_version": getattr(args, "ltx_version", "2.3"),
+        "generation_fps": getattr(args, "generation_fps", "source"),
+        "gguf_model": LTX25_GGUF_MODEL if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "gguf_model", ""),
+        "video_vae": LTX25_VIDEO_VAE if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "video_vae", ""),
+        "text_encoder": LTX25_TEXT_ENCODER if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "text_encoder", ""),
+        "audio_vae": LTX25_AUDIO_VAE if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "audio_vae_checkpoint", ""),
+        "latent_upscaler": LTX25_LATENT_UPSCALER if getattr(args, "ltx_version", "2.3") == "2.5" else "",
+        "outpaint_lora": args.outpaint_lora,
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
-        "outpaint_pipeline": "crop_first_pillarbox_letterbox_video_only_v1",
+        "outpaint_pipeline": (
+            "ltx25_official_two_stage_24fps_v2"
+            if getattr(args, "ltx_version", "2.3") == "2.5"
+            else "crop_first_pillarbox_letterbox_video_only_v1"
+        ),
         "ltx_runtime_adapter": getattr(args, "ltx_runtime_adapter", "unchecked"),
-        "ltx_workflow_adapter": LTX_WORKFLOW_ADAPTER,
+        "ltx_workflow_adapter": (
+            "official_ltx25_subgraph_v2"
+            if getattr(args, "ltx_version", "2.3") == "2.5"
+            else LTX_WORKFLOW_ADAPTER
+        ),
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 8)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 2)),
         "chunk_seconds": args.chunk_seconds,
@@ -1325,7 +1668,7 @@ def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> l
     total_frames = int(info["frames"])
     if chunk_seconds <= 0 or total_frames <= 0:
         return [(0, 0, total_frames)]
-    chunk_frames = max(1, int(round(chunk_seconds * info["fps"])))
+    chunk_frames = ltx_valid_frame_count(chunk_seconds, float(info["fps"]))
     if chunk_frames >= total_frames:
         return [(0, 0, total_frames)]
     overlap = max(0, min(int(overlap_frames), chunk_frames - 1))
@@ -1334,11 +1677,31 @@ def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> l
     start = 0
     while start < total_frames:
         end = min(total_frames, start + chunk_frames)
+        if end == total_frames:
+            start = valid_final_chunk_start(total_frames, start, ranges)
         ranges.append((len(ranges), start, end))
         if end >= total_frames:
             break
         start += step
     return ranges
+
+
+def ltx_valid_frame_count(seconds: float, fps: float) -> int:
+    """Return the closest positive LTX temporal length (8n + 1)."""
+    requested = max(1, int(round(float(seconds) * float(fps))))
+    lower = max(1, ((requested - 1) // 8) * 8 + 1)
+    upper = lower + 8
+    return lower if requested - lower <= upper - requested else upper
+
+
+def valid_final_chunk_start(total_frames: int, start: int, ranges: list[tuple[int, int, int]]) -> int:
+    """Grow the final overlap just enough to make its temporal length 8n + 1."""
+    length = total_frames - start
+    grow = (1 - length) % 8
+    adjusted = max(0, start - grow)
+    if ranges and adjusted <= ranges[-1][1]:
+        return start
+    return adjusted
 
 
 def combine_prompt(prompt: str, suffix: str) -> str:
@@ -1354,7 +1717,7 @@ def combine_prompt(prompt: str, suffix: str) -> str:
 
 def default_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
     crop, black = _crop_black(args)
-    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv")
+    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "chunks"), "csv")
 
 
 def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
@@ -1458,8 +1821,10 @@ def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: f
                 seconds = float(custom)
             except ValueError:
                 seconds = default_seconds
-        chunk_frames = max(1, int(round(seconds * fps)))
+        chunk_frames = ltx_valid_frame_count(seconds, fps)
         end = min(total_frames, start + chunk_frames)
+        if end == total_frames:
+            start = valid_final_chunk_start(total_frames, start, ranges)
         ranges.append((index, start, end))
         if end >= total_frames:
             break
@@ -1644,10 +2009,18 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
         command.extend(["-filter_complex", filters, "-map", "[v]", "-map", "[a]"])
     else:
         command.extend(["-vf", vf, "-an"])
-    command.extend(["-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast"])
+    # AAC packet boundaries can end just before the last video timestamp.  Using
+    # -shortest here used to turn a valid 49-frame LTX chunk into 48 frames, which
+    # the temporal VAE then rounded down to 41.  Pin the video frame count and let
+    # the already-trimmed audio stream carry its normal encoder padding instead.
+    command.extend([
+        "-frames:v", str(max(1, end_frame - start_frame)),
+        "-r", f"{fps:.8f}", "-fps_mode", "cfr",
+        "-c:v", "libx264", "-crf", "12", "-preset", "veryfast",
+    ])
     if has_audio:
         # Normalize WebM/Opus and other source codecs to a broadly supported chunk codec.
-        command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+        command.extend(["-c:a", "aac", "-b:a", "192k"])
     command.append(str(partial))
     subprocess.run(command, check=True)
     replace_unless_identical(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
@@ -1798,6 +2171,16 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
     parser = argparse.ArgumentParser(description="Run the LTX IC-LoRA outpainting stage end to end.")
+    parser.add_argument("--ltx-version", choices=["2.3", "2.5"], default="2.3", help="LTX outpainting generation backend.")
+    parser.add_argument(
+        "--generation-fps",
+        choices=["source", "24", "24-fast"],
+        default="24",
+        help=(
+            "LTX 2.5 generation cadence. 24 motion-interpolates lower-rate input without changing duration; "
+            "24-fast retimes untouched source frames and trims to the nearest lower 8n+1 count."
+        ),
+    )
     parser.add_argument("--source", required=True)
     parser.add_argument("--target-aspect", default="16:9")
     parser.add_argument("--target-height", type=int, default=720)
@@ -1820,11 +2203,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generation-mask-overlap", type=int, choices=range(0, 97), default=8, metavar="0-96", help="Expand the generation mask beneath protected source pixels so narrow requested bands survive LTX's spatial compression. The final composite still uses the exact requested mask.")
     parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=2, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
     parser.add_argument("--black-mask-threshold", type=int, choices=range(0, 65), default=12, metavar="0-64", help="Maximum source level treated as black in dynamic all-black-region masks. Raise only when encoded bars are not truly zero.")
-    # Internal workflow value, deliberately not exposed as a model selector.
-    parser.set_defaults(outpaint_lora=DEFAULT_OUTPAINT_LORA)
+    parser.add_argument("--outpaint-lora", choices=[DEFAULT_OUTPAINT_LORA, OUMOUMAD_OUTPAINT_LORA], default=DEFAULT_OUTPAINT_LORA)
     parser.add_argument("--output")
     parser.add_argument("--raw-output")
-    parser.add_argument("--workflow", default=str(DEFAULT_WORKFLOW))
+    parser.add_argument("--workflow")
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(DEFAULT_COMFY_DIR)))
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-output-root")
@@ -1844,8 +2226,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--negative-prompt", default="cartoon, game, 3d render, still image, static, warped geometry, flicker, smeared details, extra fingers, broken fingers, deformed hands")
     parser.add_argument("--guide-strength", type=float, default=0.7, help="Conditioning strength for the start-frame guide (LTX i2v, 0–1). Default: 0.7.")
     parser.add_argument("--guide-end-strength", type=float, default=1.0, help="Conditioning strength for the end-frame guide (IC-LoRA, 0–1). Default: 1.0.")
-    parser.add_argument("--black-lift", type=float, default=0.018)
-    parser.add_argument("--gamma", type=float, default=1.06)
+    parser.add_argument("--black-lift", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--gamma", type=float, default=1.0, help=argparse.SUPPRESS)
     parser.add_argument("--outpaint-all-black-regions", action="store_true", help="Leave source blacks untouched so black regions inside the source can be outpainted.")
     parser.add_argument("--allow-color-outpaint", action="store_true", help="Allow colour generation even when the source is detected as monochrome.")
     # Qwen guide seeding: when LTX won't outpaint, auto-generate filled guide frames at every
@@ -1870,7 +2252,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     source = resolve_path(args.source)
-    workflow_path = resolve_path(args.workflow)
+    workflow_path = resolve_path(args.workflow or (LTX25_WORKFLOW if args.ltx_version == "2.5" else DEFAULT_WORKFLOW))
     comfy_dir = resolve_path(args.comfy_dir)
     comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
 
@@ -1896,23 +2278,28 @@ def main() -> int:
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
-        ensure_outpaint_models(
-            comfy_dir,
-            include_distilled_lora=args.model_backend != "gguf",
-        )
+        if args.ltx_version == "2.5":
+            ensure_ltx25_outpaint_models(comfy_dir)
+        else:
+            ensure_outpaint_models(
+                comfy_dir,
+                include_distilled_lora=args.model_backend != "gguf",
+                outpaint_lora=args.outpaint_lora,
+            )
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-        required_nodes = dict(OUTPAINT_COMMON_NODES)
-        required_nodes.update(OFFICIAL_OUTPAINT_REQUIRED_NODES)
-        if args.model_backend == "gguf":
-            required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
+        if args.ltx_version == "2.5":
+            required_nodes = dict(LTX25_OUTPAINT_REQUIRED_NODES)
+        else:
+            required_nodes = dict(OUTPAINT_COMMON_NODES)
+            required_nodes.update(LEGACY_OUTPAINT_REQUIRED_NODES if uses_legacy_black_outpaint(args.outpaint_lora) else OFFICIAL_OUTPAINT_REQUIRED_NODES)
+            if args.model_backend == "gguf":
+                required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
-        compatibility = ensure_arp_ltx_compatible(args.comfy_url)
-        args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
-        print(
-            f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}",
-            flush=True,
-        )
+        if args.ltx_version == "2.3":
+            compatibility = ensure_arp_ltx_compatible(args.comfy_url)
+            args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
+            print(f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}", flush=True)
 
     prepare_command = [
         sys.executable,
@@ -1921,10 +2308,6 @@ def main() -> int:
         str(source),
         "--target-aspect",
         args.target_aspect,
-        "--black-lift",
-        str(args.black_lift),
-        "--gamma",
-        str(args.gamma),
         "--output",
         str(prepared),
         "--crop-left",
@@ -1936,6 +2319,8 @@ def main() -> int:
         "--crop-bottom",
         str(args.crop_bottom),
     ]
+    if uses_legacy_black_outpaint(args.outpaint_lora):
+        prepare_command.extend(["--legacy-black-mask", "--black-lift", "0.018", "--gamma", "1.06"])
     if args.outpaint_all_black_regions:
         prepare_command.append("--outpaint-all-black-regions")
     prepare_command += ["--target-height", str(work_height)]
@@ -1953,17 +2338,25 @@ def main() -> int:
             flush=True,
         )
     mode = "all black regions" if args.outpaint_all_black_regions else "protected source blacks"
-    print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, black_lift={args.black_lift}, gamma={args.gamma}, mode={mode}", flush=True)
+    conditioning = "oumoumad legacy black mask" if uses_legacy_black_outpaint(args.outpaint_lora) else "official explicit mask"
+    print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, mode={mode}, conditioning={conditioning}", flush=True)
     run_command(prepare_command, False)
+
+    generation_prepared = prepared
+    if args.ltx_version == "2.5" and not args.dry_run:
+        generation_prepared = prepare_ltx25_frame_rate(find_ffmpeg(), prepared, args.generation_fps, args.force)
 
     output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
         chunk_crop, chunk_black = _crop_black(args)
-        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, args.target_aspect, work_width, work_height, chunk_crop, chunk_black, "chunks")
+        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(
+            source.name, args.target_aspect, work_width, work_height, chunk_crop, chunk_black,
+            outpaint_artifact_tag(args, "chunks"),
+        )
         chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, work_width, work_height, args)
-        prepared_info = probe_video(prepared)
+        prepared_info = probe_video(generation_prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
         ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
         chunk_overrides = sync_chunk_manifest(
@@ -1977,9 +2370,9 @@ def main() -> int:
         )
         print(f"Outpaint chunk manifest: {chunk_manifest}", flush=True)
         if args.seed_qwen_guides:
-            chunk_overrides = apply_qwen_seed_guides(args, prepared, ranges, chunk_manifest)
-        raw_sig = raw_signature(args, workflow_path, prepared, chunk_manifest=chunk_manifest)  # outer whole-run signature
-        if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=prepared):
+            chunk_overrides = apply_qwen_seed_guides(args, generation_prepared, ranges, chunk_manifest)
+        raw_sig = raw_signature(args, workflow_path, generation_prepared, chunk_manifest=chunk_manifest)  # outer whole-run signature
+        if args.only_chunk is None and not args.force and resumable_output(raw_output, raw_sig, video_like=generation_prepared):
             print(f"Reuse raw Comfy render: {raw_output}", flush=True)
         else:
             print(f"ComfyUI is ready at {args.comfy_url}.", flush=True)
@@ -2001,7 +2394,7 @@ def main() -> int:
                 chunk_raw = resolve_path(chunk_row.get("raw_path", "")) if chunk_row.get("raw_path") else chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 force_this_split = args.force and (args.only_chunk is None or chunk_index == args.only_chunk)
-                split_chunk(ffmpeg, prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split, chunk_offset_x, chunk_offset_y, raw_sig["prepared_fingerprint"])
+                split_chunk(ffmpeg, generation_prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split, chunk_offset_x, chunk_offset_y, raw_sig["prepared_fingerprint"])
                 previous_raw = raw_chunks[-1] if raw_chunks else None
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
@@ -2124,7 +2517,7 @@ def main() -> int:
             elif args.only_chunk is not None:
                 return 0
 
-    # Finalize restores the black/gamma lift but does NOT upscale to delivery resolution.
+    # Finalize applies generated-edge detail recovery but does NOT alter gamma or upscale.
     # The outpainted and colorised layers stay at model-safe dimensions (e.g. 1280×704)
     # all the way through to recomposition, where final_composite.py scales up to delivery.
     finalize_command = [
@@ -2134,13 +2527,22 @@ def main() -> int:
         str(raw_output),
         "--output",
         str(output),
-        "--black-lift",
-        str(args.black_lift),
-        "--gamma",
-        str(args.gamma),
     ]
-    if args.outpaint_all_black_regions:
-        finalize_command.append("--skip-restore")
+    if uses_legacy_black_outpaint(args.outpaint_lora):
+        finalize_command.extend(["--restore-tone", "--black-lift", "0.018", "--gamma", "1.06"])
+    source_rect = prepared_source_rectangle(prepared, work_width, work_height)
+    if source_rect and not args.outpaint_all_black_regions:
+        left, top, right, bottom = source_rect
+        left += int(args.offset_x)
+        top += int(args.offset_y)
+        left = max(0, min(work_width - 1, left))
+        top = max(0, min(work_height - 1, top))
+        right = max(left + 1, min(work_width, right + int(args.offset_x)))
+        bottom = max(top + 1, min(work_height, bottom + int(args.offset_y)))
+        finalize_command.extend([
+            "--source-x", str(left), "--source-y", str(top),
+            "--source-width", str(right - left), "--source-height", str(bottom - top),
+        ])
     if source_monochrome:
         finalize_command.append("--monochrome")
     if args.force:
