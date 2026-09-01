@@ -1629,6 +1629,9 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             set_widget(node_by_id(workflow, "5012"), "1", fidelity)
         except KeyError:
             pass
+        # The Dearchive model card uses guidance 4.0. Keep the author's short distilled
+        # sigma schedule, while restoring the guidance strength expected by the LoRA recipe.
+        set_widget(node_by_id(workflow, "4828"), "0", 4.0)
 
     # Extra guide frames via LTXVAddGuideAdvanced — inserted after GGUF patching so the VAE
     # source is already resolved.  Each guide is chained off the previous one.
@@ -1642,7 +1645,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 38,
+        "version": 39,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),

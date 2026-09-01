@@ -44,18 +44,10 @@ MIN_CHUNK_SECONDS = 2.0
 MAX_CHUNK_SECONDS = 20.0
 DEFAULT_COMFY_DIR = ROOT / "tools" / "comfyui"
 DEFAULT_PROMPT = (
-    "Clean, restored archive footage. Remove vertical scratches, emulsion damage, dirt, dust, "
-    "blotches, gate weave, and flicker. Reconstruct clean continuous surfaces and fine natural "
-    "detail while preserving the original people, faces, hands, clothing, sets, camera motion, "
-    "composition, lighting, contrast, frame timing, and period cinematography. Natural film "
-    "texture and stable temporal consistency."
+    "A modern, high-resolution video shot in vivid color, sharp detail, clean tonality, "
+    "and contemporary cinematography."
 )
-DEFAULT_NEGATIVE = (
-    "vertical scratches, film scratches, vertical streaks, emulsion damage, dirt, dust, blotches, "
-    "gate weave, flicker, frame jitter, torn film, smeared details, warped geometry, altered faces, "
-    "altered hands, duplicate limbs, temporal inconsistency, cartoon, game, 3d render, "
-    "oversaturated color, color bleeding"
-)
+DEFAULT_NEGATIVE = "monochrome"
 REQUIRED_NODES = {
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
@@ -1218,7 +1210,7 @@ def finalize_output(
 
 def run_signature(source: Path, workflow: Path, args: argparse.Namespace, info: dict[str, Any]) -> dict[str, Any]:
     signature = {
-        "version": 5,
+        "version": 6,
         "tool": "cleanup_video.py",
         "source": root_relative(source),
         "source_fingerprint": file_fingerprint(source),

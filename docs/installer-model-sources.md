@@ -5,6 +5,7 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 ## LTX 2.3
 
 - Base checkpoint: `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors`
+- Dearchive/outpainting transformer: `QuantStack/LTX-2.3-GGUF/LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf` → `models/unet/LTX-2.3-distilled-Q4_K_M.gguf`
 - Text encoder: `Comfy-Org/ltx-2/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors`
 - Audio VAE: `Kijai/LTX2.3_comfy/vae/LTX23_audio_vae_bf16.safetensors`
 - Distilled LoRA for the full dev-model backend: `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-lora-384-1.1.safetensors` → `models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors`. The default distilled-GGUF backend bypasses this 7.6 GB LoRA because its weights are already distilled.

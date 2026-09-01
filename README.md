@@ -153,13 +153,13 @@ Choose the source video, see useful media info, and run the whole pipeline.
 
 ### Clean Up
 
-Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA and defaults on. Its resolution selector defaults to 720p (rounded to the nearest LTX-safe dimensions), and the finished Dearchive file stays at that model resolution rather than being enlarged back to the source dimensions.
+Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA at its full `1.0` strength and defaults on. It retains the fast distilled Q4 model and eight-step sigma schedule, with the model card's CFG `4.0` and restoration prompt. The resolution selector defaults to 720p (rounded to the nearest LTX-safe dimensions), and the finished Dearchive file stays at that model resolution rather than being enlarged back to the source dimensions.
 
 The order is DeVignette, AI DeScratch, then Dearchive. AI DeScratch defaults to a 720p working copy and 41-frame windows on a 24 GB GPU, but always returns the source resolution and timing. Sensitivity controls how faint a vertical mark may be before it enters the mask; mask expansion includes damaged edges around each detected line. Enable the mask preview to write a companion `_scratch_mask.mp4`; white shows the detected base mask, before the selected expansion margin. ProPainter's model and upstream code use the NTU S-Lab License 1.0 and are restricted to non-commercial use.
 
 DeVignette defaults to **Auto (prefer GPU)**. ARP uses its installed PyTorch CUDA stack directly and processes frames in adaptive batches when an NVIDIA GPU is available; otherwise it logs the reason and falls back to OpenCV/NumPy on the CPU. The log reports the selected processor, GPU name, batch size, sampled-frame analysis time, frames per second, elapsed time, and ETA.
 
-When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps); the UI accepts 2 to 20 seconds and rounds the requested duration at the source frame rate to the nearest LTX-valid `8n + 1` frame count. **Source Fidelity** controls the strength of the complete input-video IC-LoRA guide. Its safe default of `1.0` preserves the source most exactly, while lower values let Dearchive repaint more damage at increasing risk of changes to faces, hands, motion, and fine period detail. Every combination returns a video with the source resolution, sample aspect ratio, frame rate, frame count, and audio. The passes preserve colour; aspect-ratio expansion and delivery scaling happen only in later phases.
+When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps); the UI accepts 2 to 20 seconds and rounds the requested duration at the source frame rate to the nearest LTX-valid `8n + 1` frame count. Its default positive and negative prompts also match the model author's inference examples instead of instructing the model to preserve the archive look. **Source Fidelity** controls the strength of the complete input-video IC-LoRA guide. Its safe default of `1.0` preserves the source most exactly, while lower values let Dearchive repaint more damage at increasing risk of changes to faces, hands, motion, and fine period detail. Dearchive returns the selected model resolution, source frame rate, frame count, and audio. DeVignette and AI DeScratch alone retain the source dimensions.
 
 ### Stabilization
 
@@ -235,7 +235,8 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 - CUDA-accelerated automatic light/dark DeVignette correction for optional archive repair.
 - Masked ProPainter video inpainting for optional AI DeScratch (non-commercial NTU S-Lab licence).
 - LTX 2.3 Dearchive IC-LoRA for optional generative archive cleanup.
-- Configurable 540p/720p/1080p/source Dearchive processing with exact source-size delivery.
+- LTX 2.3 distilled GGUF Q4_K_M and eight-step schedule for Dearchive and lightweight outpainting.
+- Configurable 540p/720p/1080p/source Dearchive processing and delivery resolution.
 - Official LTX 2.3 v0.9 in/outpainting IC-LoRA (full-resolution mask-conditioned pass).
 - LTX 2.5 Pixel Spatial Upscaler 2x IC-LoRA as an alternative to FlashVSR.
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.

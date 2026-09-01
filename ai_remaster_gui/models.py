@@ -7,18 +7,10 @@ from .config import OUTPAINT_PROMPT, REFERENCE_PROMPT, REFERENCE_PROMPT_SUFFIX
 COLORIZE_STAGE_KEYS = {"shots", "references", "colour"}
 
 CLEANUP_PROMPT = (
-    "Clean, restored archive footage. Remove vertical scratches, emulsion damage, dirt, dust, "
-    "blotches, gate weave, and flicker. Reconstruct clean continuous surfaces and fine natural "
-    "detail while preserving the original people, faces, hands, clothing, sets, camera motion, "
-    "composition, lighting, contrast, frame timing, and period cinematography. Natural film "
-    "texture and stable temporal consistency."
+    "A modern, high-resolution video shot in vivid color, sharp detail, clean tonality, "
+    "and contemporary cinematography."
 )
-CLEANUP_NEGATIVE_PROMPT = (
-    "vertical scratches, film scratches, vertical streaks, emulsion damage, dirt, dust, blotches, "
-    "gate weave, flicker, frame jitter, torn film, smeared details, warped geometry, altered faces, "
-    "altered hands, duplicate limbs, temporal inconsistency, cartoon, game, 3d render, "
-    "oversaturated color, color bleeding"
-)
+CLEANUP_NEGATIVE_PROMPT = "monochrome"
 
 OPENAI_COLOUR_PROMPT = (
     "Enhance and colourise the first image while preserving its exact composition, camera framing, "
