@@ -10,6 +10,8 @@ venv/
 .cache/
 .ai_remaster_config.json
 .ai_remaster_gui.json
+.claude/
+/.tmp_*
 
 # Local tools and models
 /tools/ComfyUI/

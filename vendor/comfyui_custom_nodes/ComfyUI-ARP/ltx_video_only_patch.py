@@ -25,7 +25,7 @@ import types
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 4096
 DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS = 4096
-DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR = 13.0
+DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR = 3.0
 MAX_PARTITIONED_ATTENTION_RUNS = 32
 _LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
     "audio_attn1",
@@ -103,9 +103,10 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
     # 17 GiB of working memory. The CUDA async allocator then oversubscribes a
     # 24 GiB card by many GiB and silently pages through system RAM.
     #
-    # Raise the estimate only on ARP's explicitly video-only clone. At the
-    # observed 481-frame geometry, 13 leaves roughly 5-6 GiB of transformer
-    # weights resident and about 2 GiB of physical headroom for transient work.
+    # Raise the estimate only on ARP's explicitly video-only clone. Chunked
+    # attention and feed-forward execution bound the large transient tensors,
+    # so a factor of 3 reserves useful activation headroom while keeping the
+    # quantized transformer and IC-LoRA resident on a 24 GiB card.
     current_factor = float(getattr(base_model, "memory_usage_factor", 0.0))
     configured_text = os.environ.get("ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR")
     try:

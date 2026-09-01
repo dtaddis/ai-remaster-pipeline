@@ -67,6 +67,8 @@ const FIELD_DESCRIPTIONS = {
     'Auto uses CUDA through ARP\'s PyTorch installation when an NVIDIA GPU is available, otherwise it falls back to CPU. Dearchive continues to use ComfyUI separately.',
   'cleanup.dearchive':
     'Run the LTX 2.3 Dearchive LoRA after the selected DeVignette and AI DeScratch repairs.',
+  'cleanup.dearchive_height':
+    'Resolution sent to Dearchive and kept in the finished file. 720p is the 24 GB GPU default and becomes the nearest LTX-safe size (for example 928x704 for a 4096x3112 source). Source can be impractical for 4K footage. Frame timing and source audio are preserved.',
   'cleanup.chunk_seconds':
     'Requested duration, from 2 to 20 seconds. At the source frame rate it is rounded to the nearest frame count where frames % 8 = 1 (8n + 1). For example, 4.04 seconds becomes 97 frames at 24 fps. Longer chunks reduce seams but use more VRAM.',
   'cleanup.overlap_frames':
@@ -100,7 +102,17 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_y':
     'Shift the source vertically for the whole video before outpainting. Positive values move it down; negative values move it up. Chunks inherit this unless overridden.',
   'colour.processing_height':
-    'Downscale frames before they are sent to ComfyUI. Source keeps the original resolution; 1080p is a practical first stop for 4K material.',
+    'Downscale frames before colourisation. Source keeps the original resolution; 1080p is a practical first stop for 4K material.',
+  'colour.openai_image_model':
+    'The OpenAI image model used for every frame. The API key is shared with Reference Generation and is configured in Settings.',
+  'colour.openai_previous_frames':
+    'How many immediately preceding generated frames to send for temporal continuity. History resets at each shot boundary. Three is a practical starting point; more inputs increase API cost.',
+  'colour.openai_image_size':
+    'Requested OpenAI edit size. Auto lets the image model choose; every result is normalized back to the processing resolution before video assembly.',
+  'colour.openai_image_quality':
+    'OpenAI image quality for every frame request. Higher quality costs more and takes longer.',
+  'colour.openai_prompt':
+    'Instructions applied to every current frame. ARP separately labels preceding generated frames and all approved shot references so they influence colour continuity without replacing current-frame geometry.',
   'colour.use_half_resolution':
     'DeepExemplar node option. Keep this separate from Processing scale: Processing scale changes the input video size, while this asks the node to work internally at half resolution.',
   'recomp.temperature':
@@ -115,6 +127,8 @@ const FIELD_DESCRIPTIONS = {
     'Blend between the original film luminance and the colour-reference luminance. 70% retains most source shadow detail while giving the references a clear influence; 100% applies the complete bounded curve.',
   'recomp.feather_pixels':
     'Only used when an outpainted video is present. It softens the original source edge over the generated sides.',
+  'upscale.method':
+    'FlashVSR is the established fast refiner. LTX 2.5 uses Lightricks\' latest 2x Pixel Spatial Upscaler IC-LoRA to synthesize new detail from a half-resolution reference; it is slower and more creative, so preview identity-critical archival shots first.',
   'upscale.flashvsr_mode':
     'tiny = fastest, but its distilled decoder can smear fine motion such as lips. ' +
     'full = real VAE decoder with the best fidelity for faces and small movements, slowest. ' +
@@ -146,6 +160,16 @@ const FIELD_DESCRIPTIONS = {
     'Unload the diffusion model before decoding to lower peak VRAM. Slower; only needed if decoding runs out of memory.',
   'upscale.flashvsr_seed':
     'Changes the detail the model invents. If a face renders wrong, re-rolling the seed (with Regenerate) often fixes it.',
+  'upscale.ltx25_source_fidelity':
+    'How strongly the low-resolution reference controls the LTX 2.5 result. 100 is the safest archival default. Lower values let the model invent more detail but can change identities, props, text, or motion.',
+  'upscale.ltx25_lora_strength':
+    'Strength of the official LTX 2.5 Pixel Spatial Upscaler IC-LoRA. Lightricks recommends 1.0.',
+  'upscale.ltx25_seed':
+    'Controls the detail synthesized by LTX 2.5. Keep it fixed for reproducible output; change it to try another reconstruction.',
+  'upscale.ltx25_prompt':
+    'Describes the intended high-resolution reconstruction. The reference video controls layout and motion; use the prompt to stress fidelity and the kinds of fine detail to restore.',
+  'upscale.ltx25_negative_prompt':
+    'Identity, geometry, temporal, and sharpening failures that the LTX 2.5 reconstruction should avoid.',
   'upscale.blend_strength':
     'How much of the AI reconstruction is used by default. The remainder is a conventional resize of the source, which restores source-derived motion blur and reduces the stop-motion look. Each shot can override this.',
   'upscale.chunk_seconds':
@@ -251,11 +275,17 @@ function selectOptionLabel(key, option) {
   if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
+  if (key === 'method' && option === 'flashvsr') return 'FlashVSR';
+  if (key === 'method' && option === 'ltx25') return 'LTX 2.5 Pixel Spatial (2x IC-LoRA)';
   if (key === 'repair_device' && option === 'auto') return 'Auto (prefer GPU)';
   if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';
   if (key === 'repair_device' && option === 'cpu') return 'CPU';
   if (key === 'method' && option === 'qwen') return 'Qwen 2511 (local)';
   if (key === 'method' && option === 'openai') return 'OpenAI API (cloud)';
+  if ((key === 'method' || key === 'colorization_method') && option === 'cmnet2') return 'CMNET2 (multi-reference)';
+  if ((key === 'method' || key === 'colorization_method') && option === 'colormnet') return 'ColorMNet (single reference)';
+  if ((key === 'method' || key === 'colorization_method') && option === 'deepexemplar') return 'Deep Exemplar (single reference)';
+  if (key === 'colorization_method' && option === 'openai') return 'OpenAI Cloud';
   if (key === 'target_height' && option === 'source') {
     const resolution = (state.source_info && state.source_info.resolution) || '';
     const match = String(resolution).match(/x(\d+)/i);

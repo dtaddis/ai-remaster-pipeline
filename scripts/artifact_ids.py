@@ -181,8 +181,9 @@ def cleanup_identity(
     ai_chunk_frames: int = 41,
     devignette: bool = False,
     dearchive: bool = True,
+    dearchive_height: int | str = 720,
 ) -> dict:
-    """Identity for the geometry-preserving archive clean-up render.
+    """Identity for an archive clean-up render.
 
     Chunk size and overlap are deliberately resume settings rather than identity settings: changing
     how a movie is divided should rebuild the same logical output path, while model/prompt changes
@@ -212,6 +213,7 @@ def cleanup_identity(
             "strength": float(strength),
             "source_fidelity": float(source_fidelity),
             "seed": int(seed),
+            "dearchive_height": str(dearchive_height),
         })
     return identity
 
@@ -230,7 +232,7 @@ def stabilize_identity(
 ) -> dict:
     """Identity for scene-aware, geometry-preserving stabilization."""
     return {
-        "v": 3,
+        "v": 6,
         "kind": "stabilize",
         "source": safe_stem(source_name),
         "smoothing": int(smoothing),
@@ -241,6 +243,8 @@ def stabilize_identity(
         "min_shot_seconds": float(min_shot_seconds),
         "scene_aware": bool(scene_aware),
         "cut_detection": "hard_cuts_only_v1",
+        "motion_guard": "global_outlier_v1",
+        "audio_mux": "preserve_video_v1",
         "encoder": str(encoder),
     }
 

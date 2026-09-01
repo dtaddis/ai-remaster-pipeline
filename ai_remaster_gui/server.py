@@ -953,7 +953,7 @@ class PipelineApp:
         elif stage == "global" and ({"cleanup", "stabilize", "colorize", "expand_outpaint", "upscale"} & set(values)):
             self.hydrate_stage_inputs("global")
         elif stage == "colour" and "method" in values:
-            if values.get("method") in {"deepexemplar", "colormnet"}:
+            if values.get("method") in {"deepexemplar", "colormnet", "cmnet2", "openai"}:
                 self.settings.setdefault("recomp", {})["colorization_method"] = str(values["method"])
             self.hydrate_stage_inputs("colour")
         elif stage == "recomp" and "colorization_method" in values:
@@ -1368,7 +1368,7 @@ class PipelineApp:
             values,
             (
                 "repair_device", "scratch_sensitivity", "scratch_mask_dilate",
-                "ai_descratch_height", "ai_chunk_frames", "chunk_seconds",
+                "ai_descratch_height", "ai_chunk_frames", "dearchive_height", "chunk_seconds",
                 "overlap_frames", "source_fidelity", "prompt", "negative_prompt",
                 "lora_strength", "seed",
             ),
@@ -1507,11 +1507,25 @@ class PipelineApp:
         output = colorized_output_for_manifest(values.get("manifest", ""), method)
         if output:
             add(["--output", output])
+        add(["--processing-height", values.get("processing_height", "source")])
+        add(["--crf", values.get("crf", "18")])
+        if method == "openai":
+            reference_settings = self.settings.get("references", {})
+            add(["--api-key", reference_settings.get("openai_api_key", "")])
+            add(["--openai-model", values.get("openai_image_model") or reference_settings.get("openai_image_model", "gpt-image-2")])
+            add(["--openai-previous-frames", values.get("openai_previous_frames", "3")])
+            add(["--openai-size", values.get("openai_image_size") or reference_settings.get("openai_image_size", "auto")])
+            add(["--openai-quality", values.get("openai_image_quality") or reference_settings.get("openai_image_quality", "auto")])
+            if values.get("openai_prompt"):
+                add(["--openai-prompt", values["openai_prompt"]])
+            return cmd
+        if method == "cmnet2":
+            add(["--cmnet2-dir", str(ROOT / "vendor" / "cmnet2")])
+            add(["--comfy-dir", comfy_dir_for(config)])
+            return cmd
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
-        add(["--processing-height", values.get("processing_height", "source")])
-        add(["--crf", values.get("crf", "18")])
         add(["--colormnet-memory-mode", values.get("colormnet_memory_mode", "balanced")])
         add(["--colormnet-feature-encoder", values.get("colormnet_feature_encoder", "resnet50")])
         if values.get("colormnet_text_guidance"):
@@ -1639,9 +1653,10 @@ class PipelineApp:
             self.hydrate_stage_inputs("upscale")
             if not self.upscale_input_for():
                 return False, "Upscaling input is not available yet. Choose source material, or run Recomposition first when earlier phases are enabled."
-            warning = flashvsr_hardware_warning()
-            if warning:
-                return False, warning
+            if self.settings.get("upscale", {}).get("method", "flashvsr") != "ltx25":
+                warning = flashvsr_hardware_warning()
+                if warning:
+                    return False, warning
         values = self.settings[stage_key]
         if stage_key == "cleanup" and not (
             is_true(values, "ai_descratch")
@@ -1661,6 +1676,12 @@ class PipelineApp:
             return False, "Missing settings: " + ", ".join(missing)
         if stage_key == "references" and values.get("method", "qwen") == "openai" and not values.get("openai_api_key", "").strip():
             return False, "Add your OpenAI API key in Settings before running OpenAI Reference Generation."
+        if (
+            stage_key == "colour"
+            and values.get("method", "deepexemplar") == "openai"
+            and not self.settings.get("references", {}).get("openai_api_key", "").strip()
+        ):
+            return False, "Add your OpenAI API key in Settings before running OpenAI Cloud Colorization."
         try:
             self.ensure_pipeline_source()
         except Exception as exc:
@@ -1670,7 +1691,8 @@ class PipelineApp:
             if not source_text or not resolve(source_text).exists():
                 return False, "Upscaling input is not available yet. Run Recomposition first when earlier phases are enabled."
         needs_comfy = (
-            stage_key in {"outpaint", "colour", "audio"}
+            stage_key in {"outpaint", "audio"}
+            or (stage_key == "colour" and values.get("method", "deepexemplar") not in {"openai", "cmnet2"})
             or (stage_key == "cleanup" and is_true(values, "dearchive", "true"))
             or (stage_key == "references" and values.get("method", "qwen") != "openai")
             or stage_key == "upscale"
@@ -1910,6 +1932,8 @@ class PipelineApp:
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
+        method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+        add(["--method", method])
         add(["--flashvsr-model", values.get("flashvsr_model", "FlashVSR-v1.1")])
         add(["--flashvsr-mode", values.get("flashvsr_mode", "tiny")])
         add(["--flashvsr-scale", values.get("flashvsr_scale", "2")])
@@ -1920,6 +1944,11 @@ class PipelineApp:
         add(["--flashvsr-sparse-ratio", values.get("flashvsr_sparse_ratio") or "2.0"])
         add(["--flashvsr-kv-ratio", values.get("flashvsr_kv_ratio") or "3.0"])
         add(["--flashvsr-seed", values.get("flashvsr_seed", "0")])
+        add(["--ltx25-source-fidelity", str(float(values.get("ltx25_source_fidelity", "100") or 100) / 100.0)])
+        add(["--ltx25-lora-strength", values.get("ltx25_lora_strength", "1.0")])
+        add(["--ltx25-seed", values.get("ltx25_seed", "42")])
+        add(["--ltx25-prompt", values.get("ltx25_prompt", "")])
+        add(["--ltx25-negative-prompt", values.get("ltx25_negative_prompt", "")])
         add(["--blend-strength", values.get("blend_strength", "100")])
         shot_manifest = (
             self.settings.get("colour", {}).get("manifest", "")
@@ -2067,9 +2096,10 @@ class PipelineApp:
         source_text = self.upscale_input_for() or values.get("input_video")
         if not source_text:
             return False, "Choose a source and enable Upscale before generating a preview."
-        warning = flashvsr_hardware_warning()
-        if warning:
-            return False, warning
+        if values.get("method", "flashvsr") != "ltx25":
+            warning = flashvsr_hardware_warning()
+            if warning:
+                return False, warning
         seconds = max(0.1, float(values.get("preview_seconds", "6") or 6))
         try:
             source, start, end, key = self.upscale_preview_clip_source(seconds)
@@ -2342,6 +2372,7 @@ def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
         ai_chunk_frames=ai_chunk_frames,
         devignette=is_true(values, "devignette"),
         dearchive=is_true(values, "dearchive", "true"),
+        dearchive_height=values.get("dearchive_height", "720"),
     )
     return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4"))
 
@@ -2447,7 +2478,8 @@ def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
         return ""
     source = resolve(source_text)
     width, height = upscale_target_size(values)
-    ident = aid.upscale_identity(source.stem, width, height, "flashvsr", is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2"))
+    method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+    ident = aid.upscale_identity(source.stem, width, height, method, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
     return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
 
 
@@ -2467,7 +2499,8 @@ def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
     source = resolve(source_text)
     width, height = upscale_target_size(values)
     seconds = str(values.get("preview_seconds", "6") or "6")
-    ident = aid.upscale_preview_identity(source.stem, width, height, "flashvsr", seconds, is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2"))
+    method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+    ident = aid.upscale_preview_identity(source.stem, width, height, method, seconds, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
     return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
 
 

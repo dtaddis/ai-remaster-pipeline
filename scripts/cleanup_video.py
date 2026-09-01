@@ -89,6 +89,7 @@ def cleanup_identity(source: Path, args: argparse.Namespace) -> dict[str, Any]:
         ai_chunk_frames=args.ai_chunk_frames,
         devignette=args.devignette,
         dearchive=args.dearchive,
+        dearchive_height=args.dearchive_height,
     )
 
 
@@ -97,8 +98,13 @@ def default_output(source: Path, args: argparse.Namespace) -> Path:
     return ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4")
 
 
-def model_dimensions(width: int, height: int) -> tuple[int, int]:
-    return aid.model_safe(width), aid.model_safe(height)
+def model_dimensions(width: int, height: int, processing_height: int | str = 720) -> tuple[int, int]:
+    text = str(processing_height or "720").strip().lower()
+    if text in {"source", "original", "0"}:
+        return aid.model_safe(width), aid.model_safe(height)
+    target_height = aid.model_safe(min(height, max(64, int(float(text)))))
+    target_width = aid.model_safe(round(width * target_height / max(1, height)))
+    return target_width, target_height
 
 
 def _contiguous_true_runs(values: Any) -> list[tuple[int, int]]:
@@ -1082,8 +1088,8 @@ def processing_signature(source: Path, width: int, height: int, fps: float, fram
     }
 
 
-def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[str, Any], force: bool) -> Path:
-    width, height = model_dimensions(int(info["width"]), int(info["height"]))
+def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[str, Any], processing_height: int | str, force: bool) -> Path:
+    width, height = model_dimensions(int(info["width"]), int(info["height"]), processing_height)
     fps = float(info.get("fps") or 24.0)
     frames = int(info.get("frames") or 0)
     output = work_dir / f"model_input_{width}x{height}.mp4"
@@ -1172,8 +1178,15 @@ def first_audio_packet_stream(ffmpeg: str, source: Path) -> int | None:
     return None
 
 
-def finalize_output(ffmpeg: str, generated: Path, source: Path, output: Path, info: dict[str, Any]) -> None:
-    width, height = int(info["width"]), int(info["height"])
+def finalize_output(
+    ffmpeg: str,
+    generated: Path,
+    source: Path,
+    output: Path,
+    info: dict[str, Any],
+    output_dimensions: tuple[int, int] | None = None,
+) -> None:
+    width, height = output_dimensions or (int(info["width"]), int(info["height"]))
     fps = float(info.get("fps") or 24.0)
     frames = int(info.get("frames") or 0)
     duration = max(1, frames) / max(fps, 0.001)
@@ -1355,6 +1368,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--overlap-frames", type=int, default=8)
     parser.add_argument(
+        "--dearchive-height",
+        choices=["540", "720", "1080", "source"],
+        default="720",
+        help="Dearchive processing and output height. Values are rounded to an LTX-safe multiple of 64.",
+    )
+    parser.add_argument(
         "--source-fidelity",
         type=parse_source_fidelity,
         default=1.0,
@@ -1405,15 +1424,19 @@ def main() -> int:
     info = probe_video(source)
     output = resolve_path(args.output) if args.output else default_output(source, args)
     sig = run_signature(source, workflow_path, args, info)
+    delivery_width, delivery_height = (
+        model_dimensions(int(info["width"]), int(info["height"]), args.dearchive_height)
+        if args.dearchive else (int(info["width"]), int(info["height"]))
+    )
     if not args.force and resumable_output(
-        output, sig, width=int(info["width"]), height=int(info["height"]), video_like=source
+        output, sig, width=delivery_width, height=delivery_height, video_like=source
     ):
         print(f"Reuse Clean Up output: {output}", flush=True)
         return 0
     if args.dry_run:
         print(
-            f"Would clean {source} -> {output} while preserving "
-            f"{int(info['width'])}x{int(info['height'])} at {float(info.get('fps') or 24.0):g} fps",
+            f"Would clean {source} -> {output} at "
+            f"{delivery_width}x{delivery_height} and {float(info.get('fps') or 24.0):g} fps",
             flush=True,
         )
         return 0
@@ -1456,7 +1479,9 @@ def main() -> int:
         flush=True,
     )
 
-    model_input = prepare_model_input(ffmpeg, repaired_source, work_dir, info, args.force)
+    model_input = prepare_model_input(
+        ffmpeg, repaired_source, work_dir, info, args.dearchive_height, args.force
+    )
     model_info = probe_video(model_input)
     fps = float(model_info.get("fps") or info.get("fps") or 24.0)
     width, height = int(model_info["width"]), int(model_info["height"])
@@ -1466,8 +1491,8 @@ def main() -> int:
     print(
         f"Clean Up: requested {args.chunk_seconds:g}s chunks; using {chunk_frames} frames "
         f"({effective_chunk_seconds:.3f}s at {fps:g} fps, frame count = 8n + 1). "
-        f"{len(ranges)} LTX chunk(s); source delivery stays "
-        f"{int(info['width'])}x{int(info['height'])} at {float(info.get('fps') or fps):g} fps",
+        f"{len(ranges)} LTX chunk(s); Dearchive delivery stays at the model resolution "
+        f"{width}x{height} and {float(info.get('fps') or fps):g} fps",
         flush=True,
     )
     raw_chunks: list[Path] = []
@@ -1497,7 +1522,7 @@ def main() -> int:
 
     stitched = work_dir / "stitched.mp4"
     stitch_chunks(ffmpeg, raw_chunks, ranges, stitched, fps, True)
-    finalize_output(ffmpeg, stitched, source, output, info)
+    finalize_output(ffmpeg, stitched, source, output, info, (width, height))
     if args.save_scratch_mask and scratch_mask_preview is not None:
         save_scratch_mask_preview(ffmpeg, scratch_mask_preview, output, info)
     write_signature(output, sig)

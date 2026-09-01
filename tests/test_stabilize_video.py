@@ -40,6 +40,80 @@ class StabilizeVideoTests(unittest.TestCase):
         self.assertIn("smoothing=4", filter_graph)
         self.assertIn("maxangle=0.05235988", filter_graph)
 
+    def test_motion_guard_rejects_large_failed_global_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            report = Path(tmp_text) / "global_motions.trf"
+            report.write_text(
+                "0 0 0 0 0 1\n"
+                "# no fields\n"
+                "0 0.4 -0.8 0.0002 0 0\n"
+                "# 4.2 3\n"
+                "0 1.8 -71.6 -0.0081 0.39 1\n"
+                "# 698.4 3\n",
+                encoding="utf-8",
+            )
+
+            reason = stabilize_video.unreliable_motion_report(report, 108)
+
+        self.assertIn("71.6px", reason)
+
+    def test_motion_guard_allows_confident_fast_camera_move(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            report = Path(tmp_text) / "global_motions.trf"
+            report.write_text(
+                "0 0 0 0 0 1\n"
+                "# no fields\n"
+                "0 18 2 0.002 0 0\n"
+                "# 2.0 3\n",
+                encoding="utf-8",
+            )
+
+            reason = stabilize_video.unreliable_motion_report(report, 48)
+
+        self.assertEqual(reason, "")
+
+    def test_unreliable_shot_is_reencoded_without_transform(self) -> None:
+        args = stabilize_video.build_parser().parse_args(["--source", "source.mp4"])
+        commands = []
+        with tempfile.TemporaryDirectory() as tmp_text:
+            work_dir = Path(tmp_text)
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                if len(commands) == 2:
+                    (work_dir / "global_motions.trf").write_text(
+                        "0 0 0 0 0 1\n0 0 -64 0 0 1\n",
+                        encoding="utf-8",
+                    )
+
+            with mock.patch.object(stabilize_video, "run", side_effect=fake_run):
+                stabilize_video.stabilize_shot(
+                    "ffmpeg", Path("source.mp4"), work_dir, 0, 0, 24, 24.0, args, "yuv420p"
+                )
+
+        self.assertEqual(len(commands), 3)
+        fallback_filter = commands[2][commands[2].index("-vf") + 1]
+        self.assertNotIn("vidstabtransform", fallback_filter)
+
+    def test_audio_mux_does_not_trim_the_authoritative_video_stream(self) -> None:
+        commands = []
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            source.write_bytes(b"source")
+            chunk = folder / "shot.mkv"
+            chunk.write_bytes(b"chunk")
+            output = folder / "output.mkv"
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"result")
+
+            with mock.patch.object(stabilize_video, "run", side_effect=fake_run):
+                stabilize_video.concat_chunks("ffmpeg", source, [chunk], output, folder, has_audio=True)
+
+        self.assertNotIn("-shortest", commands[1])
+
     def test_user_reviewed_manifest_provides_exact_contiguous_shots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             manifest = Path(tmp_text) / "shots.csv"

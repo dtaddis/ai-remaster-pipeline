@@ -12,16 +12,39 @@ from typing import Any
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
+from dependency_manager import (
+    LTX25_GGUF_MODEL,
+    LTX25_PIXEL_UPSCALER_LORA,
+    LTX25_TEXT_ENCODER,
+    LTX25_VIDEO_VAE,
+    ensure_ltx25_upscale_models,
+)
 
 
 config = load_local_config()
 
 SOURCE_SECTION_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<start>\d{10})_(?P<end>\d{10})$")
 ARP_ARTIFACT_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<tag>outpaint|recomp|color|audio)_[0-9a-f]{8}$")
+LTX25_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+DEFAULT_LTX25_PROMPT = (
+    "The exact same video, faithfully reconstructed at twice the spatial resolution with "
+    "natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, "
+    "lighting, colour, film texture, and camera movement."
+)
+DEFAULT_LTX25_NEGATIVE_PROMPT = (
+    "changed identity, changed face, changed hands, changed objects, altered composition, "
+    "warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, "
+    "plastic skin, invented text, compression artifacts"
+)
 
 
-def default_output(source: Path, width: int, height: int) -> Path:
-    suffix = f"flashvsr_{width}x{height}" if width and height else "flashvsr"
+def upscale_method(args: argparse.Namespace) -> str:
+    return "ltx25" if str(getattr(args, "method", "flashvsr")).lower() == "ltx25" else "flashvsr"
+
+
+def default_output(source: Path, width: int, height: int, method: str = "flashvsr") -> Path:
+    backend = "ltx25" if method == "ltx25" else "flashvsr"
+    suffix = f"{backend}_{width}x{height}" if width and height else backend
     return ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{suffix}.mp4"
 
 
@@ -38,7 +61,8 @@ def upscale_chunk_source_key(source: Path) -> str:
 
 def upscale_chunk_dir(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> Path:
     source_key = upscale_chunk_source_key(source)
-    return ROOT / ".cache" / "upscale_chunks" / f"{source_key}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
+    backend = upscale_method(args)
+    return ROOT / ".cache" / "upscale_chunks" / f"{source_key}_{backend}_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
 
 
 def chunk_signature_match_view(signature: dict[str, Any]) -> dict[str, Any]:
@@ -103,6 +127,30 @@ ADVANCED_DEFAULTS = {
 
 
 def signature(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> dict[str, Any]:
+    if upscale_method(args) == "ltx25":
+        return {
+            "version": 1,
+            "tool": "upscale_video.py",
+            "method": "ltx25_pixel_spatial_ic_lora_x2",
+            "source": root_relative(source),
+            "source_fingerprint": file_fingerprint(source),
+            "target_width": output_width,
+            "target_height": output_height,
+            "comfy_dir": root_relative(resolve_path(args.comfy_dir)),
+            "comfy_url": args.comfy_url,
+            "model": args.ltx25_model,
+            "text_encoder": args.ltx25_text_encoder,
+            "video_vae": args.ltx25_video_vae,
+            "lora": args.ltx25_upscaler_lora,
+            "lora_strength": args.ltx25_lora_strength,
+            "source_fidelity": args.ltx25_source_fidelity,
+            "prompt": args.ltx25_prompt,
+            "negative_prompt": args.ltx25_negative_prompt,
+            "seed": args.ltx25_seed,
+            "chunk_seconds": args.chunk_seconds,
+            "overlap_frames": args.overlap_frames,
+            "fps": args.fps,
+        }
     sig = {
         "version": 6,
         "tool": "upscale_video.py",
@@ -144,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-output-root", default="")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--method", choices=["flashvsr", "ltx25"], default="flashvsr")
     parser.add_argument("--flashvsr-model", choices=["FlashVSR", "FlashVSR-v1.1"], default="FlashVSR-v1.1")
     parser.add_argument("--flashvsr-mode", choices=["tiny", "tiny-long", "full"], default="tiny")
     parser.add_argument("--flashvsr-scale", type=int, default=2)
@@ -164,6 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flashvsr-kv-ratio", type=float, default=3.0, help="Attention memory budget, 1.0-3.0: 3.0 is highest quality, lower saves VRAM.")
     parser.add_argument("--flashvsr-local-range", type=int, choices=[9, 11], default=11, help="Temporal attention window: 11 is more stable, 9 keeps more fine motion (lips) and detail.")
     parser.add_argument("--flashvsr-seed", type=int, default=0)
+    parser.add_argument("--ltx25-model", default=LTX25_GGUF_MODEL)
+    parser.add_argument("--ltx25-text-encoder", default=LTX25_TEXT_ENCODER)
+    parser.add_argument("--ltx25-video-vae", default=LTX25_VIDEO_VAE)
+    parser.add_argument("--ltx25-upscaler-lora", default=LTX25_PIXEL_UPSCALER_LORA)
+    parser.add_argument("--ltx25-lora-strength", type=float, default=1.0)
+    parser.add_argument("--ltx25-source-fidelity", type=float, default=1.0)
+    parser.add_argument("--ltx25-seed", type=int, default=42)
+    parser.add_argument("--ltx25-prompt", default=DEFAULT_LTX25_PROMPT)
+    parser.add_argument("--ltx25-negative-prompt", default=DEFAULT_LTX25_NEGATIVE_PROMPT)
     parser.add_argument("--chunk-seconds", type=float, default=6.0, help="Upscale in chunks of roughly this many seconds. Use 0 to send the whole clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated before each chunk, then trimmed before stitching.")
     parser.add_argument("--blend-strength", type=float, default=100.0, help="FlashVSR contribution in the final delivery. 0 is a conventional Lanczos resize; 100 is the full AI upscale.")
@@ -405,6 +463,177 @@ def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_w
     return partial
 
 
+def ltx25_generation_dimensions(output_width: int, output_height: int) -> tuple[int, int]:
+    """Return the nearest LTX-safe 2x canvas; delivery is normalized afterwards."""
+    return (
+        max(64, int(round(output_width / 64.0)) * 64),
+        max(64, int(round(output_height / 64.0)) * 64),
+    )
+
+
+def ltx25_prompt(
+    video_name: str,
+    fps: float,
+    frames: int,
+    width: int,
+    height: int,
+    args: argparse.Namespace,
+    prefix: str,
+) -> dict[str, Any]:
+    """Build a video-only LTX 2.5 Pixel Spatial Upscaler IC-LoRA prompt."""
+    return {
+        "1": {
+            "class_type": "VHS_LoadVideo",
+            "inputs": {
+                "video": video_name,
+                "force_rate": 0.0,
+                "custom_width": 0,
+                "custom_height": 0,
+                "frame_load_cap": frames,
+                "skip_first_frames": 0,
+                "select_every_nth": 1,
+                "format": "None",
+            },
+        },
+        "2": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": args.ltx25_model}},
+        "3": {
+            "class_type": "ARPLTXVideoOnlyICLoRALoader",
+            "inputs": {
+                "model": ["2", 0],
+                "lora_name": args.ltx25_upscaler_lora,
+                "strength_model": float(args.ltx25_lora_strength),
+            },
+        },
+        "4": {
+            "class_type": "CLIPLoaderGGUF",
+            "inputs": {"clip_name": args.ltx25_text_encoder, "type": "ltxv"},
+        },
+        "5": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"clip": ["4", 0], "text": args.ltx25_prompt},
+        },
+        "6": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"clip": ["4", 0], "text": args.ltx25_negative_prompt},
+        },
+        "7": {
+            "class_type": "LTXVConditioning",
+            "inputs": {"positive": ["5", 0], "negative": ["6", 0], "frame_rate": fps},
+        },
+        "8": {"class_type": "VAELoader", "inputs": {"vae_name": args.ltx25_video_vae}},
+        "9": {
+            "class_type": "EmptyLTXVLatentVideo",
+            "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1},
+        },
+        "10": {
+            "class_type": "LTXAddVideoICLoRAGuide",
+            "inputs": {
+                "positive": ["7", 0],
+                "negative": ["7", 1],
+                "vae": ["8", 0],
+                "latent": ["9", 0],
+                "image": ["1", 0],
+                "frame_idx": 0,
+                "strength": float(args.ltx25_source_fidelity),
+                "latent_downscale_factor": 2.0,
+                "crop": "disabled",
+                "use_tiled_encode": True,
+                "tile_size": 256,
+                "tile_overlap": 64,
+            },
+        },
+        "11": {
+            "class_type": "CFGGuider",
+            "inputs": {"model": ["3", 0], "positive": ["10", 0], "negative": ["10", 1], "cfg": 1.0},
+        },
+        "12": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(args.ltx25_seed), "control_after_generate": "fixed"}},
+        "13": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
+        "14": {"class_type": "ManualSigmas", "inputs": {"sigmas": LTX25_SIGMAS}},
+        "15": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["12", 0],
+                "guider": ["11", 0],
+                "sampler": ["13", 0],
+                "sigmas": ["14", 0],
+                "latent_image": ["10", 2],
+            },
+        },
+        "16": {
+            "class_type": "LTXVCropGuides",
+            "inputs": {"positive": ["10", 0], "negative": ["10", 1], "latent": ["15", 0]},
+        },
+        "17": {
+            "class_type": "VAEDecodeTiled",
+            "inputs": {
+                "samples": ["16", 2],
+                "vae": ["8", 0],
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 512,
+                "temporal_overlap": 4,
+            },
+        },
+        "18": {
+            "class_type": "VHS_VideoCombine",
+            "inputs": {
+                "images": ["17", 0],
+                "frame_rate": fps,
+                "loop_count": 0,
+                "filename_prefix": prefix,
+                "format": "video/h264-mp4",
+                "pix_fmt": "yuv420p",
+                "crf": 16,
+                "save_metadata": True,
+                "pingpong": False,
+                "save_output": True,
+            },
+        },
+    }
+
+
+def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int) -> Path:
+    comfy_dir = resolve_path(args.comfy_dir)
+    comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
+    if not (comfy_dir / "main.py").exists():
+        raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
+    ensure_ltx25_upscale_models(comfy_dir)
+    wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+    ensure_node_types(
+        args.comfy_url,
+        {
+            "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+            "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+            "UnetLoaderGGUF": "ComfyUI-GGUF",
+            "CLIPLoaderGGUF": "ComfyUI-GGUF",
+            "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
+            "LTXVConditioning": "ComfyUI-LTXVideo",
+            "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+            "LTXVCropGuides": "ComfyUI-LTXVideo",
+        },
+        "LTX 2.5 Pixel Spatial upscaling",
+    )
+    source_info = video_info(source)
+    video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_ltx25")
+    fps = args.fps or float(source_info["fps"])
+    frames = int(source_info["frames"])
+    generation_width, generation_height = ltx25_generation_dimensions(output_width, output_height)
+    prefix = f"arp_upscale/{safe_stem(source.name)}_ltx25_{generation_width}x{generation_height}"
+    prompt = ltx25_prompt(video_name, fps, frames, generation_width, generation_height, args, prefix)
+    print(f"Sending LTX 2.5 upscale prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
+    prompt_id = queue_prompt(args.comfy_url, prompt)
+    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    produced = newest_comfy_output(
+        extract_output_files(history, comfy_output_root),
+        {".mp4", ".mov", ".mkv", ".webm"},
+        "LTX 2.5 upscaled video",
+    )
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(produced, partial)
+    return partial
+
+
 def chunk_ranges(total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int) -> list[tuple[int, int, int]]:
     if total_frames <= 0 or fps <= 0 or chunk_seconds <= 0:
         return [(0, 0, total_frames)]
@@ -422,6 +651,32 @@ def chunk_ranges(total_frames: int, fps: float, chunk_seconds: float, overlap_fr
         if end >= total_frames:
             break
         start = end
+    return ranges
+
+
+def ltx25_chunk_ranges(
+    total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int
+) -> list[tuple[int, int, int, int, int]]:
+    """Create LTX-valid 8n+1 windows while preserving every delivery frame once."""
+    if total_frames <= 0:
+        return []
+    if chunk_seconds <= 0:
+        model_frames = max(9, int(math.ceil(max(0, total_frames - 1) / 8.0)) * 8 + 1)
+    else:
+        requested = max(9, int(round(chunk_seconds * max(fps, 0.001))))
+        model_frames = max(9, int(round((requested - 1) / 8.0)) * 8 + 1)
+    overlap = max(0, min(int(overlap_frames), model_frames - 1))
+    ranges: list[tuple[int, int, int, int, int]] = []
+    delivery_start = 0
+    while delivery_start < total_frames:
+        source_start = max(0, delivery_start - overlap)
+        source_end = min(total_frames, source_start + model_frames)
+        trim_start = delivery_start - source_start
+        keep_frames = source_end - delivery_start
+        ranges.append((source_start, source_end, trim_start, keep_frames, model_frames))
+        if source_end >= total_frames:
+            break
+        delivery_start = source_end
     return ranges
 
 
@@ -458,6 +713,69 @@ def split_video_chunk(ffmpeg: str, source: Path, target: Path, start_frame: int,
     subprocess.run(command, check=True)
     replace_unless_identical(partial, target, f"Upscale prepared chunk {target.name}")
     write_split_sidecar(target, source, source_fingerprint)
+
+
+def prepare_ltx25_chunk(
+    ffmpeg: str,
+    source: Path,
+    target: Path,
+    start_frame: int,
+    end_frame: int,
+    model_frames: int,
+    fps: float,
+    width: int,
+    height: int,
+    force: bool,
+    source_fingerprint: dict[str, Any],
+) -> None:
+    if target.exists() and not force and split_matches_source(target, source_fingerprint):
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    duration = model_frames / max(fps, 0.001)
+    vf = (
+        f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),"
+        f"scale={width}:{height}:flags=lanczos,setsar=1,"
+        f"tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={model_frames},fps={fps:.8f}"
+    )
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
+            "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+        ],
+        check=True,
+    )
+    replace_unless_identical(partial, target, f"LTX 2.5 prepared chunk {target.name}")
+    write_split_sidecar(target, source, source_fingerprint)
+
+
+def normalize_ltx25_chunk(
+    ffmpeg: str,
+    source: Path,
+    target: Path,
+    width: int,
+    height: int,
+    trim_start: int,
+    keep_frames: int,
+    fps: float,
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    trim_end = trim_start + keep_frames
+    vf = (
+        f"trim=start_frame={trim_start}:end_frame={trim_end},setpts=N/({fps:.8f}*TB),"
+        f"fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1"
+    )
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
+            "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16", "-preset", "slow",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+        ],
+        check=True,
+    )
+    replace_with_retry(partial, target, f"LTX 2.5 normalized chunk {target.name}")
 
 
 def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height: int, trim_start: int, fps: float, force: bool) -> None:
@@ -601,6 +919,79 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
     stitch_chunks(ffmpeg, normalized_chunks, audio_source, output)
 
 
+def chunked_ltx25_run(
+    args: argparse.Namespace,
+    source: Path,
+    output: Path,
+    output_width: int,
+    output_height: int,
+    info: dict[str, Any],
+    source_fingerprint: dict[str, Any],
+) -> None:
+    ffmpeg = find_ffmpeg(args.ffmpeg)
+    fps = args.fps or float(info["fps"])
+    generation_width, generation_height = ltx25_generation_dimensions(output_width, output_height)
+    reference_width, reference_height = generation_width // 2, generation_height // 2
+    ranges = ltx25_chunk_ranges(
+        int(info["frames"]), fps, args.chunk_seconds, args.overlap_frames
+    )
+    if not ranges:
+        raise RuntimeError("The source has no frames to upscale.")
+    chunk_dir = upscale_chunk_dir(args, source, output_width, output_height)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Splitting LTX 2.5 upscaling into {len(ranges)} chunk(s): "
+        f"{reference_width}x{reference_height} reference -> "
+        f"{generation_width}x{generation_height} generated -> "
+        f"{output_width}x{output_height} delivery",
+        flush=True,
+    )
+    normalized_chunks: list[Path] = []
+    digits = max(4, int(math.log10(len(ranges))) + 1)
+    for index, (start_frame, end_frame, trim_start, keep_frames, model_frames) in enumerate(ranges):
+        chunk_input = chunk_dir / f"ltx25_input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_raw = chunk_dir / f"ltx25_raw_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_final = chunk_dir / f"ltx25_final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        print(
+            f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, "
+            f"trim {trim_start}, keep {keep_frames}, LTX window {model_frames}",
+            flush=True,
+        )
+        prepare_ltx25_chunk(
+            ffmpeg, source, chunk_input, start_frame, end_frame, model_frames, fps,
+            reference_width, reference_height, args.force, source_fingerprint,
+        )
+        chunk_sig = signature(args, chunk_input, output_width, output_height)
+        if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, output_width, output_height):
+            print(f"Reuse LTX 2.5 upscaled chunk: {chunk_final}", flush=True)
+            normalized_chunks.append(chunk_final)
+            continue
+        reusable = None if args.force else find_reusable_upscale_chunk(
+            chunk_dir, chunk_final.name, chunk_sig, output_width, output_height
+        )
+        if reusable:
+            shutil.copy2(reusable, chunk_final)
+            shutil.copy2(
+                reusable.with_suffix(reusable.suffix + ".sig.json"),
+                chunk_final.with_suffix(chunk_final.suffix + ".sig.json"),
+            )
+            print(f"Reuse LTX 2.5 chunk from compatible cache: {reusable}", flush=True)
+            normalized_chunks.append(chunk_final)
+            continue
+        ltx25_run(args, chunk_input, chunk_raw, generation_width, generation_height)
+        normalize_ltx25_chunk(
+            ffmpeg, chunk_raw, chunk_final, output_width, output_height,
+            trim_start, keep_frames, fps,
+        )
+        write_signature(chunk_final, chunk_sig)
+        print(f"Wrote LTX 2.5 upscaled chunk: {chunk_final}", flush=True)
+        chunk_raw.unlink(missing_ok=True)
+        normalized_chunks.append(chunk_final)
+    if output.exists():
+        output.unlink()
+    stitch_chunks(ffmpeg, normalized_chunks, source, output)
+
+
 def fit_dimensions(source_width: int, source_height: int, target_width: int, target_height: int) -> tuple[int, int]:
     if target_width <= 0 and target_height <= 0:
         return source_width * 4, source_height * 4
@@ -716,7 +1107,8 @@ def run(args: argparse.Namespace) -> int:
 
     info = video_info(source)
     output_width, output_height = fit_dimensions(int(info["width"]), int(info["height"]), args.target_width, args.target_height)
-    output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height)
+    method = upscale_method(args)
+    output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height, method)
     sig = signature(args, source, output_width, output_height)
     manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
     final_sig = dict(sig)
@@ -731,28 +1123,38 @@ def run(args: argparse.Namespace) -> int:
         print(f"Reuse upscaled video: {output}", flush=True)
         return 0
     if args.dry_run:
-        if args.flashvsr_pre_downscale:
+        if method == "flashvsr" and args.flashvsr_pre_downscale:
             processing_width, processing_height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
             print(f"Would pre-downscale FlashVSR input to {processing_width}x{processing_height}", flush=True)
-        print(f"Would upscale {source} -> {output} using FlashVSR in ComfyUI at {args.comfy_url} ({args.comfy_dir})", flush=True)
+        label = "LTX 2.5 Pixel Spatial IC-LoRA" if method == "ltx25" else "FlashVSR"
+        print(f"Would upscale {source} -> {output} using {label} in ComfyUI at {args.comfy_url} ({args.comfy_dir})", flush=True)
         return 0
 
     output.parent.mkdir(parents=True, exist_ok=True)
     processing_source = source
     processing_info = info
     processing_fingerprint = sig["source_fingerprint"]
-    if args.flashvsr_pre_downscale:
+    if method == "flashvsr" and args.flashvsr_pre_downscale:
         ffmpeg = find_ffmpeg(args.ffmpeg)
         processing_source = pre_downscale_source(ffmpeg, args, source, output_width, output_height, info)
         processing_info = video_info(processing_source)
         processing_fingerprint = file_fingerprint(processing_source)
-    ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_flashvsr.mp4"
+    ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mp4"
     ai_output.parent.mkdir(parents=True, exist_ok=True)
     if args.force or not resumable_output(ai_output, sig, video_like=source, width=output_width, height=output_height):
-        chunked_flashvsr_run(args, processing_source, ai_output, output_width, output_height, processing_info, processing_fingerprint, audio_source=source)
+        if method == "ltx25":
+            chunked_ltx25_run(
+                args, source, ai_output, output_width, output_height, info,
+                sig["source_fingerprint"],
+            )
+        else:
+            chunked_flashvsr_run(
+                args, processing_source, ai_output, output_width, output_height,
+                processing_info, processing_fingerprint, audio_source=source,
+            )
         write_signature(ai_output, sig)
     else:
-        print(f"Reuse full-strength FlashVSR render: {ai_output}", flush=True)
+        print(f"Reuse full-strength {method} render: {ai_output}", flush=True)
     ffmpeg = find_ffmpeg(args.ffmpeg)
     default_strength = normalized_blend_strength(args.blend_strength)
     shots = read_upscale_shots(manifest, int(info["frames"]), float(info["fps"]), default_strength)

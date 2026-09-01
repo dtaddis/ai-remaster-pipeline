@@ -20,6 +20,14 @@ CLEANUP_NEGATIVE_PROMPT = (
     "oversaturated color, color bleeding"
 )
 
+OPENAI_COLOUR_PROMPT = (
+    "Enhance and colourise the first image while preserving its exact composition, camera framing, "
+    "geometry, identities, faces, hands, poses, objects, fine texture, film grain and luminance. "
+    "Use its existing colour as evidence rather than removing it. Make the colour vivid, natural, "
+    "period-appropriate and consistent with the supplied shot references. Do not add, remove, move, "
+    "redesign or sharpen objects. Output one edited version of the first image only."
+)
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -35,7 +43,7 @@ STAGES = (
     Stage(
         "cleanup",
         "Clean Up",
-        "Reconstruct masked scratches with ProPainter, correct vignettes, then optionally restore archive footage with Dearchive. Source geometry is preserved.",
+        "Reconstruct masked scratches with ProPainter, correct vignettes, then optionally restore archive footage with Dearchive at a selectable model-safe resolution.",
         ("intermediate/cleaned",),
         (
             ("ai_descratch", "AI DeScratch (ProPainter)", "checkbox", "false"),
@@ -46,6 +54,7 @@ STAGES = (
             ("save_scratch_mask", "Save scratch-mask preview", "checkbox", "true"),
             ("devignette", "DeVignette", "checkbox", "false"),
             ("dearchive", "Dearchive (LTX 2.3 LoRA)", "checkbox", "true"),
+            ("dearchive_height", "Dearchive resolution", "select:540|720|1080|source", "720"),
             ("repair_device", "DeVignette processor", "select:auto|cuda|cpu", "auto"),
             ("chunk_seconds", "Dearchive chunk length", "range:2|20|0.01", "4.04"),
             ("overlap_frames", "Overlap frames", "number", "8"),
@@ -137,8 +146,13 @@ STAGES = (
         ("intermediate/outpainted_references_color", "intermediate/outpainted_colorized", "manifests/references"),
         (
             ("manifest", "Manifest", "file", ""),
-            ("method", "Method", "select:deepexemplar|colormnet|both", "deepexemplar"),
+            ("method", "Method", "select:deepexemplar|colormnet|cmnet2|openai|both", "deepexemplar"),
             ("processing_height", "Processing scale", "select:source|2160|1440|1080|720|540", "source"),
+            ("openai_image_model", "OpenAI image model", "select:gpt-image-2|gpt-image-1.5|gpt-image-1|gpt-image-1-mini", "gpt-image-2"),
+            ("openai_previous_frames", "Preceding generated frames", "range:0|12|1", "3"),
+            ("openai_image_size", "OpenAI output size", "select:auto|1024x1024|1536x1024|1024x1536", "auto"),
+            ("openai_image_quality", "OpenAI quality", "select:auto|low|medium|high", "auto"),
+            ("openai_prompt", "OpenAI frame prompt", "text", OPENAI_COLOUR_PROMPT),
             ("frame_propagate", "Frame propagation", "select:true|false", "true"),
             ("use_half_resolution", "Half-resolution processing", "checkbox", "true"),
             ("use_torch_compile", "Torch compile", "select:false|true", "false"),
@@ -158,7 +172,7 @@ STAGES = (
         (
             ("outpainted_video", "Outpainted video", "file", ""),
             ("source", "Original source", "file", ""),
-            ("colorization_method", "Colorization layer", "select:deepexemplar|colormnet", "deepexemplar"),
+            ("colorization_method", "Colorization layer", "select:deepexemplar|colormnet|cmnet2|openai", "deepexemplar"),
             ("colorized_video", "Colorized video", "file", ""),
             ("feather_pixels", "Feather pixels", "range:0|240|1", "80"),
             ("saturation", "Saturation", "range:0|200|1", "82"),
@@ -205,6 +219,7 @@ STAGES = (
             ("target_width", "Target width", "number", "3840"),
             ("target_height", "Target height", "number", "2160"),
             ("output", "Upscaled output", "save", ""),
+            ("method", "Upscale method", "select:flashvsr|ltx25", "flashvsr"),
             ("flashvsr_model", "FlashVSR model", "select:FlashVSR|FlashVSR-v1.1", "FlashVSR-v1.1"),
             ("flashvsr_mode", "FlashVSR mode", "select:tiny|tiny-long|full", "tiny"),
             ("flashvsr_scale", "FlashVSR scale", "select:2|3|4", "2"),
@@ -220,6 +235,11 @@ STAGES = (
             ("flashvsr_tiled_vae", "Tiled decode (tiled_vae)", "checkbox", "true"),
             ("flashvsr_unload_dit", "Unload before decode (unload_dit)", "checkbox", "false"),
             ("flashvsr_seed", "FlashVSR seed", "number", "0"),
+            ("ltx25_source_fidelity", "LTX 2.5 source fidelity", "range:0|100|1", "100"),
+            ("ltx25_lora_strength", "LTX 2.5 LoRA strength", "number", "1.0"),
+            ("ltx25_seed", "LTX 2.5 seed", "number", "42"),
+            ("ltx25_prompt", "LTX 2.5 upscale prompt", "text", "The exact same video, faithfully reconstructed at twice the spatial resolution with natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, lighting, colour, film texture, and camera movement."),
+            ("ltx25_negative_prompt", "LTX 2.5 negative prompt", "text", "changed identity, changed face, changed hands, changed objects, altered composition, warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, plastic skin, invented text, compression artifacts"),
             ("blend_strength", "Default AI upscale strength", "range:0|100|1", "100"),
             ("chunk_seconds", "Chunk seconds", "number", "6"),
             ("overlap_frames", "Overlap frames", "number", "8"),

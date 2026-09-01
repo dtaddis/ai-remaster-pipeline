@@ -5,3 +5,6 @@ pillow
 imageio-ffmpeg
 pyyaml
 sam2
+scikit-image
+einops
+tqdm

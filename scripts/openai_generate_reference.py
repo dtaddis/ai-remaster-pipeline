@@ -7,6 +7,7 @@ import json
 import mimetypes
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -50,7 +51,7 @@ def build_body(args: argparse.Namespace, source: Path, references: list[Path] | 
     return b"".join(parts)
 
 
-def normalize_to_source_size(path: Path, source_path: Path) -> None:
+def normalize_to_source_size(path: Path, source_path: Path, *, quiet: bool = False) -> None:
     try:
         from PIL import Image
     except Exception:
@@ -62,7 +63,8 @@ def normalize_to_source_size(path: Path, source_path: Path) -> None:
             return
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         image.convert("RGB").resize(target_size, resampling).save(path, format="PNG")
-    print(f"Normalized OpenAI output to source size: {path} ({target_size[0]}x{target_size[1]})", flush=True)
+    if not quiet:
+        print(f"Normalized OpenAI output to source size: {path} ({target_size[0]}x{target_size[1]})", flush=True)
 
 
 def generate(args: argparse.Namespace, references: list[Path] | None = None) -> Path:
@@ -82,7 +84,7 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     reference_paths = [resolve_path(path) for path in (references or []) if resolve_path(path).is_file()]
     continuity = ""
     if reference_paths:
-        continuity = (
+        continuity = getattr(args, "reference_instructions", "") or (
             "Use the additional colour reference images only to preserve palette, material colours, "
             "skin tones, lighting temperature, and overall colour continuity. The first image is the "
             "black-and-white shot to colourise."
@@ -99,18 +101,42 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
         },
         method="POST",
     )
-    print(f"OpenAI image edit: {source} -> {output}", flush=True)
-    print(f"OpenAI model: {args.model}", flush=True)
-    if reference_paths:
-        print(f"OpenAI reference images: {len(reference_paths)}", flush=True)
+    quiet = bool(getattr(args, "quiet", False))
+    if not quiet:
+        print(f"OpenAI image edit: {source} -> {output}", flush=True)
+        print(f"OpenAI model: {args.model}", flush=True)
+        if reference_paths:
+            print(f"OpenAI reference images: {len(reference_paths)}", flush=True)
     if args.dry_run:
         return output
-    try:
-        with urllib.request.urlopen(request, timeout=args.timeout, context=ssl.create_default_context()) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenAI API error {exc.code}: {text}") from exc
+    max_retries = max(0, int(getattr(args, "max_retries", 5)))
+    payload = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=args.timeout, context=ssl.create_default_context()) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            error_text = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            if not retryable or attempt >= max_retries:
+                raise RuntimeError(f"OpenAI API error {exc.code}: {error_text}") from exc
+            retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+            try:
+                delay = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                delay = min(60.0, 2.0 ** attempt)
+            print(f"OpenAI API temporarily unavailable ({exc.code}); retrying in {delay:.0f}s...", flush=True)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt >= max_retries:
+                raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
+            delay = min(60.0, 2.0 ** attempt)
+            print(f"OpenAI connection interrupted; retrying in {delay:.0f}s...", flush=True)
+            time.sleep(delay)
+
+    if payload is None:
+        raise RuntimeError("OpenAI API request failed without a response.")
 
     images = payload.get("data") or []
     if not images or not images[0].get("b64_json"):
@@ -119,9 +145,10 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     temp = output.with_suffix(output.suffix + ".partial")
     temp.write_bytes(base64.b64decode(images[0]["b64_json"]))
     if not args.no_normalize_to_source_size:
-        normalize_to_source_size(temp, source)
+        normalize_to_source_size(temp, source, quiet=quiet)
     temp.replace(output)
-    print(f"Wrote {output}", flush=True)
+    if not quiet:
+        print(f"Wrote {output}", flush=True)
     return output
 
 
@@ -224,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--size", default="auto")
     parser.add_argument("--quality", default="auto")
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--row-index", type=int)
     parser.add_argument("--reference-index", type=int, default=0)

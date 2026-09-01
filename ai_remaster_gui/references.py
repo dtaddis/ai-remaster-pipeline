@@ -67,9 +67,15 @@ def color_reference_outputs(manifest_text: str) -> list[str]:
     return [item.get("color_reference", "") for row in rows for item in reference_items(row) if item.get("color_reference")]
 
 def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = True) -> dict[str, object]:
-    shots_manifest = manifest_for_outpainted(settings.get("shots", {}).get("outpainted_video", ""))
+    shots_settings = settings.get("shots", {})
     references_manifest = settings.get("references", {}).get("manifest", "")
     colour_manifest = settings.get("colour", {}).get("manifest", "") or references_manifest
+    shots_manifest = manifest_for_outpainted(shots_settings.get("outpainted_video", ""))
+    if not shots_manifest or not resolve(shots_manifest).is_file():
+        for configured_manifest in (shots_settings.get("manifest", ""), references_manifest, colour_manifest):
+            if configured_manifest and resolve(configured_manifest).is_file():
+                shots_manifest = configured_manifest
+                break
     upscale_manifest = colour_manifest or references_manifest or shots_manifest
     return {
         "shots_manifest": shots_manifest,

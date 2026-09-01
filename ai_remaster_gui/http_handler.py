@@ -52,6 +52,14 @@ from .references import (
     update_shot_fade,
 )
 
+
+def redact_command_arguments(command: list[str]) -> list[str]:
+    redacted = list(command)
+    for index, value in enumerate(redacted[:-1]):
+        if value in {"--api-key", "--openai-api-key"}:
+            redacted[index + 1] = "[redacted]"
+    return redacted
+
 # These outpaint helpers stay in server.py because they are wired into its chunk/guide internals;
 # importing server here would be circular (see state.py's note). server.py injects them at startup
 # via bind_context. Declared here so the names resolve statically and tooling can see them.
@@ -151,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(state.APP.state(view, generate_shot_previews=generate_shot_previews))
         elif parsed.path == "/api/command":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
-            self.send_json({"command": state.APP.command_for(stage) if stage else []})
+            self.send_json({"command": redact_command_arguments(state.APP.command_for(stage)) if stage else []})
         elif parsed.path == "/api/existing-outputs":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"paths": state.APP.existing_outputs(stage) if stage else []})

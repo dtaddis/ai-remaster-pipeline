@@ -1597,6 +1597,36 @@ async function browseGlobalSource() {
   lastRenderSignature = renderSignature();
 }
 
+function updateReferenceAnchorPreview(manifest, index, referenceIndex, frame, imgId, labelId, fps) {
+  const exactFrame = Math.max(0, Math.round(Number(frame || 0)));
+  const rate = Math.max(1, Number(fps || 24));
+  const seconds = exactFrame / rate;
+  const label = document.getElementById(labelId);
+  if (label) label.textContent = `Frame ${exactFrame} · ${formatSeconds(seconds)}`;
+  queueShotPreview(imgId, () => (
+    '?manifest=' + encodeURIComponent(manifest)
+      + '&index=' + index
+      + '&time=' + encodeURIComponent(seconds)
+      + '&frame=' + encodeURIComponent(exactFrame)
+  ), 180);
+}
+
+async function useReferenceAnchorFrame(manifest, index, referenceIndex, frame, fps) {
+  const exactFrame = Math.max(0, Math.round(Number(frame || 0)));
+  const rate = Math.max(1, Number(fps || 24));
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-scrub', {
+    manifest,
+    index,
+    reference_index: referenceIndex,
+    frame: exactFrame,
+    time: exactFrame / rate,
+  });
+  if (!result.ok) return alert(result.error || 'Could not update reference frame');
+  await refreshReferenceRowFromState(result.state, index);
+  restoreScrollState(snap);
+}
+
 async function addReferenceAtCurrentFrame(manifest, index, time, frame = null) {
   const snap = captureScrollState();
   const payload = { manifest, index, time };
@@ -1711,6 +1741,13 @@ async function runStage(key) {
   await saveStage(key);
   if (key === 'references' && (settings('references').method || 'qwen') === 'openai' && !((settings('references').openai_api_key || '').trim())) {
     alert('Add your OpenAI API key in Settings before running OpenAI Reference Generation.');
+    active = 'settings';
+    drawTabs();
+    draw();
+    return;
+  }
+  if (key === 'colour' && (settings('colour').method || 'deepexemplar') === 'openai' && !((settings('references').openai_api_key || '').trim())) {
+    alert('Add your OpenAI API key in Settings before running OpenAI Cloud Colorization.');
     active = 'settings';
     drawTabs();
     draw();

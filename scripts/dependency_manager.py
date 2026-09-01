@@ -66,12 +66,24 @@ LTX25_TEXT_ENCODER = "gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf"
 LTX25_VIDEO_VAE = "ltx-2.5-video-vae-conv-bf16.safetensors"
 LTX25_AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
 LTX25_LATENT_UPSCALER = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
-LTX25_OUTPAINT_MODELS = [
+LTX25_PIXEL_UPSCALER_LORA = "ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors"
+LTX25_CORE_MODELS = [
     HfModel("vantagewithai/LTX-2.5-GGUF", f"distilled/{LTX25_GGUF_MODEL}", f"models/diffusion_models/{LTX25_GGUF_MODEL}"),
     HfModel("elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF", LTX25_TEXT_ENCODER, f"models/text_encoders/{LTX25_TEXT_ENCODER}"),
     HfModel("Lightricks/LTX-2.5", f"vae/{LTX25_VIDEO_VAE}", f"models/vae/{LTX25_VIDEO_VAE}"),
+]
+LTX25_OUTPAINT_MODELS = [
+    *LTX25_CORE_MODELS,
     HfModel("Lightricks/LTX-2.5", f"vae/{LTX25_AUDIO_VAE}", f"models/vae/{LTX25_AUDIO_VAE}"),
     HfModel("Lightricks/LTX-2.5", f"latent_upscale_models/{LTX25_LATENT_UPSCALER}", f"models/latent_upscale_models/{LTX25_LATENT_UPSCALER}"),
+]
+LTX25_PIXEL_UPSCALE_MODELS = [
+    *LTX25_CORE_MODELS,
+    HfModel(
+        "Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler",
+        LTX25_PIXEL_UPSCALER_LORA,
+        f"models/loras/{LTX25_PIXEL_UPSCALER_LORA}",
+    ),
 ]
 
 OUTPAINT_LORA_FILES = [
@@ -409,6 +421,10 @@ def ensure_ltx25_outpaint_models(comfy_dir: Path) -> None:
     # The in/outpainting IC-LoRA remains the official 2.3 v0.9 adapter used by
     # Lightricks' 2.5 workflow; do not download a redundant or unrelated LoRA.
     ensure_hf_models(comfy_dir, [*LTX25_OUTPAINT_MODELS, OUTPAINT_LORA_FILES[0]])
+
+
+def ensure_ltx25_upscale_models(comfy_dir: Path) -> None:
+    ensure_hf_models(comfy_dir, LTX25_PIXEL_UPSCALE_MODELS)
 
 
 def ensure_cleanup_models(comfy_dir: Path) -> None:

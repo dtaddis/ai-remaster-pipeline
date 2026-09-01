@@ -11,6 +11,30 @@ from ai_remaster_gui.manifests import read_manifest, write_manifest_details
 
 
 class ReferenceScrubTests(unittest.TestCase):
+    def test_shot_view_falls_back_to_loaded_reference_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir=references.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            loaded_manifest = folder / "loaded-project-shots.csv"
+            loaded_manifest.write_text("enabled,start_frame,end_frame,end\ntrue,0,24,00:00:01.000\n", encoding="utf-8")
+            missing_derived = folder / "new-derived-name.csv"
+            loaded_text = references.rel(loaded_manifest)
+
+            def fake_rows(manifest, **_kwargs):
+                return [{"manifest": manifest}] if manifest else []
+
+            with (
+                mock.patch.object(references, "manifest_for_outpainted", return_value=references.rel(missing_derived)),
+                mock.patch.object(references, "shot_rows", side_effect=fake_rows),
+            ):
+                views = references.shot_views({
+                    "shots": {"outpainted_video": "intermediate/outpainted/renamed.mp4"},
+                    "references": {"manifest": loaded_text},
+                    "colour": {"manifest": loaded_text},
+                })
+
+        self.assertEqual(views["shots_manifest"], loaded_text)
+        self.assertEqual(views["shots"], [{"manifest": loaded_text}])
+
     def test_extract_reference_frame_persists_selected_frame(self) -> None:
         previous_app = state.APP
         state.APP = SimpleNamespace(log=[], settings={"references": {}})
@@ -121,6 +145,17 @@ class ReferenceScrubTests(unittest.TestCase):
                 view = references.shot_rows(references.rel(manifest))[0]
                 self.assertEqual(view["reference_count"], 2)
                 self.assertEqual(view["reference_items"][1]["selected_frame"], 60)
+
+                with (
+                    mock.patch.object(references, "local_tool", return_value="ffmpeg"),
+                    mock.patch.object(references, "manifest_fps", return_value=25.0),
+                    mock.patch.object(references.subprocess, "run", return_value=fake_result),
+                ):
+                    references.extract_reference_frame(
+                        references.rel(manifest), 0, 3.2, frame=80, reference_index=1
+                    )
+                updated = references.reference_items(read_manifest(manifest)[0])
+                self.assertEqual([item["selected_frame"] for item in updated], ["20", "80"])
 
                 references.remove_additional_reference(references.rel(manifest), 0, 1)
                 self.assertEqual(len(references.reference_items(read_manifest(manifest)[0])), 1)

@@ -555,6 +555,44 @@ def bypass_optional_preview_nodes(workflow: dict[str, Any]) -> None:
         pass
 
 
+def bypass_optional_float_to_int(workflow: dict[str, Any], prepared_info: dict[str, Any]) -> None:
+    """Inline Dearchive's FPS conversion from the optional ComfyMath pack.
+
+    The author workflow converts ``VHS_VideoInfo.source_fps`` with ``CM_FloatToInt`` solely to
+    satisfy ``LTXVEmptyLatentAudio.frame_rate``'s integer socket. ARP already probes the prepared
+    clip, so keeping that frontend convenience node in the API prompt adds an unnecessary custom
+    node dependency and makes otherwise complete installations fail prompt validation.
+    """
+    try:
+        converter = node_by_id(workflow, "5024")
+        audio_latent = node_by_id(workflow, "3980")
+    except KeyError:
+        return
+    if converter.get("type") != "CM_FloatToInt" or audio_latent.get("type") != "LTXVEmptyLatentAudio":
+        return
+
+    fps = max(1, int(round(float(prepared_info.get("fps") or 24.0))))
+    clear_input_link(workflow, "3980", "frame_rate")
+    set_widget(audio_latent, "1", fps)
+
+
+def bypass_optional_cleanup_audio(workflow: dict[str, Any]) -> None:
+    """Keep Dearchive's temporary video-only chunks out of VHS audio extraction.
+
+    Clean Up restores audio from the untouched source during final delivery. Its model chunks are
+    intentionally written without audio, so evaluating the author workflow's VHS audio output is
+    both redundant and an error on current VideoHelperSuite releases.
+    """
+    try:
+        loader = node_by_id(workflow, "5060")
+        save = node_by_id(workflow, "5076")
+    except KeyError:
+        return
+    if loader.get("type") != "VHS_LoadVideo" or save.get("type") != "VHS_VideoCombine":
+        return
+    clear_input_link(workflow, "5076", "audio")
+
+
 def bypass_demo_padding_node(workflow: dict[str, Any]) -> None:
     """Route around KJNodes' ImagePadKJ when ARP has already prepared the canvas."""
     try:
@@ -782,6 +820,36 @@ def patch_video_only_sampling(workflow: dict[str, Any]) -> None:
     patch_link(workflow, sampler_latent_link, 5114, 2, 5093, 4, "LATENT")
     set_input_link(workflow, "5093", "latent_image", sampler_latent_link)
     patch_link(workflow, crop_latent_link, 5093, 1, 5013, 2, "LATENT")
+    set_input_link(workflow, "5013", "latent", crop_latent_link)
+
+
+def patch_dearchive_video_only_sampling(workflow: dict[str, Any]) -> None:
+    """Remove Dearchive's audio latent path when using the video-only GGUF model."""
+    try:
+        concat_node = node_by_id(workflow, "4528")
+        separate_node = node_by_id(workflow, "4845")
+        guide_node = node_by_id(workflow, "5012")
+        sampler_node = node_by_id(workflow, "4829")
+        crop_node = node_by_id(workflow, "5013")
+    except KeyError:
+        return
+    if (
+        concat_node.get("type") != "LTXVConcatAVLatent"
+        or separate_node.get("type") != "LTXVSeparateAVLatent"
+        or guide_node.get("type") != "LTXAddVideoICLoRAGuide"
+        or sampler_node.get("type") != "SamplerCustomAdvanced"
+        or crop_node.get("type") != "LTXVCropGuides"
+    ):
+        return
+
+    sampler_latent_link = input_link(workflow, "4829", "latent_image")
+    crop_latent_link = input_link(workflow, "5013", "latent")
+    if sampler_latent_link is None or crop_latent_link is None:
+        raise ValueError("Dearchive workflow is missing its sampler or crop latent link.")
+
+    patch_link(workflow, sampler_latent_link, 5012, 2, 4829, 4, "LATENT")
+    set_input_link(workflow, "4829", "latent_image", sampler_latent_link)
+    patch_link(workflow, crop_latent_link, 4829, 0, 5013, 2, "LATENT")
     set_input_link(workflow, "5013", "latent", crop_latent_link)
 
 
@@ -1087,6 +1155,15 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     set_widget(text_node, "0", args.text_encoder)
     set_widget(text_node, "1", args.text_encoder_checkpoint)
     set_widget(text_node, "2", getattr(args, "text_encoder_device", "cpu"))
+    audio_vae_checkpoint = getattr(args, "audio_vae_checkpoint", "")
+    if audio_vae_checkpoint:
+        try:
+            audio_vae_node = node_by_id(workflow, "4010")
+            ensure_widget_input(audio_vae_node, "ckpt_name")
+            set_widget(audio_vae_node, "0", audio_vae_checkpoint)
+        except KeyError:
+            pass
+    patch_dearchive_video_only_sampling(workflow)
 
 
 def resolve_guide_coords(extra_guides: "list[dict]", num_pixel_frames: int) -> "list[dict]":
@@ -1489,6 +1566,8 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
         set_widget_if_node(workflow, node_id, args.save_prefix_widget, output_prefix)
 
     bypass_optional_preview_nodes(workflow)
+    bypass_optional_float_to_int(workflow, prepared_info)
+    bypass_optional_cleanup_audio(workflow)
 
     if not is_official_outpaint_template(workflow):
         try:

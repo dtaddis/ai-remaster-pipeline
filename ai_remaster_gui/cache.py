@@ -32,7 +32,7 @@ def cache_categories() -> tuple[dict, ...]:
         {
             "key": "cleanup",
             "title": "Clean Up",
-            "description": "DeVignette and AI DeScratch passes, model-safe Dearchive inputs, per-chunk renders, and geometry-preserving restored videos.",
+            "description": "DeVignette and AI DeScratch passes, model-safe Dearchive inputs, per-chunk renders, and restored videos.",
             "folders": (
                 ROOT / ".cache" / "cleanup_chunks",
                 ROOT / "intermediate" / "cleaned",
@@ -72,7 +72,7 @@ def cache_categories() -> tuple[dict, ...]:
         {
             "key": "colour",
             "title": "Colorization",
-            "description": "Per-shot colorized chunks and stitched Deep Exemplar colorized videos.",
+            "description": "Per-shot colorized chunks and stitched colourisation outputs.",
             "folders": (
                 ROOT / ".cache" / "colorized_chunks",
                 ROOT / "intermediate" / "outpainted_colorized",

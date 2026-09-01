@@ -433,6 +433,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(fields["ai_chunk_frames"], ("ai_chunk_frames", "AI DeScratch chunk frames", "select:25|33|41|49", "41"))
         self.assertEqual(fields["devignette"], ("devignette", "DeVignette", "checkbox", "false"))
         self.assertEqual(fields["dearchive"], ("dearchive", "Dearchive (LTX 2.3 LoRA)", "checkbox", "true"))
+        self.assertEqual(fields["dearchive_height"], ("dearchive_height", "Dearchive resolution", "select:540|720|1080|source", "720"))
         self.assertEqual(fields["repair_device"], ("repair_device", "DeVignette processor", "select:auto|cuda|cpu", "auto"))
         self.assertEqual(fields["source_fidelity"], ("source_fidelity", "Source Fidelity", "range:0|1|0.05", "1.0"))
         helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
@@ -447,6 +448,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(defaults.dearchive)
         self.assertFalse(defaults.ai_descratch)
         self.assertEqual(defaults.ai_descratch_height, "720")
+        self.assertEqual(defaults.dearchive_height, "720")
         self.assertEqual(defaults.ai_chunk_frames, 41)
         self.assertAlmostEqual(defaults.scratch_sensitivity, 0.65)
         self.assertEqual(defaults.repair_device, "auto")
@@ -475,7 +477,13 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--repair-device") + 1], "auto")
         self.assertEqual(command[command.index("--source-fidelity") + 1], "0.55")
         self.assertEqual(command[command.index("--ai-descratch-height") + 1], "720")
+        self.assertEqual(command[command.index("--dearchive-height") + 1], "720")
         self.assertEqual(command[command.index("--ai-chunk-frames") + 1], "41")
+
+    def test_dearchive_processing_resolution_preserves_aspect_on_model_safe_grid(self) -> None:
+        self.assertEqual(cleanup_video.model_dimensions(4096, 3112, "1080"), (1440, 1088))
+        self.assertEqual(cleanup_video.model_dimensions(4096, 3112, "720"), (928, 704))
+        self.assertEqual(cleanup_video.model_dimensions(4096, 3112, "source"), (4096, 3104))
 
     def test_cleanup_identity_changes_with_each_operation(self) -> None:
         source = "input/example.mp4"
@@ -652,7 +660,16 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5012"]["inputs"]["strength"], 1.0)
         self.assertEqual(prompt["9001"]["class_type"], "VAELoader")
         self.assertEqual(prompt["4851"]["inputs"]["vae"], ["9001", 0])
-        self.assertNotIn("Switch latent [Crystools]", {node["class_type"] for node in prompt.values()})
+        self.assertEqual(prompt["4829"]["inputs"]["latent_image"], ["5012", 2])
+        self.assertEqual(prompt["5013"]["inputs"]["latent"], ["4829", 0])
+        self.assertNotIn("audio", prompt["5076"]["inputs"])
+        class_types = {node["class_type"] for node in prompt.values()}
+        self.assertNotIn("CM_FloatToInt", class_types)
+        self.assertNotIn("Switch latent [Crystools]", class_types)
+        self.assertNotIn("LTXVEmptyLatentAudio", class_types)
+        self.assertNotIn("LTXVAudioVAELoader", class_types)
+        self.assertNotIn("LTXVConcatAVLatent", class_types)
+        self.assertNotIn("LTXVSeparateAVLatent", class_types)
 
     def test_cleanup_source_fidelity_controls_the_complete_video_guide(self) -> None:
         args = cleanup_video.build_parser().parse_args([
@@ -714,7 +731,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(output_sar, "1280/1281")
         self.assertEqual(audio_streams, [{"channels": 2, "channel_layout": "stereo"}])
 
-    def test_cleanup_finalize_handles_a_source_with_no_audio_packets(self) -> None:
+    def test_cleanup_finalize_keeps_model_resolution_and_handles_no_audio_packets(self) -> None:
         ffmpeg = common.find_ffmpeg()
         with tempfile.TemporaryDirectory() as tmp_text:
             folder = Path(tmp_text)
@@ -730,10 +747,12 @@ class GuiSmokeTests(unittest.TestCase):
                 )
 
             self.assertIsNone(cleanup_video.first_audio_packet_stream(ffmpeg, source))
-            cleanup_video.finalize_output(ffmpeg, generated, source, output, cleanup_video.probe_video(source))
+            cleanup_video.finalize_output(
+                ffmpeg, generated, source, output, cleanup_video.probe_video(source), (96, 64)
+            )
             result = cleanup_video.probe_video(output)
 
-        self.assertEqual((result["width"], result["height"], result["frames"]), (86, 48, 12))
+        self.assertEqual((result["width"], result["height"], result["frames"]), (96, 64, 12))
 
     def test_colorization_always_builds_a_grayscale_model_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -769,33 +788,148 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertEqual(prompt["3"]["class_type"], expected_node)
                 self.assertEqual(prompt["3"]["inputs"]["video_frames"], ["1", 0])
 
+    def test_openai_colorization_keeps_colour_input_and_labels_all_image_roles(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "shots.csv"
+            source = folder / "source.mp4"
+            reference_a = folder / "reference_a.png"
+            reference_b = folder / "reference_b.png"
+            source.write_bytes(b"video")
+            Image.new("RGB", (16, 8), (20, 40, 60)).save(reference_a)
+            Image.new("RGB", (16, 8), (60, 40, 20)).save(reference_b)
+            manifest.write_text("enabled,color_reference,end\ntrue," + str(reference_a) + ",1\n", encoding="utf-8")
+            args = colorize_video.build_parser().parse_args(
+                ["--manifest", str(manifest), "--method", "openai", "--api-key", "sk-test"]
+            )
+            sig = colorize_video.signature(
+                args,
+                manifest,
+                source,
+                [{"color_reference": str(reference_a), "end": "1"}],
+            )
+            _extra, instructions = colorize_video.openai_frame_prompt(3, 2)
+
+        self.assertFalse(sig["grayscale_video_input"])
+        self.assertIn("Images 2-4", instructions)
+        self.assertIn("Images 5-6", instructions)
+        self.assertIn("only image to edit", instructions)
+
+    def test_openai_colorization_sends_previous_frames_before_every_shot_reference(self) -> None:
+        from PIL import Image
+        from reference_sets import encode_additional_references
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source_dir = folder / "source_frames"
+            source_dir.mkdir()
+            for index in range(4):
+                Image.new("RGB", (16, 8), (index * 20, 30, 40)).save(source_dir / f"frame_{index:08d}.png")
+            source_video = folder / "source.mp4"
+            source_video.write_bytes(b"video")
+            references = [folder / "reference_a.png", folder / "reference_b.png"]
+            for index, reference in enumerate(references):
+                Image.new("RGB", (16, 8), (80 + index, 40, 20)).save(reference)
+            row = {
+                "start_frame": "0",
+                "end_frame": "4",
+                "color_reference": str(references[0]),
+                "additional_references": encode_additional_references([{"color_reference": str(references[1])}]),
+            }
+            args = colorize_video.build_parser().parse_args(
+                ["--manifest", "shots.csv", "--method", "openai", "--api-key", "sk-test", "--openai-previous-frames", "3"]
+            )
+            calls = []
+
+            def fake_generate(child, inputs):
+                calls.append(list(inputs))
+                shutil.copy2(child.source_image, child.output)
+                return child.output
+
+            with (
+                mock.patch.object(colorize_video, "ROOT", folder),
+                mock.patch.object(colorize_video, "prepare_openai_source_frames", return_value=source_dir),
+                mock.patch.object(colorize_video.openai_images, "generate", side_effect=fake_generate),
+                mock.patch.object(colorize_video, "resumable_output", return_value=False),
+                mock.patch.object(colorize_video, "assemble_openai_frames"),
+            ):
+                colorize_video.run_openai_colorization(
+                    args, folder / "shots.csv", source_video, [row], folder / "output.mp4",
+                    {"source_fingerprint": colorize_video.file_fingerprint(source_video)},
+                    "ffmpeg", 16, 8, 4.0, 4,
+                )
+
+        self.assertEqual(calls[0], references)
+        self.assertEqual(calls[1][-2:], references)
+        self.assertEqual(calls[2][-2:], references)
+        self.assertEqual(calls[3][-2:], references)
+        self.assertEqual([len(inputs) for inputs in calls], [2, 3, 4, 5])
+        self.assertEqual(calls[1][0].name, "frame_00000000.png")
+
     def test_colormnet_prompt_rejects_unpacked_multi_reference_batch(self) -> None:
         args = colorize_video.build_parser().parse_args(["--manifest", "shots.csv", "--method", "colormnet"])
-        with self.assertRaisesRegex(RuntimeError, "pack multiple references"):
+        with self.assertRaisesRegex(RuntimeError, "exactly one reference"):
             colorize_video.build_prompt(
                 "arp_colorize/guarded_gray.mp4", ["reference_1.png", "reference_2.png"],
                 0, 240, 640, 360, 24.0, args, "test/output",
             )
 
-    def test_colormnet_reference_atlas_is_one_canvas_with_every_reference(self) -> None:
-        from PIL import Image
+    def test_cmnet2_orders_real_reference_anchors_by_source_frame(self) -> None:
+        import cmnet2_runtime
+
+        references = [
+            {"path": Path("late.png"), "selected_frame": 200},
+            {"path": Path("early.png"), "selected_frame": 20},
+            {"path": Path("middle.png"), "selected_frame": 90},
+        ]
+
+        ordered = cmnet2_runtime.ordered_references(references)
+
+        self.assertEqual([item["selected_frame"] for item in ordered], [20, 90, 200])
+
+    def test_cmnet2_preloads_every_reference_for_the_shot(self) -> None:
+        import cmnet2_runtime
+        from reference_sets import encode_additional_references
 
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
-            references = []
-            for index, colour in enumerate(((255, 0, 0), (0, 255, 0), (0, 0, 255))):
-                reference = folder / f"reference_{index}.png"
-                Image.new("RGB", (160, 90), colour).save(reference)
-                references.append(reference)
+            source = folder / "gray.mp4"
+            source.write_bytes(b"video")
+            refs = [folder / "early.png", folder / "late.png"]
+            for index, reference in enumerate(refs):
+                reference.write_bytes(f"ref {index}".encode())
+            row = {
+                "start_frame": "0",
+                "end_frame": "10",
+                "selected_frame": "2",
+                "color_reference": str(refs[0]),
+                "additional_references": encode_additional_references(
+                    [{"selected_frame": "8", "color_reference": str(refs[1])}]
+                ),
+            }
+            args = colorize_video.build_parser().parse_args(
+                ["--manifest", "shots.csv", "--method", "cmnet2", "--cmnet2-dir", str(folder)]
+            )
+            session = mock.Mock()
+            session_type = mock.Mock(return_value=session)
+            with (
+                mock.patch.object(cmnet2_runtime, "resolve_model", return_value=folder / "model.pth"),
+                mock.patch.object(cmnet2_runtime, "CMNet2Session", session_type),
+                mock.patch.object(colorize_video, "resumable_output", return_value=False),
+                mock.patch.object(colorize_video, "prepare_processing_reference", side_effect=lambda path, _w, _h: path),
+                mock.patch.object(colorize_video, "stitch_colorized"),
+                mock.patch.object(colorize_video, "write_signature"),
+            ):
+                colorize_video.run_cmnet2_colorization(
+                    args, source, [row], folder / "output.mp4", {"settings": {}},
+                    "ffmpeg", 640, 360, 24.0, 10,
+                )
 
-            atlas = colorize_video.prepare_reference_atlas(references, 640, 360)
-            with Image.open(atlas) as atlas_image:
-                size = atlas_image.size
-                colours = atlas_image.convert("RGB").getcolors(maxcolors=640 * 360)
-
-        self.assertEqual(size, (640, 360))
-        present = {colour for _count, colour in (colours or [])}
-        self.assertTrue({(255, 0, 0), (0, 255, 0), (0, 0, 255)} <= present)
+        supplied = session.colorize_segment.call_args.args[2]
+        self.assertEqual([item["selected_frame"] for item in supplied], [2, 8])
+        self.assertEqual([item["path"] for item in supplied], refs)
 
     def test_source_resolver_accepts_ascii_pipe_for_full_width_pipe_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -3723,6 +3857,44 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--reference-count", command)
         self.assertNotIn("qwen_colorize_references.py", " ".join(command))
 
+    def test_openai_cloud_colorization_command_uses_shared_key_and_cloud_controls(self) -> None:
+        app.APP.settings["references"].update({"openai_api_key": "sk-test"})
+        app.APP.settings["colour"].update(
+            {
+                "manifest": "manifests/references/demo.csv",
+                "method": "openai",
+                "openai_image_model": "gpt-image-2",
+                "openai_previous_frames": "3",
+                "openai_image_size": "auto",
+                "openai_image_quality": "high",
+                "openai_prompt": "Enhance colour without changing geometry.",
+            }
+        )
+
+        command = app.APP.command_for("colour")
+
+        self.assertEqual(command[command.index("--method") + 1], "openai")
+        self.assertEqual(command[command.index("--openai-previous-frames") + 1], "3")
+        self.assertEqual(command[command.index("--openai-model") + 1], "gpt-image-2")
+        self.assertIn("--api-key", command)
+        self.assertNotIn("--comfy-url", command)
+
+    def test_cmnet2_colorization_command_uses_local_runtime_without_comfy_server(self) -> None:
+        app.APP.settings["colour"].update(
+            {
+                "manifest": "manifests/references/demo.csv",
+                "method": "cmnet2",
+                "processing_height": "source",
+            }
+        )
+
+        command = app.APP.command_for("colour")
+
+        self.assertEqual(command[command.index("--method") + 1], "cmnet2")
+        self.assertIn("--cmnet2-dir", command)
+        self.assertIn("--comfy-dir", command)  # checkpoint fallback only; no HTTP dependency
+        self.assertNotIn("--comfy-url", command)
+
     def test_openai_nearby_references_prefer_previous_then_later(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -4325,7 +4497,7 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(stage_keys, ["upscale"])
         self.assertEqual(app.APP.settings["upscale"]["input_video"], "input/example.mp4")
-        self.assertNotIn("--method", command)
+        self.assertEqual(command[command.index("--method") + 1], "flashvsr")
         self.assertIn("--target-width", command)
         self.assertIn("1920", command)
         self.assertIn("--comfy-url", command)
@@ -4523,7 +4695,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--input", command)
         self.assertEqual(command[command.index("--input") + 1], "input/example.mp4")
         self.assertEqual(command[command.index("--output") + 1], app.upscale_output_for("input/example.mp4", app.APP.settings["upscale"]))
-        self.assertNotIn("--method", command)
+        self.assertEqual(command[command.index("--method") + 1], "flashvsr")
 
     def test_upscale_ignores_stale_backend_method_setting(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
@@ -4531,10 +4703,34 @@ class GuiSmokeTests(unittest.TestCase):
 
         command = app.APP.command_for("upscale")
 
-        self.assertNotIn("--method", command)
+        self.assertEqual(command[command.index("--method") + 1], "flashvsr")
         self.assertNotIn("--realbasicvsr-repo", command)
         self.assertIn("--comfy-url", command)
         self.assertEqual(command[command.index("--output") + 1], app.upscale_output_for("input/example.mp4", app.APP.settings["upscale"]))
+
+    def test_upscale_can_select_ltx25_pixel_spatial_backend(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+        app.APP.settings["upscale"].update({
+            "method": "ltx25",
+            "target_width": "1920",
+            "target_height": "1080",
+            "ltx25_source_fidelity": "95",
+            "ltx25_lora_strength": "1.0",
+            "ltx25_seed": "77",
+            "ltx25_prompt": "faithful upscale",
+            "ltx25_negative_prompt": "changed identity",
+        })
+
+        command = app.APP.command_for("upscale")
+
+        self.assertEqual(command[command.index("--method") + 1], "ltx25")
+        self.assertEqual(command[command.index("--ltx25-source-fidelity") + 1], "0.95")
+        self.assertEqual(command[command.index("--ltx25-lora-strength") + 1], "1.0")
+        self.assertEqual(command[command.index("--ltx25-seed") + 1], "77")
+        self.assertEqual(command[command.index("--ltx25-prompt") + 1], "faithful upscale")
+        ltx_output = app.upscale_output_for("input/example.mp4", app.APP.settings["upscale"])
+        flash_values = dict(app.APP.settings["upscale"], method="flashvsr")
+        self.assertNotEqual(ltx_output, app.upscale_output_for("input/example.mp4", flash_values))
 
     def test_flashvsr_prompt_uses_video_helper_load_and_combine_nodes(self) -> None:
         args = argparse.Namespace(
@@ -4613,6 +4809,37 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["4"]["class_type"], "VHS_VideoCombine")
         self.assertEqual(prompt["4"]["inputs"]["images"], ["3", 0])
         self.assertNotIn("audio", prompt["4"]["inputs"])
+
+    def test_ltx25_upscale_prompt_is_video_only_and_uses_x2_ic_lora(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25"])
+
+        prompt = upscale_video.ltx25_prompt(
+            "example.mp4", 24.0, 97, 1920, 1088, args, "arp_upscale/example"
+        )
+
+        self.assertEqual(prompt["2"]["inputs"]["unet_name"], upscale_video.LTX25_GGUF_MODEL)
+        self.assertEqual(prompt["3"]["inputs"]["lora_name"], upscale_video.LTX25_PIXEL_UPSCALER_LORA)
+        self.assertEqual(prompt["10"]["inputs"]["latent_downscale_factor"], 2.0)
+        self.assertEqual(prompt["10"]["inputs"]["latent"], ["9", 0])
+        self.assertEqual(prompt["15"]["inputs"]["latent_image"], ["10", 2])
+        self.assertEqual(prompt["16"]["inputs"]["latent"], ["15", 0])
+        self.assertEqual(prompt["17"]["inputs"]["samples"], ["16", 2])
+        self.assertNotIn("audio", prompt["18"]["inputs"])
+        class_types = {node["class_type"] for node in prompt.values()}
+        self.assertNotIn("LTXVConcatAVLatent", class_types)
+        self.assertNotIn("LTXVSeparateAVLatent", class_types)
+
+    def test_ltx25_upscale_chunks_keep_every_frame_in_valid_windows(self) -> None:
+        ranges = upscale_video.ltx25_chunk_ranges(294, 24.0, 4.04, 8)
+
+        self.assertEqual(ranges, [
+            (0, 97, 0, 97, 97),
+            (89, 186, 8, 89, 97),
+            (178, 275, 8, 89, 97),
+            (267, 294, 8, 19, 97),
+        ])
+        self.assertEqual(sum(item[3] for item in ranges), 294)
+        self.assertTrue(all(item[4] % 8 == 1 for item in ranges))
 
     def test_upscale_signature_only_records_advanced_knobs_when_changed(self) -> None:
         parser = upscale_video.build_parser()

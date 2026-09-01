@@ -19,7 +19,7 @@ The app is still alpha software, but the goal is simple: you should be able to r
 - Outpaints 4:3 or similar archive footage into common target aspect ratios such as `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, and `1.85:1`.
 - Splits video into shots and lets you review, merge, enable, disable, and adjust shot boundaries.
 - Generates per-shot reference frames and colorizes them with Qwen Image Edit.
-- Optionally reconstructs vertical scratches with masked ProPainter inpainting, corrects light/dark vignettes, then optionally restores archive footage with the LTX 2.3 Dearchive LoRA while preserving source geometry.
+- Optionally reconstructs vertical scratches with masked ProPainter inpainting, corrects light/dark vignettes, then restores archive footage with the LTX 2.3 Dearchive LoRA at a selectable model-safe output resolution (720p by default).
 - Uses reference-guided video colorization for the outpainted footage.
 - Recombines the original, outpainted, and colorized layers into a final output.
 - Keeps intermediate files deterministic and resumable, so reruns can reuse valid existing work.
@@ -96,7 +96,7 @@ install_windows.bat -InstallCorrelationExtension
 install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu128
 ```
 
-ColorMNet uses a PyTorch fallback by default with the same output quality. `-InstallCorrelationExtension` attempts the optional faster CUDA correlation extension; it requires Visual Studio C++ Build Tools and a local CUDA Toolkit matching the installed PyTorch CUDA build. If the extension cannot build, installation continues in fallback mode.
+ColorMNet and CMNET2 use a PyTorch correlation fallback by default with the same output quality. `-InstallCorrelationExtension` attempts the optional faster CUDA correlation extension for ColorMNet; it requires Visual Studio C++ Build Tools and a local CUDA Toolkit matching the installed PyTorch CUDA build. If the extension cannot build, installation continues in fallback mode. The installer also downloads CMNET2's checkpoint and DINOv2/ResNet support files into the ignored runtime directories under `vendor/cmnet2`.
 
 See [docs/installer-model-sources.md](docs/installer-model-sources.md) for the exact model and LoRA sources.
 
@@ -153,7 +153,7 @@ Choose the source video, see useful media info, and run the whole pipeline.
 
 ### Clean Up
 
-Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA and defaults on.
+Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA and defaults on. Its resolution selector defaults to 720p (rounded to the nearest LTX-safe dimensions), and the finished Dearchive file stays at that model resolution rather than being enlarged back to the source dimensions.
 
 The order is DeVignette, AI DeScratch, then Dearchive. AI DeScratch defaults to a 720p working copy and 41-frame windows on a 24 GB GPU, but always returns the source resolution and timing. Sensitivity controls how faint a vertical mark may be before it enters the mask; mask expansion includes damaged edges around each detected line. Enable the mask preview to write a companion `_scratch_mask.mp4`; white shows the detected base mask, before the selected expansion margin. ProPainter's model and upstream code use the NTU S-Lab License 1.0 and are restricted to non-commercial use.
 
@@ -189,15 +189,15 @@ Review the detected shots, inspect start/middle/end frames, merge shots that sho
 
 ### Reference Generation
 
-Pick the primary reference time inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, scrub to another useful frame and choose **Add Reference**. Additional reference keyframes remain part of the same shot rather than creating artificial cuts.
+Pick the primary reference frame inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, choose **Add Reference**, then scrub that reference's own frame slider to the exact source frame and select **Use Frame**. Additional reference frames remain part of the same shot rather than creating artificial cuts.
 
 ![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg)
 
 ### Colorization
 
-Review each shot's colour references alongside the corresponding colourized video segment. ColorMNet consumes all keyframes for a shot in one continuous run: the primary reference seeds the shot, and later references are injected into the same temporal memory at their selected frames. Deep Exemplar currently uses the primary reference only.
+Review each shot's colour references alongside the corresponding colourized video segment. **CMNET2** preloads every reference frame for a shot into permanent memory and is the local multi-reference option. **OpenAI Cloud** also receives every reference. ColorMNet and Deep Exemplar deliberately use Reference 1 only.
 
-Because Dearchive can introduce colour of its own, ARP converts extracted source stills and the video stream back to neutral grayscale before reference generation and before Deep Exemplar/ColorMNet. The generated colour reference stays in colour and guides the selected model as usual.
+Because Dearchive can introduce colour of its own, ARP converts extracted source stills and the video stream back to neutral grayscale before reference generation and before Deep Exemplar, ColorMNet, or CMNET2. The generated colour reference stays in colour and guides the selected model as usual. OpenAI Cloud is the exception: it may retain existing colour evidence when enhancing footage.
 
 ![Colorization tab](assets/screenshots/walkthrough/arp-walkthrough-colorization.jpg)
 
@@ -217,9 +217,11 @@ Once recomposition finishes, the Output tab plays the final render.
 
 ### Upscaling and source motion
 
-FlashVSR can make motion look unnaturally crisp when it reconstructs every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full FlashVSR render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
+The Upscaling page offers two backends. **FlashVSR** remains the fast, established refiner. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to the LTX path. Its gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
 
-After Shot Detection, the Upscaling page also exposes this strength per shot. A hard cut switches strength on the cut; a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength FlashVSR render is cached separately, so changing only these blend decisions does not rerun the AI upscale.
+FlashVSR can make motion look unnaturally crisp when it reconstructs every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full AI render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
+
+After Shot Detection, the Upscaling page also exposes this strength per shot. A hard cut switches strength on the cut; a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength AI render is cached separately, so changing only these blend decisions does not rerun the upscale.
 
 ### Settings
 
@@ -233,10 +235,14 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 - CUDA-accelerated automatic light/dark DeVignette correction for optional archive repair.
 - Masked ProPainter video inpainting for optional AI DeScratch (non-commercial NTU S-Lab licence).
 - LTX 2.3 Dearchive IC-LoRA for optional generative archive cleanup.
+- Configurable 540p/720p/1080p/source Dearchive processing with exact source-size delivery.
 - Official LTX 2.3 v0.9 in/outpainting IC-LoRA (full-resolution mask-conditioned pass).
+- LTX 2.5 Pixel Spatial Upscaler 2x IC-LoRA as an alternative to FlashVSR.
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
 - Qwen Image Edit Lightning LoRA.
 - Deep Exemplar reference-guided video colorization.
+- ColorMNet single-reference and CMNET2 multi-reference video colorization.
+- Optional OpenAI Cloud per-frame colour enhancement with resumable caching.
 
 The repo stores orchestration code, GUI code, workflows, wrappers, docs, and small assets. Runtime media, model caches, ComfyUI installs, and generated outputs are ignored by Git.
 
@@ -246,13 +252,13 @@ ARP bundles the ComfyUI workflow JSONs it needs to queue jobs:
 - `workflows/outpaint_ltx/outpaint_LTX-IC.json` for LTX IC outpainting.
 - `workflows/qwen_image_edit/Image Edit (Qwen 2511).json` for Qwen Image Edit reference frames and outpaint guide frames.
 
-Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON files; ARP builds those ComfyUI API prompts directly from the selected source, manifest, and method. ComfyUI itself and model weights remain external dependencies. ARP bundles the required custom-node packages where their licenses allow redistribution; see `vendor/comfyui_custom_nodes/README.md`.
+Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON files; ARP builds those ComfyUI API prompts directly from the selected source, manifest, and method. CMNET2 runs directly through its bundled Python runtime rather than ComfyUI. ComfyUI itself and model weights remain external dependencies. ARP bundles the required custom-node packages and CMNET2 runtime source where their licenses allow redistribution; see `vendor/comfyui_custom_nodes/README.md` and `vendor/cmnet2/README.md`.
 
 ## Folder Layout
 
 ```text
 input/                                   Optional source clips
-intermediate/cleaned/                    Geometry-preserving Clean Up outputs
+intermediate/cleaned/                    Clean Up outputs at the selected Dearchive resolution
 intermediate/stabilized/                 Lossless, scene-aware stabilization outputs
 intermediate/outpaint_prepared/          Expanded/lifted clips prepared for LTX
 intermediate/outpainted/                 Widescreen/outpainted clips

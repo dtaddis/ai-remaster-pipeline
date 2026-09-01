@@ -1018,6 +1018,21 @@ function Download-HfFile {
     Write-Host "Downloaded: $Destination"
 }
 
+function Download-WebFile {
+    param(
+        [string]$Uri,
+        [string]$Destination
+    )
+    if (Test-Path -LiteralPath $Destination) {
+        Write-Host "Model already exists: $Destination"
+        return
+    }
+    Ensure-Directory (Split-Path -Parent $Destination)
+    Write-Host "Downloading: $Uri"
+    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing
+    Write-Host "Downloaded: $Destination"
+}
+
 function Resolve-ComfyModelDestination {
     param([string]$Destination)
     $resolver = Join-Path $Root 'scripts\model_paths.py'
@@ -1206,6 +1221,34 @@ Invoke-Step 'Install local FFmpeg tools' {
 }
 
 if ($DownloadModels -and -not $SkipModelDownloads) {
+    Invoke-Step 'Download CMNET2 multi-reference colourisation assets' {
+        $cmnet2 = Join-Path $Root 'vendor\cmnet2'
+        Download-WebFile `
+            'https://github.com/dan64/cmnet2/releases/download/v1.0.0/DINOv2FeatureV6_LocalAtten_s2_154000.pth' `
+            (Join-Path $cmnet2 'weights\DINOv2FeatureV6_LocalAtten_s2_154000.pth')
+        Download-WebFile `
+            'https://github.com/dan64/cmnet2/releases/download/v1.0.0/dinov2_vits14_pretrain.pth' `
+            (Join-Path $cmnet2 'models\checkpoints\dinov2_vits14_pretrain.pth')
+        Download-WebFile `
+            'https://github.com/dan64/cmnet2/releases/download/v1.0.0/resnet18-5c106cde.pth' `
+            (Join-Path $cmnet2 'models\checkpoints\resnet18-5c106cde.pth')
+        Download-WebFile `
+            'https://github.com/dan64/cmnet2/releases/download/v1.0.0/resnet50-19c8e357.pth' `
+            (Join-Path $cmnet2 'models\checkpoints\resnet50-19c8e357.pth')
+        $dinoDir = Join-Path $cmnet2 'models\facebookresearch_dinov2_main'
+        if (-not (Test-Path -LiteralPath (Join-Path $dinoDir 'hubconf.py'))) {
+            $dinoArchive = Join-Path $Root '.cache\downloads\facebookresearch_dinov2_main.zip'
+            Download-WebFile `
+                'https://github.com/dan64/cmnet2/releases/download/v1.0.0/facebookresearch_dinov2_main.zip' `
+                $dinoArchive
+            Ensure-Directory (Join-Path $cmnet2 'models')
+            Expand-Archive -LiteralPath $dinoArchive -DestinationPath (Join-Path $cmnet2 'models') -Force
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $dinoDir 'hubconf.py'))) {
+            throw "CMNET2 DINOv2 runtime was not extracted correctly: $dinoDir"
+        }
+    }
+
     Invoke-Step 'Download LTX 2.3 models, Clean Up LoRA, and outpainting LoRAs' {
         Download-HfFile 'QuantStack/LTX-2.3-GGUF' 'LTX-2.3-distilled/LTX-2.3-distilled-Q4_K_M.gguf' 'models\unet\LTX-2.3-distilled-Q4_K_M.gguf'
         Download-HfFile 'Lightricks/LTX-2.3-fp8' 'ltx-2.3-22b-dev-fp8.safetensors' 'models\checkpoints\ltx-2.3-22b-dev-fp8.safetensors'

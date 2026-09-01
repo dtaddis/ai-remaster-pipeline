@@ -4,13 +4,13 @@ import argparse
 import csv
 import hashlib
 import json
-import math
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import artifact_ids as aid
+import openai_generate_reference as openai_images
 from reference_sets import reference_items
 from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import (
@@ -68,7 +68,9 @@ def parse_time(text: str) -> float:
 
 
 def method_suffix(method: str) -> str:
-    return "colormnet" if method == "colormnet" else "deepexemplar"
+    if method in {"colormnet", "cmnet2", "openai"}:
+        return method
+    return "deepexemplar"
 
 
 def processing_dimensions(width: int, height: int, processing_height: str) -> tuple[int, int]:
@@ -175,57 +177,6 @@ def prepare_processing_reference(reference: Path, width: int, height: int) -> Pa
         return reference
 
 
-def prepare_reference_atlas(references: list[Path], width: int, height: int) -> Path:
-    """Pack multiple exemplars into one batch-safe ColorMNet texture."""
-    if not references:
-        raise RuntimeError("At least one reference image is required.")
-    if len(references) == 1:
-        return prepare_processing_reference(references[0], width, height)
-    try:
-        from PIL import Image, ImageOps
-    except ImportError as exc:
-        raise RuntimeError("Pillow is required to pack multiple ColorMNet references.") from exc
-
-    columns = max(1, int(math.ceil(math.sqrt(len(references)))))
-    rows = max(1, int(math.ceil(len(references) / columns)))
-    fingerprints = [file_fingerprint(reference) for reference in references]
-    digest = hashlib.sha256(json.dumps(fingerprints, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-    output = ROOT / ".cache" / "colorize_refs" / f"multi_reference_{digest}_{width}x{height}.png"
-    sig = {
-        "version": 1,
-        "tool": "colorize_video.py",
-        "kind": "multi-reference atlas",
-        "references": [
-            {"source": root_relative(reference), "fingerprint": fingerprint}
-            for reference, fingerprint in zip(references, fingerprints)
-        ],
-        "width": width,
-        "height": height,
-        "columns": columns,
-        "rows": rows,
-    }
-    if resumable_output(output, sig, width=width, height=height):
-        return output
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    resampling = getattr(Image, "Resampling", Image).LANCZOS
-    canvas = Image.new("RGB", (width, height), (128, 128, 128))
-    for index, reference in enumerate(references):
-        column, row = index % columns, index // columns
-        left, right = (column * width) // columns, ((column + 1) * width) // columns
-        top, bottom = (row * height) // rows, ((row + 1) * height) // rows
-        cell_width, cell_height = max(1, right - left), max(1, bottom - top)
-        with Image.open(reference) as image:
-            fitted = ImageOps.contain(image.convert("RGB"), (cell_width, cell_height), resampling)
-        x = left + (cell_width - fitted.width) // 2
-        y = top + (cell_height - fitted.height) // 2
-        canvas.paste(fitted, (x, y))
-    canvas.save(output, format="PNG")
-    write_signature(output, sig)
-    print(f"Packed {len(references)} ColorMNet references into one {columns}x{rows} texture: {output}", flush=True)
-    return output
-
-
 def copy_reference_to_comfy_input(reference: Path, comfy_dir: Path, width: int | None = None, height: int | None = None) -> str:
     if width and height:
         reference = prepare_processing_reference(reference, width, height)
@@ -305,13 +256,32 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
         "crf": args.crf,
         "processing_height": getattr(args, "processing_height", "source"),
     }
-    if args.method == "colormnet":
+    if args.method == "openai":
+        settings.update(
+            {
+                "openai_model": args.openai_model,
+                "openai_previous_frames": args.openai_previous_frames,
+                "openai_prompt": args.openai_prompt,
+                "openai_size": args.openai_size,
+                "openai_quality": args.openai_quality,
+            }
+        )
+    elif args.method == "colormnet":
         settings.update(
             {
                 "colormnet_memory_mode": args.colormnet_memory_mode,
                 "colormnet_feature_encoder": args.colormnet_feature_encoder,
                 "colormnet_text_guidance": args.colormnet_text_guidance,
                 "colormnet_text_guidance_weight": args.colormnet_text_guidance_weight,
+            }
+        )
+    elif args.method == "cmnet2":
+        settings.update(
+            {
+                "cmnet2_top_k": args.cmnet2_top_k,
+                "cmnet2_mem_every": args.cmnet2_mem_every,
+                "cmnet2_runtime": root_relative(resolve_path(args.cmnet2_dir)),
+                "cmnet2_model": root_relative(resolve_path(args.cmnet2_model)) if args.cmnet2_model else "auto",
             }
         )
     else:
@@ -327,14 +297,14 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
 
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 9,
+        "version": 11,
         "tool": "colorize_video.py",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
-        "grayscale_video_input": True,
+        "grayscale_video_input": args.method != "openai",
         "references": [reference_signature(row) for row in rows],
         "shot_inputs": [shot_input_signature(row) for row in rows],
         "settings": method_settings_signature(args),
@@ -411,7 +381,7 @@ def build_prompt(
         },
     }
     if len(ref_names) != 1:
-        raise RuntimeError("ColorMNet accepts one image batch item; pack multiple references into an atlas first.")
+        raise RuntimeError("ColorMNet and Deep Exemplar accept exactly one reference image per shot.")
     prompt["2"] = {"class_type": "LoadImage", "inputs": {"image": ref_names[0]}}
     prompt["3"] = colorization_node(args, width, height, ["2", 0])
     return prompt
@@ -470,7 +440,7 @@ def segment_signature(
     if isinstance(references, Path):
         references = [{"path": references, "selected_frame": optional_int(row.get("selected_frame"))}]
     return {
-        "version": 9,
+        "version": 10,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
         "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
@@ -724,13 +694,329 @@ def stitch_colorized(ffmpeg: str, chunks: list[Path], transitions: list[int], ou
     stitch(ffmpeg, group_outputs, output, fps)
 
 
+def prepare_openai_source_frames(
+    ffmpeg: str,
+    source: Path,
+    width: int,
+    height: int,
+    total_frames: int,
+) -> Path:
+    """Extract colour-preserving source frames for cloud image editing.
+
+    The directory is content-addressed, so it remains safe to reuse across interrupted jobs and
+    never shares frames with the compulsory grayscale inputs used by the local colourizers.
+    """
+    digest = file_fingerprint(source)["sha256"][:16]
+    frame_dir = ROOT / ".cache" / "openai_colorize" / f"{safe_stem(source.name)}_{digest}_{width}x{height}" / "source"
+    expected = [frame_dir / f"frame_{index:08d}.png" for index in range(total_frames)]
+    if expected and all(path.is_file() for path in expected):
+        print(f"Reuse {total_frames} colour source frames for OpenAI Cloud: {frame_dir}", flush=True)
+        return frame_dir
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    pattern = frame_dir / "frame_%08d.png"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"scale={width}:{height}:flags=lanczos,setsar=1",
+        "-an",
+        "-vsync",
+        "0",
+        "-start_number",
+        "0",
+        str(pattern),
+    ]
+    print(f"Extracting {total_frames} colour-preserving frames for OpenAI Cloud...", flush=True)
+    subprocess.run(cmd, check=True)
+    missing = [path for path in expected if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"FFmpeg extracted an incomplete frame sequence; first missing frame: {missing[0]}")
+    print(f"Extracted {total_frames} source frames: {frame_dir}", flush=True)
+    return frame_dir
+
+
+def openai_frame_prompt(previous_count: int, reference_count: int) -> tuple[str, str]:
+    parts = ["The first image is the current source frame and is the only image to edit."]
+    if previous_count:
+        if previous_count > 1:
+            parts.append(
+                f"Images 2-{previous_count + 1} are preceding generated frames in chronological order, oldest first; "
+                "use them only for temporal continuity of colours, texture, grain, lighting and identity."
+            )
+        else:
+            parts.append(
+                "Image 2 is the immediately preceding generated frame; use it only for temporal continuity "
+                "of colours, texture, grain, lighting and identity."
+            )
+    reference_start = previous_count + 2
+    reference_end = previous_count + reference_count + 1
+    if reference_count:
+        if reference_count > 1:
+            parts.append(
+                f"Images {reference_start}-{reference_end} are the approved colour references for this shot; "
+                "use all of them to infer stable object, clothing, skin, architecture and landscape colours throughout the pan."
+            )
+        else:
+            parts.append(
+                f"Image {reference_start} is the approved colour reference for this shot; use it to infer "
+                "stable object, clothing, skin, architecture and landscape colours throughout the pan."
+            )
+    parts.append(
+        "Never copy composition, people, poses or geometry from a preceding frame or reference into the current frame."
+    )
+    instructions = " ".join(parts)
+    return "", instructions
+
+
+def openai_frame_signature(
+    args: argparse.Namespace,
+    source_frame: Path,
+    previous_frames: list[Path],
+    references: list[Path],
+    shot_index: int,
+    frame_index: int,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "tool": "colorize_video.py",
+        "kind": "OpenAI Cloud colourized frame",
+        "frame": frame_index,
+        "shot": shot_index,
+        "source": file_fingerprint(source_frame),
+        "previous_generated_frames": [file_fingerprint(path) for path in previous_frames],
+        "references": [
+            {"path": root_relative(path), "fingerprint": file_fingerprint(path)} for path in references
+        ],
+        "model": args.openai_model,
+        "prompt": args.openai_prompt,
+        "size": args.openai_size,
+        "quality": args.openai_quality,
+    }
+
+
+def assemble_openai_frames(ffmpeg: str, frame_dir: Path, output: Path, fps: float, total_frames: int, crf: int) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-framerate",
+        f"{fps:.12g}",
+        "-start_number",
+        "0",
+        "-i",
+        str(frame_dir / "frame_%08d.png"),
+        "-frames:v",
+        str(total_frames),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        str(partial),
+    ]
+    print("Assembling OpenAI Cloud frames into the colorized video...", flush=True)
+    subprocess.run(cmd, check=True)
+    replace_with_retry(partial, output)
+
+
+def run_openai_colorization(
+    args: argparse.Namespace,
+    manifest: Path,
+    source_video: Path,
+    rows: list[dict[str, str]],
+    output: Path,
+    output_sig: dict[str, Any],
+    ffmpeg: str,
+    width: int,
+    height: int,
+    fps: float,
+    total_frames: int,
+) -> int:
+    token = str(args.api_key or "").strip()
+    if not token:
+        raise RuntimeError("Missing OpenAI API key. Add it in ARP Settings before running OpenAI Cloud colorization.")
+    previous_limit = max(0, min(12, int(args.openai_previous_frames)))
+    plan, _transitions = shot_plan(rows, total_frames, fps)
+    source_dir = prepare_openai_source_frames(ffmpeg, source_video, width, height, total_frames)
+    # Keep the cache location stable when a project save rewrites identical files with new mtimes.
+    # Per-frame signatures below still invalidate precisely when source, prompt, model, history or
+    # reference content changes.
+    cache_identity = {
+        "source_sha256": output_sig["source_fingerprint"]["sha256"],
+        "manifest": root_relative(manifest),
+        "width": width,
+        "height": height,
+        "model": args.openai_model,
+    }
+    digest = hashlib.sha256(json.dumps(cache_identity, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    generated_dir = ROOT / ".cache" / "openai_colorize" / f"{safe_stem(source_video.name)}_{digest}_{width}x{height}" / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    row_references_cache = [[item["path"] for item in row_references(row)] for row in rows]
+    print(
+        f"OpenAI Cloud colorization: {total_frames} frames, model {args.openai_model}, "
+        f"up to {previous_limit} preceding frame(s), all shot references.",
+        flush=True,
+    )
+    print("Each completed frame is cached; this job can be stopped and resumed.", flush=True)
+    history: list[Path] = []
+    active_shot = -1
+    reused = 0
+    for frame_index in range(total_frames):
+        shot_index = next(
+            (index for index, item in enumerate(plan) if item["base_start"] <= frame_index < item["base_end"]),
+            len(rows) - 1,
+        )
+        if shot_index != active_shot:
+            history = []
+            active_shot = shot_index
+        previous = history[-previous_limit:] if previous_limit else []
+        references = row_references_cache[shot_index]
+        source_frame = source_dir / f"frame_{frame_index:08d}.png"
+        generated = generated_dir / f"frame_{frame_index:08d}.png"
+        frame_sig = openai_frame_signature(args, source_frame, previous, references, shot_index, frame_index)
+        if not args.force and resumable_output(generated, frame_sig, width=width, height=height):
+            reused += 1
+        else:
+            role_prompt, reference_instructions = openai_frame_prompt(len(previous), len(references))
+            child = argparse.Namespace(
+                source_image=source_frame,
+                output=generated,
+                api_key=token,
+                model=args.openai_model,
+                prompt=args.openai_prompt,
+                prompt_suffix="",
+                add_prompt=role_prompt,
+                reference_instructions=reference_instructions,
+                size=args.openai_size,
+                quality=args.openai_quality,
+                timeout=args.openai_timeout,
+                max_retries=args.openai_max_retries,
+                force=True,
+                no_normalize_to_source_size=False,
+                dry_run=False,
+                quiet=True,
+            )
+            # Input order is significant and is described explicitly in the prompt.
+            openai_images.generate(child, [*previous, *references])
+            write_signature(generated, frame_sig)
+        history.append(generated)
+        print(
+            f"OpenAI Cloud frame {frame_index + 1}/{total_frames}; "
+            f"shot {shot_index + 1}/{len(rows)}; cached {reused}",
+            flush=True,
+        )
+    assemble_openai_frames(ffmpeg, generated_dir, output, fps, total_frames, args.crf)
+    write_signature(output, output_sig)
+    print(f"Wrote OpenAI Cloud colorized video: {output}", flush=True)
+    return 0
+
+
+def run_cmnet2_colorization(
+    args: argparse.Namespace,
+    source_video: Path,
+    rows: list[dict[str, str]],
+    output: Path,
+    output_sig: dict[str, Any],
+    ffmpeg: str,
+    width: int,
+    height: int,
+    fps: float,
+    total_frames: int,
+) -> int:
+    """Colorize each true shot with every one of its timed CMNET2 reference anchors."""
+    from cmnet2_runtime import CMNet2Session, resolve_model
+
+    runtime_dir = resolve_path(args.cmnet2_dir)
+    model_path = resolve_model(runtime_dir, args.cmnet2_model, args.comfy_dir)
+    plan, transitions = shot_plan(rows, total_frames, fps)
+    cache_dir = ROOT / ".cache" / "colorized_chunks" / "cmnet2" / safe_stem(source_video.name)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    session: CMNet2Session | None = None
+    chunks: list[Path] = []
+
+    for index, row in enumerate(rows):
+        item = plan[index]
+        start_frame, end_frame = item["start"], item["end"]
+        frame_count = max(1, end_frame - start_frame)
+        references = row_references(row)
+        prepared_references = [
+            {
+                **reference,
+                "path": prepare_processing_reference(reference["path"], width, height),
+            }
+            for reference in references
+        ]
+        chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_sig = segment_signature(
+            args,
+            source_video,
+            row,
+            references,
+            start_frame,
+            end_frame,
+            item["base_start"],
+            item["base_end"],
+            width,
+            height,
+            fps,
+        )
+        if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
+            print(f"Reuse CMNET2 segment {index + 1}/{len(rows)}: {chunk}", flush=True)
+            chunks.append(chunk)
+            continue
+        if session is None:
+            session = CMNet2Session(
+                runtime_dir,
+                model_path,
+                top_k=args.cmnet2_top_k,
+                mem_every=args.cmnet2_mem_every,
+                max_frames=total_frames,
+            )
+        frame_labels = ", ".join(
+            str(reference["selected_frame"]) if reference["selected_frame"] is not None else "unspecified"
+            for reference in references
+        )
+        print(
+            f"Colorize segment {index + 1}/{len(rows)} with CMNET2: frames {start_frame}-{end_frame}; "
+            f"{len(references)} permanent reference(s) at source frames {frame_labels}",
+            flush=True,
+        )
+        session.colorize_segment(
+            source_video,
+            chunk,
+            prepared_references,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            width=width,
+            height=height,
+            fps=fps,
+            ffmpeg=ffmpeg,
+            crf=args.crf,
+        )
+        write_signature(chunk, chunk_sig)
+        chunks.append(chunk)
+
+    stitch_colorized(ffmpeg, chunks, transitions, output, fps, safe_stem(source_video.name))
+    write_signature(output, output_sig)
+    print(f"Wrote CMNET2 colorized video: {output}", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
     parser = argparse.ArgumentParser(description="Colorize outpainted video shots with reference-guided ComfyUI colorization.")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--source-video", help="Override the # source_video from the manifest.")
     parser.add_argument("--output")
-    parser.add_argument("--method", choices=["deepexemplar", "colormnet", "both"], default="deepexemplar")
+    parser.add_argument("--method", choices=["deepexemplar", "colormnet", "cmnet2", "openai", "both"], default="deepexemplar")
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     parser.add_argument("--comfy-output-root", default="")
@@ -743,6 +1029,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--colormnet-feature-encoder", choices=["resnet50", "vgg19", "dinov2_vits", "dinov2_vitb", "dinov2_vitl", "clip_vitb"], default="resnet50")
     parser.add_argument("--colormnet-text-guidance", default="")
     parser.add_argument("--colormnet-text-guidance-weight", type=float, default=0.3)
+    parser.add_argument("--cmnet2-dir", default=str(ROOT / "vendor" / "cmnet2"))
+    parser.add_argument("--cmnet2-model", default="")
+    parser.add_argument("--cmnet2-top-k", type=int, default=30)
+    parser.add_argument("--cmnet2-mem-every", type=int, default=5)
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--openai-model", default=openai_images.DEFAULT_MODEL)
+    parser.add_argument("--openai-previous-frames", type=int, default=3)
+    parser.add_argument(
+        "--openai-prompt",
+        default=(
+            "Enhance and colourise the first image while preserving its exact composition, camera framing, "
+            "geometry, identities, faces, hands, poses, objects, fine texture, film grain and luminance. "
+            "Use its existing colour as evidence rather than removing it. Make the colour vivid, natural, "
+            "period-appropriate and consistent with the supplied shot references. Do not add, remove, move, "
+            "redesign or sharpen objects. Output one edited version of the first image only."
+        ),
+    )
+    parser.add_argument("--openai-size", default="auto")
+    parser.add_argument("--openai-quality", default="auto")
+    parser.add_argument("--openai-timeout", type=float, default=900.0)
+    parser.add_argument("--openai-max-retries", type=int, default=5)
     parser.add_argument("--video-format", default="video/h264-mp4")
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
@@ -784,15 +1091,60 @@ def run(args: argparse.Namespace) -> int:
         print(f"Reuse colorized video: {output}", flush=True)
         return 0
     if args.dry_run:
-        print(f"Would colorize {len(rows)} shot segment(s): {source_video} -> {output}", flush=True)
+        if args.method == "openai":
+            counts = [len(row_references(row)) for row in rows]
+            print(
+                f"Would send {int(source_info['frames'])} frame edit request(s) to {args.openai_model}: "
+                f"{source_video} -> {output}; references per shot: {counts}; "
+                f"up to {max(0, int(args.openai_previous_frames))} preceding frame(s).",
+                flush=True,
+            )
+        elif args.method == "cmnet2":
+            counts = [len(row_references(row)) for row in rows]
+            print(
+                f"Would colorize {len(rows)} shot segment(s) with CMNET2: {source_video} -> {output}; "
+                f"permanent references per shot: {counts}.",
+                flush=True,
+            )
+        else:
+            print(f"Would colorize {len(rows)} shot segment(s): {source_video} -> {output}", flush=True)
         return 0
 
-    comfy_dir = resolve_path(args.comfy_dir)
-    comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
     ffmpeg = find_ffmpeg(args.ffmpeg)
+    if args.method == "openai":
+        return run_openai_colorization(
+            args,
+            manifest,
+            source_video,
+            rows,
+            output,
+            sig,
+            ffmpeg,
+            target_width,
+            target_height,
+            float(source_info["fps"]),
+            int(source_info["frames"]),
+        )
+
     processing_video = prepare_processing_video(ffmpeg, source_video, target_width, target_height, source_width, source_height)
     info = video_info(processing_video)
     width, height, fps, total_frames = int(info["width"]), int(info["height"]), float(info["fps"]), int(info["frames"])
+    if args.method == "cmnet2":
+        return run_cmnet2_colorization(
+            args,
+            processing_video,
+            rows,
+            output,
+            sig,
+            ffmpeg,
+            width,
+            height,
+            fps,
+            total_frames,
+        )
+
+    comfy_dir = resolve_path(args.comfy_dir)
+    comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
     video_name = copy_to_comfy_input(processing_video, comfy_dir, "arp_colorize")
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
     required_nodes = {
@@ -815,18 +1167,19 @@ def run(args: argparse.Namespace) -> int:
         end_frame = item["end"]
         frame_count = max(1, end_frame - start_frame)
         references = row_references(row)
-        active_references = references if args.method == "colormnet" else references[:1]
-        if args.method != "colormnet" and len(references) > 1:
-            print(f"Deep Exemplar supports one reference; using reference 1 of {len(references)} for shot {index + 1}.", flush=True)
+        active_references = references[:1]
+        if len(references) > 1:
+            display_method = "ColorMNet" if args.method == "colormnet" else "Deep Exemplar"
+            print(
+                f"{display_method} supports one reference per shot; using reference 1 of {len(references)} "
+                f"for shot {index + 1}. Choose CMNET2 or OpenAI Cloud to use every reference.",
+                flush=True,
+            )
         source_reference_indices = [
-            0 if ref_index == 0 else max(1, min(frame_count - 1, int(item["selected_frame"] or start_frame) - start_frame))
-            for ref_index, item in enumerate(active_references)
+            max(start_frame, min(end_frame - 1, int(reference["selected_frame"] or start_frame)))
+            for reference in active_references
         ]
-        if args.method == "colormnet" and len(active_references) > 1:
-            atlas = prepare_reference_atlas([item["path"] for item in active_references], width, height)
-            ref_names = [copy_reference_to_comfy_input(atlas, comfy_dir)]
-        else:
-            ref_names = [copy_reference_to_comfy_input(item["path"], comfy_dir, width, height) for item in active_references]
+        ref_names = [copy_reference_to_comfy_input(item["path"], comfy_dir, width, height) for item in active_references]
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_sig = segment_signature(args, source_video, row, active_references, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
@@ -834,7 +1187,7 @@ def run(args: argparse.Namespace) -> int:
             chunks.append(chunk)
             continue
         prefix = f"arp_colorize/{method_suffix(args.method)}_{safe_stem(source_video.name)}_segment_{index:04d}_{start_frame:06d}_{end_frame:06d}"
-        keyframe_note = ", ".join(str(value + start_frame) for value in source_reference_indices)
+        keyframe_note = ", ".join(str(value) for value in source_reference_indices)
         print(f"Colorize segment {index + 1}/{len(rows)} with {args.method}: frames {start_frame}-{end_frame} using {len(active_references)} reference(s) at source frames {keyframe_note}", flush=True)
         prompt = build_prompt(video_name, ref_names, start_frame, frame_count, width, height, fps, args, prefix)
         prompt_id = queue_prompt(args.comfy_url, prompt)

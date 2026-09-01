@@ -45,7 +45,7 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   const s = settings(key);
   const expected = (state.expected_outputs && state.expected_outputs[key]) || [];
   const sp = stageProgress(key);
-  const visibleFields = shotStageVisibleFields(st);
+  const visibleFields = shotStageVisibleFields(st, s);
 
   document.getElementById('app').innerHTML = `
     <div class="shot-page">
@@ -77,9 +77,21 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   showCommand(key);
 }
 
-function shotStageVisibleFields(st) {
+function shotStageVisibleFields(st, s = {}) {
   if (st.key === 'shots') return st.fields.filter(field => field[0] !== 'outpainted_video');
   if (st.key === 'references') return st.fields.filter(field => field[0] !== 'manifest');
+  if (st.key === 'colour') {
+    const common = new Set(['manifest', 'method', 'processing_height', 'crf']);
+    const cloud = new Set(['openai_image_model', 'openai_previous_frames', 'openai_image_size', 'openai_image_quality', 'openai_prompt']);
+    const deep = new Set(['frame_propagate', 'use_half_resolution', 'use_torch_compile', 'use_sage_attention']);
+    const legacyColorMNet = new Set(['use_torch_compile', 'colormnet_memory_mode', 'colormnet_feature_encoder', 'colormnet_text_guidance', 'colormnet_text_guidance_weight']);
+    const method = s.method || 'deepexemplar';
+    if (method === 'openai') return st.fields.filter(field => common.has(field[0]) || cloud.has(field[0]));
+    if (method === 'cmnet2') return st.fields.filter(field => common.has(field[0]));
+    if (method === 'colormnet') return st.fields.filter(field => common.has(field[0]) || legacyColorMNet.has(field[0]));
+    if (method === 'deepexemplar') return st.fields.filter(field => common.has(field[0]) || deep.has(field[0]));
+    return st.fields.filter(field => !cloud.has(field[0]));
+  }
   return st.fields;
 }
 
@@ -111,8 +123,14 @@ function shotDetectionInputStatus(s) {
 }
 
 function colorizationMethodWarning(s) {
+  if (s.method === 'openai') {
+    return '<div class="inline-warning">OpenAI Cloud makes one paid image-edit request per video frame. Completed frames are cached for safe resume. The existing colour is retained as evidence, unlike the compulsory grayscale input used by Deep Exemplar and ColorMNet.</div>';
+  }
+  if (s.method === 'cmnet2') {
+    return '<div class="inline-warning">CMNET2 preloads every approved reference frame for each shot into permanent memory. It inherits ColorMNet\'s non-commercial CC BY-NC-SA 4.0 terms.</div>';
+  }
   if (!['colormnet', 'both'].includes(s.method)) return '';
-  return '<div class="inline-warning">ColorMNet is available for comparison, but its custom node reports a CC BY-NC-SA 4.0 license. Use it only for non-commercial work unless you have separate rights.</div>';
+  return '<div class="inline-warning">ColorMNet uses Reference 1 only. Its custom node reports a CC BY-NC-SA 4.0 license; use it only for non-commercial work unless you have separate rights.</div>';
 }
 
 function shotCards(mode) {
@@ -299,68 +317,92 @@ function colourSegmentCard(context) {
 }
 
 function colorizationLabel(method) {
+  if (method === 'openai') return 'OpenAI Cloud';
+  if (method === 'cmnet2') return 'CMNET2';
   if (method === 'colormnet') return 'ColorMNet';
   if (method === 'both') return 'Deep Exemplar and ColorMNet';
   return 'Deep Exemplar';
 }
 
 function referenceCard(context) {
-  const { manifest, row, idx, sourceReady, sourceUrl, colorReady, colorUrl } = context;
-  const slider = `shotSlider_references_${idx}`;
-  const label = `shotLabel_references_${idx}`;
-  const img = `shotImg_references_${idx}`;
-
+  const { manifest, row, idx } = context;
+  const items = row.reference_items || [];
+  const primaryTime = Number(row.selected_time || row.start || 0);
+  const primaryFrame = Number(row.selected_frame || row.start_frame || 0);
   return `
-    <article class="shot-card" data-shot-card-mode="references" data-shot-card-index="${idx}">
-      ${shotSummary(context, referenceTimeControl(manifest, row, idx, slider, label, img))}
-      <div>
-        <label>B&W screenshot</label>
-        ${sourceReady ? `<div class="thumb-wrap"><img id="${img}" src="${sourceUrl}" alt="" onclick="openImageModal(this.src,${jsArg('B&W screenshot')})"><button class="icon-button" type="button" title="Save B&W screenshot" onclick="exportMedia('${esc(row.source_reference)}')">&#128190;</button></div>` : missingImage('Image not present')}
+    <article class="shot-card reference-shot-card" data-shot-card-mode="references" data-shot-card-index="${idx}">
+      ${shotSummary(context, `<p class="shot-empty">${items.length} reference frame${items.length === 1 ? '' : 's'}</p>`)}
+      <div class="reference-shot-workspace">
+        <div class="reference-use-note">
+          <strong>Reference frames</strong>
+          <span>CMNET2 and OpenAI Cloud use every reference frame. ColorMNet and Deep Exemplar use Reference 1 only.</span>
+        </div>
+        <div class="reference-anchor-grid">
+          ${items.map(item => referenceAnchorCard(manifest, row, idx, item)).join('')}
+        </div>
+        <div class="shot-tools reference-add-row">
+          <button type="button" onclick="addReferenceAtCurrentFrame('${esc(manifest)}',${idx},${primaryTime},${primaryFrame})">+ Add Reference</button>
+          <span class="shot-time">Add a reference, then scrub its frame slider and press Use Frame.</span>
+        </div>
+        <div class="reference-shot-prompt">${referencePromptTools(context)}</div>
       </div>
-      <div>
-        <label>Color reference</label>
-        ${colorReady ? colorReferenceThumb(manifest, idx, colorUrl, row, 0) : missingImage('Image not present')}
-      </div>
-      <div>${referencePromptTools(context)}</div>
-      ${additionalReferenceList(manifest, row, idx)}
     </article>
   `;
 }
 
-function additionalReferenceList(manifest, row, idx) {
-  const items = (row.reference_items || []).slice(1);
-  if (!items.length) return '';
-  return `
-    <div class="additional-reference-list">
-      <label>Additional ColorMNet keyframes</label>
-      <div class="additional-reference-grid">
-        ${items.map(item => additionalReferenceCard(manifest, row, idx, item)).join('')}
-      </div>
-    </div>
-  `;
-}
-
-function additionalReferenceCard(manifest, row, idx, item) {
+function referenceAnchorCard(manifest, row, idx, item) {
   const referenceIndex = Number(item.reference_index || 0);
   const sourceReady = item.source_reference && item.source_reference_mtime;
   const colorReady = item.color_reference && item.color_reference_mtime;
   const sourceUrl = sourceReady ? media(item.source_reference) + '&t=' + item.source_reference_mtime : '';
   const colorUrl = colorReady ? media(item.color_reference) + '&t=' + item.color_reference_mtime : '';
+  const fps = Math.max(1, Number(row.fps || 24));
+  const frame = Math.max(Number(row.start_frame || 0), Math.min(Number(row.end_frame || 0), Number(item.selected_frame || row.start_frame || 0)));
+  const slider = `referenceSlider_${idx}_${referenceIndex}`;
+  const label = `referenceLabel_${idx}_${referenceIndex}`;
+  const image = `referenceImage_${idx}_${referenceIndex}`;
   const regenerating = state.running_reference
     && state.running_reference.index === idx
     && state.running_reference.manifest === manifest;
   return `
-    <section class="additional-reference-card">
-      <div class="shot-time">Reference ${referenceIndex + 1} · ${esc(item.selected_label || '')}</div>
-      <div class="additional-reference-images">
-        <div>${sourceReady ? `<img src="${sourceUrl}" alt="B&W keyframe" onclick="openImageModal(this.src,${jsArg('B&W keyframe')})">` : missingImage('B&W frame missing')}</div>
-        <div>${colorReady ? `<img src="${colorUrl}" alt="Colour keyframe" onclick="openImageModal(this.src,${jsArg('Colour keyframe')})">` : missingImage('Colour reference missing')}</div>
+    <section class="reference-anchor-card">
+      <div class="reference-anchor-heading">
+        <strong>Reference ${referenceIndex + 1}</strong>
+        <span class="shot-time" id="${label}">Frame ${frame} · ${esc(item.selected_label || '')}</span>
       </div>
+      <div class="reference-anchor-images">
+        <div>
+          <label>Source frame</label>
+          ${sourceReady ? `<div class="thumb-wrap"><img id="${image}" src="${sourceUrl}" alt="B&W keyframe" onclick="openImageModal(this.src,${jsArg('B&W keyframe')})"><button class="icon-button" type="button" title="Save source frame" onclick="exportMedia('${esc(item.source_reference)}')">&#128190;</button></div>` : `<img id="${image}" alt="Scrub to preview this source frame">`}
+        </div>
+        <div>
+          <label>Colour reference</label>
+          ${colorReady ? (referenceIndex === 0
+            ? colorReferenceThumb(manifest, idx, colorUrl, row, 0)
+            : `<div class="thumb-wrap"><img src="${colorUrl}" alt="Colour keyframe" onclick="openImageModal(this.src,${jsArg('Colour keyframe')})"><button class="icon-button" type="button" title="Delete colour reference" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">&#128465;</button></div>`)
+            : missingImage('Colour reference missing')}
+        </div>
+      </div>
+      <label>Reference frame</label>
+      <input
+        id="${slider}"
+        type="range"
+        min="${Number(row.start_frame || 0)}"
+        max="${Number(row.end_frame || 0)}"
+        step="1"
+        value="${frame}"
+        data-reference-anchor-slider="true"
+        data-shot-index="${idx}"
+        data-reference-index="${referenceIndex}"
+        data-fps="${fps}"
+        oninput="this.dataset.referenceTimeDirty='true';updateReferenceAnchorPreview('${esc(manifest)}',${idx},${referenceIndex},this.value,'${image}','${label}',${fps})"
+      >
       <div class="shot-tools">
+        <button type="button" onclick="useReferenceAnchorFrame('${esc(manifest)}',${idx},${referenceIndex},document.getElementById('${slider}').value,${fps})">Use Frame</button>
         <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx},${referenceIndex})">Use Custom Image</button>
         <button type="button" onclick="regenerateReference('${esc(manifest)}',${idx},${referenceIndex})" ${state.running ? 'disabled' : ''}>${regenerating ? 'Generating...' : 'Generate Reference'}</button>
         ${colorReady ? `<button type="button" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">Delete Colour</button>` : ''}
-        <button type="button" class="danger" onclick="removeAdditionalReference('${esc(manifest)}',${idx},${referenceIndex})">Remove Keyframe</button>
+        ${referenceIndex > 0 ? `<button type="button" class="danger" onclick="removeAdditionalReference('${esc(manifest)}',${idx},${referenceIndex})">Remove Reference</button>` : ''}
       </div>
     </section>
   `;
@@ -402,7 +444,7 @@ function updateReferencesDynamicStatus() {
   if (progressEl) progressEl.outerHTML = progressHtml(sp.percent, sp.label);
 
   const dirtyRows = new Set(
-    [...document.querySelectorAll('[data-reference-time-slider][data-reference-time-dirty="true"]')]
+    [...document.querySelectorAll('[data-reference-anchor-slider][data-reference-time-dirty="true"]')]
       .map(el => Number(el.dataset.shotIndex))
       .filter(Number.isInteger)
   );
@@ -410,27 +452,6 @@ function updateReferencesDynamicStatus() {
     .map(row => row.index)
     .filter(index => !dirtyRows.has(index));
   refreshShotRows('references', rows);
-}
-
-function referenceTimeControl(manifest, row, idx, slider, label, img) {
-  const fps = Math.max(1, Number(row.fps || 24));
-  return `
-    <label>Reference time</label>
-    <input
-      id="${slider}"
-      type="range"
-      min="${row.start}"
-      max="${row.end}"
-      step="0.041"
-      value="${row.selected_time}"
-      disabled
-      data-reference-time-slider="true"
-      data-shot-index="${idx}"
-      data-fps="${fps}"
-      oninput="this.dataset.referenceTimeDirty='true';updateShotPreview('${esc(manifest)}',${idx},this.value,'${img}','${label}',Math.round(Number(this.value) * Number(this.dataset.fps || 24)))"
-    >
-    <div class="shot-time" id="${label}">${esc(row.selected_label)}</div>
-  `;
 }
 
 function colorReferenceThumb(manifest, idx, colorUrl, row, referenceIndex = 0) {
@@ -485,33 +506,7 @@ function missingImage(text) {
 }
 
 function wireReferenceTimeControls() {
-  const manifest = (state.shot_views && state.shot_views.references_manifest) || '';
-  const rows = (state.shot_views && state.shot_views.references) || [];
-
-  for (const row of rows) {
-    const slider = document.getElementById(`shotSlider_references_${row.index}`);
-    if (!slider) continue;
-
-    slider.disabled = false;
-    slider.min = row.start;
-    slider.max = row.end;
-
-    let tools = slider.parentElement.querySelector('.reference-time-tools');
-    if (!tools) {
-      tools = document.createElement('div');
-      tools.className = 'shot-tools reference-time-tools';
-      slider.parentElement.appendChild(tools);
-    }
-
-    tools.innerHTML = `
-      <button type="button" onclick="scrubShot('${esc(manifest)}',${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
-        Use Frame
-      </button>
-      <button type="button" onclick="addReferenceAtCurrentFrame('${esc(manifest)}',${row.index},document.getElementById('shotSlider_references_${row.index}').value,Math.round(Number(document.getElementById('shotSlider_references_${row.index}').value) * ${Math.max(1, Number(row.fps || 24))}))">
-        Add Reference
-      </button>
-    `;
-  }
+  document.querySelectorAll('[data-reference-anchor-slider]').forEach(slider => { slider.disabled = false; });
 }
 
 function wireColourShotVideos() {

@@ -130,6 +130,49 @@ def encoder_args(encoder: str, pix_fmt: str) -> list[str]:
     return args
 
 
+def unreliable_motion_report(path: Path, frame_count: int) -> str:
+    """Describe an unusable libvidstab global-motion fit, or return an empty string.
+
+    With ``debug=1``, vidstabtransform writes one global transform per frame.  The final field
+    marks fits for which the robust estimator had to fall back.  A fallback by itself is harmless
+    (the first frame always has one), but a large fallback transform is not: smoothing spreads the
+    bad estimate into neighbouring frames and makes an otherwise steady shot lurch.
+    """
+    if not path.is_file():
+        return ""
+    motions: list[tuple[float, float, float, bool]] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 6:
+                continue
+            motions.append((float(fields[1]), float(fields[2]), float(fields[3]), bool(int(float(fields[5])))))
+    except (OSError, ValueError):
+        return ""
+    # The no-fields transform for frame zero is intentionally marked as a fallback.
+    suspicious = [
+        (x, y, angle)
+        for x, y, angle, fallback in motions[1:]
+        if fallback and (math.hypot(x, y) > 12.0 or abs(angle) > math.radians(0.75))
+    ]
+    extreme = [
+        (x, y, angle)
+        for x, y, angle in suspicious
+        if math.hypot(x, y) > 32.0 or abs(angle) > math.radians(1.5)
+    ]
+    allowance = max(2, math.ceil(max(1, frame_count - 1) * 0.03))
+    if not extreme and len(suspicious) < allowance:
+        return ""
+    worst_shift = max((math.hypot(x, y) for x, y, _angle in suspicious), default=0.0)
+    worst_angle = max((math.degrees(abs(angle)) for _x, _y, angle in suspicious), default=0.0)
+    return (
+        f"{len(suspicious)} unreliable frame fit(s), worst translation {worst_shift:.1f}px, "
+        f"worst rotation {worst_angle:.2f} degrees"
+    )
+
+
 def probe_streams(ffmpeg: str, source: Path) -> dict[str, Any]:
     ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
     result = subprocess.run(
@@ -191,14 +234,33 @@ def stabilize_shot(
     transform = (
         f"{trim},vidstabtransform=input='{filter_path(transform_name)}':smoothing={smoothing}:"
         f"maxshift={max_shift}:maxangle={max_angle:.8f}:crop=black:relative=1:"
-        f"optzoom=0:zoom={float(args.zoom):.4f}:interpol=bicubic,"
+        f"optzoom=0:zoom={float(args.zoom):.4f}:interpol=bicubic:debug=1,"
         f"fps={fps:.10f},setsar=1"
     )
+    motion_report = work_dir / "global_motions.trf"
+    motion_report.unlink(missing_ok=True)
     command = [
-        ffmpeg, "-hide_banner", "-y", "-i", str(source), "-map", "0:v:0", "-vf", transform,
+        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(source), "-map", "0:v:0", "-vf", transform,
         "-an", "-fps_mode", "cfr", "-r", f"{fps:.10f}", *encoder_args(args.encoder, pix_fmt), str(chunk),
     ]
     run(command, cwd=work_dir, label=f"Shot {index + 1}: stabilizing {frames} frames")
+    unreliable = unreliable_motion_report(motion_report, frames)
+    if unreliable:
+        print(
+            f"Shot {index + 1}: motion tracking is unreliable ({unreliable}); "
+            "preserving the original shot instead of applying false camera movement.",
+            flush=True,
+        )
+        passthrough = f"{trim},fps={fps:.10f},setsar=1"
+        run(
+            [
+                ffmpeg, "-hide_banner", "-y", "-i", str(source), "-map", "0:v:0", "-vf", passthrough,
+                "-an", "-fps_mode", "cfr", "-r", f"{fps:.10f}",
+                *encoder_args(args.encoder, pix_fmt), str(chunk),
+            ],
+            cwd=work_dir,
+            label=f"Shot {index + 1}: writing safe unstabilized fallback",
+        )
     return chunk
 
 
@@ -221,7 +283,9 @@ def concat_chunks(ffmpeg: str, source: Path, chunks: list[Path], output: Path, w
         run(
             [
                 ffmpeg, "-hide_banner", "-y", "-i", str(video_only), "-i", str(source),
-                "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-shortest", str(partial),
+                # The stabilized stream is authoritative. ``-shortest`` can discard its final
+                # frame when the source audio and the per-shot MKV time bases round differently.
+                "-map", "0:v:0", "-map", "1:a?", "-c", "copy", str(partial),
             ],
             cwd=work_dir,
             label="Restoring source audio",
