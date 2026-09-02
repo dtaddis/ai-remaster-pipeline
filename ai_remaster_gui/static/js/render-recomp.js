@@ -190,7 +190,7 @@ function upscaleMainFields(st) {
   const fieldKeys = ['method'];
   if (method === 'ltx25') {
     fieldKeys.push(
-      'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_seed',
+      'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_guidance_scale', 'ltx25_seed',
       'ltx25_prompt', 'ltx25_negative_prompt',
     );
   } else {

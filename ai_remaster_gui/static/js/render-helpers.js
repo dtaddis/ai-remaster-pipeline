@@ -161,13 +161,15 @@ const FIELD_DESCRIPTIONS = {
   'upscale.flashvsr_seed':
     'Changes the detail the model invents. If a face renders wrong, re-rolling the seed (with Regenerate) often fixes it.',
   'upscale.ltx25_source_fidelity':
-    'How strongly the low-resolution reference controls the LTX 2.5 result. 100 is the safest archival default. Lower values let the model invent more detail but can change identities, props, text, or motion.',
+    'How strongly the low-resolution reference controls the LTX 2.5 result. 85 is the modern reconstruction default: enough freedom to replace softness while retaining the scene. Raise toward 100 for literal archival fidelity.',
   'upscale.ltx25_lora_strength':
     'Strength of the official LTX 2.5 Pixel Spatial Upscaler IC-LoRA. Lightricks recommends 1.0.',
+  'upscale.ltx25_guidance_scale':
+    'How strongly the text prompt steers the reconstruction. Keep 1 for the fast distilled path. Values above 1 run both positive and negative passes, are much slower on a 24 GB GPU, and may invent detail.',
   'upscale.ltx25_seed':
     'Controls the detail synthesized by LTX 2.5. Keep it fixed for reproducible output; change it to try another reconstruction.',
   'upscale.ltx25_prompt':
-    'Describes the intended high-resolution reconstruction. The reference video controls layout and motion; use the prompt to stress fidelity and the kinds of fine detail to restore.',
+    'Describes the intended high-resolution reconstruction. The default deliberately asks LTX to re-photograph the scene with modern optical clarity while the reference video anchors layout and motion.',
   'upscale.ltx25_negative_prompt':
     'Identity, geometry, temporal, and sharpening failures that the LTX 2.5 reconstruction should avoid.',
   'upscale.blend_strength':

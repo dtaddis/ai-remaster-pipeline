@@ -16,7 +16,13 @@ from .config import (
     comfy_output_root_for,
     current_config,
 )
-from .models import CLEANUP_NEGATIVE_PROMPT, CLEANUP_PROMPT, STAGES
+from .models import (
+    CLEANUP_NEGATIVE_PROMPT,
+    CLEANUP_PROMPT,
+    LTX25_UPSCALE_NEGATIVE_PROMPT,
+    LTX25_UPSCALE_PROMPT,
+    STAGES,
+)
 from .paths import newest, rel, resolve
 
 
@@ -176,6 +182,29 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["cleanup"]["prompt"] = CLEANUP_PROMPT
     if defaults["cleanup"].get("negative_prompt", "").strip() in old_cleanup_negative_prompts:
         defaults["cleanup"]["negative_prompt"] = CLEANUP_NEGATIVE_PROMPT
+    old_ltx25_upscale_prompts = {
+        "",
+        (
+            "The exact same video, faithfully reconstructed at twice the spatial resolution with "
+            "natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, "
+            "lighting, colour, film texture, and camera movement."
+        ),
+    }
+    old_ltx25_upscale_negative_prompts = {
+        "",
+        (
+            "changed identity, changed face, changed hands, changed objects, altered composition, "
+            "warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, "
+            "plastic skin, invented text, compression artifacts"
+        ),
+    }
+    migrating_literal_ltx25 = defaults["upscale"].get("ltx25_prompt", "").strip() in old_ltx25_upscale_prompts
+    if migrating_literal_ltx25:
+        defaults["upscale"]["ltx25_prompt"] = LTX25_UPSCALE_PROMPT
+        if defaults["upscale"].get("ltx25_source_fidelity", "") == "100":
+            defaults["upscale"]["ltx25_source_fidelity"] = "85"
+    if defaults["upscale"].get("ltx25_negative_prompt", "").strip() in old_ltx25_upscale_negative_prompts:
+        defaults["upscale"]["ltx25_negative_prompt"] = LTX25_UPSCALE_NEGATIVE_PROMPT
     if "colormnet" in defaults["recomp"].get("colorized_video", "").lower():
         defaults["recomp"]["colorized_video"] = ""
     old_outpaint_prompts = {

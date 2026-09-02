@@ -27,14 +27,17 @@ SOURCE_SECTION_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<start>\d{10})_(?P<end>
 ARP_ARTIFACT_STEM_RE = re.compile(r"^(?P<prefix>.+)_(?P<tag>outpaint|recomp|color|audio)_[0-9a-f]{8}$")
 LTX25_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 DEFAULT_LTX25_PROMPT = (
-    "The exact same video, faithfully reconstructed at twice the spatial resolution with "
-    "natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, "
-    "lighting, colour, film texture, and camera movement."
+    "A modern high-resolution live-action video, professionally photographed with a contemporary "
+    "cinema camera and a sharp modern lens. Re-render the scene with crisp natural facial features, "
+    "realistic skin texture, finely resolved hair and fabric, clean optical detail, rich micro-contrast, "
+    "controlled highlights, natural depth, and stable coherent motion. Preserve the original people, "
+    "action, composition, timing, clothing, objects, location, lighting intent, and camera movement."
 )
 DEFAULT_LTX25_NEGATIVE_PROMPT = (
-    "changed identity, changed face, changed hands, changed objects, altered composition, "
-    "warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, "
-    "plastic skin, invented text, compression artifacts"
+    "soft focus, blurry, smeared detail, waxy faces, plastic skin, painterly, illustration, cartoon, "
+    "video game, CGI, oversharpened, halos, ringing, warped faces, changed identity, changed clothing, "
+    "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
+    "text, compression artifacts, film damage, dust, scratches"
 )
 
 
@@ -144,6 +147,7 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
             "lora": args.ltx25_upscaler_lora,
             "lora_strength": args.ltx25_lora_strength,
             "source_fidelity": args.ltx25_source_fidelity,
+            "guidance_scale": args.ltx25_guidance_scale,
             "prompt": args.ltx25_prompt,
             "negative_prompt": args.ltx25_negative_prompt,
             "seed": args.ltx25_seed,
@@ -218,7 +222,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ltx25-video-vae", default=LTX25_VIDEO_VAE)
     parser.add_argument("--ltx25-upscaler-lora", default=LTX25_PIXEL_UPSCALER_LORA)
     parser.add_argument("--ltx25-lora-strength", type=float, default=1.0)
-    parser.add_argument("--ltx25-source-fidelity", type=float, default=1.0)
+    parser.add_argument("--ltx25-source-fidelity", type=float, default=0.85)
+    parser.add_argument(
+        "--ltx25-guidance-scale",
+        type=float,
+        default=1.0,
+        help="Text guidance for LTX reconstruction. Keep 1 for the fast distilled path; values above 1 use slower classifier-free guidance.",
+    )
     parser.add_argument("--ltx25-seed", type=int, default=42)
     parser.add_argument("--ltx25-prompt", default=DEFAULT_LTX25_PROMPT)
     parser.add_argument("--ltx25-negative-prompt", default=DEFAULT_LTX25_NEGATIVE_PROMPT)
@@ -544,7 +554,12 @@ def ltx25_prompt(
         },
         "11": {
             "class_type": "CFGGuider",
-            "inputs": {"model": ["3", 0], "positive": ["10", 0], "negative": ["10", 1], "cfg": 1.0},
+            "inputs": {
+                "model": ["3", 0],
+                "positive": ["10", 0],
+                "negative": ["10", 1],
+                "cfg": float(args.ltx25_guidance_scale),
+            },
         },
         "12": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(args.ltx25_seed), "control_after_generate": "fixed"}},
         "13": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
@@ -939,11 +954,15 @@ def chunked_ltx25_run(
         raise RuntimeError("The source has no frames to upscale.")
     chunk_dir = upscale_chunk_dir(args, source, output_width, output_height)
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    requested_note = (
+        ""
+        if (generation_width, generation_height) == (output_width, output_height)
+        else f" (nearest model-safe size to requested {output_width}x{output_height})"
+    )
     print(
         f"Splitting LTX 2.5 upscaling into {len(ranges)} chunk(s): "
         f"{reference_width}x{reference_height} reference -> "
-        f"{generation_width}x{generation_height} generated -> "
-        f"{output_width}x{output_height} delivery",
+        f"{generation_width}x{generation_height} native delivery{requested_note}",
         flush=True,
     )
     normalized_chunks: list[Path] = []
@@ -962,12 +981,14 @@ def chunked_ltx25_run(
             reference_width, reference_height, args.force, source_fingerprint,
         )
         chunk_sig = signature(args, chunk_input, output_width, output_height)
-        if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, output_width, output_height):
+        if not args.force and resumable_upscale_chunk(
+            chunk_final, chunk_sig, generation_width, generation_height
+        ):
             print(f"Reuse LTX 2.5 upscaled chunk: {chunk_final}", flush=True)
             normalized_chunks.append(chunk_final)
             continue
         reusable = None if args.force else find_reusable_upscale_chunk(
-            chunk_dir, chunk_final.name, chunk_sig, output_width, output_height
+            chunk_dir, chunk_final.name, chunk_sig, generation_width, generation_height
         )
         if reusable:
             shutil.copy2(reusable, chunk_final)
@@ -980,7 +1001,7 @@ def chunked_ltx25_run(
             continue
         ltx25_run(args, chunk_input, chunk_raw, generation_width, generation_height)
         normalize_ltx25_chunk(
-            ffmpeg, chunk_raw, chunk_final, output_width, output_height,
+            ffmpeg, chunk_raw, chunk_final, generation_width, generation_height,
             trim_start, keep_frames, fps,
         )
         write_signature(chunk_final, chunk_sig)
@@ -1108,6 +1129,11 @@ def run(args: argparse.Namespace) -> int:
     info = video_info(source)
     output_width, output_height = fit_dimensions(int(info["width"]), int(info["height"]), args.target_width, args.target_height)
     method = upscale_method(args)
+    delivery_width, delivery_height = (
+        ltx25_generation_dimensions(output_width, output_height)
+        if method == "ltx25"
+        else (output_width, output_height)
+    )
     output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height, method)
     sig = signature(args, source, output_width, output_height)
     manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
@@ -1119,7 +1145,9 @@ def run(args: argparse.Namespace) -> int:
         "shot_manifest_fingerprint": file_fingerprint(manifest) if manifest and manifest.is_file() else None,
     })
 
-    if not args.force and resumable_output(output, final_sig, video_like=source, width=output_width, height=output_height):
+    if not args.force and resumable_output(
+        output, final_sig, video_like=source, width=delivery_width, height=delivery_height
+    ):
         print(f"Reuse upscaled video: {output}", flush=True)
         return 0
     if args.dry_run:
@@ -1127,7 +1155,11 @@ def run(args: argparse.Namespace) -> int:
             processing_width, processing_height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
             print(f"Would pre-downscale FlashVSR input to {processing_width}x{processing_height}", flush=True)
         label = "LTX 2.5 Pixel Spatial IC-LoRA" if method == "ltx25" else "FlashVSR"
-        print(f"Would upscale {source} -> {output} using {label} in ComfyUI at {args.comfy_url} ({args.comfy_dir})", flush=True)
+        print(
+            f"Would upscale {source} -> {output} at {delivery_width}x{delivery_height} "
+            f"using {label} in ComfyUI at {args.comfy_url} ({args.comfy_dir})",
+            flush=True,
+        )
         return 0
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1141,7 +1173,9 @@ def run(args: argparse.Namespace) -> int:
         processing_fingerprint = file_fingerprint(processing_source)
     ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mp4"
     ai_output.parent.mkdir(parents=True, exist_ok=True)
-    if args.force or not resumable_output(ai_output, sig, video_like=source, width=output_width, height=output_height):
+    if args.force or not resumable_output(
+        ai_output, sig, video_like=source, width=delivery_width, height=delivery_height
+    ):
         if method == "ltx25":
             chunked_ltx25_run(
                 args, source, ai_output, output_width, output_height, info,
@@ -1164,7 +1198,10 @@ def run(args: argparse.Namespace) -> int:
         shutil.copy2(ai_output, full_partial)
         replace_with_retry(full_partial, output, "Full-strength upscaled output")
     else:
-        blend_upscale_delivery(ffmpeg, source, ai_output, output, output_width, output_height, float(info["fps"]), shots, default_strength)
+        blend_upscale_delivery(
+            ffmpeg, source, ai_output, output, delivery_width, delivery_height,
+            float(info["fps"]), shots, default_strength,
+        )
     write_signature(output, final_sig)
     print(f"Wrote upscaled video: {output}", flush=True)
     return 0

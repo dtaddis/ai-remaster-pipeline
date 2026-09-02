@@ -12,6 +12,20 @@ CLEANUP_PROMPT = (
 )
 CLEANUP_NEGATIVE_PROMPT = "monochrome"
 
+LTX25_UPSCALE_PROMPT = (
+    "A modern high-resolution live-action video, professionally photographed with a contemporary "
+    "cinema camera and a sharp modern lens. Re-render the scene with crisp natural facial features, "
+    "realistic skin texture, finely resolved hair and fabric, clean optical detail, rich micro-contrast, "
+    "controlled highlights, natural depth, and stable coherent motion. Preserve the original people, "
+    "action, composition, timing, clothing, objects, location, lighting intent, and camera movement."
+)
+LTX25_UPSCALE_NEGATIVE_PROMPT = (
+    "soft focus, blurry, smeared detail, waxy faces, plastic skin, painterly, illustration, cartoon, "
+    "video game, CGI, oversharpened, halos, ringing, warped faces, changed identity, changed clothing, "
+    "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
+    "text, compression artifacts, film damage, dust, scratches"
+)
+
 OPENAI_COLOUR_PROMPT = (
     "Enhance and colourise the first image while preserving its exact composition, camera framing, "
     "geometry, identities, faces, hands, poses, objects, fine texture, film grain and luminance. "
@@ -227,11 +241,12 @@ STAGES = (
             ("flashvsr_tiled_vae", "Tiled decode (tiled_vae)", "checkbox", "true"),
             ("flashvsr_unload_dit", "Unload before decode (unload_dit)", "checkbox", "false"),
             ("flashvsr_seed", "FlashVSR seed", "number", "0"),
-            ("ltx25_source_fidelity", "LTX 2.5 source fidelity", "range:0|100|1", "100"),
+            ("ltx25_source_fidelity", "LTX 2.5 source fidelity", "range:0|100|1", "85"),
             ("ltx25_lora_strength", "LTX 2.5 LoRA strength", "number", "1.0"),
+            ("ltx25_guidance_scale", "LTX 2.5 creativity guidance", "range:1|5|0.25", "1.0"),
             ("ltx25_seed", "LTX 2.5 seed", "number", "42"),
-            ("ltx25_prompt", "LTX 2.5 upscale prompt", "text", "The exact same video, faithfully reconstructed at twice the spatial resolution with natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, lighting, colour, film texture, and camera movement."),
-            ("ltx25_negative_prompt", "LTX 2.5 negative prompt", "text", "changed identity, changed face, changed hands, changed objects, altered composition, warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, plastic skin, invented text, compression artifacts"),
+            ("ltx25_prompt", "LTX 2.5 upscale prompt", "text", LTX25_UPSCALE_PROMPT),
+            ("ltx25_negative_prompt", "LTX 2.5 negative prompt", "text", LTX25_UPSCALE_NEGATIVE_PROMPT),
             ("blend_strength", "Default AI upscale strength", "range:0|100|1", "100"),
             ("chunk_seconds", "Chunk seconds", "number", "6"),
             ("overlap_frames", "Overlap frames", "number", "8"),

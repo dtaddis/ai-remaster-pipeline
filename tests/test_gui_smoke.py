@@ -352,7 +352,7 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertIn("const fieldKeys = ['method']", comparison)
         self.assertIn("if (method === 'ltx25')", comparison)
-        self.assertIn("'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_seed'", comparison)
+        self.assertIn("'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_guidance_scale', 'ltx25_seed'", comparison)
         self.assertIn("'ltx25_prompt', 'ltx25_negative_prompt'", comparison)
 
     def test_upscale_shot_comparison_uses_latest_full_output_and_marks_it_stale(self) -> None:
@@ -443,6 +443,29 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(normalized["cleanup"]["prompt"], app.CLEANUP_PROMPT)
         self.assertEqual(normalized["cleanup"]["negative_prompt"], app.CLEANUP_NEGATIVE_PROMPT)
+
+    def test_upscale_migrates_literal_ltx_prompt_to_modern_reconstruction(self) -> None:
+        settings = app.default_settings()
+        settings["upscale"]["ltx25_prompt"] = (
+            "The exact same video, faithfully reconstructed at twice the spatial resolution with "
+            "natural fine detail, stable motion, unchanged people, faces, clothing, objects, framing, "
+            "lighting, colour, film texture, and camera movement."
+        )
+        settings["upscale"]["ltx25_negative_prompt"] = (
+            "changed identity, changed face, changed hands, changed objects, altered composition, "
+            "warped geometry, duplicate limbs, temporal inconsistency, flicker, oversharpening, halos, "
+            "plastic skin, invented text, compression artifacts"
+        )
+
+        normalized = runtime_settings.normalize_settings(settings, include_newest_source=False)
+
+        self.assertEqual(normalized["upscale"]["ltx25_prompt"], runtime_settings.LTX25_UPSCALE_PROMPT)
+        self.assertEqual(
+            normalized["upscale"]["ltx25_negative_prompt"],
+            runtime_settings.LTX25_UPSCALE_NEGATIVE_PROMPT,
+        )
+        self.assertEqual(normalized["upscale"]["ltx25_source_fidelity"], "85")
+        self.assertEqual(normalized["upscale"]["ltx25_guidance_scale"], "1.0")
 
     def test_cleanup_exposes_independent_repairs_and_optional_dearchive(self) -> None:
         cleanup_stage = next(stage for stage in app.STAGES if stage.key == "cleanup")
@@ -4745,6 +4768,7 @@ class GuiSmokeTests(unittest.TestCase):
             "target_height": "1080",
             "ltx25_source_fidelity": "95",
             "ltx25_lora_strength": "1.0",
+            "ltx25_guidance_scale": "3.5",
             "ltx25_seed": "77",
             "ltx25_prompt": "faithful upscale",
             "ltx25_negative_prompt": "changed identity",
@@ -4755,6 +4779,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--method") + 1], "ltx25")
         self.assertEqual(command[command.index("--ltx25-source-fidelity") + 1], "0.95")
         self.assertEqual(command[command.index("--ltx25-lora-strength") + 1], "1.0")
+        self.assertEqual(command[command.index("--ltx25-guidance-scale") + 1], "3.5")
         self.assertEqual(command[command.index("--ltx25-seed") + 1], "77")
         self.assertEqual(command[command.index("--ltx25-prompt") + 1], "faithful upscale")
         ltx_output = app.upscale_output_for("input/example.mp4", app.APP.settings["upscale"])
@@ -4849,6 +4874,8 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["2"]["inputs"]["unet_name"], upscale_video.LTX25_GGUF_MODEL)
         self.assertEqual(prompt["3"]["inputs"]["lora_name"], upscale_video.LTX25_PIXEL_UPSCALER_LORA)
         self.assertEqual(prompt["3"]["inputs"]["strength_model"], 1.0)
+        self.assertEqual(prompt["10"]["inputs"]["strength"], 0.85)
+        self.assertEqual(prompt["11"]["inputs"]["cfg"], 1.0)
         self.assertEqual(prompt["11"]["inputs"]["model"], ["3", 0])
         self.assertEqual(prompt["10"]["inputs"]["latent_downscale_factor"], ["3", 1])
         self.assertEqual(prompt["10"]["inputs"]["latent"], ["9", 0])
