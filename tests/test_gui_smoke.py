@@ -46,6 +46,7 @@ from ai_remaster_gui import lifecycle
 from ai_remaster_gui import media
 from ai_remaster_gui import outpaint_guides
 from ai_remaster_gui import project_io
+from ai_remaster_gui import runtime_settings
 from ai_remaster_gui import sam_masks
 from ai_remaster_gui import server
 from ai_remaster_gui import system_status
@@ -422,6 +423,18 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("frames % 8 = 1 (8n + 1)", helpers)
         self.assertIn("4.04 seconds becomes 97 frames at 24 fps", helpers)
         self.assertIn("const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds'", helpers)
+
+    def test_cleanup_migrates_stale_dearchive_prompt_variants(self) -> None:
+        settings = app.default_settings()
+        settings["cleanup"]["prompt"] = (
+            "A modern, high-resolution video shot in vivid color, sharp detail, contemporary cinematography."
+        )
+        settings["cleanup"]["negative_prompt"] = "black and white, old, grainy, desaturated, sepia"
+
+        normalized = runtime_settings.normalize_settings(settings, include_newest_source=False)
+
+        self.assertEqual(normalized["cleanup"]["prompt"], app.CLEANUP_PROMPT)
+        self.assertEqual(normalized["cleanup"]["negative_prompt"], app.CLEANUP_NEGATIVE_PROMPT)
 
     def test_cleanup_exposes_independent_repairs_and_optional_dearchive(self) -> None:
         cleanup_stage = next(stage for stage in app.STAGES if stage.key == "cleanup")

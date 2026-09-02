@@ -1411,6 +1411,13 @@ def main() -> int:
         raise FileNotFoundError(f"Clean Up source video not found: {source}")
     if not (args.ai_descratch or args.devignette or args.dearchive):
         raise ValueError("Select at least one Clean Up operation: AI DeScratch, DeVignette, or Dearchive.")
+    print(
+        "Clean Up operations: "
+        f"AI DeScratch={'on' if args.ai_descratch else 'off'}, "
+        f"DeVignette={'on' if args.devignette else 'off'}, "
+        f"Dearchive={'on' if args.dearchive else 'off'}.",
+        flush=True,
+    )
     if args.dearchive and not workflow_path.is_file():
         raise FileNotFoundError(f"Clean Up workflow not found: {workflow_path}")
     info = probe_video(source)

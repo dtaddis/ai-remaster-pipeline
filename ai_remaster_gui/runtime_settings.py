@@ -151,6 +151,7 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     old_cleanup_prompts = {
         "",
         "Clean, restored archive footage with sharp detail, clean tonality, and natural cinematography.",
+        "A modern, high-resolution video shot in vivid color, sharp detail, contemporary cinematography.",
         (
             "Clean, restored archive footage. Remove vertical scratches, emulsion damage, dirt, dust, "
             "blotches, gate weave, and flicker. Reconstruct clean continuous surfaces and fine natural "
@@ -162,6 +163,8 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     old_cleanup_negative_prompts = {
         "",
         "cartoon, game, 3d render, oversaturated color, color bleeding, flicker, warped geometry, smeared details",
+        "old, archive, desaturated",
+        "black and white, old, grainy, desaturated, sepia",
         (
             "vertical scratches, film scratches, vertical streaks, emulsion damage, dirt, dust, blotches, "
             "gate weave, flicker, frame jitter, torn film, smeared details, warped geometry, altered faces, "
