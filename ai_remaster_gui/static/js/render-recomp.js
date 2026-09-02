@@ -186,15 +186,24 @@ function drawUpscale() {
 }
 
 function upscaleMainFields(st) {
-  const fieldKeys = [
-    'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
-    'flashvsr_pre_downscale',
-    'flashvsr_tiled_dit', 'flashvsr_tile_size', 'flashvsr_tile_overlap',
-    'flashvsr_vae_tile_multiplier',
-    'flashvsr_local_range', 'flashvsr_sparse_ratio', 'flashvsr_kv_ratio',
-    'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
-    'flashvsr_seed',
-  ];
+  const method = settings('upscale').method || 'flashvsr';
+  const fieldKeys = ['method'];
+  if (method === 'ltx25') {
+    fieldKeys.push(
+      'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_seed',
+      'ltx25_prompt', 'ltx25_negative_prompt',
+    );
+  } else {
+    fieldKeys.push(
+      'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
+      'flashvsr_pre_downscale',
+      'flashvsr_tiled_dit', 'flashvsr_tile_size', 'flashvsr_tile_overlap',
+      'flashvsr_vae_tile_multiplier',
+      'flashvsr_local_range', 'flashvsr_sparse_ratio', 'flashvsr_kv_ratio',
+      'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
+      'flashvsr_seed',
+    );
+  }
   fieldKeys.push('blend_strength', 'target_width', 'target_height', 'chunk_seconds', 'overlap_frames', 'preview_seconds');
   return fieldKeys
     .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
@@ -222,7 +231,7 @@ function upscaleComparisonHtml(s, preview) {
   if (!after) {
     return `
       <video src="${media(before)}" controls preload="metadata"></video>
-      <p class="shot-empty">Generate a preview to compare FlashVSR output against the input.</p>
+      <p class="shot-empty">Generate a preview to compare ${s.method === 'ltx25' ? 'LTX 2.5' : 'FlashVSR'} output against the input.</p>
     `;
   }
   return `

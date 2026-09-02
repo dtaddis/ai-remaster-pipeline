@@ -347,6 +347,14 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn('/api/upscale-shot-comparison?', comparison)
         self.assertIn('bindUpscaleShotComparisons()', comparison)
 
+    def test_upscale_page_exposes_method_specific_controls(self) -> None:
+        comparison = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-recomp.js").read_text(encoding="utf-8")
+
+        self.assertIn("const fieldKeys = ['method']", comparison)
+        self.assertIn("if (method === 'ltx25')", comparison)
+        self.assertIn("'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_seed'", comparison)
+        self.assertIn("'ltx25_prompt', 'ltx25_negative_prompt'", comparison)
+
     def test_upscale_shot_comparison_uses_latest_full_output_and_marks_it_stale(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
