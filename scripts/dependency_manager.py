@@ -211,8 +211,9 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
                     if huggingface_access_denied(exc):
                         model_url = f"https://huggingface.co/{model.repo}"
                         raise HuggingFaceAccessError(
-                            "Approve the official LTX outpainting model download on Hugging Face. "
-                            f"ARP will open {model_url}; approve access there, then run Outpainting again."
+                            f"Approve access to the required model repository on Hugging Face: {model_url}. "
+                            "Then authenticate the local downloader with `hf auth login --force` (or HF_TOKEN) "
+                            "and retry the stage."
                         ) from None
                     raise
                 print(f"Warning: could not auto-download {model.repo}/{model.file}: {exc}", flush=True)

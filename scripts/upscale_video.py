@@ -535,7 +535,7 @@ def ltx25_prompt(
                 "image": ["1", 0],
                 "frame_idx": 0,
                 "strength": float(args.ltx25_source_fidelity),
-                "latent_downscale_factor": 2.0,
+                "latent_downscale_factor": ["3", 1],
                 "crop": "disabled",
                 "use_tiled_encode": True,
                 "tile_size": 256,

@@ -4848,7 +4848,9 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(prompt["2"]["inputs"]["unet_name"], upscale_video.LTX25_GGUF_MODEL)
         self.assertEqual(prompt["3"]["inputs"]["lora_name"], upscale_video.LTX25_PIXEL_UPSCALER_LORA)
-        self.assertEqual(prompt["10"]["inputs"]["latent_downscale_factor"], 2.0)
+        self.assertEqual(prompt["3"]["inputs"]["strength_model"], 1.0)
+        self.assertEqual(prompt["11"]["inputs"]["model"], ["3", 0])
+        self.assertEqual(prompt["10"]["inputs"]["latent_downscale_factor"], ["3", 1])
         self.assertEqual(prompt["10"]["inputs"]["latent"], ["9", 0])
         self.assertEqual(prompt["15"]["inputs"]["latent_image"], ["10", 2])
         self.assertEqual(prompt["16"]["inputs"]["latent"], ["15", 0])
