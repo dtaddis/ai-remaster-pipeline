@@ -17,6 +17,16 @@ PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-ARP" / "ltx_vid
 
 
 class SparseGuideAttentionTests(unittest.TestCase):
+    def test_production_defaults_match_known_good_4090_profile(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_video_only_defaults_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        self.assertEqual(patch_module.DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR, 13.0)
+        self.assertEqual(patch_module.DEFAULT_FEED_FORWARD_CHUNK_TOKENS, 4096)
+        self.assertEqual(patch_module.DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS, 4096)
+
     def test_video_only_pruning_removes_only_audio_block_modules(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_video_only_patch_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None
