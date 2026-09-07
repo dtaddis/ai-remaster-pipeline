@@ -2544,6 +2544,22 @@ def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, tag)
 
 
+def legacy_ltx25_outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> Path:
+    """Return the pre-v1.0 model-specific LTX 2.5 manifest path.
+
+    Render caches remain model-specific, but the CSV is user-authored project data. Older
+    ARP builds accidentally gave LTX 2.5 a separate CSV, making settings and guide frames
+    appear to vanish whenever the model selector changed.
+    """
+    source = resolve_video_source(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    crop, black = _outpaint_crop_black(values)
+    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(
+        source.name, aspect, width, height, crop, black, "chunks25", "csv"
+    )
+
+
 def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
     if not source_text:
         return ""
@@ -2551,8 +2567,24 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    tag = "chunks25" if values.get("outpaint_model") == "ltx25" else "chunks"
-    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "csv"))
+    # Model choice affects generated files, not the user's chunk plan. All engines share this
+    # manifest so model comparison cannot discard seeds, prompts, offsets, guide frames, or
+    # previous-chunk guide choices.
+    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
+
+
+def migrate_legacy_outpaint_chunk_manifest(source_text: str, values: dict[str, str], manifest: Path) -> None:
+    """Recover an LTX 2.5-only chunk plan when no shared manifest exists yet."""
+    if manifest.exists():
+        return
+    legacy = legacy_ltx25_outpaint_chunk_manifest_for(source_text, values)
+    if not legacy.exists() or legacy == manifest:
+        return
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(legacy, manifest)
+    APP.log.append(
+        f"Recovered outpaint chunk settings and guide frames from legacy LTX 2.5 manifest: {rel(legacy)}"
+    )
 
 
 def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
@@ -2680,6 +2712,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         overlap_frames = 8
     chunk_dir = outpaint_chunk_dir_for(source_text, values)
     manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
+    migrate_legacy_outpaint_chunk_manifest(source_text, values, manifest)
     values["manifest"] = rel(manifest)
     existing = read_outpaint_chunk_rows(manifest)
     ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)

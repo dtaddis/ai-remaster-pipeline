@@ -23,9 +23,9 @@ import types
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 4096
+DEFAULT_FEED_FORWARD_CHUNK_TOKENS = 2048
 DEFAULT_ATTENTION_QUERY_CHUNK_TOKENS = 4096
-DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR = 3.0
+DEFAULT_VIDEO_ONLY_MEMORY_USAGE_FACTOR = 5.0
 MAX_PARTITIONED_ATTENTION_RUNS = 32
 _LTXAV_AUDIO_BLOCK_ATTRIBUTES = (
     "audio_attn1",
@@ -105,8 +105,10 @@ def prune_ltxav_audio_transformer_blocks(model_patcher):
     #
     # Raise the estimate only on ARP's explicitly video-only clone. Chunked
     # attention and feed-forward execution bound the large transient tensors,
-    # so a factor of 3 reserves useful activation headroom while keeping the
-    # quantized transformer and IC-LoRA resident on a 24 GiB card.
+    # so a factor of 5 reserves enough activation headroom for a full-resolution
+    # 720p IC-LoRA guide on a 24 GiB card. The previous factor of 3 allowed a
+    # 13.7 GiB transformer load and left the CUDA async allocator reserving
+    # more than physical VRAM on an RTX 4090, which made Windows page into RAM.
     current_factor = float(getattr(base_model, "memory_usage_factor", 0.0))
     configured_text = os.environ.get("ARP_LTX_VIDEO_ONLY_MEMORY_USAGE_FACTOR")
     try:
@@ -626,6 +628,12 @@ def install_sparse_guide_attention_patch(model_patcher=None):
         if diagnose_first and q.device.type == "cuda":
             # Separate Q/K/V projection and RoPE work from the attention timing.
             torch.cuda.synchronize(q.device)
+            # VAE encoding and model loading can leave several GiB of unused blocks in the
+            # cudaMallocAsync pool. At long guide lengths that idle reservation pushes WDDM
+            # beyond physical VRAM even though live tensors still fit, causing system-wide
+            # paging. Release only unused cached blocks once, immediately before the first
+            # guide-attention pass; live tensors and model weights are unaffected.
+            torch.cuda.empty_cache()
         attention_start = time.perf_counter()
         if diagnose_first:
             LOGGER.info(
@@ -809,7 +817,7 @@ def install_sparse_guide_attention_patch(model_patcher=None):
         diffusion_model,
     )
 
-    def install_model_scoped_attention(attention) -> None:
+    def install_model_scoped_attention(attention, block_index: int, block_count: int) -> None:
         if getattr(attention, "_arp_sparse_guide_attention", False):
             return
         original_forward = attention.forward
@@ -844,6 +852,10 @@ def install_sparse_guide_attention_patch(model_patcher=None):
                     transformer_options=options,
                 )
 
+            first_guide_pass = not getattr(self, "_arp_first_guide_pass_complete", False)
+            if first_guide_pass and block_index == 0:
+                diagnostics["first_guide_pass_start"] = time.perf_counter()
+
             q = self.to_q(x)
             active_context = x if context is None else context
             k = self.to_k(active_context)
@@ -874,7 +886,23 @@ def install_sparse_guide_attention_patch(model_patcher=None):
                 out = (out * gates.unsqueeze(-1)).view(
                     batch, tokens, self.heads * self.dim_head
                 )
-            return self.to_out(out)
+            result = self.to_out(out)
+            if first_guide_pass:
+                self._arp_first_guide_pass_complete = True
+                completed = block_index + 1
+                if completed % 8 == 0 or completed == block_count:
+                    if result.device.type == "cuda":
+                        torch.cuda.synchronize(result.device)
+                    started = diagnostics.get("first_guide_pass_start")
+                    elapsed = time.perf_counter() - started if started else 0.0
+                    LOGGER.info(
+                        "ARP first guide pass completed block %d/%d in %.1fs (%s)",
+                        completed,
+                        block_count,
+                        elapsed,
+                        _cuda_memory_summary(torch, result.device),
+                    )
+            return result
 
         attention.forward = types.MethodType(model_scoped_forward, attention)
         attention._arp_sparse_guide_attention = True
@@ -883,9 +911,10 @@ def install_sparse_guide_attention_patch(model_patcher=None):
         "gguf_reuse": False,
         "gguf_fallback": False,
         "first_timing": False,
+        "first_guide_pass_start": None,
     }
     patched_blocks = 0
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
         attention = getattr(block, "attn1", None)
         feed_forward = getattr(block, "ff", None)
         if attention is None or feed_forward is None:
@@ -893,7 +922,7 @@ def install_sparse_guide_attention_patch(model_patcher=None):
                 "ARP's video-only LTX patch found a transformer block without "
                 "video self-attention or feed-forward modules. Update ARP before rendering."
             )
-        install_model_scoped_attention(attention)
+        install_model_scoped_attention(attention, block_index, len(blocks))
         _install_chunked_feed_forward(torch, feed_forward, diagnostics)
         patched_blocks += 1
 

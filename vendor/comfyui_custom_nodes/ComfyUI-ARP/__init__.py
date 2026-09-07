@@ -7,12 +7,15 @@ not alter global model behavior.
 
 from __future__ import annotations
 
+import gc
 import logging
 
 from aiohttp import web
+import comfy.model_management
 import comfy.sd
 import comfy.utils
 import folder_paths
+import torch
 from server import PromptServer
 
 from .ltx_video_only_patch import (
@@ -92,12 +95,79 @@ class ARPLTXVideoOnlyICLoRALoader:
         return video_only_model, latent_downscale_factor
 
 
+class ARPLTXEphemeralTextEncode:
+    """Encode both prompts, then release the large LTX text encoder.
+
+    Returning a CLIP object from a conventional loader makes Comfy's execution
+    cache retain Gemma for the whole diffusion run.  On a 64 GB / RTX 4090
+    workstation that leaves too little host RAM for GGUF offload and guide
+    attention.  This combined node keeps only the small conditioning tensors.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text_encoder": (folder_paths.get_filename_list("text_encoders"),),
+                "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
+                "device": (["default", "cpu"], {"default": "cpu"}),
+                "positive": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "encode"
+    CATEGORY = "ARP/LTX"
+    DESCRIPTION = (
+        "Encodes both LTX prompts and immediately releases Gemma before video "
+        "diffusion, preventing the text encoder from consuming host RAM for the run."
+    )
+
+    def encode(self, text_encoder, ckpt_name, device, positive, negative):
+        clip_path = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
+        ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        model_options = {}
+        if device == "cpu":
+            cpu = torch.device("cpu")
+            model_options["load_device"] = cpu
+            model_options["offload_device"] = cpu
+
+        clip = comfy.sd.load_clip(
+            ckpt_paths=[clip_path, ckpt_path],
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            clip_type=comfy.sd.CLIPType.LTXV,
+            model_options=model_options,
+        )
+        try:
+            positive_conditioning = clip.encode_from_tokens_scheduled(
+                clip.tokenize(positive)
+            )
+            negative_conditioning = clip.encode_from_tokens_scheduled(
+                clip.tokenize(negative)
+            )
+        finally:
+            # The conditionings are tensors and do not need the CLIP wrapper. Once
+            # this last strong reference is gone, Comfy's weak loaded-model entry
+            # can be removed and the encoder's CPU tensors reclaimed.
+            del clip
+            gc.collect()
+            comfy.model_management.cleanup_models()
+            gc.collect()
+
+        LOGGER.info("ARP released the LTX text encoder after prompt encoding")
+        return positive_conditioning, negative_conditioning
+
+
 NODE_CLASS_MAPPINGS = {
     "ARPLTXVideoOnlyICLoRALoader": ARPLTXVideoOnlyICLoRALoader,
+    "ARPLTXEphemeralTextEncode": ARPLTXEphemeralTextEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ARPLTXVideoOnlyICLoRALoader": "ARP LTX Video-Only IC-LoRA Loader",
+    "ARPLTXEphemeralTextEncode": "ARP LTX Ephemeral Text Encode",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

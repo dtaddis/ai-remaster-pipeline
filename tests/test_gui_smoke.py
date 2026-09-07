@@ -1091,6 +1091,61 @@ class GuiSmokeTests(unittest.TestCase):
             outpaint_video.default_output(source, "16:9", 720, args).name,
         )
 
+    def test_outpaint_models_share_user_chunk_manifest_but_not_render_cache(self) -> None:
+        base = {
+            "target_aspect": "16:9",
+            "target_height": "720",
+            "crop_left": "0",
+            "crop_right": "0",
+            "crop_top": "0",
+            "crop_bottom": "0",
+            "outpaint_all_black_regions": "false",
+        }
+        official = {**base, "outpaint_model": "official"}
+        ltx25 = {**base, "outpaint_model": "ltx25"}
+
+        official_manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", official)
+        ltx25_manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", ltx25)
+
+        self.assertEqual(official_manifest, ltx25_manifest)
+        self.assertIn("_chunks_", Path(official_manifest).name)
+        self.assertNotEqual(
+            app.outpaint_chunk_dir_for("input/My Source.mp4", official),
+            app.outpaint_chunk_dir_for("input/My Source.mp4", ltx25),
+        )
+
+        source = app.resolve_video_source("input/My Source.mp4")
+        official_args = argparse.Namespace(
+            crop_left=0, crop_right=0, crop_top=0, crop_bottom=0,
+            outpaint_all_black_regions=False, ltx_version="2.3",
+        )
+        ltx25_args = argparse.Namespace(
+            crop_left=0, crop_right=0, crop_top=0, crop_bottom=0,
+            outpaint_all_black_regions=False, ltx_version="2.5",
+        )
+        self.assertEqual(
+            outpaint_video.default_chunk_manifest(source, "16:9", 1280, 704, official_args),
+            outpaint_video.default_chunk_manifest(source, "16:9", 1280, 704, ltx25_args),
+        )
+
+    def test_outpaint_manifest_migration_copies_legacy_ltx25_plan_non_destructively(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            legacy = folder / "movie_chunks25_deadbeef.csv"
+            shared = folder / "movie_chunks_deadbeef.csv"
+            legacy.write_text("chunk_index,guide_frames\n0,valuable-user-guide\n", encoding="utf-8")
+            args = argparse.Namespace(
+                crop_left=0, crop_right=0, crop_top=0, crop_bottom=0,
+                outpaint_all_black_regions=False, ltx_version="2.5",
+            )
+            with mock.patch.object(outpaint_video, "legacy_ltx25_chunk_manifest", return_value=legacy):
+                outpaint_video.migrate_legacy_chunk_manifest(
+                    shared, folder / "source.mp4", "16:9", 1280, 704, args
+                )
+
+            self.assertEqual(shared.read_bytes(), legacy.read_bytes())
+            self.assertTrue(legacy.exists())
+
     def test_source_height_outpaint_option_uses_video_height(self) -> None:
         app.APP.settings.setdefault("outpaint", {}).update(
             {
@@ -1438,7 +1493,7 @@ class GuiSmokeTests(unittest.TestCase):
 
     def test_required_custom_nodes_are_bundled(self) -> None:
         required = {
-            "ComfyUI-ARP": ("ARPLTXVideoOnlyICLoRALoader",),
+            "ComfyUI-ARP": ("ARPLTXVideoOnlyICLoRALoader", "ARPLTXEphemeralTextEncode"),
             "ComfyUI-LTXVideo": ("LTXVImgToVideoConditionOnly", "LTXAddVideoICLoRAGuideAdvanced", "LTXVInpaintPreprocess", "LTXVLaplacianPyramidBlend"),
             "ComfyUI-GGUF": ("UnetLoaderGGUF",),
             "ComfyUI-VideoHelperSuite": ("VHS_LoadVideo", "VHS_VideoCombine"),
@@ -1603,9 +1658,20 @@ class GuiSmokeTests(unittest.TestCase):
                 42,
             )
 
-        self.assertEqual(prompt["2483"]["inputs"]["text"], "outpaint with natural film grain. continue the wallpaper")
+        self.assertNotIn("2483", prompt)
+        self.assertNotIn("2612", prompt)
+        self.assertNotIn("5023", prompt)
+        self.assertEqual(
+            prompt["9199"]["inputs"]["positive"],
+            "outpaint with natural film grain. continue the wallpaper",
+        )
+        self.assertEqual(
+            prompt["9199"]["inputs"]["negative"],
+            args.negative_prompt,
+        )
         self.assertEqual(prompt["5114"]["inputs"]["positive"], ["1241", 0])
-        self.assertEqual(prompt["1241"]["inputs"]["positive"], ["2483", 0])
+        self.assertEqual(prompt["1241"]["inputs"]["positive"], ["9199", 0])
+        self.assertEqual(prompt["1241"]["inputs"]["negative"], ["9199", 1])
 
     def test_outpaint_conditioning_bypasses_resize_without_replacing_video_control(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -1651,7 +1717,9 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["3059"]["inputs"]["width"], ["5054", 0])
         self.assertEqual(prompt["3059"]["inputs"]["height"], ["5054", 1])
         self.assertEqual(prompt["3059"]["inputs"]["length"], ["5054", 2])
-        self.assertEqual(prompt["5023"]["inputs"]["device"], "cpu")
+        self.assertNotIn("5023", prompt)
+        self.assertEqual(prompt["9199"]["inputs"]["device"], "cpu")
+        self.assertEqual(prompt["9199"]["class_type"], "ARPLTXEphemeralTextEncode")
         self.assertEqual(prompt["5093"]["inputs"]["latent_image"], ["5114", 2])
         self.assertEqual(prompt["5013"]["inputs"]["latent"], ["5093", 1])
         for audio_diffusion_node in ("5382", "5383", "5385", "5386", "5389", "5390", "9110"):

@@ -76,6 +76,7 @@ MODEL_SIZE_MULTIPLE = 32
 LTX_SPATIAL_MASK_CELL = 32
 OUTPAINT_COMMON_NODES = {
     "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
+    "ARPLTXEphemeralTextEncode": "ComfyUI-ARP",
     "LTXVImgToVideoConditionOnly": "ComfyUI-LTXVideo",
     "LTXVPreprocess": "ComfyUI-LTXVideo",
     "LoadVideo": "ComfyUI core",
@@ -1638,14 +1639,85 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     if extra_guides:
         _patch_extra_guides(workflow, args, extra_guides, canvas_width, canvas_height, int(prepared_info.get("frames") or 0))
 
-    return workflow_to_prompt(workflow, args.output_node_id)
+    prompt = workflow_to_prompt(workflow, args.output_node_id)
+    # Clean Up reuses this graph patcher with its own shorter Dearchive workflow.
+    # Keep this outpaint-specific memory policy out of that separate pipeline.
+    if hasattr(args, "cleanup_lora"):
+        return prompt
+    return patch_ephemeral_ltx_text_encoder(
+        prompt, args, prompt_text, negative_text
+    )
+
+
+def patch_ephemeral_ltx_text_encoder(
+    prompt: dict[str, Any],
+    args,
+    prompt_text: str,
+    negative_text: str,
+) -> dict[str, Any]:
+    """Replace the cached Gemma loader/encoders with one release-after-use node."""
+
+    positive_id = str(args.positive_node_id)
+    negative_id = str(args.negative_node_id)
+    positive_node = prompt.get(positive_id)
+    negative_node = prompt.get(negative_id)
+    if not positive_node or not negative_node:
+        return prompt
+    if (
+        positive_node.get("class_type") != "CLIPTextEncode"
+        or negative_node.get("class_type") != "CLIPTextEncode"
+    ):
+        return prompt
+
+    positive_clip = positive_node.get("inputs", {}).get("clip")
+    negative_clip = negative_node.get("inputs", {}).get("clip")
+    if not (
+        isinstance(positive_clip, list)
+        and len(positive_clip) == 2
+        and isinstance(negative_clip, list)
+        and len(negative_clip) == 2
+        and str(positive_clip[0]) == str(negative_clip[0])
+    ):
+        return prompt
+    loader_id = str(positive_clip[0])
+    loader = prompt.get(loader_id)
+    if not loader or loader.get("class_type") != "LTXAVTextEncoderLoader":
+        return prompt
+
+    node_id = "9199"
+    prompt[node_id] = {
+        "class_type": "ARPLTXEphemeralTextEncode",
+        "inputs": {
+            "text_encoder": args.text_encoder,
+            "ckpt_name": args.text_encoder_checkpoint,
+            "device": getattr(args, "text_encoder_device", "cpu"),
+            "positive": prompt_text,
+            "negative": negative_text,
+        },
+        "_meta": {"title": "ARP LTX ephemeral prompt encoding"},
+    }
+
+    for node in prompt.values():
+        for input_name, value in list(node.get("inputs", {}).items()):
+            if not (isinstance(value, list) and len(value) == 2):
+                continue
+            source_id = str(value[0])
+            if source_id == positive_id:
+                node["inputs"][input_name] = [node_id, 0]
+            elif source_id == negative_id:
+                node["inputs"][input_name] = [node_id, 1]
+
+    prompt.pop(positive_id, None)
+    prompt.pop(negative_id, None)
+    prompt.pop(loader_id, None)
+    return prompt
 
 
 def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 39,
+        "version": 40,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1799,7 +1871,31 @@ def combine_prompt(prompt: str, suffix: str) -> str:
 
 def default_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
     crop, black = _crop_black(args)
-    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "chunks"), "csv")
+    # Chunk rows and guide-frame paths are authored project data, not a render cache. Keep one
+    # plan across every LTX backend; raw/prepared chunk directories remain model-specific.
+    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv")
+
+
+def legacy_ltx25_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
+    crop, black = _crop_black(args)
+    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(
+        source.name, aspect, width, height, crop, black, "chunks25", "csv"
+    )
+
+
+def migrate_legacy_chunk_manifest(path: Path, source: Path, aspect: str, width: int, height: int, args) -> None:
+    """Promote a pre-v1.0 LTX 2.5-only plan without deleting the original."""
+    if path.exists():
+        return
+    legacy = legacy_ltx25_chunk_manifest(source, aspect, width, height, args)
+    if not legacy.exists() or legacy == path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(legacy, path)
+    print(
+        f"Recovered chunk settings and guide frames from legacy LTX 2.5 manifest: {legacy}",
+        flush=True,
+    )
 
 
 def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
@@ -2437,7 +2533,14 @@ def main() -> int:
             source.name, args.target_aspect, work_width, work_height, chunk_crop, chunk_black,
             outpaint_artifact_tag(args, "chunks"),
         )
-        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, work_width, work_height, args)
+        shared_chunk_manifest = default_chunk_manifest(
+            source, args.target_aspect, work_width, work_height, args
+        )
+        chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else shared_chunk_manifest
+        if chunk_manifest.resolve() == shared_chunk_manifest.resolve():
+            migrate_legacy_chunk_manifest(
+                chunk_manifest, source, args.target_aspect, work_width, work_height, args
+            )
         prepared_info = probe_video(generation_prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
         ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
