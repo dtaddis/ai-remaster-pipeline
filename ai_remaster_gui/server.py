@@ -303,11 +303,15 @@ def outpaint_browser_handoff(outpaint_lora: str = DEFAULT_OUTPAINT_LORA) -> tupl
     if opened:
         return False, (
             "Approve the official LTX outpainting model download on Hugging Face. "
-            "ARP opened the approval page in a new browser tab. After approving it, click Run Outpainting again."
+            "ARP opened the approval page in a new browser tab. Browser approval does not sign ARP's local "
+            "downloader in; run 'hf auth login --force' from ARP's activated environment (or set HF_TOKEN) "
+            "using the same account, then click Run Outpainting again."
         )
     return False, (
         "Approve the official LTX outpainting model download on Hugging Face. "
-        f"ARP could not open the browser automatically; open {OUTPAINT_LICENSE_URL}, approve access, then click Run Outpainting again."
+        f"ARP could not open the browser automatically; open {OUTPAINT_LICENSE_URL} and approve access. "
+        "Then run 'hf auth login --force' from ARP's activated environment (or set HF_TOKEN) using the same "
+        "account, and click Run Outpainting again."
     )
 
 

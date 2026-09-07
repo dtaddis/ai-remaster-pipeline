@@ -3238,18 +3238,21 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Approve the official LTX outpainting model download", message)
         self.assertIn("opened the approval page", message)
+        self.assertIn("hf auth login --force", message)
         open_browser.assert_called_once_with(server.OUTPAINT_LICENSE_URL)
 
-    def test_outpaint_403_reopens_approval_page_with_short_message(self) -> None:
-        error = outpaint_video.HuggingFaceAccessError("long recovery instructions")
+    def test_outpaint_403_opens_failing_repository_and_keeps_auth_guidance(self) -> None:
+        model_url = "https://huggingface.co/owner/gated-model"
+        error = outpaint_video.HuggingFaceAccessError(
+            "Approve access, then run `hf auth login --force` using the same account.",
+            model_url=model_url,
+        )
         with mock.patch.object(outpaint_video.webbrowser, "open", return_value=True) as open_browser:
             message = outpaint_video.outpaint_access_error_message(error)
 
-        self.assertEqual(
-            message,
-            "Approve the official LTX outpainting model download in the Hugging Face tab ARP just opened, then run Outpainting again.",
-        )
-        open_browser.assert_called_once_with(outpaint_video.OUTPAINT_ACCESS_URL)
+        self.assertIn("hf auth login --force", message)
+        self.assertIn("opened the required model repository", message)
+        open_browser.assert_called_once_with(model_url)
 
     def test_audio_state_exposes_lossless_stems(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

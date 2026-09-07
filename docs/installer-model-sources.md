@@ -12,6 +12,17 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 - Clean Up / Dearchive LoRA: `oumoumad/ltx-2.3-dearchive-lora/lora_weights_step_05000.safetensors` → `models/loras/ltx-2.3-dearchive-lora.safetensors`
 - In/Outpainting LoRA: `Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors` (gated; accept/request browser access for the same individual account used by ARP, then run `hf auth login --force` if the saved token still receives a 403)
 
+## LTX 2.5
+
+- Distilled transformer: `vantagewithai/LTX-2.5-GGUF/distilled/ltx-2.5-22b-distilled-transformer-Q4_K_M.gguf`
+- Text encoder: `elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF/gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf`
+- Video/audio VAEs and latent upscaler: `Lightricks/LTX-2.5`
+- In/Outpainting LoRA: the gated LTX 2.3 model listed above
+
+The quantized text encoder is also gated. Accept its terms in the browser, then authenticate ARP's
+local downloader with `hf auth login --force` from the activated ARP environment (or set `HF_TOKEN`)
+using the same account. Browser approval by itself does not provide credentials to the local process.
+
 ## ProPainter (AI DeScratch)
 
 The installer adds `daniabib/ComfyUI_ProPainter_Nodes`. On the first AI DeScratch run that node

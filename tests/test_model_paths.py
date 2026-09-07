@@ -163,7 +163,9 @@ class DependencyManagerPathTests(unittest.TestCase):
 
         self.assertIn("https://huggingface.co/owner/gated-model", str(raised.exception))
         self.assertIn("Approve access", str(raised.exception))
+        self.assertIn("Browser approval alone does not authenticate", str(raised.exception))
         self.assertIn("hf auth login --force", str(raised.exception))
+        self.assertEqual(raised.exception.model_url, "https://huggingface.co/owner/gated-model")
 
     def test_download_uses_configured_cache_and_comfy_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

@@ -108,12 +108,13 @@ LTX25_OUTPAINT_REQUIRED_NODES = {
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
+    access_url = exc.model_url or OUTPAINT_ACCESS_URL
     try:
-        opened = bool(webbrowser.open(OUTPAINT_ACCESS_URL))
+        opened = bool(webbrowser.open(access_url))
     except Exception:
         opened = False
     if opened:
-        return "Approve the official LTX outpainting model download in the Hugging Face tab ARP just opened, then run Outpainting again."
+        return f"{exc} ARP opened the required model repository in your browser."
     return str(exc)
 
 

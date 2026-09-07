@@ -28,6 +28,10 @@ class HfModel:
 class HuggingFaceAccessError(RuntimeError):
     """A gated Hugging Face model could not be read with the active credentials."""
 
+    def __init__(self, message: str, *, model_url: str = "") -> None:
+        super().__init__(message)
+        self.model_url = model_url
+
 
 def huggingface_access_denied(exc: BaseException) -> bool:
     """Recognize Hub access failures without depending on a particular hub/httpx version."""
@@ -211,9 +215,11 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
                     if huggingface_access_denied(exc):
                         model_url = f"https://huggingface.co/{model.repo}"
                         raise HuggingFaceAccessError(
-                            f"Approve access to the required model repository on Hugging Face: {model_url}. "
-                            "Then authenticate the local downloader with `hf auth login --force` (or HF_TOKEN) "
-                            "and retry the stage."
+                            f"Access to the required Hugging Face model {model.repo} was denied. "
+                            f"Approve access at {model_url}. Browser approval alone does not authenticate "
+                            "ARP's local downloader: run `hf auth login --force` from ARP's activated "
+                            "environment (or set HF_TOKEN) using the same Hugging Face account, then retry the stage.",
+                            model_url=model_url,
                         ) from None
                     raise
                 print(f"Warning: could not auto-download {model.repo}/{model.file}: {exc}", flush=True)
