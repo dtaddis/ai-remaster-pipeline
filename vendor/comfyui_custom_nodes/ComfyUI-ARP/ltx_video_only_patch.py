@@ -356,6 +356,17 @@ def _merge_adjacent_partitions(partitions):
     return merged
 
 
+def _xformers_supports_tensor(torch, tensor):
+    """Return false for CUDA generations unsupported by the pinned wheel."""
+    if tensor.device.type != "cuda":
+        return True
+    try:
+        capability = tuple(int(part) for part in torch.cuda.get_device_capability(tensor.device))
+    except Exception:
+        return True
+    return capability <= (9, 0)
+
+
 def _xformers_partitioned_attention(torch, q, k, v, heads, partitions):
     """Evaluate additive per-partition biases using unmasked xFormers kernels.
 
@@ -615,6 +626,7 @@ def install_sparse_guide_attention_patch(model_patcher=None):
         if use_partitioned_xformers:
             try:
                 import xformers.ops  # noqa: F401
+                use_partitioned_xformers = _xformers_supports_tensor(torch, q)
             except Exception:
                 use_partitioned_xformers = False
 

@@ -179,6 +179,10 @@ Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk 
 
 If outpainting fails immediately with missing `LTXVInpaintPreprocess`, `LTXVLaplacianPyramidBlend`, or `LTXAddVideoICLoRAGuideAdvanced` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
 
+The installer also adds ARP's Gemma 4 compatibility adjustment to ComfyUI-GGUF for the quantized LTX 2.5 text encoder. If LTX 2.5 reports `Unexpected text model architecture type ... 'gemma4'`, fully close ComfyUI and rerun `install_windows.bat` against the same ComfyUI directory before restarting it.
+
+ARP automatically uses PyTorch cross-attention instead of xFormers when it starts ComfyUI on newer GPUs that the pinned xFormers wheel cannot execute on. If you start ComfyUI yourself on such a GPU and see `No operator found for memory_efficient_attention_forward`, add ComfyUI's `--use-pytorch-cross-attention` launch option.
+
 If you use ComfyUI portable, select either the inner folder that contains `main.py` or the portable parent folder; ARP will look for `ComfyUI\main.py` inside it.
 
 ### Shot Detection

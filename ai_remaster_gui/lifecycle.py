@@ -19,6 +19,20 @@ from .http_handler import Handler
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 COMFY_STARTUP_LOG = ROOT / "output" / "logs" / "comfyui-startup.log"
+XFORMERS_MAX_CUDA_CAPABILITY = (9, 0)
+
+
+def comfy_requires_pytorch_attention() -> bool:
+    """Return whether ARP's pinned xFormers build cannot run on this GPU."""
+    try:
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available():
+            return False
+        capability = tuple(int(part) for part in torch.cuda.get_device_capability(0))
+        return capability > XFORMERS_MAX_CUDA_CAPABILITY
+    except Exception:
+        return False
 
 
 def port_can_bind(host: str, port: int) -> bool:
@@ -220,6 +234,12 @@ def start_comfy_if_needed(monitor: bool = True) -> bool:
     host = config.get("comfy_host", "127.0.0.1")
     port = str(config.get("comfy_port", "8188"))
     command = [sys.executable, "main.py", "--listen", host, "--port", port]
+    if comfy_requires_pytorch_attention():
+        command.append("--use-pytorch-cross-attention")
+        startup_log(
+            "Using PyTorch cross-attention because the installed xFormers kernels "
+            "do not support this GPU generation."
+        )
     log_path = comfy_startup_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", errors="replace") as log:

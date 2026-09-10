@@ -17,6 +17,23 @@ PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-ARP" / "ltx_vid
 
 
 class SparseGuideAttentionTests(unittest.TestCase):
+    def test_xformers_falls_back_for_unsupported_cuda_generation(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        tensor = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda"))
+        blackwell_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(get_device_capability=lambda _device: (12, 0))
+        )
+        hopper_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(get_device_capability=lambda _device: (9, 0))
+        )
+
+        self.assertFalse(patch_module._xformers_supports_tensor(blackwell_torch, tensor))
+        self.assertTrue(patch_module._xformers_supports_tensor(hopper_torch, tensor))
+
     def test_production_defaults_match_known_good_4090_profile(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_video_only_defaults_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None

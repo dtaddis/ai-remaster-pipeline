@@ -1405,6 +1405,45 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertTrue(log_path.exists())
             self.assertIn("Starting ComfyUI:", log_path.read_text(encoding="utf-8"))
 
+    def test_start_comfy_uses_pytorch_attention_on_newer_gpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            root = Path(tmp_text)
+            comfy = root / "tools" / "comfyui"
+            comfy.mkdir(parents=True)
+            (comfy / "main.py").write_text("# comfy\n", encoding="utf-8")
+
+            class FakeProcess:
+                returncode = None
+
+                def poll(self):
+                    return None
+
+            popen_calls: list[list[str]] = []
+
+            def fake_popen(command, **_kwargs):
+                popen_calls.append(command)
+                return FakeProcess()
+
+            with (
+                mock.patch.object(lifecycle, "STARTED_COMFY_PROCESS", None),
+                mock.patch.object(lifecycle, "current_config", return_value={
+                    "comfy_dir": str(comfy),
+                    "comfy_url": "http://127.0.0.1:8188",
+                    "comfy_host": "127.0.0.1",
+                    "comfy_port": "8188",
+                    "comfy_managed_by_arp": "true",
+                }),
+                mock.patch.object(lifecycle, "discover_comfy_instances", return_value=[]),
+                mock.patch.object(lifecycle, "ensure_bindable_managed_comfy_endpoint", side_effect=lambda value: value),
+                mock.patch.object(lifecycle, "comfy_requires_pytorch_attention", return_value=True),
+                mock.patch.object(lifecycle.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(lifecycle.threading.Thread, "start", lambda _self: None),
+            ):
+                lifecycle.start_comfy_if_needed()
+
+        self.assertEqual(len(popen_calls), 1)
+        self.assertIn("--use-pytorch-cross-attention", popen_calls[0])
+
     def test_managed_comfy_moves_from_an_unbindable_port_and_persists_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             config_path = Path(tmp_text) / ".ai_remaster_config.json"
@@ -1518,6 +1557,11 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("guide_attention_patch", upstream_init)
         arp_init = (vendor_root / "ComfyUI-ARP" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn("install_sparse_guide_attention_patch()", arp_init)
+        gguf_loader = (vendor_root / "ComfyUI-GGUF" / "loader.py").read_text(encoding="utf-8")
+        self.assertRegex(gguf_loader, r"TXT_ARCH_LIST\s*=.*[\"']gemma4[\"']")
+        self.assertIn("audio_embeddings_connector.learnable_registers", gguf_loader)
+        installer = (app.ROOT / "install_windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("Ensure-ComfyUIGGUFGemma4Support", installer)
 
     def test_wait_for_prompt_retries_transient_polling_errors(self) -> None:
         calls = {"count": 0}

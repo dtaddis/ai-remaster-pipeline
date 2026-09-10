@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -137,6 +137,21 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
+
+        # LTX 2.5 Gemma 4 GGUFs use ComfyUI-native state-dict names and can
+        # otherwise pass through unchanged. These three BF16 tensors are read
+        # directly by the LTXAV model rather than through GGUF-aware linear
+        # operations, so leave them as ordinary torch tensors.
+        if (
+            arch_str == "gemma4"
+            and sd_key in {
+                "audio_embeddings_connector.learnable_registers",
+                "keyframes_abs_pos_embedding",
+                "video_embeddings_connector.learnable_registers",
+            }
+            and tensor.tensor_type == gguf.GGMLQuantizationType.BF16
+        ):
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.bfloat16)
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16
         if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:

@@ -717,6 +717,59 @@ function Install-CustomNodePackage {
     }
 }
 
+function Ensure-ComfyUIGGUFGemma4Support {
+    param([string]$Directory)
+    $loaderPath = Join-Path $Directory 'loader.py'
+    if (-not (Test-Path -LiteralPath $loaderPath -PathType Leaf)) {
+        throw "ComfyUI-GGUF loader was not found: $loaderPath"
+    }
+
+    $content = Get-Content -LiteralPath $loaderPath -Raw
+    $changed = $false
+    if ($content -notmatch '(?m)^TXT_ARCH_LIST\s*=.*["'']gemma4["'']') {
+        $architectureLine = [regex]::new('(?m)^(TXT_ARCH_LIST\s*=\s*\{[^\r\n]*)(\}\s*)$')
+        $updated = $architectureLine.Replace($content, '$1, "gemma4"$2', 1)
+        if ($updated -eq $content) {
+            throw 'Could not add Gemma 4 support to ComfyUI-GGUF: TXT_ARCH_LIST has an unsupported layout.'
+        }
+        $content = $updated
+        $changed = $true
+    }
+
+    $compatibilityMarker = 'audio_embeddings_connector.learnable_registers'
+    if (-not $content.Contains($compatibilityMarker)) {
+        $anchor = '        state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)'
+        $compatibilityBlock = @'
+
+
+        # LTX 2.5 Gemma 4 GGUFs contain three raw BF16 parameters which bypass
+        # GGUF-aware linear operations and must therefore be ordinary tensors.
+        if (
+            arch_str == "gemma4"
+            and sd_key in {
+                "audio_embeddings_connector.learnable_registers",
+                "keyframes_abs_pos_embedding",
+                "video_embeddings_connector.learnable_registers",
+            }
+            and tensor.tensor_type == gguf.GGMLQuantizationType.BF16
+        ):
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.bfloat16)
+'@
+        if (-not $content.Contains($anchor)) {
+            throw 'Could not add Gemma 4 support to ComfyUI-GGUF: state-dict loader has an unsupported layout.'
+        }
+        $content = $content.Replace($anchor, $anchor + $compatibilityBlock)
+        $changed = $true
+    }
+
+    if ($changed) {
+        [System.IO.File]::WriteAllText($loaderPath, $content, [System.Text.UTF8Encoding]::new($false))
+        Write-Host 'Installed ARP Gemma 4 compatibility for ComfyUI-GGUF.'
+    } else {
+        Write-Host 'ComfyUI-GGUF Gemma 4 compatibility already installed.'
+    }
+}
+
 function Test-DirectoryContainsText {
     param([string]$Directory, [string]$Needle)
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -1139,6 +1192,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
         throw 'Bundled ComfyUI-ARP custom node is missing from the installer payload.'
     }
     Install-CustomNodePackage 'ComfyUI-GGUF' 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
+    Ensure-ComfyUIGGUFGemma4Support (Join-Path $CustomNodes 'ComfyUI-GGUF')
     Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI_ProPainter_Nodes' 'https://github.com/daniabib/ComfyUI_ProPainter_Nodes.git' (Join-Path $CustomNodes 'ComfyUI_ProPainter_Nodes') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-FlashVSR_Ultra_Fast' 'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git' (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') -UpdateExisting
