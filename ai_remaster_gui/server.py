@@ -44,7 +44,7 @@ from .manifests import (
     write_manifest_details,
     write_outpaint_chunk_rows,
 )
-from .models import CLEANUP_NEGATIVE_PROMPT, CLEANUP_PROMPT, COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
+from .models import CLEANUP_NEGATIVE_PROMPT, CLEANUP_PROMPT, COLORIZE_STAGE_KEYS, SHOT_STAGE_KEYS, STAGES, Stage, output_stage
 from .paths import even_int, format_timecode, newest, rel, resolve, resolve_served, resolve_video_source, safe_stem
 from .power import keep_awake, release_keep_awake
 from .naming import manifest_for_outpainted
@@ -465,8 +465,10 @@ class PipelineApp:
             stages.append(by_key["stabilize"])
         if self.outpaint_enabled():
             stages.append(by_key["outpaint"])
+        if self.colorize_enabled() or self.upscale_enabled():
+            stages.append(by_key["shots"])
         if self.colorize_enabled():
-            stages.extend(by_key[key] for key in ("shots", "references", "colour"))
+            stages.extend(by_key[key] for key in ("references", "colour"))
         if self.outpaint_enabled() or self.colorize_enabled():
             stages.append(by_key["recomp"])
         if self.soundtrack_enabled():
@@ -806,8 +808,11 @@ class PipelineApp:
             milestones = [
                 ("splitting upscaling into", 8, "Splitting into chunks"),
                 ("queueing flashvsr", 20, "Queueing FlashVSR in ComfyUI"),
+                ("queueing seedvr2", 20, "Queueing SeedVR2 in ComfyUI"),
                 ("queued comfyui prompt", 40, "Queued in ComfyUI"),
                 ("sending prompt nodes", 42, "Sending FlashVSR prompt"),
+                ("sending seedvr2 prompt nodes", 42, "Sending SeedVR2 prompt"),
+                ("sending ltx 2.5 upscale prompt nodes", 42, "Sending LTX 2.5 prompt"),
                 ("stitching upscaled chunks", 96, "Stitching upscaled chunks"),
                 ("muxing original audio", 98, "Muxing original audio"),
                 ("wrote upscaled video", 100, "Upscaled video written"),
@@ -1499,9 +1504,10 @@ class PipelineApp:
             cmd = [sys.executable, "-u", str(SCRIPTS / "openai_generate_reference.py")]
             add = cmd.extend
             add(["--manifest", values.get("manifest", ""), "--api-key", values.get("openai_api_key", "")])
-            add(["--model", values.get("openai_image_model", "gpt-image-2") or "gpt-image-2"])
+            add(["--model", values.get("openai_image_model", "gpt-image-2.5-sunburst") or "gpt-image-2.5-sunburst"])
             add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
-            add(["--size", values.get("openai_image_size", "auto"), "--quality", values.get("openai_image_quality", "auto")])
+            add(["--size", values.get("openai_image_size", "max"), "--quality", values.get("openai_image_quality", "max")])
+            add(["--no-normalize-to-source-size"])
             if is_true(values, "openai_send_references"):
                 add(["--reference-count", "3"])
         else:
@@ -1636,6 +1642,8 @@ class PipelineApp:
             return False, "Stabilization is disabled on the Overview tab."
         if stage_key == "outpaint" and not self.outpaint_enabled():
             return False, "Expand using Outpainting is disabled on the Overview tab."
+        if stage_key in SHOT_STAGE_KEYS and not (self.colorize_enabled() or self.upscale_enabled()):
+            return False, "Shot Detection is only enabled when Colorize or Upscale is selected."
         if stage_key in COLORIZE_STAGE_KEYS and not self.colorize_enabled():
             return False, "Colorize is disabled on the Overview tab."
         if stage_key == "recomp" and not (self.outpaint_enabled() or self.colorize_enabled()):
@@ -1675,7 +1683,7 @@ class PipelineApp:
             if not self.upscale_input_for():
                 return False, "Upscaling input is not available yet. Choose source material, or run Recomposition first when earlier phases are enabled."
             if (
-                self.settings.get("upscale", {}).get("method", "flashvsr") != "ltx25"
+                self.settings.get("upscale", {}).get("method", "flashvsr") == "flashvsr"
                 and self.settings.get("upscale", {}).get("compute", "local") != "runpod"
             ):
                 warning = flashvsr_hardware_warning()
@@ -1967,7 +1975,9 @@ class PipelineApp:
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
-        method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+        method = values.get("method", "flashvsr")
+        if method not in {"flashvsr", "seedvr2", "ltx25"}:
+            method = "flashvsr"
         add(["--method", method])
         add(["--flashvsr-model", values.get("flashvsr_model", "FlashVSR-v1.1")])
         add(["--flashvsr-mode", values.get("flashvsr_mode", "tiny")])
@@ -1979,6 +1989,15 @@ class PipelineApp:
         add(["--flashvsr-sparse-ratio", values.get("flashvsr_sparse_ratio") or "2.0"])
         add(["--flashvsr-kv-ratio", values.get("flashvsr_kv_ratio") or "3.0"])
         add(["--flashvsr-seed", values.get("flashvsr_seed", "0")])
+        add(["--seedvr2-model", values.get("seedvr2_model", "seedvr2_ema_3b_fp8_e4m3fn.safetensors")])
+        add(["--seedvr2-batch-size", values.get("seedvr2_batch_size", "5")])
+        add(["--seedvr2-color-correction", values.get("seedvr2_color_correction", "wavelet")])
+        add(["--seedvr2-input-noise-scale", values.get("seedvr2_input_noise_scale", "0")])
+        add(["--seedvr2-latent-noise-scale", values.get("seedvr2_latent_noise_scale", "0")])
+        add(["--seedvr2-vae-tile-size", values.get("seedvr2_vae_tile_size", "512")])
+        add(["--seedvr2-vae-tile-overlap", values.get("seedvr2_vae_tile_overlap", "64")])
+        add(["--seedvr2-blocks-to-swap", values.get("seedvr2_blocks_to_swap", "16")])
+        add(["--seedvr2-seed", values.get("seedvr2_seed", "100")])
         add(["--ltx25-source-fidelity", str(float(values.get("ltx25_source_fidelity", "85") or 85) / 100.0)])
         add(["--ltx25-lora-strength", values.get("ltx25_lora_strength", "1.0")])
         add(["--ltx25-guidance-scale", values.get("ltx25_guidance_scale", "1.0")])
@@ -1997,6 +2016,8 @@ class PipelineApp:
         add(["--overlap-frames", values.get("overlap_frames", "8")])
         add_bool_flags(cmd, values, ("flashvsr_tiled_vae", "flashvsr_tiled_dit", "flashvsr_color_fix"), "true")
         add_bool_flags(cmd, values, ("flashvsr_pre_downscale",))
+        add_bool_flags(cmd, values, ("seedvr2_tiled_vae", "seedvr2_preserve_vram"), "true")
+        add_bool_flags(cmd, values, ("seedvr2_cache_model", "seedvr2_offload_io_components"))
         if is_true(values, "flashvsr_unload_dit"):
             add(["--flashvsr-unload-dit"])
         return [part for part in cmd if part != ""]
@@ -2132,7 +2153,7 @@ class PipelineApp:
         source_text = self.upscale_input_for() or values.get("input_video")
         if not source_text:
             return False, "Choose a source and enable Upscale before generating a preview."
-        if values.get("method", "flashvsr") != "ltx25":
+        if values.get("method", "flashvsr") == "flashvsr":
             warning = flashvsr_hardware_warning()
             if warning:
                 return False, warning
@@ -2544,7 +2565,9 @@ def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
         return ""
     source = resolve(source_text)
     width, height = upscale_target_size(values)
-    method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+    method = values.get("method", "flashvsr")
+    if method not in {"flashvsr", "seedvr2", "ltx25"}:
+        method = "flashvsr"
     ident = aid.upscale_identity(source.stem, width, height, method, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
     return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
 
@@ -2565,7 +2588,9 @@ def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
     source = resolve(source_text)
     width, height = upscale_target_size(values)
     seconds = str(values.get("preview_seconds", "6") or "6")
-    method = "ltx25" if values.get("method") == "ltx25" else "flashvsr"
+    method = values.get("method", "flashvsr")
+    if method not in {"flashvsr", "seedvr2", "ltx25"}:
+        method = "flashvsr"
     ident = aid.upscale_preview_identity(source.stem, width, height, method, seconds, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
     return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
 

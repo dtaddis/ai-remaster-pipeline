@@ -102,7 +102,7 @@ function openAISettingsHtml(refs) {
     <input id="openaiApiKey" type="password" autocomplete="off" value="${esc(refs.openai_api_key || '')}" placeholder="sk-...">
     <label>Image model</label>
     <div class="row">
-      <input id="openaiImageModel" value="${esc(refs.openai_image_model || 'gpt-image-2')}">
+      <input id="openaiImageModel" value="${esc(refs.openai_image_model || 'gpt-image-2.5-sunburst')}">
       <button type="button" onclick="refreshOpenAIModels()">Query Models</button>
     </div>
     <label>Discovered image models</label>
@@ -111,11 +111,21 @@ function openAISettingsHtml(refs) {
     </select>
     <label>Size</label>
     <select id="openaiImageSize">
-      ${['auto', '1024x1024', '1536x1024', '1024x1536'].map(value => `<option value="${value}" ${(refs.openai_image_size || 'auto') === value ? 'selected' : ''}>${value}</option>`).join('')}
+      ${[
+        ['max', 'Maximum (source aspect, up to 4K)'],
+        ['auto', 'Auto'],
+        ['3840x2160', '3840x2160 (4K landscape)'],
+        ['2160x3840', '2160x3840 (4K portrait)'],
+        ['2048x2048', '2048x2048 (2K square)'],
+        ['1536x1024', '1536x1024 (landscape)'],
+        ['1024x1536', '1024x1536 (portrait)'],
+        ['1024x1024', '1024x1024 (square)'],
+      ].map(([value, label]) => `<option value="${value}" ${(refs.openai_image_size || 'max') === value ? 'selected' : ''}>${label}</option>`).join('')}
     </select>
+    <small class="field-help">Maximum preserves the extracted frame's aspect ratio and requests the largest supported multiple-of-16 dimensions. The returned master is kept at that resolution.</small>
     <label>Quality</label>
     <select id="openaiImageQuality">
-      ${['auto', 'low', 'medium', 'high'].map(value => `<option value="${value}" ${(refs.openai_image_quality || 'auto') === value ? 'selected' : ''}>${value}</option>`).join('')}
+      ${['max', 'xhigh', 'high', 'medium', 'low', 'auto'].map(value => `<option value="${value}" ${(refs.openai_image_quality || 'max') === value ? 'selected' : ''}>${value}</option>`).join('')}
     </select>
     <div class="actions">
       <button type="button" class="primary" onclick="saveOpenAISettings()">Save OpenAI Settings</button>
@@ -171,9 +181,9 @@ async function saveOpenAISettings() {
     stage: 'references',
     values: {
       openai_api_key: document.getElementById('openaiApiKey')?.value || '',
-      openai_image_model: document.getElementById('openaiImageModel')?.value || 'gpt-image-2',
-      openai_image_size: document.getElementById('openaiImageSize')?.value || 'auto',
-      openai_image_quality: document.getElementById('openaiImageQuality')?.value || 'auto',
+      openai_image_model: document.getElementById('openaiImageModel')?.value || 'gpt-image-2.5-sunburst',
+      openai_image_size: document.getElementById('openaiImageSize')?.value || 'max',
+      openai_image_quality: document.getElementById('openaiImageQuality')?.value || 'max',
     },
   });
   state = await api(stateUrl());

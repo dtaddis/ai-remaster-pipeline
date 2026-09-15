@@ -40,13 +40,17 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "text, compression artifacts, film damage, dust, scratches"
 )
 
+UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25"}
+DEFAULT_SEEDVR2_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+
 
 def upscale_method(args: argparse.Namespace) -> str:
-    return "ltx25" if str(getattr(args, "method", "flashvsr")).lower() == "ltx25" else "flashvsr"
+    method = str(getattr(args, "method", "flashvsr")).lower()
+    return method if method in UPSCALE_METHODS else "flashvsr"
 
 
 def default_output(source: Path, width: int, height: int, method: str = "flashvsr") -> Path:
-    backend = "ltx25" if method == "ltx25" else "flashvsr"
+    backend = method if method in UPSCALE_METHODS else "flashvsr"
     suffix = f"{backend}_{width}x{height}" if width and height else backend
     return ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{suffix}.mp4"
 
@@ -130,7 +134,8 @@ ADVANCED_DEFAULTS = {
 
 
 def signature(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> dict[str, Any]:
-    if upscale_method(args) == "ltx25":
+    method = upscale_method(args)
+    if method == "ltx25":
         return {
             "version": 1,
             "tool": "upscale_video.py",
@@ -151,6 +156,34 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
             "prompt": args.ltx25_prompt,
             "negative_prompt": args.ltx25_negative_prompt,
             "seed": args.ltx25_seed,
+            "chunk_seconds": args.chunk_seconds,
+            "overlap_frames": args.overlap_frames,
+            "fps": args.fps,
+        }
+    if method == "seedvr2":
+        return {
+            "version": 1,
+            "tool": "upscale_video.py",
+            "method": "seedvr2_video_upscaler",
+            "source": root_relative(source),
+            "source_fingerprint": file_fingerprint(source),
+            "target_width": output_width,
+            "target_height": output_height,
+            "comfy_dir": root_relative(resolve_path(args.comfy_dir)),
+            "comfy_url": args.comfy_url,
+            "model": args.seedvr2_model,
+            "batch_size": args.seedvr2_batch_size,
+            "color_correction": args.seedvr2_color_correction,
+            "input_noise_scale": args.seedvr2_input_noise_scale,
+            "latent_noise_scale": args.seedvr2_latent_noise_scale,
+            "tiled_vae": args.seedvr2_tiled_vae,
+            "vae_tile_size": args.seedvr2_vae_tile_size,
+            "vae_tile_overlap": args.seedvr2_vae_tile_overlap,
+            "preserve_vram": args.seedvr2_preserve_vram,
+            "cache_model": args.seedvr2_cache_model,
+            "blocks_to_swap": args.seedvr2_blocks_to_swap,
+            "offload_io_components": args.seedvr2_offload_io_components,
+            "seed": args.seedvr2_seed,
             "chunk_seconds": args.chunk_seconds,
             "overlap_frames": args.overlap_frames,
             "fps": args.fps,
@@ -196,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-output-root", default="")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
-    parser.add_argument("--method", choices=["flashvsr", "ltx25"], default="flashvsr")
+    parser.add_argument("--method", choices=sorted(UPSCALE_METHODS), default="flashvsr")
     parser.add_argument("--flashvsr-model", choices=["FlashVSR", "FlashVSR-v1.1"], default="FlashVSR-v1.1")
     parser.add_argument("--flashvsr-mode", choices=["tiny", "tiny-long", "full"], default="tiny")
     parser.add_argument("--flashvsr-scale", type=int, default=2)
@@ -217,6 +250,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flashvsr-kv-ratio", type=float, default=3.0, help="Attention memory budget, 1.0-3.0: 3.0 is highest quality, lower saves VRAM.")
     parser.add_argument("--flashvsr-local-range", type=int, choices=[9, 11], default=11, help="Temporal attention window: 11 is more stable, 9 keeps more fine motion (lips) and detail.")
     parser.add_argument("--flashvsr-seed", type=int, default=0)
+    parser.add_argument("--seedvr2-model", default=DEFAULT_SEEDVR2_MODEL)
+    parser.add_argument("--seedvr2-batch-size", type=int, default=5, help="Frames per SeedVR2 batch. Values in the 4n+1 sequence (1, 5, 9, ...) are supported; at least 5 enables temporal consistency.")
+    parser.add_argument("--seedvr2-color-correction", choices=["wavelet", "adain", "none"], default="wavelet")
+    parser.add_argument("--seedvr2-input-noise-scale", type=float, default=0.0)
+    parser.add_argument("--seedvr2-latent-noise-scale", type=float, default=0.0)
+    parser.add_argument("--seedvr2-tiled-vae", dest="seedvr2_tiled_vae", action="store_true", default=True)
+    parser.add_argument("--no-seedvr2-tiled-vae", dest="seedvr2_tiled_vae", action="store_false")
+    parser.add_argument("--seedvr2-vae-tile-size", type=int, default=512)
+    parser.add_argument("--seedvr2-vae-tile-overlap", type=int, default=64)
+    parser.add_argument("--seedvr2-preserve-vram", dest="seedvr2_preserve_vram", action="store_true", default=True)
+    parser.add_argument("--no-seedvr2-preserve-vram", dest="seedvr2_preserve_vram", action="store_false")
+    parser.add_argument("--seedvr2-cache-model", dest="seedvr2_cache_model", action="store_true", default=False)
+    parser.add_argument("--no-seedvr2-cache-model", dest="seedvr2_cache_model", action="store_false")
+    parser.add_argument("--seedvr2-blocks-to-swap", type=int, default=16)
+    parser.add_argument("--seedvr2-offload-io-components", dest="seedvr2_offload_io_components", action="store_true", default=False)
+    parser.add_argument("--no-seedvr2-offload-io-components", dest="seedvr2_offload_io_components", action="store_false")
+    parser.add_argument("--seedvr2-seed", type=int, default=100)
     parser.add_argument("--ltx25-model", default=LTX25_GGUF_MODEL)
     parser.add_argument("--ltx25-text-encoder", default=LTX25_TEXT_ENCODER)
     parser.add_argument("--ltx25-video-vae", default=LTX25_VIDEO_VAE)
@@ -234,7 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ltx25-negative-prompt", default=DEFAULT_LTX25_NEGATIVE_PROMPT)
     parser.add_argument("--chunk-seconds", type=float, default=6.0, help="Upscale in chunks of roughly this many seconds. Use 0 to send the whole clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated before each chunk, then trimmed before stitching.")
-    parser.add_argument("--blend-strength", type=float, default=100.0, help="FlashVSR contribution in the final delivery. 0 is a conventional Lanczos resize; 100 is the full AI upscale.")
+    parser.add_argument("--blend-strength", type=float, default=100.0, help="AI upscale contribution in the final delivery. 0 is a conventional Lanczos resize; 100 is the full AI upscale.")
     parser.add_argument("--shot-manifest", default="", help="Optional shot CSV containing per-row upscale_strength plus fade_to_next/crossfade_seconds tween metadata.")
     parser.add_argument("--fps", type=float, default=0.0)
     parser.add_argument("--ffmpeg", default="")
@@ -351,7 +401,7 @@ def blend_upscale_delivery(
         "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16",
         "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(partial),
     ]
-    print("Blending source motion/detail with FlashVSR by shot", flush=True)
+    print("Blending source motion/detail with AI upscale by shot", flush=True)
     subprocess.run(command, check=True)
     replace_with_retry(partial, output, "Blended upscaled output")
 
@@ -365,7 +415,7 @@ def default_from_spec(spec: Any) -> Any:
     return None
 
 
-def flashvsr_node_inputs(class_type: str, info: dict[str, Any], values: dict[str, Any], connections: dict[str, list[Any]]) -> dict[str, Any]:
+def comfy_node_inputs(class_type: str, info: dict[str, Any], values: dict[str, Any], connections: dict[str, list[Any]]) -> dict[str, Any]:
     inputs: dict[str, Any] = dict(connections)
     input_info = info.get(class_type, {}).get("input", {})
     accepted: set[str] = set()
@@ -422,8 +472,8 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
                 "format": "None",
             },
         },
-        "2": {"class_type": "FlashVSRInitPipe", "inputs": flashvsr_node_inputs("FlashVSRInitPipe", info, init_values, {})},
-        "3": {"class_type": "FlashVSRNodeAdv", "inputs": flashvsr_node_inputs("FlashVSRNodeAdv", info, adv_values, {"pipe": ["2", 0], "frames": ["1", 0]})},
+        "2": {"class_type": "FlashVSRInitPipe", "inputs": comfy_node_inputs("FlashVSRInitPipe", info, init_values, {})},
+        "3": {"class_type": "FlashVSRNodeAdv", "inputs": comfy_node_inputs("FlashVSRNodeAdv", info, adv_values, {"pipe": ["2", 0], "frames": ["1", 0]})},
         "4": {
             "class_type": "VHS_VideoCombine",
             "inputs": {
@@ -468,6 +518,126 @@ def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_w
     print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
     history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
     produced = newest_comfy_output(extract_output_files(history, comfy_output_root), {".mp4", ".mov", ".mkv", ".webm"}, "FlashVSR video")
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(produced, partial)
+    return partial
+
+
+def seedvr2_generation_resolution(output_width: int, output_height: int) -> int:
+    """Return the nearest SeedVR2-safe output short edge (a multiple of 16)."""
+    return max(16, int(round(min(output_width, output_height) / 16.0)) * 16)
+
+
+def seedvr2_prompt(
+    video_name: str,
+    fps: float,
+    output_width: int,
+    output_height: int,
+    args: argparse.Namespace,
+    prefix: str,
+    info: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a SeedVR2 prompt while adapting to the installed node version."""
+    block_swap_values = {
+        "blocks_to_swap": int(args.seedvr2_blocks_to_swap),
+        "offload_io_components": bool(args.seedvr2_offload_io_components),
+    }
+    extra_values = {
+        "tiled_vae": bool(args.seedvr2_tiled_vae),
+        "vae_tile_size": int(args.seedvr2_vae_tile_size),
+        "vae_tile_overlap": int(args.seedvr2_vae_tile_overlap),
+        "preserve_vram": bool(args.seedvr2_preserve_vram),
+        "cache_model": bool(args.seedvr2_cache_model),
+        "enable_debug": False,
+    }
+    upscale_values = {
+        "model": args.seedvr2_model,
+        "seed": int(args.seedvr2_seed),
+        # SeedVR2 defines this as the output's short edge and preserves aspect ratio.
+        # ARP normalizes the result to the exact requested delivery size afterwards.
+        "new_resolution": seedvr2_generation_resolution(output_width, output_height),
+        "batch_size": int(args.seedvr2_batch_size),
+        "color_correction": args.seedvr2_color_correction,
+        "input_noise_scale": float(args.seedvr2_input_noise_scale),
+        "latent_noise_scale": float(args.seedvr2_latent_noise_scale),
+    }
+    return {
+        "1": {
+            "class_type": "VHS_LoadVideo",
+            "inputs": {
+                "video": video_name,
+                "force_rate": 0.0,
+                "custom_width": 0,
+                "custom_height": 0,
+                "frame_load_cap": 0,
+                "skip_first_frames": 0,
+                "select_every_nth": 1,
+                "format": "None",
+            },
+        },
+        "2": {
+            "class_type": "SeedVR2BlockSwap",
+            "inputs": comfy_node_inputs("SeedVR2BlockSwap", info, block_swap_values, {}),
+        },
+        "3": {
+            "class_type": "SeedVR2ExtraArgs",
+            "inputs": comfy_node_inputs("SeedVR2ExtraArgs", info, extra_values, {}),
+        },
+        "4": {
+            "class_type": "SeedVR2",
+            "inputs": comfy_node_inputs(
+                "SeedVR2",
+                info,
+                upscale_values,
+                {"images": ["1", 0], "block_swap_config": ["2", 0], "extra_args": ["3", 0]},
+            ),
+        },
+        "5": {
+            "class_type": "VHS_VideoCombine",
+            "inputs": {
+                "images": ["4", 0],
+                "frame_rate": fps,
+                "loop_count": 0,
+                "filename_prefix": prefix,
+                "format": "video/h264-mp4",
+                "pix_fmt": "yuv420p",
+                "crf": 16,
+                "save_metadata": True,
+                "pingpong": False,
+                "save_output": True,
+            },
+        },
+    }
+
+
+def seedvr2_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int) -> Path:
+    comfy_dir = resolve_path(args.comfy_dir)
+    comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
+    if not (comfy_dir / "main.py").exists():
+        raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
+    wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+    required_nodes = {
+        "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+        "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+        "SeedVR2": "ComfyUI-SeedVR2_VideoUpscaler",
+        "SeedVR2BlockSwap": "ComfyUI-SeedVR2_VideoUpscaler",
+        "SeedVR2ExtraArgs": "ComfyUI-SeedVR2_VideoUpscaler",
+    }
+    ensure_node_types(args.comfy_url, required_nodes, "SeedVR2 upscaling", comfy_dir=comfy_dir)
+    info = object_info(args.comfy_url)
+    video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_seedvr2")
+    fps = args.fps or float(video_info(source)["fps"])
+    prefix = f"arp_upscale/{safe_stem(source.name)}_seedvr2_{output_width}x{output_height}"
+    prompt = seedvr2_prompt(video_name, fps, output_width, output_height, args, prefix, info)
+    print(f"Sending SeedVR2 prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
+    prompt_id = queue_prompt(args.comfy_url, prompt)
+    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    produced = newest_comfy_output(
+        extract_output_files(history, comfy_output_root),
+        {".mp4", ".mov", ".mkv", ".webm"},
+        "SeedVR2 video",
+    )
     partial.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(produced, partial)
     return partial
@@ -873,21 +1043,35 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: P
     video_partial.unlink(missing_ok=True)
 
 
-def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, output_width: int, output_height: int, info: dict[str, Any], source_fingerprint: dict[str, Any], audio_source: Path | None = None) -> None:
+def chunked_standard_upscale_run(
+    args: argparse.Namespace,
+    source: Path,
+    output: Path,
+    output_width: int,
+    output_height: int,
+    info: dict[str, Any],
+    source_fingerprint: dict[str, Any],
+    method: str,
+    audio_source: Path | None = None,
+) -> None:
+    if method not in {"flashvsr", "seedvr2"}:
+        raise ValueError(f"Unsupported standard upscale method: {method}")
+    runner = flashvsr_run if method == "flashvsr" else seedvr2_run
+    label = "FlashVSR" if method == "flashvsr" else "SeedVR2"
     ffmpeg = find_ffmpeg(args.ffmpeg)
     audio_source = audio_source or source
     fps = args.fps or float(info["fps"])
     ranges = chunk_ranges(int(info["frames"]), fps, args.chunk_seconds, args.overlap_frames)
     if len(ranges) <= 1:
-        raw_partial = output.with_suffix(output.suffix + ".flashvsr.partial" + output.suffix)
+        raw_partial = output.with_suffix(output.suffix + f".{method}.partial" + output.suffix)
         final_partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
         for path in (raw_partial, final_partial):
             if path.exists():
                 path.unlink()
-        print(f"Queueing FlashVSR in ComfyUI: {source}", flush=True)
-        flashvsr_run(args, source, raw_partial, output_width, output_height)
+        print(f"Queueing {label} in ComfyUI: {source}", flush=True)
+        runner(args, source, raw_partial, output_width, output_height)
         if not raw_partial.exists():
-            raise RuntimeError(f"FlashVSR finished but did not create expected output: {raw_partial}")
+            raise RuntimeError(f"{label} finished but did not create expected output: {raw_partial}")
         raw_info = video_info(raw_partial)
         if raw_info["width"] == output_width and raw_info["height"] == output_height:
             replace_with_retry(raw_partial, final_partial, "Upscaled preview")
@@ -923,7 +1107,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
             print(f"Reuse upscaled chunk from compatible cache: {reusable}", flush=True)
             normalized_chunks.append(chunk_final)
             continue
-        flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height)
+        runner(args, chunk_input, chunk_raw, output_width, output_height)
         normalize_chunk(ffmpeg, chunk_raw, chunk_final, output_width, output_height, trim_start, fps, True)
         write_signature(chunk_final, chunk_sig)
         print(f"Wrote upscaled chunk: {chunk_final}", flush=True)
@@ -1129,6 +1313,11 @@ def run(args: argparse.Namespace) -> int:
     info = video_info(source)
     output_width, output_height = fit_dimensions(int(info["width"]), int(info["height"]), args.target_width, args.target_height)
     method = upscale_method(args)
+    if method == "seedvr2":
+        if args.seedvr2_batch_size < 1 or (args.seedvr2_batch_size - 1) % 4 != 0:
+            raise ValueError("SeedVR2 batch size must use the 4n+1 sequence: 1, 5, 9, 13, ...")
+        if args.seedvr2_vae_tile_overlap >= args.seedvr2_vae_tile_size:
+            raise ValueError("SeedVR2 VAE tile overlap must be smaller than the tile size.")
     delivery_width, delivery_height = (
         ltx25_generation_dimensions(output_width, output_height)
         if method == "ltx25"
@@ -1154,10 +1343,14 @@ def run(args: argparse.Namespace) -> int:
         if method == "flashvsr" and args.flashvsr_pre_downscale:
             processing_width, processing_height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
             print(f"Would pre-downscale FlashVSR input to {processing_width}x{processing_height}", flush=True)
-        label = "LTX 2.5 Pixel Spatial IC-LoRA" if method == "ltx25" else "FlashVSR"
+        labels = {
+            "flashvsr": "FlashVSR",
+            "seedvr2": "SeedVR2",
+            "ltx25": "LTX 2.5 Pixel Spatial IC-LoRA",
+        }
         print(
             f"Would upscale {source} -> {output} at {delivery_width}x{delivery_height} "
-            f"using {label} in ComfyUI at {args.comfy_url} ({args.comfy_dir})",
+            f"using {labels[method]} in ComfyUI at {args.comfy_url} ({args.comfy_dir})",
             flush=True,
         )
         return 0
@@ -1182,9 +1375,9 @@ def run(args: argparse.Namespace) -> int:
                 sig["source_fingerprint"],
             )
         else:
-            chunked_flashvsr_run(
+            chunked_standard_upscale_run(
                 args, processing_source, ai_output, output_width, output_height,
-                processing_info, processing_fingerprint, audio_source=source,
+                processing_info, processing_fingerprint, method, audio_source=source,
             )
         write_signature(ai_output, sig)
     else:

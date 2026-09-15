@@ -1196,6 +1196,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI_ProPainter_Nodes' 'https://github.com/daniabib/ComfyUI_ProPainter_Nodes.git' (Join-Path $CustomNodes 'ComfyUI_ProPainter_Nodes') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-FlashVSR_Ultra_Fast' 'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git' (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-SeedVR2_VideoUpscaler' 'https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git' (Join-Path $CustomNodes 'ComfyUI-SeedVR2_VideoUpscaler') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-MMAudio' 'https://github.com/kijai/ComfyUI-MMAudio.git' (Join-Path $CustomNodes 'ComfyUI-MMAudio') -UpdateExisting
     if (-not $SkipDeepExemplar) {
         Install-CustomNodePackage 'reference-video-colorization' 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting -PreferBundled
@@ -1234,6 +1235,11 @@ Invoke-Step 'Verify required ComfyUI custom nodes' {
         'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast' `
         @('FlashVSRNode')
     Assert-CustomNodeSymbols `
+        'ComfyUI-SeedVR2_VideoUpscaler' `
+        (Join-Path $CustomNodes 'ComfyUI-SeedVR2_VideoUpscaler') `
+        'https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler' `
+        @('SeedVR2', 'SeedVR2BlockSwap', 'SeedVR2ExtraArgs')
+    Assert-CustomNodeSymbols `
         'ComfyUI-MMAudio' `
         (Join-Path $CustomNodes 'ComfyUI-MMAudio') `
         'https://github.com/kijai/ComfyUI-MMAudio' `
@@ -1252,6 +1258,7 @@ Invoke-Step 'Install custom-node requirements' {
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-GGUF\requirements.txt')
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite\requirements.txt')
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast\requirements.txt')
+    Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-SeedVR2_VideoUpscaler\requirements.txt')
     Install-RequirementsIfPresent (Join-Path $CustomNodes 'ComfyUI-MMAudio\requirements.txt')
     if (-not $SkipDeepExemplar) {
         Install-RequirementsIfPresent (Join-Path $CustomNodes 'reference-video-colorization\requirements.txt')
@@ -1265,7 +1272,7 @@ Invoke-Step 'Install custom-node requirements' {
 }
 
 Invoke-Step 'Create model directories' {
-    foreach ($dir in @('checkpoints','diffusion_models','loras','text_encoders','unet','vae','latent_upscale_models','mmaudio')) {
+    foreach ($dir in @('checkpoints','diffusion_models','loras','text_encoders','unet','vae','latent_upscale_models','mmaudio','SEEDVR2')) {
         Ensure-Directory (Resolve-ComfyModelDestination "models\$dir")
     }
 }

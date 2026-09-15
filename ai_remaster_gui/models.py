@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 from .config import OUTPAINT_PROMPT, REFERENCE_PROMPT, REFERENCE_PROMPT_SUFFIX
 
-COLORIZE_STAGE_KEYS = {"shots", "references", "colour"}
+SHOT_STAGE_KEYS = {"shots"}
+COLORIZE_STAGE_KEYS = {"references", "colour"}
 
 CLEANUP_PROMPT = (
     "A modern, high-resolution video shot in vivid color, sharp detail, clean tonality, "
@@ -123,7 +124,7 @@ STAGES = (
     Stage(
         "shots",
         "Shot Detection",
-        "Detect cuts and divide the video into sections for independent colorization.",
+        "Detect cuts and divide the video into sections for independent colorization and per-shot upscaling controls.",
         ("intermediate/outpainted", "intermediate/outpainted_references", "manifests/references"),
         (
             ("compute", "Compute", "select:local|runpod", "local"),
@@ -234,7 +235,7 @@ STAGES = (
             ("target_width", "Target width", "number", "3840"),
             ("target_height", "Target height", "number", "2160"),
             ("output", "Upscaled output", "save", ""),
-            ("method", "Upscale method", "select:flashvsr|ltx25", "flashvsr"),
+            ("method", "Upscale method", "select:flashvsr|seedvr2|ltx25", "flashvsr"),
             ("flashvsr_model", "FlashVSR model", "select:FlashVSR|FlashVSR-v1.1", "FlashVSR-v1.1"),
             ("flashvsr_mode", "FlashVSR mode", "select:tiny|tiny-long|full", "tiny"),
             ("flashvsr_scale", "FlashVSR scale", "select:2|3|4", "2"),
@@ -250,6 +251,19 @@ STAGES = (
             ("flashvsr_tiled_vae", "Tiled decode (tiled_vae)", "checkbox", "true"),
             ("flashvsr_unload_dit", "Unload before decode (unload_dit)", "checkbox", "false"),
             ("flashvsr_seed", "FlashVSR seed", "number", "0"),
+            ("seedvr2_model", "SeedVR2 model", "select:seedvr2_ema_3b_fp8_e4m3fn.safetensors|seedvr2_ema_3b-Q4_K_M.gguf|seedvr2_ema_3b_fp16.safetensors|seedvr2_ema_7b-Q4_K_M.gguf|seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors|seedvr2_ema_7b_fp16.safetensors|seedvr2_ema_7b_sharp-Q4_K_M.gguf|seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors|seedvr2_ema_7b_sharp_fp16.safetensors", "seedvr2_ema_3b_fp8_e4m3fn.safetensors"),
+            ("seedvr2_batch_size", "SeedVR2 batch size", "select:1|5|9|13|17|21", "5"),
+            ("seedvr2_color_correction", "SeedVR2 color correction", "select:wavelet|adain|none", "wavelet"),
+            ("seedvr2_input_noise_scale", "Input noise", "range:0|1|0.01", "0"),
+            ("seedvr2_latent_noise_scale", "Latent noise", "range:0|1|0.01", "0"),
+            ("seedvr2_tiled_vae", "Tiled VAE", "checkbox", "true"),
+            ("seedvr2_vae_tile_size", "VAE tile size (px)", "number", "512"),
+            ("seedvr2_vae_tile_overlap", "VAE tile overlap (px)", "number", "64"),
+            ("seedvr2_preserve_vram", "Preserve VRAM", "checkbox", "true"),
+            ("seedvr2_cache_model", "Cache model between chunks", "checkbox", "false"),
+            ("seedvr2_blocks_to_swap", "Transformer blocks to swap", "range:0|36|1", "16"),
+            ("seedvr2_offload_io_components", "Offload I/O components", "checkbox", "false"),
+            ("seedvr2_seed", "SeedVR2 seed", "number", "100"),
             ("ltx25_source_fidelity", "LTX 2.5 source fidelity", "range:0|100|1", "85"),
             ("ltx25_lora_strength", "LTX 2.5 LoRA strength", "number", "1.0"),
             ("ltx25_guidance_scale", "LTX 2.5 creativity guidance", "range:1|5|0.25", "1.0"),

@@ -5,6 +5,7 @@ import base64
 import csv
 import json
 import mimetypes
+import math
 import ssl
 import sys
 import time
@@ -15,8 +16,10 @@ from pathlib import Path
 from common import ROOT, resolve_path
 from reference_sets import expanded_reference_rows, reference_items
 
-DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_MODEL = "gpt-image-2.5-sunburst"
 BOUNDARY = "----arp-openai-image-edit"
+MAX_IMAGE_EDGE = 3840
+MAX_IMAGE_PIXELS = 8_294_400
 
 
 def multipart_field(name: str, value: str) -> bytes:
@@ -49,6 +52,60 @@ def build_body(args: argparse.Namespace, source: Path, references: list[Path] | 
         f"--{BOUNDARY}--\r\n".encode("utf-8"),
     ]
     return b"".join(parts)
+
+
+def maximum_source_aspect_size(source_path: Path) -> str:
+    """Return the largest API-safe multiple-of-16 size at the source aspect ratio."""
+    try:
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError("Pillow is required to calculate maximum OpenAI image dimensions.") from exc
+    with Image.open(source_path) as image:
+        source_width, source_height = image.size
+    if source_width <= 0 or source_height <= 0:
+        raise RuntimeError(f"Cannot read source image dimensions: {source_path}")
+    aspect = source_width / source_height
+    if not 1 / 3 <= aspect <= 3:
+        raise RuntimeError(
+            f"OpenAI maximum-size output requires an aspect ratio between 1:3 and 3:1; "
+            f"{source_path.name} is {source_width}x{source_height}."
+        )
+
+    scale = min(
+        MAX_IMAGE_EDGE / source_width,
+        MAX_IMAGE_EDGE / source_height,
+        math.sqrt(MAX_IMAGE_PIXELS / (source_width * source_height)),
+    )
+    width = max(16, int(round(source_width * scale / 16)) * 16)
+    height = max(16, int(round(source_height * scale / 16)) * 16)
+    width = min(width, MAX_IMAGE_EDGE)
+    height = min(height, MAX_IMAGE_EDGE)
+
+    # Rounding both edges can put an otherwise valid aspect a fraction over the
+    # pixel budget. Remove one 16px strip at a time from whichever edge keeps
+    # the requested aspect closest.
+    while width * height > MAX_IMAGE_PIXELS:
+        candidates: list[tuple[float, int, int]] = []
+        if width > 16:
+            candidates.append((abs(((width - 16) / height) - aspect), width - 16, height))
+        if height > 16:
+            candidates.append((abs((width / (height - 16)) - aspect), width, height - 16))
+        if not candidates:
+            break
+        _error, width, height = min(candidates, key=lambda item: item[0])
+    return f"{width}x{height}"
+
+
+def resolved_output_size(requested: str, source_path: Path, model: str) -> str:
+    if requested.strip().lower() != "max":
+        return requested
+    model_id = model.strip().lower()
+    if not (model_id.startswith("gpt-image-2.5-") or model_id == "gpt-image-2"):
+        raise RuntimeError(
+            "Maximum source-aspect output requires GPT Image 2.5 or GPT Image 2; "
+            f"the selected model is {model}."
+        )
+    return maximum_source_aspect_size(source_path)
 
 
 def normalize_to_source_size(path: Path, source_path: Path, *, quiet: bool = False) -> None:
@@ -91,6 +148,8 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
         )
     prompt = " ".join(part.strip() for part in (args.prompt, args.prompt_suffix, continuity, args.add_prompt) if part and part.strip())
     args.prompt = prompt
+    requested_size = args.size
+    args.size = resolved_output_size(requested_size, source, args.model)
     body = build_body(args, source, reference_paths)
     request = urllib.request.Request(
         "https://api.openai.com/v1/images/edits",
@@ -105,6 +164,7 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     if not quiet:
         print(f"OpenAI image edit: {source} -> {output}", flush=True)
         print(f"OpenAI model: {args.model}", flush=True)
+        print(f"OpenAI output: {args.size}, quality={args.quality}", flush=True)
         if reference_paths:
             print(f"OpenAI reference images: {len(reference_paths)}", flush=True)
     if args.dry_run:
@@ -248,8 +308,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--prompt-suffix", default="")
     parser.add_argument("--add-prompt", default="")
-    parser.add_argument("--size", default="auto")
-    parser.add_argument("--quality", default="auto")
+    parser.add_argument("--size", default="max", help="API size or 'max' for the largest source-aspect dimensions supported by GPT Image 2/2.5.")
+    parser.add_argument("--quality", default="max")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--limit", type=int)

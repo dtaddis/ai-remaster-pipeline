@@ -111,6 +111,7 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
         "ComfyUI-VideoHelperSuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite -> ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
         "ComfyUI_ProPainter_Nodes": "https://github.com/daniabib/ComfyUI_ProPainter_Nodes -> ComfyUI/custom_nodes/ComfyUI_ProPainter_Nodes",
         "ComfyUI-FlashVSR_Ultra_Fast": "https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast -> ComfyUI/custom_nodes/ComfyUI-FlashVSR_Ultra_Fast",
+        "ComfyUI-SeedVR2_VideoUpscaler": "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler -> ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler",
         "ComfyUI-Reference-Based-Video-Colorization": "https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization -> ComfyUI/custom_nodes/reference-video-colorization",
         "ComfyUI-MMAudio": "https://github.com/kijai/ComfyUI-MMAudio -> ComfyUI/custom_nodes/ComfyUI-MMAudio",
     }

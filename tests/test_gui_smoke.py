@@ -139,7 +139,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(active(T, T, T, T), ["outpaint", "shots", "references", "colour", "recomp", "audio", "upscale"])
         self.assertEqual(active(T, F, F, F), ["outpaint", "recomp"])
         self.assertEqual(active(F, T, F, F), ["shots", "references", "colour", "recomp"])
-        self.assertEqual(active(F, F, F, T), ["upscale"])
+        self.assertEqual(active(F, F, F, T), ["shots", "upscale"])
         self.assertEqual(active(F, F, T, F), ["audio"])
         self.assertEqual(active(F, F, F, F), [])
 
@@ -304,7 +304,7 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             cleaned_path.unlink(missing_ok=True)
 
-        self.assertEqual([stage.key for stage in app.APP.active_stages()], ["cleanup", "upscale"])
+        self.assertEqual([stage.key for stage in app.APP.active_stages()], ["cleanup", "shots", "upscale"])
         self.assertEqual(command[command.index("--input") + 1], cleaned)
 
     def test_cleanup_comparison_pairs_pipeline_source_with_finished_output(self) -> None:
@@ -4046,6 +4046,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn("--manifest", command)
             self.assertIn("--row-index", command)
             self.assertEqual(command[command.index("--model") + 1], "gpt-image-1")
+            self.assertIn("--no-normalize-to-source-size", command)
             self.assertEqual(output, app.rel(color))
 
     def test_openai_manifest_command_can_send_nearby_reference_images(self) -> None:
@@ -4063,7 +4064,43 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertIn("openai_generate_reference.py", " ".join(command))
         self.assertIn("--reference-count", command)
+        self.assertIn("--no-normalize-to-source-size", command)
         self.assertNotIn("qwen_colorize_references.py", " ".join(command))
+
+    def test_openai_reference_max_size_preserves_aspect_and_api_limits(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            source = Path(tmp_text) / "source.png"
+            Image.new("RGB", (1200, 700)).save(source)
+
+            resolved = openai_generate_reference.resolved_output_size(
+                "max", source, "gpt-image-2.5-sunburst"
+            )
+
+        width, height = (int(part) for part in resolved.split("x"))
+        self.assertEqual(width % 16, 0)
+        self.assertEqual(height % 16, 0)
+        self.assertLessEqual(max(width, height), 3840)
+        self.assertLessEqual(width * height, 8_294_400)
+        self.assertGreater(width * height, 8_000_000)
+        self.assertAlmostEqual(width / height, 1200 / 700, delta=0.01)
+
+    def test_openai_reference_defaults_migrate_to_sunburst_maximum(self) -> None:
+        values = runtime_settings.base_settings()
+        values["references"].update(
+            {
+                "openai_image_model": "gpt-image-2.5-sunburst",
+                "openai_image_size": "auto",
+                "openai_image_quality": "high",
+            }
+        )
+
+        normalized = runtime_settings.normalize_settings(values, include_newest_source=False)
+
+        self.assertEqual(normalized["references"]["openai_image_model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(normalized["references"]["openai_image_size"], "max")
+        self.assertEqual(normalized["references"]["openai_image_quality"], "max")
 
     def test_openai_cloud_colorization_command_uses_shared_key_and_cloud_controls(self) -> None:
         app.APP.settings["references"].update({"openai_api_key": "sk-test"})
@@ -4586,9 +4623,9 @@ class GuiSmokeTests(unittest.TestCase):
             (False, False, False, []),
             (True, False, False, ["outpaint", "recomp"]),
             (False, True, False, ["shots", "references", "colour", "recomp"]),
-            (False, False, True, ["upscale"]),
+            (False, False, True, ["shots", "upscale"]),
             (True, True, False, ["outpaint", "shots", "references", "colour", "recomp"]),
-            (True, False, True, ["outpaint", "recomp", "upscale"]),
+            (True, False, True, ["outpaint", "shots", "recomp", "upscale"]),
             (False, True, True, ["shots", "references", "colour", "recomp", "upscale"]),
             (True, True, True, ["outpaint", "shots", "references", "colour", "recomp", "upscale"]),
         ]
@@ -4622,7 +4659,7 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             outpainted_path.unlink(missing_ok=True)
 
-        self.assertEqual([stage.key for stage in app.APP.active_stages()], ["outpaint", "recomp", "upscale"])
+        self.assertEqual([stage.key for stage in app.APP.active_stages()], ["outpaint", "shots", "recomp", "upscale"])
         self.assertEqual(app.APP.settings["upscale"]["input_video"], recomp_output)
         self.assertEqual(command[command.index("--input") + 1], recomp_output)
 
@@ -4703,7 +4740,7 @@ class GuiSmokeTests(unittest.TestCase):
         stage_keys = [stage.key for stage in app.APP.active_stages()]
         command = app.APP.command_for("upscale")
 
-        self.assertEqual(stage_keys, ["upscale"])
+        self.assertEqual(stage_keys, ["shots", "upscale"])
         self.assertEqual(app.APP.settings["upscale"]["input_video"], "input/example.mp4")
         self.assertEqual(command[command.index("--method") + 1], "flashvsr")
         self.assertIn("--target-width", command)
@@ -5020,6 +5057,117 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["4"]["inputs"]["images"], ["3", 0])
         self.assertNotIn("audio", prompt["4"]["inputs"])
 
+    def test_upscale_can_select_seedvr2_backend(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+        app.APP.settings["upscale"].update({
+            "method": "seedvr2",
+            "target_width": "1920",
+            "target_height": "1080",
+            "seedvr2_model": "seedvr2_ema_7b-Q4_K_M.gguf",
+            "seedvr2_batch_size": "9",
+            "seedvr2_color_correction": "adain",
+            "seedvr2_input_noise_scale": "0.05",
+            "seedvr2_latent_noise_scale": "0.1",
+            "seedvr2_tiled_vae": "true",
+            "seedvr2_vae_tile_size": "768",
+            "seedvr2_vae_tile_overlap": "96",
+            "seedvr2_preserve_vram": "true",
+            "seedvr2_cache_model": "true",
+            "seedvr2_blocks_to_swap": "24",
+            "seedvr2_offload_io_components": "true",
+            "seedvr2_seed": "321",
+        })
+
+        command = app.APP.command_for("upscale")
+
+        self.assertEqual(command[command.index("--method") + 1], "seedvr2")
+        self.assertEqual(command[command.index("--seedvr2-model") + 1], "seedvr2_ema_7b-Q4_K_M.gguf")
+        self.assertEqual(command[command.index("--seedvr2-batch-size") + 1], "9")
+        self.assertEqual(command[command.index("--seedvr2-color-correction") + 1], "adain")
+        self.assertEqual(command[command.index("--seedvr2-input-noise-scale") + 1], "0.05")
+        self.assertEqual(command[command.index("--seedvr2-latent-noise-scale") + 1], "0.1")
+        self.assertEqual(command[command.index("--seedvr2-vae-tile-size") + 1], "768")
+        self.assertEqual(command[command.index("--seedvr2-vae-tile-overlap") + 1], "96")
+        self.assertEqual(command[command.index("--seedvr2-blocks-to-swap") + 1], "24")
+        self.assertEqual(command[command.index("--seedvr2-seed") + 1], "321")
+        self.assertIn("--seedvr2-tiled-vae", command)
+        self.assertIn("--seedvr2-preserve-vram", command)
+        self.assertIn("--seedvr2-cache-model", command)
+        self.assertIn("--seedvr2-offload-io-components", command)
+        seed_output = app.upscale_output_for("input/example.mp4", app.APP.settings["upscale"])
+        flash_values = dict(app.APP.settings["upscale"], method="flashvsr")
+        self.assertNotEqual(seed_output, app.upscale_output_for("input/example.mp4", flash_values))
+
+    def test_seedvr2_prompt_uses_memory_controls_and_video_helper_nodes(self) -> None:
+        args = upscale_video.build_parser().parse_args([
+            "--input", "input/example.mp4",
+            "--method", "seedvr2",
+            "--seedvr2-model", "seedvr2_ema_3b-Q4_K_M.gguf",
+            "--seedvr2-batch-size", "9",
+            "--seedvr2-color-correction", "adain",
+            "--seedvr2-input-noise-scale", "0.05",
+            "--seedvr2-latent-noise-scale", "0.1",
+            "--seedvr2-vae-tile-size", "768",
+            "--seedvr2-vae-tile-overlap", "96",
+            "--seedvr2-blocks-to-swap", "24",
+            "--seedvr2-offload-io-components",
+            "--seedvr2-seed", "321",
+        ])
+        info = {
+            "SeedVR2BlockSwap": {"input": {"required": {
+                "blocks_to_swap": ("INT", {"default": 16}),
+                "offload_io_components": ("BOOLEAN", {"default": False}),
+            }}},
+            "SeedVR2ExtraArgs": {"input": {"required": {
+                "tiled_vae": ("BOOLEAN", {"default": False}),
+                "vae_tile_size": ("INT", {"default": 512}),
+                "vae_tile_overlap": ("INT", {"default": 64}),
+                "preserve_vram": ("BOOLEAN", {"default": False}),
+                "cache_model": ("BOOLEAN", {"default": False}),
+                "enable_debug": ("BOOLEAN", {"default": False}),
+                "device": (["cuda:0"], {"default": "cuda:0"}),
+            }}},
+            "SeedVR2": {"input": {
+                "required": {
+                    "images": ("IMAGE",),
+                    "model": (["seedvr2_ema_3b-Q4_K_M.gguf"],),
+                    "seed": ("INT", {"default": 100}),
+                    "new_resolution": ("INT", {"default": 1072}),
+                    "batch_size": ("INT", {"default": 5}),
+                    "color_correction": (["wavelet", "adain", "none"], {"default": "wavelet"}),
+                    "input_noise_scale": ("FLOAT", {"default": 0.0}),
+                    "latent_noise_scale": ("FLOAT", {"default": 0.0}),
+                },
+                "optional": {
+                    "block_swap_config": ("block_swap_config",),
+                    "extra_args": ("extra_args",),
+                },
+            }},
+        }
+
+        prompt = upscale_video.seedvr2_prompt("example.mp4", 24.0, 1920, 1080, args, "arp_upscale/example", info)
+
+        self.assertEqual(prompt["1"]["class_type"], "VHS_LoadVideo")
+        self.assertEqual(prompt["2"]["inputs"]["blocks_to_swap"], 24)
+        self.assertTrue(prompt["2"]["inputs"]["offload_io_components"])
+        self.assertTrue(prompt["3"]["inputs"]["tiled_vae"])
+        self.assertTrue(prompt["3"]["inputs"]["preserve_vram"])
+        self.assertEqual(prompt["3"]["inputs"]["vae_tile_size"], 768)
+        self.assertEqual(prompt["3"]["inputs"]["vae_tile_overlap"], 96)
+        self.assertEqual(prompt["3"]["inputs"]["device"], "cuda:0")
+        self.assertEqual(prompt["4"]["class_type"], "SeedVR2")
+        self.assertEqual(prompt["4"]["inputs"]["images"], ["1", 0])
+        self.assertEqual(prompt["4"]["inputs"]["block_swap_config"], ["2", 0])
+        self.assertEqual(prompt["4"]["inputs"]["extra_args"], ["3", 0])
+        self.assertEqual(prompt["4"]["inputs"]["model"], "seedvr2_ema_3b-Q4_K_M.gguf")
+        self.assertEqual(prompt["4"]["inputs"]["new_resolution"], 1088)
+        self.assertEqual(prompt["4"]["inputs"]["batch_size"], 9)
+        self.assertEqual(prompt["4"]["inputs"]["color_correction"], "adain")
+        self.assertEqual(prompt["4"]["inputs"]["seed"], 321)
+        self.assertEqual(prompt["5"]["class_type"], "VHS_VideoCombine")
+        self.assertEqual(prompt["5"]["inputs"]["images"], ["4", 0])
+        self.assertNotIn("audio", prompt["5"]["inputs"])
+
     def test_ltx25_upscale_prompt_is_video_only_and_uses_x2_ic_lora(self) -> None:
         args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25"])
 
@@ -5125,7 +5273,7 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             outpainted_path.unlink(missing_ok=True)
 
-        self.assertEqual(stage_keys, ["outpaint", "recomp", "upscale"])
+        self.assertEqual(stage_keys, ["outpaint", "shots", "recomp", "upscale"])
         self.assertTrue(app.APP.settings["upscale"]["input_video"].startswith("output/reassembled/"))
 
     def test_new_outpaint_source_does_not_hydrate_empty_manifest_as_repo_root(self) -> None:

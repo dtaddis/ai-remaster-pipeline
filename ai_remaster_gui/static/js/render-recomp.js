@@ -193,6 +193,14 @@ function upscaleMainFields(st) {
       'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_guidance_scale', 'ltx25_seed',
       'ltx25_prompt', 'ltx25_negative_prompt',
     );
+  } else if (method === 'seedvr2') {
+    fieldKeys.push(
+      'seedvr2_model', 'seedvr2_batch_size', 'seedvr2_color_correction',
+      'seedvr2_input_noise_scale', 'seedvr2_latent_noise_scale',
+      'seedvr2_tiled_vae', 'seedvr2_vae_tile_size', 'seedvr2_vae_tile_overlap',
+      'seedvr2_preserve_vram', 'seedvr2_cache_model',
+      'seedvr2_blocks_to_swap', 'seedvr2_offload_io_components', 'seedvr2_seed',
+    );
   } else {
     fieldKeys.push(
       'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
@@ -231,7 +239,7 @@ function upscaleComparisonHtml(s, preview) {
   if (!after) {
     return `
       <video src="${media(before)}" controls preload="metadata"></video>
-      <p class="shot-empty">Generate a preview to compare ${s.method === 'ltx25' ? 'LTX 2.5' : 'FlashVSR'} output against the input.</p>
+      <p class="shot-empty">Generate a preview to compare ${upscaleMethodLabel(s.method)} output against the input.</p>
     `;
   }
   return `
@@ -251,6 +259,12 @@ function upscaleComparisonHtml(s, preview) {
 
 function bindUpscaleComparison() {
   bindVideoComparison('upscaleCompareSlider');
+}
+
+function upscaleMethodLabel(method) {
+  if (method === 'ltx25') return 'LTX 2.5';
+  if (method === 'seedvr2') return 'SeedVR2';
+  return 'FlashVSR';
 }
 
 function upscaleShotBreakdownHtml(s) {

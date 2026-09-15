@@ -128,7 +128,7 @@ const FIELD_DESCRIPTIONS = {
   'recomp.feather_pixels':
     'Only used when an outpainted video is present. It softens the original source edge over the generated sides.',
   'upscale.method':
-    'FlashVSR is the established fast refiner. LTX 2.5 uses Lightricks\' latest 2x Pixel Spatial Upscaler IC-LoRA to synthesize new detail from a half-resolution reference; it is slower and more creative, so preview identity-critical archival shots first.',
+    'FlashVSR is the fast refiner. SeedVR2 is a higher-quality one-step video restoration model with heavier VRAM requirements. LTX 2.5 uses a creative 2x Pixel Spatial Upscaler IC-LoRA; preview identity-critical archival shots before a full run.',
   'upscale.flashvsr_mode':
     'tiny = fastest, but its distilled decoder can smear fine motion such as lips. ' +
     'full = real VAE decoder with the best fidelity for faces and small movements, slowest. ' +
@@ -160,6 +160,32 @@ const FIELD_DESCRIPTIONS = {
     'Unload the diffusion model before decoding to lower peak VRAM. Slower; only needed if decoding runs out of memory.',
   'upscale.flashvsr_seed':
     'Changes the detail the model invents. If a face renders wrong, re-rolling the seed (with Regenerate) often fixes it.',
+  'upscale.seedvr2_model':
+    '3B FP8 is the practical default. GGUF variants reduce memory; 7B and 7B Sharp can recover more detail but need considerably more compute and memory. Models download automatically on first use.',
+  'upscale.seedvr2_batch_size':
+    'Frames processed together. SeedVR2 needs at least 5 frames for temporal consistency and accepts the 4n+1 sequence (1, 5, 9, ...). Larger batches can improve continuity but use more VRAM.',
+  'upscale.seedvr2_color_correction':
+    'Wavelet is the recommended natural color match. AdaIN matches broader image statistics; None leaves the generated colors untouched.',
+  'upscale.seedvr2_input_noise_scale':
+    'Adds noise before encoding to suppress high-resolution input artefacts. Leave at 0 unless the result preserves unwanted compression or ringing.',
+  'upscale.seedvr2_latent_noise_scale':
+    'Adds noise in latent space and can soften detail. Leave at 0 unless input noise alone does not resolve artefacts.',
+  'upscale.seedvr2_tiled_vae':
+    'Processes VAE encode/decode in tiles to reduce peak VRAM. It is slower and can introduce seams, but is safer on a 24 GB GPU.',
+  'upscale.seedvr2_vae_tile_size':
+    'VAE tile edge in pixels. Larger tiles are faster and reduce seam risk; smaller tiles use less VRAM.',
+  'upscale.seedvr2_vae_tile_overlap':
+    'Overlap used to blend neighbouring VAE tiles. It must be smaller than the tile size.',
+  'upscale.seedvr2_preserve_vram':
+    'Offload components between SeedVR2 phases. Keep enabled below 24 GB or when other models occupy VRAM; disabling it is faster.',
+  'upscale.seedvr2_cache_model':
+    'Keep SeedVR2 in RAM between ComfyUI prompts. This speeds multi-chunk runs but retains substantial system memory.',
+  'upscale.seedvr2_blocks_to_swap':
+    'Transformer blocks swapped between GPU and CPU. 16 is a balanced default; increase toward 32-36 after an out-of-memory error, or lower it for speed.',
+  'upscale.seedvr2_offload_io_components':
+    'Also move embeddings and I/O layers to CPU for additional VRAM savings at a speed cost.',
+  'upscale.seedvr2_seed':
+    'Controls SeedVR2 reconstruction detail. Keep fixed for reproducible output or change it to try another restoration.',
   'upscale.ltx25_source_fidelity':
     'How strongly the low-resolution reference controls the LTX 2.5 result. 85 is the modern reconstruction default: enough freedom to replace softness while retaining the scene. Raise toward 100 for literal archival fidelity.',
   'upscale.ltx25_lora_strength':
@@ -280,6 +306,7 @@ function selectOptionLabel(key, option) {
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
   if (key === 'method' && option === 'flashvsr') return 'FlashVSR';
+  if (key === 'method' && option === 'seedvr2') return 'SeedVR2';
   if (key === 'method' && option === 'ltx25') return 'LTX 2.5 Pixel Spatial (2x IC-LoRA)';
   if (key === 'repair_device' && option === 'auto') return 'Auto (prefer GPU)';
   if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';

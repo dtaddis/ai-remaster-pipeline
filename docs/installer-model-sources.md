@@ -23,6 +23,16 @@ The quantized text encoder is also gated. Accept its terms in the browser, then 
 local downloader with `hf auth login --force` from the activated ARP environment (or set `HF_TOKEN`)
 using the same account. Browser approval by itself does not provide credentials to the local process.
 
+## SeedVR2
+
+The `numz/ComfyUI-SeedVR2_VideoUpscaler` custom node downloads the selected model and shared VAE
+into `models/SEEDVR2` on first use. SeedVR2 is not included in the installer's eager
+`-DownloadModels` set because the selectable 3B/7B and precision variants are large and mutually
+exclusive.
+
+- 3B/7B FP16 and FP8 models plus `ema_vae_fp16.safetensors`: `numz/SeedVR2_comfyUI`
+- 3B/7B Q4_K_M GGUF and mixed/sharp variants: `AInVFX/SeedVR2_comfyUI`
+
 ## ProPainter (AI DeScratch)
 
 The installer adds `daniabib/ComfyUI_ProPainter_Nodes`. On the first AI DeScratch run that node

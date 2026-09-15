@@ -283,9 +283,20 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["references"]["masked_workflow"] = default_qwen_masked_workflow(config)
     defaults["references"].setdefault("method", "qwen")
     defaults["references"].setdefault("openai_api_key", "")
-    defaults["references"].setdefault("openai_image_model", "gpt-image-2")
-    defaults["references"].setdefault("openai_image_size", "auto")
-    defaults["references"].setdefault("openai_image_quality", "auto")
+    defaults["references"].setdefault("openai_image_model", "gpt-image-2.5-sunburst")
+    defaults["references"].setdefault("openai_image_size", "max")
+    defaults["references"].setdefault("openai_image_quality", "max")
+    # Reference images are visual masters for downstream processing. Migrate the
+    # former untouched defaults to the explicit highest-quality, source-aspect route.
+    reference_model = defaults["references"].get("openai_image_model", "").strip()
+    if reference_model in {"", "gpt-image-2"}:
+        reference_model = "gpt-image-2.5-sunburst"
+        defaults["references"]["openai_image_model"] = reference_model
+    if reference_model.startswith("gpt-image-2.5-"):
+        if defaults["references"].get("openai_image_size", "").strip() in {"", "auto"}:
+            defaults["references"]["openai_image_size"] = "max"
+        if defaults["references"].get("openai_image_quality", "").strip() in {"", "auto", "high"}:
+            defaults["references"]["openai_image_quality"] = "max"
     defaults["references"].setdefault("openai_send_references", "false")
     old_reference_prompts = {
         "",

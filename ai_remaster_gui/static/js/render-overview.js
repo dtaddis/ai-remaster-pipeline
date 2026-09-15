@@ -96,7 +96,7 @@ function workflowPickerHtml(cleanup, stabilize, expandOutpaint, colorize, upscal
         checked: upscale,
         icon: 'upscale',
         title: 'Upscale',
-        body: 'Run FlashVSR after recomposition, or directly on the selected source section if no earlier processing is selected.',
+        body: 'Run the selected AI video upscaler after recomposition, or directly on the selected source section if no earlier processing is selected.',
       })}
     </div>
   `;

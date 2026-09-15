@@ -758,7 +758,7 @@ def openai_reference_regeneration_command(manifest_text: str, index: int, refere
         "--api-key",
         token,
         "--model",
-        values.get("openai_image_model", "gpt-image-2") or "gpt-image-2",
+        values.get("openai_image_model", "gpt-image-2.5-sunburst") or "gpt-image-2.5-sunburst",
         "--prompt",
         values.get("prompt", REFERENCE_PROMPT),
         "--prompt-suffix",
@@ -768,6 +768,11 @@ def openai_reference_regeneration_command(manifest_text: str, index: int, refere
         cmd.extend(["--size", values["openai_image_size"]])
     if values.get("openai_image_quality"):
         cmd.extend(["--quality", values["openai_image_quality"]])
+    # Reference stills are visual masters for later phases. Keep the native
+    # high-resolution API result rather than shrinking it back to the extracted
+    # source frame. Per-frame OpenAI colorization intentionally does not use
+    # this flag because its output must match the video processing dimensions.
+    cmd.append("--no-normalize-to-source-size")
     if values.get("openai_send_references", "false") == "true":
         cmd.extend(["--reference-count", "3"])
     cmd.append("--force")

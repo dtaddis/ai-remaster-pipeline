@@ -214,7 +214,7 @@ Review the detected shots, inspect start/middle/end frames, merge shots that sho
 
 ### Reference Generation
 
-Pick the primary reference frame inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, choose **Add Reference**, then scrub that reference's own frame slider to the exact source frame and select **Use Frame**. Additional reference frames remain part of the same shot rather than creating artificial cuts.
+Pick the primary reference frame inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, choose **Add Reference**, then scrub that reference's own frame slider to the exact source frame and select **Use Frame**. Additional reference frames remain part of the same shot rather than creating artificial cuts. OpenAI Reference Generation defaults to GPT Image 2.5 Sunburst at maximum quality and the largest supported source-aspect resolution (up to 4K); ARP keeps that high-resolution master rather than shrinking it back to the extracted frame size.
 
 ![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg)
 
@@ -242,11 +242,11 @@ Once recomposition finishes, the Output tab plays the final render.
 
 ### Upscaling and source motion
 
-The Upscaling page offers two backends. **FlashVSR** remains the fast, established refiner. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to the LTX path. Its gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
+The Upscaling page offers three backends. **FlashVSR** remains the fast, established refiner. **SeedVR2** is a heavier one-step video restoration model; the practical default is its 3B FP8 model with five-frame batches for temporal consistency, VAE tiling, VRAM preservation, and balanced BlockSwap. SeedVR2 models download automatically on first use. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to either generative path. The LTX gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
 
-FlashVSR can make motion look unnaturally crisp when it reconstructs every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full AI render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
+AI video upscalers can make motion look unnaturally crisp when they reconstruct every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full AI render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
 
-After Shot Detection, the Upscaling page also exposes this strength per shot. A hard cut switches strength on the cut; a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength AI render is cached separately, so changing only these blend decisions does not rerun the upscale.
+Selecting Upscaling also enables Shot Detection. The Upscaling page exposes AI strength per shot: a hard cut switches strength on the cut, while a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength AI render is cached separately, so changing only these blend decisions does not rerun the upscale.
 
 ### Settings
 
@@ -263,7 +263,7 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 - LTX 2.3 distilled GGUF Q4_K_M and eight-step schedule for Dearchive and lightweight outpainting.
 - Configurable 540p/720p/1080p/source Dearchive processing and delivery resolution.
 - Official LTX 2.3 v0.9 in/outpainting IC-LoRA (full-resolution mask-conditioned pass).
-- LTX 2.5 Pixel Spatial Upscaler 2x IC-LoRA as an alternative to FlashVSR.
+- SeedVR2 and LTX 2.5 Pixel Spatial Upscaler as alternatives to FlashVSR.
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
 - Qwen Image Edit Lightning LoRA.
 - Deep Exemplar reference-guided video colorization.

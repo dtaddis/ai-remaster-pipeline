@@ -2,8 +2,8 @@
 
 This phase generates a soundtrack for a silent film and muxes it onto the latest render
 **without re-encoding the video** (`-c:v copy`). It runs after Recomposition and before
-Upscaling; when Upscaling is enabled, FlashVSR carries the new audio track through via its
-existing audio-mux step.
+Upscaling; when Upscaling is enabled, the selected backend carries the new audio track through
+via the shared audio-mux step.
 
 Unlike the other phases, the ComfyUI graphs are built in code (see
 `scripts/audio_models.py`) rather than loaded from JSON, so there are no `.json` files to
