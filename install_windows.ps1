@@ -1,7 +1,7 @@
 ﻿param(
     [string]$ComfyDir,
     [string]$PythonLauncher = 'py -3.13',
-    [string]$TorchIndexUrl = 'https://download.pytorch.org/whl/cu128',
+    [string]$TorchIndexUrl = 'https://download.pytorch.org/whl/cu130',
     [switch]$SkipModelDownloads,
     [switch]$DownloadModels,
     [switch]$SkipDeepExemplar,

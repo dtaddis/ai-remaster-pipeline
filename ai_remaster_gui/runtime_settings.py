@@ -137,10 +137,35 @@ def base_settings() -> dict[str, dict[str, str]]:
         "section_end": "",
         "last_browse_dir": "",
     }
+    defaults["cloud"] = {
+        "runpod_api_key": "",
+        "runpod_pod_id": "",
+        "runpod_gpu_types": "NVIDIA RTX PRO 4500 Blackwell,NVIDIA GeForce RTX 5090,NVIDIA RTX 6000 Ada Generation,NVIDIA L40S,NVIDIA A40,NVIDIA RTX A6000,NVIDIA GeForce RTX 4090",
+        "runpod_image": "runpod/pytorch:1.0.3-cu1300-torch291-ubuntu2404",
+        "runpod_storage_mode": "network",
+        "runpod_volume_gb": "100",
+        "runpod_data_center_id": "EU-RO-1",
+        "runpod_network_volume_id": "",
+        "runpod_idle_minutes": "0",
+        "huggingface_token": "",
+        "intermediate_format": "hevc_high",
+    }
     return defaults
 
 
 def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_source: bool = True) -> dict[str, dict[str, str]]:
+    cloud = defaults["cloud"]
+    legacy_gpu_pool = "NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A6000,NVIDIA GeForce RTX 4090"
+    if cloud.get("runpod_gpu_types", "").strip() == legacy_gpu_pool:
+        cloud["runpod_gpu_types"] = (
+            "NVIDIA RTX PRO 4500 Blackwell,NVIDIA GeForce RTX 5090,"
+            "NVIDIA RTX 6000 Ada Generation,NVIDIA L40S,NVIDIA A40,"
+            "NVIDIA RTX A6000,NVIDIA GeForce RTX 4090"
+        )
+        # The former 200 GB default described a host-tied Pod disk.  Portable storage is billed
+        # at a different monthly rate, and the runtime plus all current ARP weights fit in 100 GB.
+        if cloud.get("runpod_volume_gb", "") == "200" and not cloud.get("runpod_network_volume_id"):
+            cloud["runpod_volume_gb"] = "100"
     app_module = sys.modules.get("ai_remaster_gui.app")
     newest_fn = getattr(app_module, "newest", newest) if app_module else newest
     source = newest_fn(ROOT / "input", VIDEO_EXTS) if include_newest_source else None
@@ -301,6 +326,26 @@ def load_settings() -> dict[str, dict[str, str]]:
                     defaults[key].update({k: str(v) for k, v in values.items()})
         except json.JSONDecodeError:
             pass
+    # Convenience for the initial RunPod setup requested by the desktop user.  Import only for
+    # the real machine-local settings path (never tests or project bundles), and never log it.
+    if settings_file.resolve(strict=False) == SETTINGS_FILE.resolve(strict=False) and not defaults["cloud"].get("runpod_api_key"):
+        desktop_key = Path.home() / "Desktop" / "Runpod_API_Key.txt"
+        try:
+            token = desktop_key.read_text(encoding="utf-8-sig").strip()
+            if token:
+                defaults["cloud"]["runpod_api_key"] = token
+        except OSError:
+            pass
+    if settings_file.resolve(strict=False) == SETTINGS_FILE.resolve(strict=False):
+        cloud = defaults["cloud"]
+        if not cloud.get("huggingface_token"):
+            hf_token = Path.home() / ".cache" / "huggingface" / "token"
+            try:
+                token = hf_token.read_text(encoding="utf-8-sig").strip()
+                if token:
+                    cloud["huggingface_token"] = token
+            except OSError:
+                pass
     return normalize_settings(defaults, include_newest_source=True)
 
 

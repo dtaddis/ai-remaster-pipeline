@@ -17,6 +17,18 @@ PATCH_PATH = ROOT / "vendor" / "comfyui_custom_nodes" / "ComfyUI-ARP" / "ltx_vid
 
 
 class SparseGuideAttentionTests(unittest.TestCase):
+    def test_runtime_capabilities_report_xformers_as_optional(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_video_only_capabilities_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        with mock.patch.object(patch_module, "install_sparse_guide_attention_patch"):
+            capabilities = patch_module.ltx_runtime_capabilities()
+
+        self.assertTrue(capabilities["compatible"])
+        self.assertTrue(capabilities["xformers_optional"])
+
     def test_xformers_falls_back_for_unsupported_cuda_generation(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_guide_attention_patch_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None

@@ -492,16 +492,22 @@ def install_sparse_guide_attention_patch(model_patcher=None):
             "the LTX FeedForward class is missing. Update ARP before rendering."
         )
     _require_parameters(feed_forward.forward, {"self", "x"}, "ComfyUI LTX feed-forward")
+    # xFormers is an optional accelerator. CUDA/PyTorch releases commonly arrive
+    # before a matching xFormers wheel; sparse_attention_with_guide_mask already
+    # falls back to broadcast-mask PyTorch SDPA in that case. Keep validating the
+    # ComfyUI/LTX interfaces below, but do not reject a sound CUDA 13 runtime merely
+    # because the optional partitioned fast path is unavailable.
     try:
         import xformers.ops as xops
-    except Exception as exc:
-        raise ARPLTXCompatibilityError(
-            "ARP video-only LTX requires xFormers. Re-run the ARP installer before rendering."
-        ) from exc
-    if not callable(getattr(xops, "memory_efficient_attention_forward_requires_grad", None)):
-        raise ARPLTXCompatibilityError(
-            "The installed xFormers build lacks the attention API required by ARP. "
-            "Re-run the ARP installer before rendering."
+
+        has_partitioned_xformers = callable(
+            getattr(xops, "memory_efficient_attention_forward_requires_grad", None)
+        )
+    except Exception:
+        has_partitioned_xformers = False
+    if not has_partitioned_xformers:
+        LOGGER.info(
+            "xFormers partitioned attention is unavailable; ARP will use PyTorch SDPA."
         )
     cross_attention = getattr(ltx_model, "CrossAttention", None)
     if cross_attention is None:
@@ -953,6 +959,7 @@ def ltx_runtime_capabilities() -> dict[str, object]:
         "adapter": "model_scoped_ltx_guide_v1",
         "global_comfy_mutation": False,
         "exact_soft_guide_weights": True,
+        "xformers_optional": True,
         "chunked_feed_forward": True,
         "video_only_audio_pruning": True,
     }

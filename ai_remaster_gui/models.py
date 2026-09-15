@@ -52,6 +52,7 @@ STAGES = (
         "Reconstruct masked scratches with ProPainter, correct vignettes, then optionally restore archive footage with Dearchive at a selectable model-safe resolution.",
         ("intermediate/cleaned",),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("ai_descratch", "AI DeScratch (ProPainter)", "checkbox", "false"),
             ("scratch_sensitivity", "Scratch detection sensitivity", "range:0|1|0.05", "0.65"),
             ("scratch_mask_dilate", "Scratch mask expansion", "range:0|12|1", "3"),
@@ -78,6 +79,7 @@ STAGES = (
         "Remove gate weave, frame jitter, and unwanted rotation before framing and colour work. It can reset camera analysis at real cuts or track one continuous camera move.",
         ("intermediate/stabilized",),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("smoothing", "Smoothing radius (frames)", "range:1|60|1", "12"),
             ("max_shift", "Maximum translation (px; 0 = unlimited)", "range:0|200|1", "48"),
             ("max_angle", "Maximum rotation (degrees; 0 = unlimited)", "range:0|10|0.1", "3.0"),
@@ -95,6 +97,7 @@ STAGES = (
         "Prepare the source clip chosen on the Global tab for LTX outpainting.",
         ("input", "intermediate/outpaint_prepared", "intermediate/outpainted"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
             ("target_height", "Output height", "select:source|480|544|576|720|768|1080", "source"),
             ("outpaint_model", "Outpaint model", "select:official|ltx25|oumoumad", "official"),
@@ -123,6 +126,7 @@ STAGES = (
         "Detect cuts and divide the video into sections for independent colorization.",
         ("intermediate/outpainted", "intermediate/outpainted_references", "manifests/references"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("outpainted_video", "Outpainted video", "file", ""),
             ("sample_seconds", "Sample seconds", "number", "0"),
             ("shot_threshold", "Shot threshold", "number", "0.075"),
@@ -137,6 +141,7 @@ STAGES = (
         "Colorize extracted stills through a Qwen Image Edit ComfyUI workflow.",
         ("intermediate/outpainted_references", "intermediate/outpainted_references_color", "manifests/references"),
         (
+            ("compute", "Qwen compute", "select:local|runpod", "local"),
             ("method", "Method", "select:qwen|openai", "qwen"),
             ("manifest", "Manifest", "file", ""),
             ("prompt", "Prompt", "text", REFERENCE_PROMPT),
@@ -151,6 +156,7 @@ STAGES = (
         "Run reference-guided video colorization over the outpainted video.",
         ("intermediate/outpainted_references_color", "intermediate/outpainted_colorized", "manifests/references"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("manifest", "Manifest", "file", ""),
             ("method", "Method", "select:deepexemplar|colormnet|cmnet2|openai|both", "deepexemplar"),
             ("processing_height", "Processing scale", "select:source|2160|1440|1080|720|540", "source"),
@@ -176,6 +182,7 @@ STAGES = (
         "Composite outpainted video, original centre footage, and optional colorized video.",
         ("input", "intermediate/outpainted", "intermediate/outpainted_colorized", "output/reassembled"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("outpainted_video", "Outpainted video", "file", ""),
             ("source", "Original source", "file", ""),
             ("colorization_method", "Colorization layer", "select:deepexemplar|colormnet|cmnet2|openai", "deepexemplar"),
@@ -196,6 +203,7 @@ STAGES = (
         "Generate a musical score and/or synchronized sound effects for a silent film and mux them onto the latest render.",
         ("output/reassembled", "intermediate/audio", "output/with_soundtrack"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("input_video", "Input video", "file", ""),
             ("create_music", "Create Music", "checkbox", "true"),
             ("create_sfx", "Create Sound Effects", "checkbox", "true"),
@@ -221,6 +229,7 @@ STAGES = (
         "Optionally upscale the composited render or selected source section.",
         ("output/reassembled", "output/upscaled"),
         (
+            ("compute", "Compute", "select:local|runpod", "local"),
             ("input_video", "Input video", "file", ""),
             ("target_width", "Target width", "number", "3840"),
             ("target_height", "Target height", "number", "2160"),

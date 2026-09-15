@@ -28,7 +28,7 @@ The app is still alpha software, but the goal is simple: you should be able to r
 
 ### Requirements
 
-- Windows with an NVIDIA GPU is the currently supported installer path. The installer defaults to CUDA 12.8 PyTorch wheels.
+- Windows with an NVIDIA GPU is the currently supported installer path. The installer defaults to CUDA 13.0 PyTorch wheels.
 - Python 3.13 is required. On Windows, install it from [python.org](https://www.python.org/downloads/) with the Python Launcher option enabled, or make sure `python.exe` is on `PATH`.
 - Git is required so the installer can clone and update ARP's managed ComfyUI runtime and required custom nodes.
 - Internet access is required during installation for Python packages, ComfyUI, FFmpeg, and optional model downloads.
@@ -93,7 +93,7 @@ Useful installer options:
 install_windows.bat -NonInteractive
 install_windows.bat -SkipDeepExemplar
 install_windows.bat -InstallCorrelationExtension
-install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu128
+install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu130
 ```
 
 ColorMNet and CMNET2 use a PyTorch correlation fallback by default with the same output quality. `-InstallCorrelationExtension` attempts the optional faster CUDA correlation extension for ColorMNet; it requires Visual Studio C++ Build Tools and a local CUDA Toolkit matching the installed PyTorch CUDA build. If the extension cannot build, installation continues in fallback mode. The installer also downloads CMNET2's checkpoint and DINOv2/ResNet support files into the ignored runtime directories under `vendor/cmnet2`.
@@ -131,6 +131,27 @@ The GUI opens as a local web app. It checks ComfyUI at `http://127.0.0.1:8188`; 
 ComfyUI runs in that separate console window, where its startup, progress, and any import/custom-node errors are visible live. ARP also records the launch command to `output/logs/comfyui-startup.log` (viewable from Settings → Log file).
 
 Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
+
+### RunPod cloud compute
+
+Every processing page has a **Compute** selector. Choose **RunPod cloud worker** to execute that phase on a secure CUDA 13 Pod while keeping the same ARP script, stage settings, paths, resumability, and local result previews. In Settings, paste a RunPod API key; ARP creates a project-local SSH key, provisions a compatible worker, installs ComfyUI and the required nodes on its persistent workspace, uploads the stage inputs, downloads its outputs, and remembers the Pod ID for later phases. The default stops the Pod as soon as the phase completes to end GPU billing.
+
+Portable network storage is the default. It is independent of a physical GPU host, so ARP can replace an unavailable Pod and mount the same models and results on another compatible worker. Leave the volume ID blank and ARP creates it once in the configured data centre, then records both the volume and replacement Pod IDs automatically. The default is 100 GB standard storage in `EU-RO-1`; the Settings page shows the recurring rate before use. Choose a host-tied Pod volume instead if lower short-term storage cost matters more than portability. A network volume is data-centre-specific, so the GPU pool should contain several compatible cards available in that region.
+
+RunPod authentication uses an API key rather than the account's Google login or a RunPod username/password. ARP keeps its provider credentials in the machine-local `.ai_remaster_gui.json` settings and excludes all of them from `.arpp` project bundles and command logs. If `Desktop/Runpod_API_Key.txt` exists, ARP imports it on the next launch without displaying it.
+
+The first cloud phase is intentionally slower because it builds the worker and downloads models. Later phases reuse both the saved Pod and its persistent model storage. ARP requests secure cloud, a public SSH endpoint, CUDA 13, and an availability-optimised GPU pool rather than waiting indefinitely for one exact card. The default image is `runpod/pytorch:1.0.3-cu1300-torch291-ubuntu2404`.
+
+### Intermediate master formats
+
+Settings controls the video master written after each complete phase:
+
+- **H.264 Standard** preserves the compact legacy output.
+- **H.264 High** uses CRF 10 and a slow encode for a substantially larger, cleaner compatible master.
+- **HEVC 10-bit High** uses x265 CRF 12 and is the recommended balance for restoration intermediates.
+- **HEVC 10-bit Lossless** uses x265's lossless mode, preserving every decoded pixel in a compressed modern video file without creating uncompressed BMP frames.
+
+The profile is applied after a local or cloud phase and keeps deterministic filenames, so existing project routing remains compatible. Lightweight H.264 browser previews are still used where a browser cannot play a 10-bit/lossless master directly. Stabilization retains its dedicated FFV1/ProRes working-master choice because those codecs suit frame-accurate motion analysis and editing interchange.
 
 ## Basic Workflow
 

@@ -70,7 +70,7 @@ function recompLayerItem(label, path, fallback) {
 }
 
 function recompPathFields(st) {
-  return ['outpainted_video', 'source', 'colorization_method', 'colorized_video']
+  return ['compute', 'outpainted_video', 'source', 'colorization_method', 'colorized_video']
     .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
     .join('');
 }

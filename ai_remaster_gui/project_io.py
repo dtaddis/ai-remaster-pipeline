@@ -11,6 +11,7 @@ from . import state
 from .manifests import read_manifest, read_outpaint_chunk_rows
 from .paths import resolve, resolve_video_source, safe_stem
 from .runtime_settings import default_settings, load_settings
+from .cloud import SECRET_SETTING_KEYS
 
 PROJECT_SCHEMA_VERSION = 2
 PROJECT_JSON_NAME = "project.json"
@@ -39,7 +40,7 @@ def source_analysis_key(signature: tuple[str, int, int]) -> str:
 
 def project_payload(settings: dict[str, dict[str, str]]) -> dict:
     stored_settings = {
-        stage: {key: value for key, value in values.items() if key != "openai_api_key"}
+        stage: {key: value for key, value in values.items() if key not in SECRET_SETTING_KEYS}
         for stage, values in settings.items()
     }
     return {
@@ -91,7 +92,12 @@ def load_project_payload(data: dict) -> dict[str, dict[str, str]]:
     # Keep only machine-local secrets which are deliberately excluded from project bundles.
     current = load_settings()
     loaded = default_settings(include_newest_source=False)
-    loaded["references"]["openai_api_key"] = current.get("references", {}).get("openai_api_key", "")
+    for stage, values in current.items():
+        if stage not in loaded:
+            continue
+        for key in SECRET_SETTING_KEYS:
+            if key in values:
+                loaded[stage][key] = values[key]
     for stage, values in settings.items():
         if stage in loaded and isinstance(values, dict):
             loaded[stage].update({str(key): str(value) for key, value in values.items()})

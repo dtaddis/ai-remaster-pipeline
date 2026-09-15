@@ -36,6 +36,7 @@ import openai_generate_reference  # noqa: E402
 import outpaint_video  # noqa: E402
 import prepare_outpaint_input  # noqa: E402
 import qwen_colorize_references  # noqa: E402
+import master_encode  # noqa: E402
 import stabilize_video  # noqa: E402
 import upscale_video  # noqa: E402
 
@@ -141,6 +142,32 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(active(F, F, F, T), ["upscale"])
         self.assertEqual(active(F, F, T, F), ["audio"])
         self.assertEqual(active(F, F, F, F), [])
+
+    def test_every_processing_stage_offers_runpod_compute(self) -> None:
+        defaults = app.default_settings()
+        for key in ("cleanup", "stabilize", "outpaint", "shots", "references", "colour", "recomp", "audio", "upscale"):
+            self.assertEqual(defaults[key]["compute"], "local", key)
+            stage = next(item for item in app.STAGES if item.key == key)
+            field = next(item for item in stage.fields if item[0] == "compute")
+            self.assertIn("runpod", field[2], key)
+
+    def test_runpod_compute_wraps_stage_and_redacts_secrets(self) -> None:
+        self._populate_full_pipeline_settings()
+        app.APP.settings["cloud"].update({"runpod_api_key": "secret-runpod", "huggingface_token": "secret-hf"})
+        app.APP.settings["cleanup"]["compute"] = "runpod"
+        command = app.APP.command_for("cleanup")
+        self.assertEqual(Path(command[2]).name, "runpod_stage.py")
+        script_names = [Path(part).name for part in command if part.endswith(".py")]
+        self.assertIn("cleanup_video.py", script_names)
+        self.assertLess(script_names.index("master_encode.py"), script_names.index("cleanup_video.py"))
+        self.assertNotIn("secret-runpod", command)
+        self.assertNotIn("secret-hf", command)
+        self.assertIn("--settings-file", command)
+
+    def test_modern_intermediate_master_profiles(self) -> None:
+        self.assertIn("libx264", master_encode.codec_args("h264_high"))
+        self.assertIn("libx265", master_encode.codec_args("hevc_high"))
+        self.assertIn("lossless=1", master_encode.codec_args("hevc_lossless"))
 
     def test_cleanup_is_optional_and_runs_before_outpainting(self) -> None:
         app.APP.settings["global"].update(
@@ -1562,6 +1589,12 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("audio_embeddings_connector.learnable_registers", gguf_loader)
         installer = (app.ROOT / "install_windows.ps1").read_text(encoding="utf-8")
         self.assertIn("Ensure-ComfyUIGGUFGemma4Support", installer)
+
+    def test_windows_installer_defaults_to_cuda_13_pytorch_wheels(self) -> None:
+        installer = (app.ROOT / "install_windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("https://download.pytorch.org/whl/cu130", installer)
+        self.assertNotIn("https://download.pytorch.org/whl/cu128", installer)
 
     def test_wait_for_prompt_retries_transient_polling_errors(self) -> None:
         calls = {"count": 0}
@@ -3621,6 +3654,12 @@ class GuiSmokeTests(unittest.TestCase):
             )
             settings = copy.deepcopy(app.APP.settings)
             settings["references"].update({"manifest": app.rel(manifest), "openai_api_key": "sk-secret"})
+            settings["cloud"].update({
+                "runpod_api_key": "rp-secret",
+                "minimax_api_key": "mm-secret",
+                "kie_api_key": "kie-secret",
+                "huggingface_token": "hf-secret",
+            })
 
             app.write_project_file(project, settings)
 
@@ -3632,6 +3671,8 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn(app.rel(source).replace("\\", "/"), names)
             self.assertIn(app.rel(color).replace("\\", "/"), names)
             self.assertNotIn("openai_api_key", payload["settings"]["references"])
+            for secret in ("runpod_api_key", "minimax_api_key", "kie_api_key", "huggingface_token"):
+                self.assertNotIn(secret, payload["settings"]["cloud"])
 
     def test_cache_categories_do_not_include_project_state(self) -> None:
         folders_by_key = {

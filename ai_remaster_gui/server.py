@@ -117,6 +117,7 @@ from .file_dialogs import (
     remember_browse_dir,
 )
 from .console_log import ConsoleLog
+from .cloud import stage_uses_runpod, stop_runpod_pod, wrap_master_command, wrap_runpod_command
 from .image_sequences import parse_image_paths, prepare_image_sequence, sequence_state
 from .lifecycle import (
     create_server,
@@ -1353,7 +1354,23 @@ class PipelineApp:
             cmd.append("--force")
         if is_true(values, "dry_run"):
             cmd.append("--dry-run")
-        return [part for part in cmd if part != ""]
+        cmd = [part for part in cmd if part != ""]
+        if stage_uses_runpod(stage_key, values):
+            # Encode the selected intermediate master before the result bundle is
+            # downloaded, keeping CPU-heavy HEVC/lossless work on the cloud worker.
+            if stage_key != "stabilize":
+                cmd = wrap_master_command(
+                    cmd,
+                    self.expected_outputs(stage_key),
+                    self.settings.get("cloud", {}).get("intermediate_format", "hevc_high"),
+                )
+            cmd = wrap_runpod_command(
+                cmd,
+                stage_key=stage_key,
+                expected_outputs=self.expected_outputs(stage_key),
+                cloud=self.settings.get("cloud", {}),
+            )
+        return cmd
 
     def _cleanup_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
         source = pipeline_source_text(self.settings)
@@ -1636,7 +1653,7 @@ class PipelineApp:
             stabilized_output = self.stabilization_output()
             if not stabilized_output or not resolve(stabilized_output).exists():
                 return False, "Run Stabilization first so this phase has its upstream video."
-        if stage_key == "outpaint":
+        if stage_key == "outpaint" and self.settings.get("outpaint", {}).get("compute", "local") != "runpod":
             selected_lora = OUMOUMAD_OUTPAINT_LORA if self.settings.get("outpaint", {}).get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
             ok, message = outpaint_browser_handoff(selected_lora)
             if not ok:
@@ -1649,7 +1666,7 @@ class PipelineApp:
             source_text = self.soundtrack_source_for()
             if not source_text or not resolve(source_text).exists():
                 return False, "No finished video is available to add a soundtrack to yet. Run Recomposition first when earlier phases are enabled."
-            if is_true(audio_values, "create_music", "true"):
+            if is_true(audio_values, "create_music", "true") and audio_values.get("compute", "local") != "runpod":
                 ok, message = stable_audio_browser_handoff(audio_values.get("music_checkpoint", STABLE_AUDIO_DEFAULT_CHECKPOINT))
                 if not ok:
                     return False, message
@@ -1657,7 +1674,10 @@ class PipelineApp:
             self.hydrate_stage_inputs("upscale")
             if not self.upscale_input_for():
                 return False, "Upscaling input is not available yet. Choose source material, or run Recomposition first when earlier phases are enabled."
-            if self.settings.get("upscale", {}).get("method", "flashvsr") != "ltx25":
+            if (
+                self.settings.get("upscale", {}).get("method", "flashvsr") != "ltx25"
+                and self.settings.get("upscale", {}).get("compute", "local") != "runpod"
+            ):
                 warning = flashvsr_hardware_warning()
                 if warning:
                     return False, warning
@@ -1694,13 +1714,16 @@ class PipelineApp:
             source_text = self.upscale_input_for()
             if not source_text or not resolve(source_text).exists():
                 return False, "Upscaling input is not available yet. Run Recomposition first when earlier phases are enabled."
-        needs_comfy = (
+        uses_runpod = stage_uses_runpod(stage_key, values)
+        needs_comfy = not uses_runpod and (
             stage_key in {"outpaint", "audio"}
             or (stage_key == "colour" and values.get("method", "deepexemplar") not in {"openai", "cmnet2"})
             or (stage_key == "cleanup" and is_true(values, "dearchive", "true"))
             or (stage_key == "references" and values.get("method", "qwen") != "openai")
             or stage_key == "upscale"
         )
+        if uses_runpod and not self.settings.get("cloud", {}).get("runpod_api_key", "").strip():
+            return False, "Add your RunPod API key in Settings before selecting RunPod compute."
         if needs_comfy:
             ok, message = ensure_comfy_available_for_stage(stage.title)
             if not ok:
@@ -1712,6 +1735,14 @@ class PipelineApp:
             self.running_stage_key = stage.key
             self.run_started_at = time.time()
             cmd = self.command_for(stage_key)
+            # Stabilization already has purpose-built FFV1 and ProRes masters. Preserve
+            # that choice instead of placing a second global transcode around it.
+            if stage_key != "stabilize" and not stage_uses_runpod(stage_key, self.settings[stage_key]):
+                cmd = wrap_master_command(
+                    cmd,
+                    self.expected_outputs(stage_key),
+                    self.settings.get("cloud", {}).get("intermediate_format", "hevc_high"),
+                )
             self.log.append("> " + redact_command_for_log(cmd))
             self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(stage.title)
@@ -2196,7 +2227,19 @@ class PipelineApp:
         try:
             for line in self.process.stdout:
                 with self.lock:
-                    self.log.append(line.rstrip())
+                    message = line.rstrip()
+                    self.log.append(message)
+                    # The worker persists this to disk as soon as a Pod is allocated. Mirror
+                    # it into live state too, otherwise post-stage hydration could save the
+                    # older blank value over it before the next cloud phase.
+                    if message.startswith("RunPod worker: "):
+                        pod_id = message.removeprefix("RunPod worker: ").split(" (", 1)[0].strip()
+                        if pod_id:
+                            self.settings.setdefault("cloud", {})["runpod_pod_id"] = pod_id
+                    elif message.startswith("Created RunPod Pod "):
+                        pod_id = message.removeprefix("Created RunPod Pod ").split(";", 1)[0].strip()
+                        if pod_id and pod_id != "<unknown>":
+                            self.settings.setdefault("cloud", {})["runpod_pod_id"] = pod_id
             code = self.process.wait()
         finally:
             self._stop_console_progress_reporter(stop_progress, reporter)
@@ -2312,7 +2355,25 @@ class PipelineApp:
     def stop(self) -> None:
         with self.lock:
             if self.process and self.process.poll() is None:
+                stage_values = self.settings.get(self.running_stage_key, {})
+                cloud = self.settings.get("cloud", {})
+                stop_cloud = (
+                    stage_uses_runpod(self.running_stage_key, stage_values)
+                    and str(cloud.get("runpod_idle_minutes", "0")) in {"", "0"}
+                    and bool(cloud.get("runpod_api_key", "").strip())
+                    and bool(cloud.get("runpod_pod_id", "").strip())
+                )
                 terminate_process_tree(self.process)
+                if stop_cloud:
+                    api_key = cloud["runpod_api_key"]
+                    pod_id = cloud["runpod_pod_id"]
+                    def stop_cloud_worker() -> None:
+                        try:
+                            stop_runpod_pod(api_key, pod_id)
+                            self.log.append(f"Stopped RunPod {pod_id} to end GPU billing.")
+                        except Exception as exc:
+                            self.log.append(f"Warning: could not stop RunPod {pod_id}: {exc}")
+                    threading.Thread(target=stop_cloud_worker, daemon=True).start()
                 release_keep_awake()
                 self.log.append("Stop requested.")
 
@@ -2902,7 +2963,7 @@ def redact_command_for_log(cmd: list[str]) -> str:
             hide_next = False
             continue
         redacted.append(part)
-        if part in {"--api-key", "--openai-api-key"}:
+        if part in {"--api-key", "--openai-api-key", "--h3-2k-api-key", "--huggingface-token"}:
             hide_next = True
     return " ".join(redacted)
 

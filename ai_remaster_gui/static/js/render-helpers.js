@@ -271,6 +271,8 @@ function selectFieldHtml(key, label, kind, value, tooltip = '') {
 }
 
 function selectOptionLabel(key, option) {
+  if (key === 'compute' && option === 'local') return 'This computer';
+  if (key === 'compute' && option === 'runpod') return 'RunPod cloud worker';
   if (key === 'outpaint_model' && option === 'official') return 'LTX 2.3 (official)';
   if (key === 'outpaint_model' && option === 'ltx25') return 'LTX 2.5 (two-stage)';
   if (key === 'outpaint_model' && option === 'oumoumad') return 'LTX 2.3 (Oumoumad LoRA)';
