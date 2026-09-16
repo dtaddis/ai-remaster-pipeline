@@ -786,7 +786,8 @@ function Assert-CustomNodeSymbols {
         [string]$Name,
         [string]$Directory,
         [string]$RepoUrl,
-        [string[]]$Symbols
+        [string[]]$Symbols,
+        [string[]]$AlternativeSymbols = @()
     )
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
         throw "$Name was not installed. Expected folder: $Directory. Install it from $RepoUrl into ComfyUI\custom_nodes and rerun install_windows.bat."
@@ -798,8 +799,24 @@ function Assert-CustomNodeSymbols {
             $missing += $symbol
         }
     }
+    if ($missing.Count -gt 0 -and $AlternativeSymbols.Count -gt 0) {
+        $alternativeMissing = @()
+        foreach ($symbol in $AlternativeSymbols) {
+            if (-not (Test-DirectoryContainsText $Directory $symbol)) {
+                $alternativeMissing += $symbol
+            }
+        }
+        if ($alternativeMissing.Count -eq 0) {
+            Write-Host "$Name node definitions found: $($AlternativeSymbols -join ', ')"
+            return
+        }
+    }
     if ($missing.Count -gt 0) {
-        $msg = "$Name is installed at $Directory, but required node type(s) are missing: $($missing -join ', '). "
+        $requiredText = $Symbols -join ', '
+        if ($AlternativeSymbols.Count -gt 0) {
+            $requiredText += " (or compatible legacy node types: $($AlternativeSymbols -join ', '))"
+        }
+        $msg = "$Name is installed at $Directory, but no supported node API was found. Expected: $requiredText. "
         if (-not $isGitCheckout) {
             $msg += "The folder is not a Git checkout (it was likely installed by extracting a zip). "
             $msg += "Delete '$Directory' and rerun install_windows.bat so it can clone the latest version. "
@@ -1238,7 +1255,8 @@ Invoke-Step 'Verify required ComfyUI custom nodes' {
         'ComfyUI-SeedVR2_VideoUpscaler' `
         (Join-Path $CustomNodes 'ComfyUI-SeedVR2_VideoUpscaler') `
         'https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler' `
-        @('SeedVR2', 'SeedVR2BlockSwap', 'SeedVR2ExtraArgs')
+        @('SeedVR2VideoUpscaler', 'SeedVR2LoadDiTModel', 'SeedVR2LoadVAEModel') `
+        -AlternativeSymbols @('SeedVR2', 'SeedVR2BlockSwap', 'SeedVR2ExtraArgs')
     Assert-CustomNodeSymbols `
         'ComfyUI-MMAudio' `
         (Join-Path $CustomNodes 'ComfyUI-MMAudio') `

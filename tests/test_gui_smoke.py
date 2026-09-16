@@ -5168,6 +5168,88 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5"]["inputs"]["images"], ["4", 0])
         self.assertNotIn("audio", prompt["5"]["inputs"])
 
+    def test_seedvr2_prompt_supports_v25_modular_nodes(self) -> None:
+        args = upscale_video.build_parser().parse_args([
+            "--input", "input/example.mp4",
+            "--method", "seedvr2",
+            "--seedvr2-model", "seedvr2_ema_3b-Q4_K_M.gguf",
+            "--seedvr2-batch-size", "9",
+            "--seedvr2-color-correction", "adain",
+            "--seedvr2-input-noise-scale", "0.05",
+            "--seedvr2-latent-noise-scale", "0.1",
+            "--seedvr2-vae-tile-size", "768",
+            "--seedvr2-vae-tile-overlap", "96",
+            "--seedvr2-blocks-to-swap", "24",
+            "--seedvr2-offload-io-components",
+            "--seedvr2-cache-model",
+            "--seedvr2-seed", "321",
+        ])
+        info = {
+            "SeedVR2LoadDiTModel": {"input": {"required": {
+                "model": (["seedvr2_ema_3b-Q4_K_M.gguf"],),
+                "device": (["cuda:0"], {"default": "cuda:0"}),
+            }, "optional": {
+                "blocks_to_swap": ("INT", {"default": 0}),
+                "swap_io_components": ("BOOLEAN", {"default": False}),
+                "offload_device": (["none", "cpu"], {"default": "none"}),
+                "cache_model": ("BOOLEAN", {"default": False}),
+                "attention_mode": (["sdpa"], {"default": "sdpa"}),
+            }}},
+            "SeedVR2LoadVAEModel": {"input": {"required": {
+                "model": (["ema_vae_fp16.safetensors"], {"default": "ema_vae_fp16.safetensors"}),
+                "device": (["cuda:0"], {"default": "cuda:0"}),
+            }, "optional": {
+                "encode_tiled": ("BOOLEAN", {"default": False}),
+                "encode_tile_size": ("INT", {"default": 1024}),
+                "encode_tile_overlap": ("INT", {"default": 128}),
+                "decode_tiled": ("BOOLEAN", {"default": False}),
+                "decode_tile_size": ("INT", {"default": 1024}),
+                "decode_tile_overlap": ("INT", {"default": 128}),
+                "tile_debug": (["false"], {"default": "false"}),
+                "offload_device": (["none", "cpu"], {"default": "none"}),
+                "cache_model": ("BOOLEAN", {"default": False}),
+            }}},
+            "SeedVR2VideoUpscaler": {"input": {"required": {
+                "image": ("IMAGE",),
+                "dit": ("SEEDVR2_DIT",),
+                "vae": ("SEEDVR2_VAE",),
+                "seed": ("INT", {"default": 42}),
+                "resolution": ("INT", {"default": 1080}),
+                "max_resolution": ("INT", {"default": 0}),
+                "batch_size": ("INT", {"default": 5}),
+                "uniform_batch_size": ("BOOLEAN", {"default": False}),
+                "color_correction": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
+            }, "optional": {
+                "input_noise_scale": ("FLOAT", {"default": 0.0}),
+                "latent_noise_scale": ("FLOAT", {"default": 0.0}),
+                "offload_device": (["none", "cpu"], {"default": "cpu"}),
+                "enable_debug": ("BOOLEAN", {"default": False}),
+            }}},
+        }
+
+        prompt = upscale_video.seedvr2_prompt("example.mp4", 24.0, 1920, 1080, args, "arp_upscale/example", info)
+
+        self.assertEqual(prompt["2"]["class_type"], "SeedVR2LoadDiTModel")
+        self.assertEqual(prompt["2"]["inputs"]["model"], "seedvr2_ema_3b-Q4_K_M.gguf")
+        self.assertEqual(prompt["2"]["inputs"]["blocks_to_swap"], 24)
+        self.assertTrue(prompt["2"]["inputs"]["swap_io_components"])
+        self.assertEqual(prompt["2"]["inputs"]["offload_device"], "cpu")
+        self.assertTrue(prompt["2"]["inputs"]["cache_model"])
+        self.assertEqual(prompt["3"]["class_type"], "SeedVR2LoadVAEModel")
+        self.assertEqual(prompt["3"]["inputs"]["model"], "ema_vae_fp16.safetensors")
+        self.assertTrue(prompt["3"]["inputs"]["encode_tiled"])
+        self.assertTrue(prompt["3"]["inputs"]["decode_tiled"])
+        self.assertEqual(prompt["3"]["inputs"]["decode_tile_size"], 768)
+        self.assertEqual(prompt["3"]["inputs"]["decode_tile_overlap"], 96)
+        self.assertEqual(prompt["3"]["inputs"]["offload_device"], "cpu")
+        self.assertEqual(prompt["4"]["class_type"], "SeedVR2VideoUpscaler")
+        self.assertEqual(prompt["4"]["inputs"]["image"], ["1", 0])
+        self.assertEqual(prompt["4"]["inputs"]["dit"], ["2", 0])
+        self.assertEqual(prompt["4"]["inputs"]["vae"], ["3", 0])
+        self.assertEqual(prompt["4"]["inputs"]["resolution"], 1088)
+        self.assertEqual(prompt["4"]["inputs"]["offload_device"], "cpu")
+        self.assertEqual(prompt["5"]["inputs"]["images"], ["4", 0])
+
     def test_ltx25_upscale_prompt_is_video_only_and_uses_x2_ic_lora(self) -> None:
         args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25"])
 

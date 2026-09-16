@@ -538,6 +538,94 @@ def seedvr2_prompt(
     info: dict[str, Any],
 ) -> dict[str, Any]:
     """Build a SeedVR2 prompt while adapting to the installed node version."""
+    new_node_types = {"SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel", "SeedVR2VideoUpscaler"}
+    if new_node_types.issubset(info):
+        preserve_vram = bool(args.seedvr2_preserve_vram)
+        cache_model = bool(args.seedvr2_cache_model)
+        dit_offload = "cpu" if preserve_vram or cache_model or args.seedvr2_blocks_to_swap or args.seedvr2_offload_io_components else "none"
+        vae_offload = "cpu" if preserve_vram or cache_model else "none"
+        dit_values = {
+            "model": args.seedvr2_model,
+            "blocks_to_swap": int(args.seedvr2_blocks_to_swap),
+            "swap_io_components": bool(args.seedvr2_offload_io_components),
+            "offload_device": dit_offload,
+            "cache_model": cache_model,
+            "attention_mode": "sdpa",
+        }
+        vae_values = {
+            "encode_tiled": bool(args.seedvr2_tiled_vae),
+            "encode_tile_size": int(args.seedvr2_vae_tile_size),
+            "encode_tile_overlap": int(args.seedvr2_vae_tile_overlap),
+            "decode_tiled": bool(args.seedvr2_tiled_vae),
+            "decode_tile_size": int(args.seedvr2_vae_tile_size),
+            "decode_tile_overlap": int(args.seedvr2_vae_tile_overlap),
+            "tile_debug": "false",
+            "offload_device": vae_offload,
+            "cache_model": cache_model,
+        }
+        upscale_values = {
+            "seed": int(args.seedvr2_seed),
+            "resolution": seedvr2_generation_resolution(output_width, output_height),
+            "max_resolution": 0,
+            "batch_size": int(args.seedvr2_batch_size),
+            "uniform_batch_size": False,
+            "temporal_overlap": 0,
+            "prepend_frames": 0,
+            "color_correction": args.seedvr2_color_correction,
+            "input_noise_scale": float(args.seedvr2_input_noise_scale),
+            "latent_noise_scale": float(args.seedvr2_latent_noise_scale),
+            "offload_device": "cpu" if preserve_vram else "none",
+            "enable_debug": False,
+        }
+        return {
+            "1": {
+                "class_type": "VHS_LoadVideo",
+                "inputs": {
+                    "video": video_name,
+                    "force_rate": 0.0,
+                    "custom_width": 0,
+                    "custom_height": 0,
+                    "frame_load_cap": 0,
+                    "skip_first_frames": 0,
+                    "select_every_nth": 1,
+                    "format": "None",
+                },
+            },
+            "2": {
+                "class_type": "SeedVR2LoadDiTModel",
+                "inputs": comfy_node_inputs("SeedVR2LoadDiTModel", info, dit_values, {}),
+            },
+            "3": {
+                "class_type": "SeedVR2LoadVAEModel",
+                "inputs": comfy_node_inputs("SeedVR2LoadVAEModel", info, vae_values, {}),
+            },
+            "4": {
+                "class_type": "SeedVR2VideoUpscaler",
+                "inputs": comfy_node_inputs(
+                    "SeedVR2VideoUpscaler",
+                    info,
+                    upscale_values,
+                    {"image": ["1", 0], "dit": ["2", 0], "vae": ["3", 0]},
+                ),
+            },
+            "5": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": ["4", 0],
+                    "frame_rate": fps,
+                    "loop_count": 0,
+                    "filename_prefix": prefix,
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 16,
+                    "save_metadata": True,
+                    "pingpong": False,
+                    "save_output": True,
+                },
+            },
+        }
+
+    # SeedVR2 releases before v2.5 used a single upscaler plus two settings nodes.
     block_swap_values = {
         "blocks_to_swap": int(args.seedvr2_blocks_to_swap),
         "offload_io_components": bool(args.seedvr2_offload_io_components),
@@ -616,15 +704,23 @@ def seedvr2_run(args: argparse.Namespace, source: Path, partial: Path, output_wi
     if not (comfy_dir / "main.py").exists():
         raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-    required_nodes = {
+    info = object_info(args.comfy_url)
+    common_nodes = {
         "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
         "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+    }
+    new_nodes = {
+        "SeedVR2LoadDiTModel": "ComfyUI-SeedVR2_VideoUpscaler",
+        "SeedVR2LoadVAEModel": "ComfyUI-SeedVR2_VideoUpscaler",
+        "SeedVR2VideoUpscaler": "ComfyUI-SeedVR2_VideoUpscaler",
+    }
+    legacy_nodes = {
         "SeedVR2": "ComfyUI-SeedVR2_VideoUpscaler",
         "SeedVR2BlockSwap": "ComfyUI-SeedVR2_VideoUpscaler",
         "SeedVR2ExtraArgs": "ComfyUI-SeedVR2_VideoUpscaler",
     }
+    required_nodes = common_nodes | (new_nodes if set(new_nodes).issubset(info) else legacy_nodes)
     ensure_node_types(args.comfy_url, required_nodes, "SeedVR2 upscaling", comfy_dir=comfy_dir)
-    info = object_info(args.comfy_url)
     video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_seedvr2")
     fps = args.fps or float(video_info(source)["fps"])
     prefix = f"arp_upscale/{safe_stem(source.name)}_seedvr2_{output_width}x{output_height}"

@@ -87,10 +87,11 @@ def package_defines_node(comfy_dir: Path | None, package: str, node_type: str) -
         return False
     needle = f'"{node_type}"'
     alt_needle = f"name={needle}"
+    v3_needle = f"node_id={needle}"
     try:
         for path in package_dir.rglob("*.py"):
             text = path.read_text(encoding="utf-8", errors="ignore")
-            if needle in text or alt_needle in text:
+            if needle in text or alt_needle in text or v3_needle in text:
                 return True
     except OSError:
         return False
