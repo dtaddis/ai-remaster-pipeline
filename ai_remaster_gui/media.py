@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import state
 from .cache import human_size
-from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SCRIPTS, VIDEO_EXTS
+from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SCRIPTS, SOURCE_PLAYBACK_DIR, VIDEO_EXTS
 from .file_dialogs import browse_path, parse_duration
 from .paths import even_int, format_timecode, parse_aspect, rel, resolve, resolve_video_source, safe_stem
 from .process_utils import format_duration
@@ -23,7 +23,10 @@ ASPECT_PREVIEW_STYLE_VERSION = 6
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
-from outpaint_geometry import crop_box, source_placement  # noqa: E402
+from outpaint_geometry import crop_box, source_envelope_size, source_placement  # noqa: E402
+from intermediate_video import audio_codec_args as intermediate_audio_codec_args  # noqa: E402
+from intermediate_video import codec_args as intermediate_codec_args  # noqa: E402
+from intermediate_video import container_args as intermediate_container_args  # noqa: E402
 
 
 def aspect_preview_identity(source: Path, size: int, mtime_ns: int, aspect: str, crops: tuple[int, int, int, int], seconds: float, offset_x: int = 0, offset_y: int = 0) -> dict:
@@ -84,6 +87,61 @@ def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple
         state.APP.log.append(f"Could not generate source previews: {exc}")
         return ()
 
+
+def browser_playback_for(
+    source_text: str,
+    create: bool = False,
+    progress: Callable[[int, str], None] | None = None,
+) -> str:
+    """Return a browser-decodable source, creating a cached H.264 proxy when needed.
+
+    Processing continues to use the untouched source. This proxy exists only for
+    Chromium's video element, which cannot play containers such as AVI/MJPEG.
+    """
+    signature = source_signature(source_text)
+    if signature is None:
+        return ""
+    source = Path(signature[0])
+    info = ffprobe_info(source)
+    codec = str(info.get("video_codec", "")).lower()
+    suffix = source.suffix.lower()
+    if suffix in {".mp4", ".m4v", ".mov"} and codec in {"h264", "av1"}:
+        return rel(source)
+    if suffix == ".webm" and codec in {"vp8", "vp9", "av1"}:
+        return rel(source)
+
+    digest = hashlib.sha1(
+        f"{source.resolve()}|{signature[1]}|{signature[2]}|browser-h264-v1".encode("utf-8", errors="ignore")
+    ).hexdigest()[:20]
+    target = SOURCE_PLAYBACK_DIR / f"{safe_stem(source.name)[:64]}_{digest}_preview.mp4"
+    if target.is_file() and target.stat().st_size > 0:
+        return rel(target)
+    if not create:
+        return ""
+    ffmpeg = local_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("Run install_windows.bat to install local FFmpeg for source playback proxies.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".partial.mp4")
+    partial.unlink(missing_ok=True)
+    if progress:
+        progress(82, f"Creating browser preview for {source.suffix.upper().lstrip('.')} source")
+    command = [
+        ffmpeg, "-y", "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
+        "-vf", "scale=w='min(1280,iw)':h=-2:flags=lanczos,setsar=1",
+        "-c:v", "libx264", "-crf", "22", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(partial),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError((result.stderr or result.stdout or "FFmpeg browser proxy failed").strip())
+    partial.replace(target)
+    if state.APP is not None:
+        state.APP.log.append(f"Created browser playback proxy: {rel(target)}")
+    return rel(target)
+
 def source_info(source_text: str) -> dict[str, str]:
     signature = source_signature(source_text)
     if signature is None:
@@ -127,9 +185,15 @@ def source_info_cached(source_path: str, size: int, _mtime_ns: int) -> tuple[tup
     info.update(ffprobe_info(source))
     return tuple(info.items())
 
+def crop_values_for_settings(settings: dict) -> tuple[int, int, int, int]:
+    values = settings.get("outpaint", {})
+    edges = tuple(int(float(values.get(key, "0") or 0)) for key in ("edge_left", "edge_right", "edge_top", "edge_bottom"))
+    legacy = tuple(int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+    return tuple(-value for value in edges) if any(edges) or not any(legacy) else legacy  # type: ignore[return-value]
+
+
 def current_crop_values() -> tuple[int, int, int, int]:
-    values = state.APP.settings.get("outpaint", {}) if state.APP is not None else {}
-    return tuple(max(0, int(float(values.get(key, "0") or 0))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))  # type: ignore[return-value]
+    return crop_values_for_settings(state.APP.settings if state.APP is not None else {})
 
 def aspect_preview(source_text: str, aspect: str) -> str:
     signature = source_signature(source_text)
@@ -145,13 +209,16 @@ def aspect_preview_for_settings(settings: dict) -> str:
     if signature is None:
         return ""
     seconds = 0.0 if source_section_is_active(settings) else 10.0
+    outpaint = settings.get("outpaint", {})
     return aspect_preview_cached(
         signature[0],
         signature[1],
         signature[2],
-        settings.get("outpaint", {}).get("target_aspect", "16:9"),
-        current_crop_values(),
+        outpaint.get("target_aspect", "16:9"),
+        crop_values_for_settings(settings),
         seconds,
+        int(float(outpaint.get("offset_x", "0") or 0)),
+        int(float(outpaint.get("offset_y", "0") or 0)),
     )
 
 def aspect_preview_at(source_text: str, aspect: str, seconds: float, offset_x: int = 0, offset_y: int = 0) -> str:
@@ -165,12 +232,21 @@ def aspect_preview_at_for_settings(settings: dict, seconds: float) -> str:
     if not source_text:
         return ""
     relative_seconds = section_relative_seconds(settings, seconds)
-    return aspect_preview_at(source_text, settings.get("outpaint", {}).get("target_aspect", "16:9"), relative_seconds)
+    outpaint = settings.get("outpaint", {})
+    signature = source_signature(source_text)
+    if signature is None:
+        return ""
+    return aspect_preview_cached(
+        signature[0], signature[1], signature[2], outpaint.get("target_aspect", "16:9"),
+        crop_values_for_settings(settings), round(max(0.0, relative_seconds), 3),
+        int(float(outpaint.get("offset_x", "0") or 0)),
+        int(float(outpaint.get("offset_y", "0") or 0)),
+    )
 
 def auto_crop_for_settings(settings: dict, seconds: float) -> dict[str, str | int]:
     source_text = preview_pipeline_source_text(settings)
     if not source_text:
-        raise RuntimeError("Choose source material before using Auto Crop.")
+        raise RuntimeError("Choose source material before using Auto Trim.")
     relative_seconds = section_relative_seconds(settings, seconds)
     signature = source_signature(source_text)
     if signature is None:
@@ -184,13 +260,13 @@ def auto_crop_for_settings(settings: dict, seconds: float) -> dict[str, str | in
     with Image.open(resolve(frame)).convert("RGB") as image:
         left, right, top, bottom = detect_letterbox_crop(image)
     values = {
-        "crop_left": str(left),
-        "crop_right": str(right),
-        "crop_top": str(top),
-        "crop_bottom": str(bottom),
+        "edge_left": str(-left),
+        "edge_right": str(-right),
+        "edge_top": str(-top),
+        "edge_bottom": str(-bottom),
     }
     state.APP.update_settings("outpaint", values)
-    state.APP.log.append(f"Auto Crop set source crop to left {left}, right {right}, top {top}, bottom {bottom}.")
+    state.APP.log.append(f"Auto Trim set edges to left {-left}, right {-right}, top {-top}, bottom {-bottom}.")
     return {**values, "preview": aspect_preview_at_for_settings(settings, seconds)}
 
 def detect_letterbox_crop(image) -> tuple[int, int, int, int]:
@@ -271,12 +347,13 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
     left, right, top, bottom = crops
     crop_left, _crop_right, crop_top, _crop_bottom, crop_width, crop_height = crop_box(width, height, left, right, top, bottom)
     cropped = image.crop((crop_left, crop_top, crop_left + crop_width, crop_top + crop_height))
-    if crop_width / crop_height < ratio:
-        target_h = crop_height
-        target_w = int(round(crop_height * ratio))
+    envelope_width, envelope_height = source_envelope_size(width, height, crops)
+    if envelope_width / envelope_height < ratio:
+        target_h = envelope_height
+        target_w = int(round(envelope_height * ratio))
     else:
-        target_w = crop_width
-        target_h = int(round(crop_width / ratio))
+        target_w = envelope_width
+        target_h = int(round(envelope_width / ratio))
     placement = source_placement(width, height, target_w, target_h, crops)
     canvas = patterned_canvas(target_w, target_h)
     paste_xy = (placement.x + int(offset_x), placement.y + int(offset_y))
@@ -325,12 +402,13 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
     source_w, source_h = dims
     ratio = parse_aspect(aspect)
     left, _right, top, _bottom, crop_width, crop_height = crop_box(source_w, source_h, *crops)
-    if crop_width / crop_height < ratio:
-        canvas_h = crop_height
-        canvas_w = int(round(crop_height * ratio))
+    envelope_width, envelope_height = source_envelope_size(source_w, source_h, crops)
+    if envelope_width / envelope_height < ratio:
+        canvas_h = envelope_height
+        canvas_w = int(round(envelope_height * ratio))
     else:
-        canvas_w = crop_width
-        canvas_h = int(round(crop_width / ratio))
+        canvas_w = envelope_width
+        canvas_h = int(round(envelope_width / ratio))
     scale = min(960 / canvas_w, 540 / canvas_h, 1.0)
     out_w = max(2, even_int(canvas_w * scale))
     out_h = max(2, even_int(canvas_h * scale))
@@ -763,9 +841,18 @@ def source_section_output_for(settings: dict) -> Path:
     start = section_float(global_settings.get("section_start", "0"), 0.0)
     end = section_float(global_settings.get("section_end", ""), 0.0)
     suffix = f"{int(round(start * 1000)):010d}_{int(round(end * 1000)):010d}"
-    # Section clips are transcoded to H.264/AAC below, so they must use an MP4
-    # container even when the original source is WebM, MKV, or another format.
-    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}.mp4"
+    # Section clips are processing masters, not browser previews.
+    profile = str(settings.get("cloud", {}).get("intermediate_format", "high") or "high").lower()
+    profile = {"h264_standard": "low", "h264_high": "high", "hevc_high": "high", "hevc_lossless": "lossless"}.get(profile, profile)
+    if profile not in {"low", "medium", "high", "lossless"}:
+        profile = "high"
+    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}_{profile}.mkv"
+
+
+def source_section_video_args(settings: dict) -> list[str]:
+    profile = str(settings.get("cloud", {}).get("intermediate_format", "high") or "high").lower()
+    profile = {"h264_standard": "low", "h264_high": "high", "hevc_high": "high", "hevc_lossless": "lossless"}.get(profile, profile)
+    return intermediate_codec_args(profile, fast=True)
 
 def source_section_is_active(settings: dict) -> bool:
     global_settings = settings.get("global", {})
@@ -808,22 +895,17 @@ def ensure_source_section_clip(settings: dict) -> str:
         "0:a?",
         "-vf",
         "setpts=PTS-STARTPTS",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "14",
-        "-preset",
-        "veryfast",
+        *source_section_video_args(settings),
         "-sn",
         "-dn",
         "-map_metadata",
         "-1",
-        "-movflags",
-        "+faststart",
+        *intermediate_container_args(str(partial), settings.get("cloud", {}).get("intermediate_format", "high")),
         str(partial),
     ]
     if has_audio:
-        audio_args = ["-af", "asetpts=PTS-STARTPTS", "-c:a", "aac", "-b:a", "192k"]
+        profile = str(settings.get("cloud", {}).get("intermediate_format", "high") or "high").lower()
+        audio_args = ["-af", "asetpts=PTS-STARTPTS", *intermediate_audio_codec_args(profile, bitrate="320k")]
         command[command.index("-sn"):command.index("-sn")] = audio_args
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:

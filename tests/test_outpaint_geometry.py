@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import final_composite  # noqa: E402
-from outpaint_geometry import source_placement  # noqa: E402
+from outpaint_geometry import source_envelope_size, source_placement  # noqa: E402
 
 
 class OutpaintGeometryTests(unittest.TestCase):
@@ -31,6 +31,23 @@ class OutpaintGeometryTests(unittest.TestCase):
         placement = source_placement(1456, 1080, 1280, 704, (10, 10, 6, 6), 1280, 720)
 
         self.assertEqual((placement.x, placement.y, placement.width, placement.height), (156, 0, 968, 704))
+
+    def test_equal_vertical_extensions_create_generation_room_on_all_four_sides(self) -> None:
+        # Backend geometry keeps its legacy sign convention: negative means extend.
+        placement = source_placement(1440, 1080, 1920, 1080, (0, 0, -180, -180))
+
+        self.assertEqual(source_envelope_size(1440, 1080, (0, 0, -180, -180)), (1440, 1440))
+        self.assertEqual((placement.x, placement.y, placement.width, placement.height), (420, 135, 1080, 810))
+
+    def test_one_sided_extension_positions_source_asymmetrically(self) -> None:
+        placement = source_placement(1440, 1080, 1920, 1080, (-240, 0, 0, 0))
+
+        self.assertEqual((placement.x, placement.y, placement.width, placement.height), (360, 0, 1440, 1080))
+
+    def test_extension_placement_maps_to_model_safe_canvas(self) -> None:
+        placement = source_placement(1440, 1080, 1920, 1088, (0, 0, -180, -180), 1920, 1080)
+
+        self.assertEqual((placement.x, placement.y, placement.width, placement.height), (420, 136, 1080, 816))
 
     def test_final_composite_does_not_expand_cropped_source_over_regenerated_pixels(self) -> None:
         args = final_composite.build_parser().parse_args(
@@ -85,6 +102,31 @@ class OutpaintGeometryTests(unittest.TestCase):
         self.assertIn("overlay=x=0:y=93", filter_text)
         self.assertIn("lt(Y,80)", filter_text)
         self.assertNotIn("lt(X,80)", filter_text)
+
+    def test_final_composite_preserves_extended_source_placement(self) -> None:
+        args = final_composite.build_parser().parse_args(
+            [
+                "--outpainted", "outpainted.mp4",
+                "--source", "source.mp4",
+                "--output", "final.mp4",
+                "--crop-top", "-180",
+                "--crop-bottom", "-180",
+                "--output-width", "1920",
+                "--output-height", "1080",
+            ]
+        )
+
+        filter_text = final_composite.build_filter(
+            args,
+            has_color=False,
+            fps=24.0,
+            source_size=(1440, 1080),
+            base_size=(1920, 1080),
+        )
+
+        self.assertIn("scale=1080:810", filter_text)
+        self.assertIn("overlay=x=420:y=135", filter_text)
+        self.assertNotIn("crop=w=", filter_text)
 
 
 if __name__ == "__main__":

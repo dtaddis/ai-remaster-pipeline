@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from intermediate_video import codec_args as intermediate_codec_args, container_args
+
 
 MODEL_NAME = "DINOv2FeatureV6_LocalAtten_s2_154000.pth"
 
@@ -103,6 +105,7 @@ class CMNet2Session:
         fps: float,
         ffmpeg: str,
         crf: int = 18,
+        intermediate_profile: str = "high",
     ) -> None:
         try:
             import cv2
@@ -154,14 +157,8 @@ class CMNet2Session:
             "-i",
             "-",
             "-an",
-            "-c:v",
-            "libx264",
-            "-crf",
-            str(max(0, min(51, int(crf)))),
-            "-preset",
-            "slow",
-            "-pix_fmt",
-            "yuv420p",
+            *intermediate_codec_args(intermediate_profile),
+            *container_args(str(partial), intermediate_profile),
             str(partial),
         ]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)

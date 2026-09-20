@@ -47,6 +47,7 @@ from dependency_manager import (
 )
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
+from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, container_args
 from outpaint_geometry import source_placement
 from ltx_outpaint_workflow_adapter import (
     ADAPTER_ID as LTX_WORKFLOW_ADAPTER,
@@ -152,13 +153,13 @@ def outpaint_artifact_tag(args: Any | None, base: str) -> str:
 def default_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "outpaint"), "mp4")
+    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "outpaint"), "mkv")
 
 
 def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "rawcomfy"), "mp4")
+    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "rawcomfy"), "mkv")
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
@@ -168,7 +169,7 @@ def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any
     # dimensions (e.g. 704) to delivery resolution (e.g. 720) when producing the final master.
     work_w, work_h = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
+    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mkv")
 
 
 def run_command(command: list[str], dry_run: bool) -> None:
@@ -177,7 +178,7 @@ def run_command(command: list[str], dry_run: bool) -> None:
         subprocess.run(command, check=True)
 
 
-def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool = False) -> Path:
+def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool = False, intermediate_profile: str = "high") -> Path:
     """Prepare archival input at LTX 2.5's cadence with a valid silent audio stream."""
 
     info = probe_video(prepared)
@@ -195,7 +196,7 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
         print(f"LTX 2.5 generation cadence: source {source_fps:g} fps", flush=True)
         return prepared
     fps_tag = f"{output_fps:g}".replace(".", "p") + ("_fast" if mode == "24-fast" else "")
-    output = prepared.with_name(f"{prepared.stem}_ltx25_{fps_tag}fps.mp4")
+    output = prepared.with_name(f"{prepared.stem}_ltx25_{fps_tag}fps.mkv")
     signature = {
         "version": 4,
         "tool": "outpaint_video.py/ltx25_fps",
@@ -212,12 +213,13 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
             else "copy-cadence"
         ),
         "audio": "preserve-or-silent-stereo-48khz",
+        "intermediate_profile": intermediate_profile,
     }
     if not force and resumable_output(output, signature):
         print(f"Reuse LTX 2.5 {output_fps:g} fps prepared input: {output}", flush=True)
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_suffix(output.suffix + ".partial.mp4")
+    partial = output.with_suffix(output.suffix + ".partial.mkv")
     if mode == "24-fast":
         duration = expected_frames / output_fps if output_fps else 0.0
         print(
@@ -239,7 +241,7 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
     audio_args = ["-map", "0:v:0"]
     inputs = ["-i", str(prepared)]
     if has_audio:
-        audio_args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"]
+        audio_args += ["-map", "0:a:0?", *intermediate_audio_codec_args(intermediate_profile, bitrate="128k")]
         if mode == "24-fast":
             speed = output_fps / source_fps
             audio_args += ["-filter:a", f"atempo={speed:.8f},atrim=duration={expected_frames / output_fps:.8f}"]
@@ -247,12 +249,12 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
         # The official two-stage graph encodes audio even for archival silent film.
         # Supplying silence keeps that graph valid without fabricating audible content.
         inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-        audio_args += ["-map", "1:a:0", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+        audio_args += ["-map", "1:a:0", *intermediate_audio_codec_args(intermediate_profile, bitrate="128k"), "-shortest"]
     subprocess.run([
         ffmpeg, "-y", *inputs, *audio_args, *video_args,
         *(["-frames:v", str(expected_frames)] if expected_frames else []),
-        "-r", f"{output_fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "slow", "-crf", "8",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+        "-r", f"{output_fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile),
+        *container_args(str(partial), intermediate_profile), str(partial),
     ], check=True)
     replace_with_retry(partial, output, "LTX 2.5 frame-rate preparation")
     write_signature(output, signature)
@@ -666,7 +668,7 @@ def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[
         sig = json.loads(sig_path.read_text(encoding="utf-8-sig"))
         if (
             sig.get("tool") != "prepare_outpaint_input.py"
-            or sig.get("geometry") != "crop_then_fit_v1"
+            or sig.get("geometry") not in {"crop_then_fit_v1", "trim_extend_then_fit_v2"}
         ):
             return None
         target_width = int(sig["target_width"])
@@ -697,10 +699,12 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     """Build one geometric mask frame; the LTX nodes broadcast it across the clip."""
     target = ROOT / ".cache" / "outpaint_masks" / f"{safe_stem(prepared.name)}_official_mask.png"
     sig = {
-        "version": 4,
+        "version": 5,
         "tool": "outpaint_video.py/official_mask",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
+        "custom_mask": root_relative(Path(args.custom_mask)) if getattr(args, "custom_mask", None) else "",
+        "custom_mask_fingerprint": file_fingerprint(Path(args.custom_mask)) if getattr(args, "custom_mask", None) and Path(args.custom_mask).is_file() else None,
     }
     if not args.force and resumable_output(target, sig, width=width, height=height):
         return target
@@ -721,10 +725,22 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     if horizontal_bands and vertical_bands:
         raise RuntimeError(
             "Prepared outpaint geometry produced borders on both axes; expected one "
-            "pillarbox or letterbox after crop-first fitting. Rebuild the prepared input."
+            "generation bands after signed trim/extend fitting. Rebuild the prepared input."
         )
     mask = np.full((height, width), 255, dtype=np.uint8)
     mask[top:bottom, left:right] = 0
+    custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
+    if custom_mask_text:
+        custom = cv2.imread(custom_mask_text, cv2.IMREAD_UNCHANGED)
+        if custom is None:
+            raise RuntimeError(f"Could not read custom outpaint mask: {custom_mask_text}")
+        if custom.ndim == 3 and custom.shape[2] == 4:
+            custom = custom[:, :, 3]
+        elif custom.ndim == 3:
+            custom = cv2.cvtColor(custom, cv2.COLOR_BGR2GRAY)
+        if custom.shape[:2] != (height, width):
+            custom = cv2.resize(custom, (width, height), interpolation=cv2.INTER_NEAREST)
+        mask = np.maximum(mask, np.where(custom >= 16, 255, 0).astype(np.uint8))
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(".partial.png")
     print(f"Building broadcast LTX outpaint mask: {target} (source rectangle {left},{top}-{right},{bottom})", flush=True)
@@ -776,7 +792,7 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     if horizontal_bands and vertical_bands:
         raise RuntimeError(
             "Exact outpaint mask has borders on both axes; expected one pillarbox "
-            "or letterbox from crop-first geometry."
+            "generation region from signed trim/extend geometry."
         )
 
     def generation_bounds(start: int, end: int, extent: int) -> tuple[int, int]:
@@ -949,6 +965,52 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         patch_link(workflow, threshold_link, 9100, 0, 9101, 0, "MASK")
         patch_link(workflow, 19102, 9101, 0, 9102, 0, "MASK")
         mask_source_id = 9102
+        custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
+        if custom_mask_text:
+            custom_mask_name = copy_to_comfy_input(Path(custom_mask_text), comfy_dir, "arp_outpaint_custom_mask")
+            add_or_replace_node(workflow, {
+                "id": 9120,
+                "type": "LoadImage",
+                "title": "ARP custom outpaint mask",
+                "mode": 0,
+                "inputs": [],
+                "outputs": [
+                    {"name": "IMAGE", "type": "IMAGE", "links": [19120]},
+                    {"name": "MASK", "type": "MASK", "links": []},
+                ],
+                "widgets_values": [custom_mask_name, "image"],
+            })
+            add_or_replace_node(workflow, {
+                "id": 9121,
+                "type": "ImageToMask",
+                "title": "ARP custom mask channel",
+                "mode": 0,
+                "inputs": [
+                    {"name": "image", "type": "IMAGE", "link": 19120},
+                    {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+                ],
+                "outputs": [{"name": "MASK", "type": "MASK", "links": [19122]}],
+                "widgets_values": ["red"],
+            })
+            add_or_replace_node(workflow, {
+                "id": 9122,
+                "type": "MaskComposite",
+                "title": "ARP combine dynamic and custom outpaint masks",
+                "mode": 0,
+                "inputs": [
+                    {"name": "destination", "type": "MASK", "link": 19121},
+                    {"name": "source", "type": "MASK", "link": 19122},
+                    {"name": "x", "type": "INT", "widget": {"name": "x"}},
+                    {"name": "y", "type": "INT", "widget": {"name": "y"}},
+                    {"name": "operation", "type": "COMBO", "widget": {"name": "operation"}},
+                ],
+                "outputs": [{"name": "MASK", "type": "MASK", "links": []}],
+                "widgets_values": [0, 0, "add"],
+            })
+            patch_link(workflow, 19120, 9120, 0, 9121, 0, "IMAGE")
+            patch_link(workflow, 19121, 9102, 0, 9122, 0, "MASK")
+            patch_link(workflow, 19122, 9121, 0, 9122, 1, "MASK")
+            mask_source_id = 9122
         generation_source_id = mask_source_id
 
         # Dynamic masks can contain arbitrary black regions, so there is no single source
@@ -1718,7 +1780,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 40,
+        "version": 41,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1729,6 +1791,8 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "model_size_multiple": MODEL_SIZE_MULTIPLE,
         "outpaint_all_black_regions": bool(getattr(args, "outpaint_all_black_regions", False)),
         "black_mask_threshold": int(getattr(args, "black_mask_threshold", 12)),
+        "custom_mask": root_relative(Path(args.custom_mask)) if getattr(args, "custom_mask", None) else "",
+        "custom_mask_fingerprint": file_fingerprint(Path(args.custom_mask)) if getattr(args, "custom_mask", None) and Path(args.custom_mask).is_file() else None,
         "prompt": prompt_text,
         "prompt_suffix": prompt_suffix,
         "negative_suffix": negative_suffix,
@@ -1757,6 +1821,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "model_backend": args.model_backend,
         "ltx_version": getattr(args, "ltx_version", "2.3"),
         "generation_fps": getattr(args, "generation_fps", "source"),
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
         "gguf_model": LTX25_GGUF_MODEL if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "gguf_model", ""),
         "video_vae": LTX25_VIDEO_VAE if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "video_vae", ""),
         "text_encoder": LTX25_TEXT_ENCODER if getattr(args, "ltx_version", "2.3") == "2.5" else getattr(args, "text_encoder", ""),
@@ -2027,7 +2092,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
                 "end_frame": str(end_frame),
                 "start_seconds": f"{start_frame / fps:.6f}",
                 "end_seconds": f"{end_frame / fps:.6f}",
-                "prepared_path": root_relative(chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"),
+                "prepared_path": root_relative(chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv"),
                 "raw_path": root_relative(chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"),
             }
         )
@@ -2155,7 +2220,7 @@ def apply_qwen_seed_guides(args, prepared: Path, ranges: list[tuple[int, int, in
     return read_chunk_manifest(chunk_manifest)
 
 
-def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool, offset_x: int = 0, offset_y: int = 0, prepared_fingerprint: dict[str, Any] | None = None) -> None:
+def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool, offset_x: int = 0, offset_y: int = 0, prepared_fingerprint: dict[str, Any] | None = None, intermediate_profile: str = "high") -> None:
     has_audio = video_has_audio(ffmpeg, prepared)
     if chunk_path.exists() and not force and (prepared_fingerprint is None or split_matches_source(chunk_path, prepared_fingerprint)):
         if not has_audio or video_has_audio(ffmpeg, chunk_path):
@@ -2195,11 +2260,11 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     command.extend([
         "-frames:v", str(max(1, end_frame - start_frame)),
         "-r", f"{fps:.8f}", "-fps_mode", "cfr",
-        "-c:v", "libx264", "-crf", "12", "-preset", "veryfast",
+        *intermediate_codec_args(intermediate_profile, fast=True),
     ])
     if has_audio:
-        # Normalize WebM/Opus and other source codecs to a broadly supported chunk codec.
-        command.extend(["-c:a", "aac", "-b:a", "192k"])
+        command.extend(intermediate_audio_codec_args(intermediate_profile, bitrate="192k"))
+    command.extend(container_args(str(partial), intermediate_profile))
     command.append(str(partial))
     subprocess.run(command, check=True)
     replace_unless_identical(partial, chunk_path, f"Prepared chunk {chunk_path.name}")
@@ -2278,22 +2343,22 @@ def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context
 
 
 
-def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float) -> None:
+def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float, intermediate_profile: str = "high") -> None:
     vf = f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
-    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
 
 
-def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fps: float) -> None:
+def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fps: float, intermediate_profile: str = "high") -> None:
     if frame_count <= 0:
         return
     info = probe_video(source)
     last = max(0, int(info["frames"]) - 1)
     duration = frame_count / fps
     vf = f"trim=start_frame={last}:end_frame={last + 1},setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={frame_count},fps={fps:.8f},setsar=1"
-    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(target)], check=True)
+    subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
 
 
-def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool) -> None:
+def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool, intermediate_profile: str = "high") -> None:
     if output.exists() and not force:
         return
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -2317,8 +2382,8 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
                 print(f"Outpaint chunk gap before chunk {index + 1}: filling {gap} frame(s) by holding the previous frame. Increase overlap to at least {gap + 1} to avoid this.", flush=True)
                 if previous_piece is None:
                     raise RuntimeError(f"First outpaint chunk starts after frame 0: {start_frame}")
-                gap_piece = tmp / f"gap_{index:04d}_{cursor:06d}_{start_frame:06d}.mp4"
-                make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps)
+                gap_piece = tmp / f"gap_{index:04d}_{cursor:06d}_{start_frame:06d}.mkv"
+                make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps, intermediate_profile)
                 piece_paths.append(gap_piece)
                 previous_piece = gap_piece
                 cursor = start_frame
@@ -2327,8 +2392,8 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             if available <= 0:
                 print(f"Skipping exhausted outpaint chunk {index + 1}: trim_start={trim_start}, raw_frames={raw_frames}", flush=True)
                 continue
-            piece = tmp / f"piece_{index:04d}_{cursor:06d}.mp4"
-            make_piece(ffmpeg, chunk, piece, trim_start, available, fps)
+            piece = tmp / f"piece_{index:04d}_{cursor:06d}.mkv"
+            make_piece(ffmpeg, chunk, piece, trim_start, available, fps, intermediate_profile)
             piece_paths.append(piece)
             previous_piece = piece
             cursor += available
@@ -2337,13 +2402,13 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             print(f"Outpaint final gap: filling {gap} frame(s) by holding the last frame.", flush=True)
             if previous_piece is None:
                 raise RuntimeError("No usable outpaint chunk frames were produced.")
-            gap_piece = tmp / f"gap_final_{cursor:06d}_{total_frames:06d}.mp4"
-            make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps)
+            gap_piece = tmp / f"gap_final_{cursor:06d}_{total_frames:06d}.mkv"
+            make_gap_piece(ffmpeg, previous_piece, gap_piece, gap, fps, intermediate_profile)
             piece_paths.append(gap_piece)
             cursor = total_frames
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)], check=True)
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], check=True)
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 
@@ -2408,6 +2473,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--black-lift", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--gamma", type=float, default=1.0, help=argparse.SUPPRESS)
     parser.add_argument("--outpaint-all-black-regions", action="store_true", help="Leave source blacks untouched so black regions inside the source can be outpainted.")
+    parser.add_argument("--custom-mask", help="Optional additive PNG mask. White or opaque pixels are outpainted on every frame.")
+    parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
     parser.add_argument("--allow-color-outpaint", action="store_true", help="Allow colour generation even when the source is detected as monochrome.")
     # Qwen guide seeding: when LTX won't outpaint, auto-generate filled guide frames at every
     # shot change with Qwen Image Edit so each shot anchors from a frame whose bars are filled.
@@ -2506,6 +2573,7 @@ def main() -> int:
     prepare_command += ["--target-width", str(work_width)]
     prepare_command += ["--delivery-width", str(delivery_width)]
     prepare_command += ["--delivery-height", str(delivery_height)]
+    prepare_command += ["--intermediate-profile", args.intermediate_profile]
     if args.force:
         prepare_command.append("--force")
     if args.dry_run:
@@ -2523,7 +2591,7 @@ def main() -> int:
 
     generation_prepared = prepared
     if args.ltx_version == "2.5" and not args.dry_run:
-        generation_prepared = prepare_ltx25_frame_rate(find_ffmpeg(), prepared, args.generation_fps, args.force)
+        generation_prepared = prepare_ltx25_frame_rate(find_ffmpeg(), prepared, args.generation_fps, args.force, args.intermediate_profile)
 
     output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
@@ -2576,11 +2644,11 @@ def main() -> int:
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_offset_x = int(float(chunk_row.get("offset_x", "0") or 0))
                 chunk_offset_y = int(float(chunk_row.get("offset_y", "0") or 0))
-                chunk_prepared = resolve_path(chunk_row.get("prepared_path", "")) if chunk_row.get("prepared_path") else chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+                chunk_prepared = resolve_path(chunk_row.get("prepared_path", "")) if chunk_row.get("prepared_path") else chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mkv"
                 chunk_raw = resolve_path(chunk_row.get("raw_path", "")) if chunk_row.get("raw_path") else chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 force_this_split = args.force and (args.only_chunk is None or chunk_index == args.only_chunk)
-                split_chunk(ffmpeg, generation_prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split, chunk_offset_x, chunk_offset_y, raw_sig["prepared_fingerprint"])
+                split_chunk(ffmpeg, generation_prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split, chunk_offset_x, chunk_offset_y, raw_sig["prepared_fingerprint"], args.intermediate_profile)
                 previous_raw = raw_chunks[-1] if raw_chunks else None
                 chunk_seed = int(chunk_row.get("seed") or args.seed + chunk_index)
                 chunk_prompt_suffix = chunk_row.get("prompt_suffix", "")
@@ -2687,7 +2755,7 @@ def main() -> int:
                 effective_ranges.append((chunk_index, start_frame, end_frame))
             restitched = True
             try:
-                stitch_chunks(ffmpeg, raw_chunks, effective_ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
+                stitch_chunks(ffmpeg, raw_chunks, effective_ranges, raw_output, float(prepared_info["fps"] or 24.0), True, args.intermediate_profile)
             except PermissionError as exc:
                 if args.only_chunk is None:
                     raise
@@ -2713,6 +2781,8 @@ def main() -> int:
         str(raw_output),
         "--output",
         str(output),
+        "--intermediate-profile",
+        args.intermediate_profile,
     ]
     if uses_legacy_black_outpaint(args.outpaint_lora):
         finalize_command.extend(["--restore-tone", "--black-lift", "0.018", "--gamma", "1.06"])

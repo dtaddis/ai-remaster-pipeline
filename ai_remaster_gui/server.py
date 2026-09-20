@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import io
 import json
 import hashlib
 import os
@@ -117,7 +120,7 @@ from .file_dialogs import (
     remember_browse_dir,
 )
 from .console_log import ConsoleLog
-from .cloud import stage_uses_runpod, stop_runpod_pod, wrap_master_command, wrap_runpod_command
+from .cloud import high_memory_gpu_types, stage_uses_runpod, stop_runpod_pod, wrap_runpod_command
 from .image_sequences import parse_image_paths, prepare_image_sequence, sequence_state
 from .lifecycle import (
     create_server,
@@ -163,6 +166,7 @@ from .media import (
     aspect_preview_for_settings,
     aspect_preview_identity,
     auto_crop_for_settings,
+    browser_playback_for,
     current_crop_values,
     detect_letterbox_crop,
     draw_source_frame_border,
@@ -481,7 +485,8 @@ class PipelineApp:
         """The video the soundtrack phase attaches sound to: the recomposed render when
         earlier processing is enabled, otherwise the selected source section."""
         if self.outpaint_enabled() or self.colorize_enabled():
-            return self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
+            recomp = self.settings.get("recomp", {})
+            return recomp.get("output") or recomposition_output_for(self.recomposition_base_input(), recomp.get("encoder", "h264"))
         return self.cleaned_source_for_downstream()
 
     def cleanup_output(self) -> str:
@@ -863,12 +868,13 @@ class PipelineApp:
                 "source_previews": source_media["previews"],
                 "source_info": source_media["info"],
                 "source_sequence": sequence_state(settings_snapshot),
-                "source_playback": settings_snapshot.get("global", {}).get("source_sequence_preview", "") or source_text,
+                "source_playback": settings_snapshot.get("global", {}).get("source_sequence_preview", "") or source_media.get("playback", "") or source_text,
                 "source_section": section,
                 "project_path": str(self.project_path) if self.project_path else "",
                 "source_monochrome": source_media["monochrome"],
                 "source_analysis": source_media["analysis"],
                 "aspect_preview": aspect_preview,
+                "custom_outpaint_mask": custom_outpaint_mask_state(settings_snapshot) if view == "outpaint" else {},
                 "outpaint_chunks": outpaint_chunks,
                 "shot_views": {"manifest": "", "rows": []},
                 "audio_stems": self.audio_stems_state() if view == "audio" else [],
@@ -1021,7 +1027,7 @@ class PipelineApp:
             if source_text:
                 source = resolve(source_text)
                 self.log.append(f"Source analysis skipped; file was not found or is not a supported video: {source}")
-            return {"previews": [], "info": {}, "monochrome": True, "aspect_preview": "", "analysis": {}}
+            return {"previews": [], "info": {}, "monochrome": True, "aspect_preview": "", "playback": "", "analysis": {}}
 
         key = source_analysis_key(signature)
         basic_info = {"file": rel(Path(signature[0])), "size": human_size(signature[1])}
@@ -1036,6 +1042,7 @@ class PipelineApp:
                     "info": result.get("info", basic_info),
                     "monochrome": result.get("monochrome", True),
                     "aspect_preview": result.get("aspect_preview", ""),
+                    "playback": result.get("playback", "") or source_text,
                     "analysis": analysis,
                 }
             if key not in self.source_analysis_threads:
@@ -1055,6 +1062,7 @@ class PipelineApp:
             "info": basic_info,
             "monochrome": True,
             "aspect_preview": "",
+            "playback": browser_playback_for(source_text, create=False) or source_text,
             "analysis": dict(status or {"ready": False, "percent": 1, "message": "Queued source analysis"}),
         }
 
@@ -1072,6 +1080,7 @@ class PipelineApp:
         previews: list[str] = []
         monochrome = True
         aspect = ""
+        playback = ""
         try:
             self.set_source_analysis_status(key, 8, "Reading basic source metadata")
             info.update(ffprobe_basic_info(source))
@@ -1079,7 +1088,19 @@ class PipelineApp:
             self.set_source_analysis_status(key, 35, "Generating a few source preview frames")
             previews = list(source_previews_for_analysis(signature, info, lambda percent, message: self.set_source_analysis_status(key, percent, message)))
 
-            self.set_source_analysis_status(key, 76, "Checking whether the source is black and white")
+            # Publish metadata/stills immediately. A long archival AVI can take a
+            # while to proxy, and that should not hide the screenshots which are
+            # already available.
+            with self.source_analysis_lock:
+                self.source_analysis_results[key] = {
+                    "previews": previews,
+                    "info": info,
+                    "monochrome": monochrome,
+                    "aspect_preview": aspect,
+                    "playback": "",
+                }
+
+            self.set_source_analysis_status(key, 68, "Checking whether the source is black and white")
             monochrome = source_monochrome_cached(*signature)
             with self.source_analysis_lock:
                 apply_tone_default = key in self.source_tone_default_keys
@@ -1087,12 +1108,25 @@ class PipelineApp:
             if apply_tone_default:
                 self.apply_detected_source_tone(signature[0], monochrome)
 
+            try:
+                playback = browser_playback_for(
+                    str(source), create=True,
+                    progress=lambda percent, message: self.set_source_analysis_status(key, percent, message),
+                )
+            except Exception as exc:
+                # Playback proxies are a convenience for the embedded browser. A
+                # failed proxy must not suppress metadata/tone analysis or make a
+                # perfectly usable processing source appear invalid.
+                playback = ""
+                self.log.append(f"Could not create browser playback proxy for {source}: {exc}")
+
             with self.source_analysis_lock:
                 self.source_analysis_results[key] = {
                     "previews": previews,
                     "info": info,
                     "monochrome": monochrome,
                     "aspect_preview": aspect,
+                    "playback": playback,
                 }
                 self.source_analysis_status[key] = {
                     "ready": True,
@@ -1265,7 +1299,9 @@ class PipelineApp:
         source = self.settings.get("global", {}).get("source")
         if source:
             self.settings.setdefault("recomp", {})["source"] = upstream_text
-        output = recomposition_output_for(self.recomposition_base_input())
+        output = recomposition_output_for(
+            self.recomposition_base_input(), self.settings.get("recomp", {}).get("encoder", "h264")
+        )
         if output:
             self.settings.setdefault("recomp", {})["output"] = output
         else:
@@ -1314,7 +1350,9 @@ class PipelineApp:
         if stage_key == "colour":
             return colorized_outputs_for_manifest(values.get("manifest", ""), values.get("method", "deepexemplar"))
         if stage_key == "recomp":
-            output = values.get("output") or recomposition_output_for(values.get("outpainted_video", "") or values.get("source", ""))
+            output = recomposition_output_for(
+                values.get("outpainted_video", "") or values.get("source", ""), values.get("encoder", "h264")
+            )
             return [output] if output else []
         if stage_key == "audio":
             source = self.soundtrack_source_for()
@@ -1361,19 +1399,24 @@ class PipelineApp:
             cmd.append("--dry-run")
         cmd = [part for part in cmd if part != ""]
         if stage_uses_runpod(stage_key, values):
-            # Encode the selected intermediate master before the result bundle is
-            # downloaded, keeping CPU-heavy HEVC/lossless work on the cloud worker.
-            if stage_key != "stabilize":
-                cmd = wrap_master_command(
-                    cmd,
-                    self.expected_outputs(stage_key),
-                    self.settings.get("cloud", {}).get("intermediate_format", "hevc_high"),
+            cloud_values = dict(self.settings.get("cloud", {}))
+            if stage_key == "outpaint":
+                source_text = self.outpaint_source_for()
+                _work_w, work_h = outpaint_work_size_for_source(
+                    source_text,
+                    values.get("target_aspect", "16:9"),
+                    values.get("target_height", "720"),
                 )
+                if work_h >= 1056:
+                    cloud_values["runpod_gpu_types"] = high_memory_gpu_types(
+                        cloud_values.get("runpod_outpaint_highres_gpu_types", "")
+                        or cloud_values.get("runpod_gpu_types", "")
+                    )
             cmd = wrap_runpod_command(
                 cmd,
                 stage_key=stage_key,
                 expected_outputs=self.expected_outputs(stage_key),
-                cloud=self.settings.get("cloud", {}),
+                cloud=cloud_values,
             )
         return cmd
 
@@ -1381,6 +1424,7 @@ class PipelineApp:
         source = pipeline_source_text(self.settings)
         output = cleanup_output_for(source, values) if source else ""
         cmd = [sys.executable, "-u", str(SCRIPTS / "cleanup_video.py"), "--source", source, "--output", output]
+        cmd.extend(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
         if is_true(values, "ai_descratch"):
             cmd.append("--ai-descratch")
             if is_true(values, "save_scratch_mask", "true"):
@@ -1430,6 +1474,7 @@ class PipelineApp:
         add(["--offset-y", str(outpaint_offset_value(values.get("offset_y", "0")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
+        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
         add(["--generation-mask-overlap", values.get("generation_mask_overlap", "8")])
         add(["--mask-blend-dilation", values.get("mask_blend_dilation", "2")])
         add(["--black-mask-threshold", values.get("black_mask_threshold", "12")])
@@ -1469,7 +1514,12 @@ class PipelineApp:
         manifest = outpaint_chunk_manifest_for(source_text, values)
         if manifest:
             add(["--chunk-manifest", manifest])
-        add_value_args(cmd, values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
+        custom_mask = custom_outpaint_mask_for(source_text, values)
+        if custom_mask.is_file():
+            add(["--custom-mask", rel(custom_mask)])
+        crop, _black = _outpaint_crop_black(values)
+        for flag, amount in zip(("--crop-left", "--crop-right", "--crop-top", "--crop-bottom"), crop):
+            add([flag, str(amount)])
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         return cmd
@@ -1535,6 +1585,7 @@ class PipelineApp:
         if output:
             add(["--output", output])
         add(["--processing-height", values.get("processing_height", "source")])
+        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
         add(["--crf", values.get("crf", "18")])
         if method == "openai":
             reference_settings = self.settings.get("references", {})
@@ -1564,7 +1615,8 @@ class PipelineApp:
         cmd = [sys.executable, "-u", str(SCRIPTS / "final_composite.py")]
         add = cmd.extend
         outpainted = values.get("outpainted_video", "")
-        output = values.get("output") or recomposition_output_for(outpainted or values.get("source", ""))
+        output = recomposition_output_for(outpainted or values.get("source", ""), values.get("encoder", "h264"))
+        values["output"] = output
         if outpainted:
             add(["--outpainted", outpainted])
         add(["--source", values.get("source", ""), "--output", output])
@@ -1578,7 +1630,12 @@ class PipelineApp:
             add(["--feather-pixels", values.get("feather_pixels", "80")])
         add(["--saturation", values.get("saturation", "82"), "--temperature", values.get("temperature", "6500"), "--color-opacity", values.get("color_opacity", "100"), "--encoder", values.get("encoder", "h264")])
         outpaint_values = self.settings.get("outpaint", {})
-        add_value_args(cmd, outpaint_values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
+        crop, _black = _outpaint_crop_black(outpaint_values)
+        for flag, amount in zip(("--crop-left", "--crop-right", "--crop-top", "--crop-bottom"), crop):
+            add([flag, str(amount)])
+        custom_mask = custom_outpaint_mask_for(self.outpaint_source_for(), outpaint_values)
+        if outpainted and custom_mask.is_file():
+            add(["--custom-mask", rel(custom_mask)])
         if outpainted and is_true(outpaint_values, "outpaint_all_black_regions"):
             add(["--source-black-transparent"])
             add(["--source-black-threshold", outpaint_values.get("black_mask_threshold", "12")])
@@ -1743,14 +1800,9 @@ class PipelineApp:
             self.running_stage_key = stage.key
             self.run_started_at = time.time()
             cmd = self.command_for(stage_key)
-            # Stabilization already has purpose-built FFV1 and ProRes masters. Preserve
-            # that choice instead of placing a second global transcode around it.
-            if stage_key != "stabilize" and not stage_uses_runpod(stage_key, self.settings[stage_key]):
-                cmd = wrap_master_command(
-                    cmd,
-                    self.expected_outputs(stage_key),
-                    self.settings.get("cloud", {}).get("intermediate_format", "hevc_high"),
-                )
+            # Video-producing stages consume the intermediate profile directly.  Do not
+            # add a post-stage transcode here: that would create an avoidable extra lossy
+            # generation after the stage has already written the selected codec.
             self.log.append("> " + redact_command_for_log(cmd))
             self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(stage.title)
@@ -1961,7 +2013,8 @@ class PipelineApp:
             if soundtrack_output:
                 return soundtrack_output
         if self.outpaint_enabled() or self.colorize_enabled():
-            recomposed = self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
+            recomp = self.settings.get("recomp", {})
+            recomposed = recomp.get("output") or recomposition_output_for(self.recomposition_base_input(), recomp.get("encoder", "h264"))
             return recomposed
         return self.stabilized_source_for_downstream()
 
@@ -1972,6 +2025,7 @@ class PipelineApp:
         add(["--input", source])
         add(["--target-width", str(values.get("target_width", "3840")), "--target-height", str(values.get("target_height", "2160"))])
         add(["--output", output])
+        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
@@ -2088,7 +2142,7 @@ class PipelineApp:
         # A selected source section is created lazily when the stage starts. Before that happens,
         # skipping Clean Up must still leave something useful in the Stabilization viewer. Show
         # the original source (or the browser-friendly image-sequence preview) until the trimmed
-        # H.264 section exists. The actual stabilization command continues to target the section.
+        # processing-master section exists. The actual stabilization command targets the section.
         if not source_available and not self.cleanup_enabled() and global_source and resolve(global_source).exists():
             source = global_source
             source_preview = global_settings.get("source_sequence_preview", "") or global_source
@@ -2119,8 +2173,9 @@ class PipelineApp:
     def output_selection_state(self) -> dict[str, str]:
         upscale = self.settings.get("upscale", {})
         upscale_output = upscale_output_for(self.upscale_input_for() or upscale.get("input_video"), upscale) or upscale.get("output")
+        recomp = self.settings.get("recomp", {})
         recomposed = (
-            self.settings.get("recomp", {}).get("output") or recomposition_output_for(self.recomposition_base_input())
+            recomp.get("output") or recomposition_output_for(self.recomposition_base_input(), recomp.get("encoder", "h264"))
         ) if (self.outpaint_enabled() or self.colorize_enabled()) else ""
         soundtrack_source = self.soundtrack_source_for()
         soundtrack_output = soundtrack_output_for(soundtrack_source, self.settings.get("audio", {})) if (self.soundtrack_enabled() and soundtrack_source) else ""
@@ -2318,8 +2373,8 @@ class PipelineApp:
             ok, message = self.run_stage(stage.key)
             if not ok:
                 with self.lock:
-                    self.log.append(f"Skipping {stage.title}: {message}")
-                continue
+                    self.log.append(f"Whole remaster stopped before {stage.title}: {message}")
+                break
             while self.process and self.process.poll() is None:
                 time.sleep(0.5)
             while self.running_stage_key == stage.key:
@@ -2411,9 +2466,89 @@ state.APP = APP  # register the singleton so sibling modules can reach it withou
 
 
 def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
-    crop = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    # GUI convention: negative trims, positive extends. Processing convention
+    # retains the existing signed crop flags: positive trims, negative extends.
+    edges = [int(float(values.get(key, "0") or 0)) for key in ("edge_left", "edge_right", "edge_top", "edge_bottom")]
+    legacy = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
+    crop = [-value for value in edges] if any(edges) or not any(legacy) else legacy
     black = is_true(values, "outpaint_all_black_regions")
     return crop, black
+
+
+def custom_outpaint_mask_for(source_text: str, values: dict[str, str]) -> Path:
+    """Return the project-owned additive mask for the current outpaint geometry."""
+    if not source_text:
+        return ROOT / "manifests" / "outpaint_masks" / "unset_custom_mask.png"
+    source = resolve_video_source(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    work_w, work_h = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    crop, black = _outpaint_crop_black(values)
+    return ROOT / "manifests" / "outpaint_masks" / aid.outpaint_name(
+        source.name, aspect, work_w, work_h, crop, black, "custommask", "png"
+    )
+
+
+def custom_outpaint_mask_state(settings: dict) -> dict[str, str | int | bool]:
+    source_text = outpaint_source_for_settings(settings)
+    if not source_text:
+        return {"path": "", "exists": False, "width": 0, "height": 0}
+    values = settings.get("outpaint", {})
+    path = custom_outpaint_mask_for(source_text, values)
+    width, height = outpaint_work_size_for_source(
+        source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720")
+    )
+    return {
+        "path": rel(path),
+        "exists": path.is_file(),
+        "width": width,
+        "height": height,
+        "mtime": path.stat().st_mtime_ns if path.is_file() else 0,
+    }
+
+
+def save_custom_outpaint_mask(image_data: str) -> dict[str, str | int | bool]:
+    """Save a browser-painted additive mask at the exact LTX working resolution."""
+    source_text = APP.outpaint_source_for()
+    if not source_text:
+        raise RuntimeError("Choose source material before editing the outpaint mask.")
+    if not image_data.startswith("data:image/png;base64,"):
+        raise ValueError("Custom outpaint mask must be a PNG image.")
+    try:
+        payload = base64.b64decode(image_data.split(",", 1)[1], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Custom outpaint mask is not valid base64 PNG data.") from exc
+    if len(payload) > 32 * 1024 * 1024:
+        raise ValueError("Custom outpaint mask is too large.")
+
+    from PIL import Image
+
+    values = APP.settings.get("outpaint", {})
+    target = custom_outpaint_mask_for(source_text, values)
+    width, height = outpaint_work_size_for_source(
+        source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720")
+    )
+    with Image.open(io.BytesIO(payload)) as uploaded:
+        rgba = uploaded.convert("RGBA")
+        # The editor paints a translucent coloured overlay. Its alpha alone is the mask;
+        # nearest-neighbour scaling keeps brush edges binary and aligned to LTX pixels.
+        mask = rgba.getchannel("A").point(lambda value: 255 if value >= 16 else 0)
+        if mask.size != (width, height):
+            mask = mask.resize((width, height), Image.Resampling.NEAREST)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".partial.png")
+        mask.save(temporary)
+        temporary.replace(target)
+    APP.log.append(f"Saved custom outpaint mask: {rel(target)}")
+    return custom_outpaint_mask_state(APP.settings)
+
+
+def clear_custom_outpaint_mask() -> dict[str, str | int | bool]:
+    source_text = APP.outpaint_source_for()
+    if source_text:
+        target = custom_outpaint_mask_for(source_text, APP.settings.get("outpaint", {}))
+        target.unlink(missing_ok=True)
+        APP.log.append(f"Cleared custom outpaint mask: {rel(target)}")
+    return custom_outpaint_mask_state(APP.settings)
 
 
 def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
@@ -2461,7 +2596,7 @@ def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
         dearchive=is_true(values, "dearchive", "true"),
         dearchive_height=values.get("dearchive_height", "720"),
     )
-    return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4"))
+    return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mkv"))
 
 
 def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
@@ -2529,7 +2664,7 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crop, black = _outpaint_crop_black(values)
     tag = "outpaint25" if values.get("outpaint_model") == "ltx25" else "outpaint"
-    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "mp4"))
+    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "mkv"))
 
 
 def outpaint_render_outputs_for_settings(source_text: str, values: dict[str, str]) -> list[Path]:
@@ -2543,8 +2678,8 @@ def outpaint_render_outputs_for_settings(source_text: str, values: dict[str, str
     folder = ROOT / "intermediate" / "outpainted"
     suffix = "25" if values.get("outpaint_model") == "ltx25" else ""
     return [
-        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"outpaint{suffix}", "mp4"),
-        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"rawcomfy{suffix}", "mp4"),
+        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"outpaint{suffix}", "mkv"),
+        folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"rawcomfy{suffix}", "mkv"),
     ]
 
 
@@ -2717,7 +2852,7 @@ def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     height_text = values.get("target_height", "720")
     work_w, work_h = outpaint_work_size_for_source(source_text, aspect, height_text)
     crop, black = _outpaint_crop_black(values)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
+    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mkv")
 
 
 def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
@@ -2726,6 +2861,7 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
     if prepared.exists():
         return prepared
 
+    crop, _black = _outpaint_crop_black(values)
     cmd = [
         sys.executable,
         str(SCRIPTS / "prepare_outpaint_input.py"),
@@ -2736,13 +2872,13 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         "--output",
         str(prepared),
         "--crop-left",
-        str(values.get("crop_left", "0") or "0"),
+        str(crop[0]),
         "--crop-right",
-        str(values.get("crop_right", "0") or "0"),
+        str(crop[1]),
         "--crop-top",
-        str(values.get("crop_top", "0") or "0"),
+        str(crop[2]),
         "--crop-bottom",
-        str(values.get("crop_bottom", "0") or "0"),
+        str(crop[3]),
         "--target-width",
         str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
         "--target-height",
@@ -2751,6 +2887,8 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
         "--delivery-height",
         str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
+        "--intermediate-profile",
+        APP.settings.get("cloud", {}).get("intermediate_format", "high"),
     ]
     if is_true(values, "outpaint_all_black_regions"):
         cmd.append("--outpaint-all-black-regions")
@@ -2816,7 +2954,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         row = dict(existing.get(index, {}))
         apply_outpaint_chunk_offsets(row, default_offset_x, default_offset_y)
         offset_slug = outpaint_chunk_offset_slug(row)
-        prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
+        prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv"
         raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
         row.update({
             "chunk_index": str(index),

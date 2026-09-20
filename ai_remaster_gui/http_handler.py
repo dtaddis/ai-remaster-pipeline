@@ -71,6 +71,8 @@ install_outpaint_guide = None
 clear_outpaint_guide = None
 install_outpaint_end_guide = None
 clear_outpaint_end_guide = None
+save_custom_outpaint_mask = None
+clear_custom_outpaint_mask = None
 
 _SERVER_OUTPAINT_OPS = (
     "ensure_outpaint_prepared_canvas",
@@ -81,6 +83,8 @@ _SERVER_OUTPAINT_OPS = (
     "clear_outpaint_guide",
     "install_outpaint_end_guide",
     "clear_outpaint_end_guide",
+    "save_custom_outpaint_mask",
+    "clear_custom_outpaint_mask",
 )
 
 
@@ -244,8 +248,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = auto_crop_for_settings(state.APP.settings, float(query.get("time", ["0"])[0]))
                 self.send_json({"ok": True, **result, "state": state.APP.state("outpaint")})
             except Exception as exc:
-                state.APP.log.append(f"Auto Crop failed: {exc}")
+                state.APP.log.append(f"Auto Trim failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-custom-mask":
+            self.send_json({"ok": True, **state.APP.state("outpaint").get("custom_outpaint_mask", {})})
         elif parsed.path == "/api/outpaint-chunk-preview":
             query = parse_qs(parsed.query)
             try:
@@ -457,6 +463,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_result("Media export", lambda: {**export_media_file(str(data.get("path", "")))})
         elif parsed.path == "/api/outpaint-chunk":
             self._send_result("Outpaint chunk save", lambda: update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True), data.get("offset_override", None)) or {"state": state.APP.state("outpaint")})
+        elif parsed.path == "/api/outpaint-custom-mask-save":
+            self._send_result("Custom outpaint mask save", lambda: {**save_custom_outpaint_mask(str(data.get("image", ""))), "state": state.APP.state("outpaint")})
+        elif parsed.path == "/api/outpaint-custom-mask-clear":
+            self._send_result("Custom outpaint mask clear", lambda: {**clear_custom_outpaint_mask(), "state": state.APP.state("outpaint")})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             self._send_action("Outpaint chunk regeneration", lambda: (
                 update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True), data.get("offset_override", None)),

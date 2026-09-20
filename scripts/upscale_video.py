@@ -39,9 +39,23 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
     "text, compression artifacts, film damage, dust, scratches"
 )
+from intermediate_video import codec_args as intermediate_codec_args, container_args
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25"}
 DEFAULT_SEEDVR2_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+CURRENT_INTERMEDIATE_PROFILE = "high"
+
+
+def working_codec_args(*, fast: bool = False) -> list[str]:
+    return intermediate_codec_args(CURRENT_INTERMEDIATE_PROFILE, fast=fast)
+
+
+def working_container_args(path: Path) -> list[str]:
+    return container_args(str(path), CURRENT_INTERMEDIATE_PROFILE)
+
+
+def delivery_codec_args() -> list[str]:
+    return ["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p"]
 
 
 def upscale_method(args: argparse.Namespace) -> str:
@@ -159,6 +173,7 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
             "chunk_seconds": args.chunk_seconds,
             "overlap_frames": args.overlap_frames,
             "fps": args.fps,
+            "intermediate_profile": getattr(args, "intermediate_profile", "high"),
         }
     if method == "seedvr2":
         return {
@@ -187,6 +202,7 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
             "chunk_seconds": args.chunk_seconds,
             "overlap_frames": args.overlap_frames,
             "fps": args.fps,
+            "intermediate_profile": getattr(args, "intermediate_profile", "high"),
         }
     sig = {
         "version": 6,
@@ -197,6 +213,7 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
         "target_width": output_width,
         "target_height": output_height,
         "flashvsr_pre_downscale": args.flashvsr_pre_downscale,
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
         "comfy_dir": root_relative(resolve_path(args.comfy_dir)),
         "comfy_url": args.comfy_url,
         "flashvsr_model": args.flashvsr_model,
@@ -288,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shot-manifest", default="", help="Optional shot CSV containing per-row upscale_strength plus fade_to_next/crossfade_seconds tween metadata.")
     parser.add_argument("--fps", type=float, default=0.0)
     parser.add_argument("--ffmpeg", default="")
+    parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -393,13 +411,14 @@ def blend_upscale_delivery(
     filters = (
         f"[0:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[src];"
         f"[1:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[ai];"
-        f"[src][ai]blend=all_expr='A*(1-({weight}))+B*({weight})',format=yuv420p[vout]"
+        f"[src][ai]blend=all_expr='A*(1-({weight}))+B*({weight})',"
+        "format=yuv420p[vout]"
     )
     command = [
         ffmpeg, "-y", "-i", str(source), "-i", str(ai_upscale),
         "-filter_complex", filters, "-map", "[vout]", "-map", "0:a?", "-shortest",
-        "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16",
-        "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(partial),
+        "-r", f"{fps:.8f}", "-fps_mode", "cfr", *delivery_codec_args(),
+        "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", str(partial),
     ]
     print("Blending source motion/detail with AI upscale by shot", flush=True)
     subprocess.run(command, check=True)
@@ -979,16 +998,8 @@ def split_video_chunk(ffmpeg: str, source: Path, target: Path, start_frame: int,
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
+        *working_codec_args(fast=True),
+        *working_container_args(partial),
         str(partial),
     ]
     subprocess.run(command, check=True)
@@ -1022,8 +1033,7 @@ def prepare_ltx25_chunk(
     subprocess.run(
         [
             ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
-            "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+            "-fps_mode", "cfr", *working_codec_args(fast=True), *working_container_args(partial), str(partial),
         ],
         check=True,
     )
@@ -1051,8 +1061,7 @@ def normalize_ltx25_chunk(
     subprocess.run(
         [
             ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
-            "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "16", "-preset", "slow",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
+            "-fps_mode", "cfr", *working_codec_args(), *working_container_args(partial), str(partial),
         ],
         check=True,
     )
@@ -1082,16 +1091,8 @@ def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height:
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     subprocess.run(command, check=True)
@@ -1115,7 +1116,9 @@ def mux_audio(ffmpeg: str, video_source: Path, audio_source: Path, output: Path)
         "-c:v",
         "copy",
         "-c:a",
-        "copy",
+        "aac",
+        "-b:a",
+        "320k",
         "-shortest",
         "-movflags",
         "+faststart",
@@ -1134,7 +1137,10 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: P
         list_file = Path(tmp_text) / "chunks.txt"
         list_file.write_text("".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks), encoding="utf-8")
         print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(video_partial)], check=True)
+        subprocess.run([
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-an", *delivery_codec_args(), "-movflags", "+faststart", str(video_partial),
+        ], check=True)
     mux_audio(ffmpeg, video_partial, audio_source, output)
     video_partial.unlink(missing_ok=True)
 
@@ -1186,9 +1192,9 @@ def chunked_standard_upscale_run(
     normalized_chunks: list[Path] = []
     digits = max(4, int(math.log10(len(ranges))) + 1)
     for index, (start_frame, end_frame, trim_start) in enumerate(ranges):
-        chunk_input = chunk_dir / f"input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_input = chunk_dir / f"input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mkv"
         chunk_raw = chunk_dir / f"raw_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        chunk_final = chunk_dir / f"final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_final = chunk_dir / f"final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mkv"
         print(f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
         split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, source_fingerprint)
         chunk_sig = signature(args, chunk_input, output_width, output_height)
@@ -1248,9 +1254,9 @@ def chunked_ltx25_run(
     normalized_chunks: list[Path] = []
     digits = max(4, int(math.log10(len(ranges))) + 1)
     for index, (start_frame, end_frame, trim_start, keep_frames, model_frames) in enumerate(ranges):
-        chunk_input = chunk_dir / f"ltx25_input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_input = chunk_dir / f"ltx25_input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mkv"
         chunk_raw = chunk_dir / f"ltx25_raw_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        chunk_final = chunk_dir / f"ltx25_final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk_final = chunk_dir / f"ltx25_final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mkv"
         print(
             f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, "
             f"trim {trim_start}, keep {keep_frames}, LTX window {model_frames}",
@@ -1311,16 +1317,8 @@ def scale_video(ffmpeg: str, source: Path, output: Path, width: int, height: int
         str(source),
         "-vf",
         f"scale={width}:{height}:flags=lanczos,setsar=1",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
+        *delivery_codec_args(),
+        "-movflags", "+faststart",
         str(output),
     ]
     subprocess.run(command, check=True)
@@ -1349,7 +1347,7 @@ def pre_downscale_dimensions(output_width: int, output_height: int, flashvsr_sca
 
 def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, output_width: int, output_height: int, source_info: dict[str, Any]) -> Path:
     width, height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
-    target = ROOT / ".cache" / "upscale_sources" / f"{safe_stem(source.name)}_flashvsr_input_{width}x{height}_s{args.flashvsr_scale}.mp4"
+    target = ROOT / ".cache" / "upscale_sources" / f"{safe_stem(source.name)}_flashvsr_input_{width}x{height}_s{args.flashvsr_scale}.mkv"
     sig = {
         "version": 1,
         "tool": "upscale_video.py",
@@ -1383,16 +1381,8 @@ def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, ou
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     subprocess.run(command, check=True)
@@ -1402,6 +1392,8 @@ def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, ou
 
 
 def run(args: argparse.Namespace) -> int:
+    global CURRENT_INTERMEDIATE_PROFILE
+    CURRENT_INTERMEDIATE_PROFILE = getattr(args, "intermediate_profile", "high")
     source = resolve_path(args.input)
     if not source.exists():
         raise FileNotFoundError(f"Input video not found for upscaling: {source}")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import state
-from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT
+from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SOURCE_PLAYBACK_DIR
 from .paths import rel, resolve
 
 
@@ -26,6 +26,7 @@ def cache_categories() -> tuple[dict, ...]:
                 FILE_PREVIEW_DIR,
                 ASPECT_PREVIEW_DIR,
                 MEDIA_CLIP_DIR,
+                SOURCE_PLAYBACK_DIR,
                 ROOT / "intermediate" / "source_sections",
             ),
         },

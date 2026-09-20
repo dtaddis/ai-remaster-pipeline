@@ -24,6 +24,15 @@ class _Response:
 
 
 class RunPodAPIRequestTests(unittest.TestCase):
+    def test_custom_outpaint_mask_is_uploaded_and_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory(dir=runpod_stage.ROOT) as folder_text:
+            mask = Path(folder_text) / "mask.png"
+            mask.write_bytes(b"mask")
+            command = [sys.executable, "-u", str(runpod_stage.ROOT / "scripts" / "outpaint_video.py"), "--custom-mask", str(mask)]
+            converted = runpod_stage.remote_command(command)
+
+        self.assertEqual(converted[converted.index("--custom-mask") + 1], runpod_stage.remote_path(str(mask)))
+
     def test_bootstrap_reuses_matching_cuda_13_image_runtime(self) -> None:
         bootstrap = (runpod_stage.ROOT / "scripts" / "bootstrap_runpod.sh").read_text(encoding="utf-8")
 

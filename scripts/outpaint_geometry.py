@@ -27,6 +27,29 @@ def crop_box(width: int, height: int, left: int, right: int, top: int, bottom: i
     return left, right, top, bottom, crop_width, crop_height
 
 
+def source_envelope_size(
+    source_width: int,
+    source_height: int,
+    adjustments: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Return cropped source plus requested virtual outpaint border.
+
+    Internal adjustment values retain the legacy crop convention: positive
+    removes source pixels and negative adds virtual black canvas.  The GUI
+    presents the friendlier inverse convention (negative trim, positive extend)
+    and converts before calling the processing scripts.
+    """
+
+    left, right, top, bottom = (int(value) for value in adjustments)
+    _crop_left, _crop_right, _crop_top, _crop_bottom, crop_width, crop_height = crop_box(
+        source_width, source_height, left, right, top, bottom
+    )
+    return (
+        crop_width + max(0, -left) + max(0, -right),
+        crop_height + max(0, -top) + max(0, -bottom),
+    )
+
+
 @dataclass(frozen=True)
 class SourcePlacement:
     x: int
@@ -44,30 +67,42 @@ def source_placement(
     reference_width: int | None = None,
     reference_height: int | None = None,
 ) -> SourcePlacement:
-    """Crop first, then fit the remaining frame into the requested canvas.
+    """Trim/extend first, then fit the source envelope into the canvas.
 
-    Trimmed pixels are discarded geometry, never outpaint targets. The cropped
-    frame is centered and scaled as one complete image, so the remaining mask is
-    always a simple pillarbox, letterbox, or empty border.
+    Positive internal values trim pixels. Negative values add virtual border on
+    that edge, shrinking and positioning the surviving source inside the fixed
+    target-aspect canvas so LTX can outpaint in any combination of directions.
     """
     reference_width = int(reference_width or target_width)
     reference_height = int(reference_height or target_height)
-    _left, _right, _top, _bottom, crop_width, crop_height = crop_box(
+    left, right, top, bottom = (int(value) for value in crops)
+    _crop_left, _crop_right, _crop_top, _crop_bottom, crop_width, crop_height = crop_box(
         source_width, source_height, *crops
     )
-    placed_width, placed_height = fit_size(
-        crop_width,
-        crop_height,
+    extend_left = max(0, -left)
+    extend_right = max(0, -right)
+    extend_top = max(0, -top)
+    extend_bottom = max(0, -bottom)
+    envelope_width = crop_width + extend_left + extend_right
+    envelope_height = crop_height + extend_top + extend_bottom
+    fitted_envelope_width, fitted_envelope_height = fit_size(
+        envelope_width,
+        envelope_height,
         reference_width,
         reference_height,
     )
+    scale_x = fitted_envelope_width / envelope_width
+    scale_y = fitted_envelope_height / envelope_height
+    placed_width = min(reference_width, max(2, even(crop_width * scale_x)))
+    placed_height = min(reference_height, max(2, even(crop_height * scale_y)))
+    x = (reference_width - fitted_envelope_width) // 2 + int(round(extend_left * scale_x))
+    y = (reference_height - fitted_envelope_height) // 2 + int(round(extend_top * scale_y))
 
     if (reference_width, reference_height) != (target_width, target_height):
         scale_x = target_width / reference_width
         scale_y = target_height / reference_height
         placed_width = min(target_width, max(2, even(placed_width * scale_x)))
         placed_height = min(target_height, max(2, even(placed_height * scale_y)))
-
-    x = (target_width - placed_width) // 2
-    y = (target_height - placed_height) // 2
+        x = int(round(x * scale_x))
+        y = int(round(y * scale_y))
     return SourcePlacement(x, y, placed_width, placed_height)

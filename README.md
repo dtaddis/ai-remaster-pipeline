@@ -144,14 +144,14 @@ The first cloud phase is intentionally slower because it builds the worker and d
 
 ### Intermediate master formats
 
-Settings controls the video master written after each complete phase:
+Settings controls video written inside the processing chain and the master produced by each complete phase:
 
-- **H.264 Standard** preserves the compact legacy output.
-- **H.264 High** uses CRF 10 and a slow encode for a substantially larger, cleaner compatible master.
-- **HEVC 10-bit High** uses x265 CRF 12 and is the recommended balance for restoration intermediates.
-- **HEVC 10-bit Lossless** uses x265's lossless mode, preserving every decoded pixel in a compressed modern video file without creating uncompressed BMP frames.
+- **Low bitrate** uses 10-bit VP9 at CRF 36.
+- **Medium bitrate** uses 10-bit VP9 at CRF 27.
+- **High bitrate** uses 10-bit VP9 at CRF 18 and is the recommended restoration default.
+- **Lossless** uses preservation-oriented FFV1 v3.
 
-The profile is applied after a local or cloud phase and keeps deterministic filenames, so existing project routing remains compatible. Lightweight H.264 browser previews are still used where a browser cannot play a 10-bit/lossless master directly. Stabilization retains its dedicated FFV1/ProRes working-master choice because those codecs suit frame-accurate motion analysis and editing interchange.
+The chosen profile is passed directly into local and RunPod producers, including temporary scaling, chunk normalization and stitching. This avoids a hidden H.264 generation in operations such as the 720p-to-704p LTX outpainting preparation, and avoids a redundant post-stage transcode. Processing masters use Matroska (`.mkv`); final delivery remains MP4/MOV, and lightweight H.264 browser previews remain separate and compact.
 
 ## Basic Workflow
 
@@ -163,6 +163,8 @@ The profile is applied after a local or cloud phase and keeps deterministic file
 6. Use the stage tabs to inspect or rerun individual phases.
 
 Every stage writes predictable intermediate files under `intermediate/`, manifests under `manifests/`, and final renders under `output/reassembled/`.
+
+**Run Whole Remaster is resumable.** It walks the enabled phases in order. Each producer compares a saved signature containing its effective settings and input fingerprints, reuses matching outputs, and regenerates work whose settings, source files, masks, prompts, guides, or upstream outputs changed. Per-chunk phases retain matching chunks. A phase with **Force** enabled deliberately bypasses reuse and runs again.
 
 ## Tabs
 
@@ -188,7 +190,9 @@ Optional and off by default. Stabilization uses FFmpeg's two-pass libvidstab fil
 
 ### Outpainting
 
-Set the target aspect ratio, output height, chunk length, overlap frames, and source crop. The target preview helps you see where ARP will add new canvas before LTX fills it.
+Set the target aspect ratio, output height, chunk length, overlap frames, and signed per-edge **Trim / Extend** values. Negative values trim source pixels; positive values reserve extra canvas for LTX on that edge. The selected target aspect ratio always remains the outer frame, so positive values can deliberately shrink and position the source inside it to outpaint above, below, left, and right at once. **Auto Trim** detects baked-in bars and writes negative values. The target preview shows the resulting canvas before LTX fills it.
+
+**Create Mask** opens that preview as a paintable canvas. Paint additional source areas that LTX should replace on every frame, or erase strokes to refine the selection. This is intended for rounded film-frame corners, damaged edges, sprocket holes, and other fixed inpaint regions. The painted mask is additive to the automatic Trim / Extend mask. Because its coordinates belong to one exact canvas geometry, changing the target aspect, output size, Trim / Extend values, or black-region mode starts a fresh mask for the new geometry without deleting the old file. The active custom mask is saved with the project, sent to RunPod when cloud compute is selected, and also applied during Recomposition so the generated pixels are not covered again by the original-source layer.
 
 Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
 
@@ -197,6 +201,8 @@ The model selector offers the established official LTX 2.3 v0.9 graph, its legac
 ARP derives a frame-aligned binary mask from the prepared canvas. **Generation mask overlap** expands only the mask seen by LTX beneath protected source pixels, preventing very thin requested bands from surviving as the green inpaint sentinel after spatial compression. The final Laplacian composite uses the exact requested crop mask and the untouched prepared source—not the green conditioning image—so the hidden overlap cannot leak into the result. Pure-white mask pixels are selected at full resolution after the pyramid boundary blend, ensuring even a very thin top or bottom strip is taken from the generated image. **Mask seam blend** adjusts only the surrounding boundary transition. The models are gated on Hugging Face: access must first be accepted in the browser for the same individual account used by ARP. Authenticate with `hf auth login --force` (or `HF_TOKEN`) if the saved token still receives a 403.
 
 Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point.
+
+1080p Outpainting renders at the nearest model-safe multiple-of-32 canvas (for 16:9, 1920×1088) and Recomposition returns it to the requested 1920×1080 delivery size. When RunPod compute is selected for a high-resolution outpaint, ARP excludes common 24/32 GB cards from that job and requests the configured 48 GB-or-larger choices instead.
 
 If outpainting fails immediately with missing `LTXVInpaintPreprocess`, `LTXVLaplacianPyramidBlend`, or `LTXAddVideoICLoRAGuideAdvanced` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
 

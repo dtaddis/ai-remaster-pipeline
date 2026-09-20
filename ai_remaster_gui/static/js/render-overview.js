@@ -213,6 +213,7 @@ function overviewActions() {
       <button class="primary" onclick="runAll()">Run Whole Remaster</button>
       <button class="warn" onclick="stopRun()" ${state.running ? '' : 'disabled'}>Stop</button>
     </div>
+    <p class="shot-empty">Safe to rerun: completed work is reused when its effective inputs are unchanged. Changed settings, source files, masks, prompts, guides, or upstream outputs invalidate only the affected phase and its downstream results. A phase with Force enabled always reruns.</p>
   `;
 }
 

@@ -28,6 +28,7 @@ from common import (
     video_info,
     write_signature,
 )
+from intermediate_video import codec_args as intermediate_codec_args, container_args
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 REFERENCE_INPUT_COPY_STRATEGY = "content-keyed-v1"
@@ -89,6 +90,17 @@ def processing_dimensions(width: int, height: int, processing_height: str) -> tu
     return target_w, target_h
 
 
+CURRENT_INTERMEDIATE_PROFILE = "high"
+
+
+def working_codec_args(*, fast: bool = False) -> list[str]:
+    return intermediate_codec_args(CURRENT_INTERMEDIATE_PROFILE, fast=fast)
+
+
+def working_container_args(path: Path) -> list[str]:
+    return container_args(str(path), CURRENT_INTERMEDIATE_PROFILE)
+
+
 def downscaled_video_signature(source: Path, width: int, height: int) -> dict[str, Any]:
     return {
         "version": 2,
@@ -99,6 +111,7 @@ def downscaled_video_signature(source: Path, width: int, height: int) -> dict[st
         "width": width,
         "height": height,
         "grayscale": True,
+        "intermediate_profile": CURRENT_INTERMEDIATE_PROFILE,
     }
 
 
@@ -109,7 +122,7 @@ def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int,
     processing dimensions match the source. Shot ranges are selected from this file in ComfyUI.
     """
     digest = file_fingerprint(source)["sha256"][:12]
-    output = ROOT / ".cache" / "colorize_inputs" / f"{safe_stem(source.name)}_{digest}_{width}x{height}_gray.mp4"
+    output = ROOT / ".cache" / "colorize_inputs" / f"{safe_stem(source.name)}_{digest}_{width}x{height}_gray.mkv"
     sig = downscaled_video_signature(source, width, height)
     if resumable_output(output, sig, width=width, height=height):
         print(f"Reuse grayscale colourisation input: {output}", flush=True)
@@ -124,14 +137,8 @@ def prepare_processing_video(ffmpeg: str, source: Path, width: int, height: int,
         "-vf",
         f"scale={width}:{height}:flags=lanczos,hue=s=0,setsar=1",
         "-an",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     print(" ".join(cmd), flush=True)
@@ -201,7 +208,7 @@ def default_output(manifest: Path, manifest_source: str | None, method: str) -> 
     # drifted from the artifact-id scheme and left "both" outputs invisible to the GUI.
     ident = aid.colorized_identity(manifest.stem, method)
     name_src = Path(manifest_source).name if manifest_source else manifest.name
-    return ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4")
+    return ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mkv")
 
 
 def reference_signature(row: dict[str, str]) -> dict[str, Any]:
@@ -255,6 +262,7 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
         "video_format": args.video_format,
         "crf": args.crf,
         "processing_height": getattr(args, "processing_height", "source"),
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
     }
     if args.method == "openai":
         settings.update(
@@ -493,14 +501,8 @@ def normalize_clip(ffmpeg: str, source: Path, output: Path, fps: float, expected
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     print(" ".join(cmd), flush=True)
@@ -596,14 +598,8 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     print(" ".join(cmd), flush=True)
@@ -647,7 +643,8 @@ def xfade_group(ffmpeg: str, chunks: list[Path], transitions: list[int], output:
         filters.append(f"[{previous}][v{index}]xfade=transition=fade:duration={duration:.8f}:offset={offset:.8f},setpts=PTS-STARTPTS[{current}]")
         previous = current
         accumulated += video_info(chunks[index])["frames"] / fps - duration
-    filters.append(f"[{previous}]format=yuv420p[vout]")
+    pixel_format = "yuv444p10le" if CURRENT_INTERMEDIATE_PROFILE == "lossless" else "yuv420p"
+    filters.append(f"[{previous}]format={pixel_format}[vout]")
 
     cmd += [
         "-filter_complex",
@@ -659,14 +656,8 @@ def xfade_group(ffmpeg: str, chunks: list[Path], transitions: list[int], output:
         f"{fps:.8f}",
         "-fps_mode",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     print(" ".join(cmd), flush=True)
@@ -688,7 +679,7 @@ def stitch_colorized(ffmpeg: str, chunks: list[Path], transitions: list[int], ou
             group_outputs.append(group_chunks[0])
             continue
         group_transitions = transitions[left:right]
-        group_output = group_dir / f"group_{group_index:04d}_{left:04d}_{right:04d}.mp4"
+        group_output = group_dir / f"group_{group_index:04d}_{left:04d}_{right:04d}.mkv"
         xfade_group(ffmpeg, group_chunks, group_transitions, group_output, fps)
         group_outputs.append(group_output)
     stitch(ffmpeg, group_outputs, output, fps)
@@ -811,14 +802,8 @@ def assemble_openai_frames(ffmpeg: str, frame_dir: Path, output: Path, fps: floa
         "-frames:v",
         str(total_frames),
         "-an",
-        "-c:v",
-        "libx264",
-        "-crf",
-        str(crf),
-        "-preset",
-        "slow",
-        "-pix_fmt",
-        "yuv420p",
+        *working_codec_args(),
+        *working_container_args(partial),
         str(partial),
     ]
     print("Assembling OpenAI Cloud frames into the colorized video...", flush=True)
@@ -954,7 +939,7 @@ def run_cmnet2_colorization(
             }
             for reference in references
         ]
-        chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mkv"
         chunk_sig = segment_signature(
             args,
             source_video,
@@ -1000,6 +985,7 @@ def run_cmnet2_colorization(
             fps=fps,
             ffmpeg=ffmpeg,
             crf=args.crf,
+            intermediate_profile=args.intermediate_profile,
         )
         write_signature(chunk, chunk_sig)
         chunks.append(chunk)
@@ -1055,13 +1041,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--ffmpeg")
+    parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main() -> int:
+    global CURRENT_INTERMEDIATE_PROFILE
     args = build_parser().parse_args()
+    CURRENT_INTERMEDIATE_PROFILE = args.intermediate_profile
     if args.method == "both":
         for method in ("deepexemplar", "colormnet"):
             child = argparse.Namespace(**vars(args))
@@ -1073,6 +1062,8 @@ def main() -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    global CURRENT_INTERMEDIATE_PROFILE
+    CURRENT_INTERMEDIATE_PROFILE = getattr(args, "intermediate_profile", "high")
     manifest = resolve_path(args.manifest)
     source_from_manifest, rows = read_manifest(manifest)
     if args.limit is not None:
@@ -1180,7 +1171,7 @@ def run(args: argparse.Namespace) -> int:
             for reference in active_references
         ]
         ref_names = [copy_reference_to_comfy_input(item["path"], comfy_dir, width, height) for item in active_references]
-        chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+        chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mkv"
         chunk_sig = segment_signature(args, source_video, row, active_references, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
             print(f"Reuse colorized segment {index + 1}/{len(rows)}: {chunk}", flush=True)

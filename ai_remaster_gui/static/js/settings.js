@@ -9,6 +9,7 @@ function drawSettings() {
     <section class="card">
       <h2>Settings</h2>
       ${comfySettingsHtml()}
+      ${intermediateSettingsHtml(cloud)}
       ${cloudSettingsHtml(cloud)}
       ${qwenSettingsHtml(refs)}
       ${openAISettingsHtml(refs)}
@@ -19,7 +20,6 @@ function drawSettings() {
 }
 
 function cloudSettingsHtml(cloud) {
-  const format = cloud.intermediate_format || 'hevc_high';
   return `
     <h3>Cloud Compute</h3>
     <p class="field-help">RunPod stages use a secure reusable CUDA 13 worker. Paste an API key; ARP creates an SSH key, provisions the Pod, installs its worker, transfers only job assets, and retrieves the results automatically. A saved Pod ID reuses an existing worker.</p>
@@ -47,18 +47,28 @@ function cloudSettingsHtml(cloud) {
     <input id="runpodIdleMinutes" type="number" min="0" max="1" step="1" value="${esc(cloud.runpod_idle_minutes || '0')}">
     <label>Hugging Face token (only needed for gated weights)</label>
     <input id="huggingfaceToken" type="password" autocomplete="off" value="${esc(cloud.huggingface_token || '')}">
-    <h3>Intermediate Master Format</h3>
+    <div class="actions">
+      <button type="button" class="primary" onclick="saveCloudSettings()">Save Cloud Settings</button>
+    </div>
+  `;
+}
+
+function intermediateSettingsHtml(cloud) {
+  const legacy = {h264_standard: 'low', h264_high: 'high', hevc_high: 'high', hevc_lossless: 'lossless'};
+  const format = legacy[cloud.intermediate_format] || cloud.intermediate_format || 'high';
+  return `
+    <h3>Intermediate Stage Video</h3>
     <select id="intermediateFormat">
       ${[
-        ['h264_standard', 'H.264 Standard — compact, broadly compatible'],
-        ['h264_high', 'H.264 High — CRF 10, broadly compatible'],
-        ['hevc_high', 'HEVC 10-bit High — recommended'],
-        ['hevc_lossless', 'HEVC 10-bit Lossless — mathematically lossless'],
+        ['low', 'Low bitrate — VP9 10-bit, CRF 36'],
+        ['medium', 'Medium bitrate — VP9 10-bit, CRF 27'],
+        ['high', 'High bitrate — VP9 10-bit, CRF 18 (recommended)'],
+        ['lossless', 'Lossless — FFV1 v3'],
       ].map(([value, label]) => `<option value="${value}" ${format === value ? 'selected' : ''}>${label}</option>`).join('')}
     </select>
-    <small class="field-help">HEVC High avoids the old low-bitrate bottleneck. HEVC Lossless preserves decoded pixels exactly in one modern compressed video file—not an uncompressed image sequence. Browser previews remain compact H.264.</small>
+    <small class="field-help">Applied to Matroska stage masters and processing-chain conversions, including the model-safe 720p→704p outpainting canvas. Low/Medium/High use VP9; Lossless uses preservation-oriented FFV1 v3. Browser-only previews and final MP4/MOV exports stay separate.</small>
     <div class="actions">
-      <button type="button" class="primary" onclick="saveCloudSettings()">Save Cloud & Format Settings</button>
+      <button type="button" class="primary" onclick="saveIntermediateSettings()">Save Intermediate Video Setting</button>
     </div>
   `;
 }
@@ -213,7 +223,16 @@ async function saveCloudSettings() {
       runpod_network_volume_id: document.getElementById('runpodNetworkVolumeId')?.value || '',
       runpod_idle_minutes: document.getElementById('runpodIdleMinutes')?.value || '0',
       huggingface_token: document.getElementById('huggingfaceToken')?.value || '',
-      intermediate_format: document.getElementById('intermediateFormat')?.value || 'hevc_high',
+    },
+  });
+  state = await api(stateUrl());
+}
+
+async function saveIntermediateSettings() {
+  await postJson('/api/settings', {
+    stage: 'cloud',
+    values: {
+      intermediate_format: document.getElementById('intermediateFormat')?.value || 'high',
     },
   });
   state = await api(stateUrl());

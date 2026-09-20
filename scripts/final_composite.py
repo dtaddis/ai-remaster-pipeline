@@ -31,7 +31,7 @@ def find_ffmpeg(explicit: str | None):
 
 def signature(args):
     values = vars(args).copy()
-    for key in ['outpainted', 'source', 'colorized']:
+    for key in ['outpainted', 'source', 'colorized', 'custom_mask']:
         value = values.get(key)
         if value:
             path = resolve_path(value)
@@ -39,7 +39,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 11
+    values['version'] = 12
     return values
 
 
@@ -228,6 +228,7 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     fps_text = f"{fps:.8f}"
     crop = source_crop_filter(args)
     color_input = 2 if has_outpainted else 1
+    custom_mask_input = (3 if has_color else 2) if has_outpainted and getattr(args, 'custom_mask', None) else None
     # Optionally scale the outpainted video to the delivery output dimensions.
     # This corrects for LTX's model-safe quantisation (e.g. 704p → 720p) so the
     # final composite is at the user's intended resolution.
@@ -236,7 +237,7 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     scale_base = f",scale={out_w}:{out_h}:flags=lanczos" if (out_w and out_h) else ""
     if has_outpainted:
         if source_size and base_size:
-            crops = tuple(max(0, int(getattr(args, key))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
+            crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
             placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
             feather_horizontal = placement.x > 0 or placement.x + placement.width < base_size[0]
             feather_vertical = placement.y > 0 or placement.y + placement.height < base_size[1]
@@ -244,8 +245,18 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}scale={placement.width}:{placement.height}:flags=lanczos,setsar=1[src]',
                 f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather, horizontal=feather_horizontal, vertical=feather_vertical)}'[srcm]",
-                f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]',
             ]
+            source_label = 'srcm'
+            if custom_mask_input is not None:
+                filters.extend([
+                    f'[{custom_mask_input}:v]scale={base_size[0]}:{base_size[1]}:flags=neighbor,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray,negate[customkeep]',
+                    '[srcm]split[srcmc][srcma0]',
+                    '[srcma0]alphaextract[srcalpha]',
+                    '[srcalpha][customkeep]blend=all_mode=multiply[srcalphacustom]',
+                    '[srcmc][srcalphacustom]alphamerge[srcmasked]',
+                ])
+                source_label = 'srcmasked'
+            filters.append(f'[base][{source_label}]overlay=x={placement.x}:y={placement.y}[merged]')
         else:
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
@@ -274,7 +285,8 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
         filters.append('[colu0]setsar=1[colu];[colv0]setsar=1[colv]')
         final_frame = max((int(item['end_frame']) for item in (luminance_plan or []) if item.get('end_frame') is not None), default=0)
         output_label = 'vouttimed' if final_frame else 'vout'
-        filters.append(f'[basey][colu][colv]mergeplanes=0x001020:yuv444p,setsar=1,format=yuv420p[{output_label}]')
+        output_format = 'yuv444p10le' if getattr(args, 'intermediate_profile', '') == 'lossless' else 'yuv420p'
+        filters.append(f'[basey][colu][colv]mergeplanes=0x001020:yuv444p,setsar=1,format={output_format}[{output_label}]')
         if final_frame:
             filters.append(f'[{output_label}]trim=end_frame={final_frame},setpts=N/({fps_text}*TB),fps=fps={fps_text}[vout]')
     else:
@@ -316,10 +328,16 @@ def run(args):
         audio_input = '0:a?'
     if colorized:
         cmd += ['-i', str(colorized)]
+    if args.custom_mask:
+        cmd += ['-loop', '1', '-i', str(resolve_path(args.custom_mask))]
     cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
-    cmd += ['-c:a', 'copy', str(partial)]
+    if args.encoder == 'prores':
+        cmd += ['-c:a', 'pcm_s16le']
+    else:
+        cmd += ['-c:a', 'aac', '-b:a', '320k', '-movflags', '+faststart']
+    cmd += [str(partial)]
     print(' '.join(cmd))
     if args.dry_run:
         return 0
@@ -358,6 +376,7 @@ def build_parser():
     parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')
     parser.add_argument('--source-black-threshold', type=int, default=24, help='Maximum RGB channel value considered source black when --source-black-transparent is enabled.')
     parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')
+    parser.add_argument('--custom-mask', help='Additive full-canvas mask whose selected pixels remain transparent in the source overlay.')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)
@@ -365,6 +384,7 @@ def build_parser():
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=16)
     parser.add_argument('--preset', default='slow')
+    parser.add_argument('--intermediate-profile', choices=['low', 'medium', 'high', 'lossless'], default='')
     parser.add_argument('--ffmpeg')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')

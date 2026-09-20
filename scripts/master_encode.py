@@ -9,25 +9,19 @@ import sys
 from pathlib import Path
 
 from common import find_ffmpeg, resolve_path
+from intermediate_video import INTERMEDIATE_PROFILES, canonical_profile, codec_args as intermediate_codec_args, container_args
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 
 def codec_args(profile: str) -> list[str]:
-    if profile == "h264_high":
-        return ["-c:v", "libx264", "-crf", "10", "-preset", "slow", "-pix_fmt", "yuv420p"]
-    if profile == "hevc_high":
-        return ["-c:v", "libx265", "-crf", "12", "-preset", "slow", "-pix_fmt", "yuv420p10le"]
-    if profile == "hevc_lossless":
-        return ["-c:v", "libx265", "-preset", "medium", "-x265-params", "lossless=1", "-pix_fmt", "yuv444p10le"]
-    return ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
+    return intermediate_codec_args(profile)
 
 
 def encode_output(ffmpeg: str, output: Path, profile: str) -> None:
     if not output.is_file() or output.suffix.lower() not in VIDEO_EXTS:
         return
-    if profile == "h264_standard":
-        return
+    profile = canonical_profile(profile)
     marker = Path(str(output) + ".master.json")
     try:
         previous = json.loads(marker.read_text(encoding="utf-8"))
@@ -39,14 +33,10 @@ def encode_output(ffmpeg: str, output: Path, profile: str) -> None:
         pass
     temporary = output.with_name(output.stem + ".master-partial" + output.suffix)
     print(f"Encoding {profile} intermediate master: {output.name}", flush=True)
-    container_args: list[str] = []
-    if output.suffix.lower() in {".mp4", ".m4v", ".mov"}:
-        if profile.startswith("hevc"):
-            container_args.extend(["-tag:v", "hvc1"])
-        container_args.extend(["-movflags", "+faststart"])
+    output_container_args = container_args(str(output), profile)
     subprocess.run([
         ffmpeg, "-y", "-i", str(output), "-map", "0:v:0", "-map", "0:a?",
-        *codec_args(profile), "-c:a", "copy", *container_args, str(temporary),
+        *codec_args(profile), "-c:a", "copy", *output_container_args, str(temporary),
     ], check=True)
     temporary.replace(output)
     stat = output.stat()
@@ -61,7 +51,7 @@ def run(args: argparse.Namespace) -> int:
         return code
     videos = [resolve_path(text) for text in args.output]
     videos = [path for path in videos if path.is_file() and path.suffix.lower() in VIDEO_EXTS]
-    if not videos or args.profile == "h264_standard":
+    if not videos:
         return 0
     ffmpeg = find_ffmpeg(args.ffmpeg)
     for output in videos:
@@ -71,7 +61,11 @@ def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Apply an ARP intermediate master profile.")
-    parser.add_argument("--profile", choices=["h264_standard", "h264_high", "hevc_high", "hevc_lossless"], default="hevc_high")
+    parser.add_argument(
+        "--profile",
+        choices=[*INTERMEDIATE_PROFILES, "h264_standard", "h264_high", "hevc_high", "hevc_lossless"],
+        default="high",
+    )
     parser.add_argument("--output", action="append", default=[])
     parser.add_argument("--ffmpeg", default="")
     parser.add_argument("command", nargs=argparse.REMAINDER)

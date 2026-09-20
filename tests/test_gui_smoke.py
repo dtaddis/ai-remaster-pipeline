@@ -159,15 +159,31 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(Path(command[2]).name, "runpod_stage.py")
         script_names = [Path(part).name for part in command if part.endswith(".py")]
         self.assertIn("cleanup_video.py", script_names)
-        self.assertLess(script_names.index("master_encode.py"), script_names.index("cleanup_video.py"))
+        self.assertNotIn("master_encode.py", script_names)
+        self.assertIn("--intermediate-profile", command)
         self.assertNotIn("secret-runpod", command)
         self.assertNotIn("secret-hf", command)
         self.assertIn("--settings-file", command)
 
     def test_modern_intermediate_master_profiles(self) -> None:
-        self.assertIn("libx264", master_encode.codec_args("h264_high"))
-        self.assertIn("libx265", master_encode.codec_args("hevc_high"))
-        self.assertIn("lossless=1", master_encode.codec_args("hevc_lossless"))
+        self.assertEqual(app.default_settings()["cloud"]["intermediate_format"], "high")
+        for profile, crf in (("low", "36"), ("medium", "27"), ("high", "18")):
+            args = master_encode.codec_args(profile)
+            self.assertIn("libvpx-vp9", args)
+            self.assertIn(crf, args)
+            self.assertNotIn("libx265", args)
+        self.assertIn("ffv1", master_encode.codec_args("lossless"))
+        self.assertNotIn("libx265", master_encode.codec_args("lossless"))
+        self.assertEqual(master_encode.codec_args("hevc_high"), master_encode.codec_args("high"))
+
+    def test_intermediate_profile_is_passed_into_video_producers(self) -> None:
+        self._populate_full_pipeline_settings()
+        app.APP.settings["cloud"]["intermediate_format"] = "lossless"
+        for stage in ("cleanup", "outpaint", "colour", "upscale"):
+            command = app.APP.command_for(stage)
+            self.assertIn("--intermediate-profile", command, stage)
+            self.assertEqual(command[command.index("--intermediate-profile") + 1], "lossless", stage)
+        self.assertNotIn("--intermediate-profile", app.APP.command_for("recomp"))
 
     def test_cleanup_is_optional_and_runs_before_outpainting(self) -> None:
         app.APP.settings["global"].update(
@@ -470,6 +486,23 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(normalized["cleanup"]["prompt"], app.CLEANUP_PROMPT)
         self.assertEqual(normalized["cleanup"]["negative_prompt"], app.CLEANUP_NEGATIVE_PROMPT)
+
+    def test_legacy_outpaint_crop_settings_migrate_to_negative_trim_values(self) -> None:
+        settings = app.default_settings()
+        settings["outpaint"].update({
+            "crop_left": "88",
+            "crop_right": "12",
+            "crop_top": "6",
+            "crop_bottom": "0",
+        })
+
+        normalized = runtime_settings.normalize_settings(settings, include_newest_source=False)
+
+        self.assertEqual(
+            [normalized["outpaint"][key] for key in ("edge_left", "edge_right", "edge_top", "edge_bottom")],
+            ["-88", "-12", "-6", "0"],
+        )
+        self.assertNotIn("crop_left", normalized["outpaint"])
 
     def test_upscale_migrates_literal_ltx_prompt_to_modern_reconstruction(self) -> None:
         settings = app.default_settings()
@@ -807,7 +840,10 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual((result["width"], result["height"]), (86, 48))
         self.assertAlmostEqual(result["fps"], 12.0, places=3)
         self.assertEqual(result["frames"], info["frames"])
-        self.assertEqual(output_sar, "1280/1281")
+        # VP9/Matroska may normalize a nearly-square SAR to 1:1 because its
+        # display dimensions are integral; the displayed geometry remains equal.
+        sar_num, sar_den = (int(part) for part in output_sar.split("/", 1))
+        self.assertAlmostEqual((result["width"] * sar_num / sar_den) / result["height"], (86 * 1280 / 1281) / 48, places=2)
         self.assertEqual(audio_streams, [{"channels": 2, "channel_layout": "stereo"}])
 
     def test_cleanup_finalize_keeps_model_resolution_and_handles_no_audio_packets(self) -> None:
@@ -849,7 +885,7 @@ class GuiSmokeTests(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertIn("hue=s=0", command[command.index("-vf") + 1])
-        self.assertTrue(output.name.endswith("_gray.mp4"))
+        self.assertTrue(output.name.endswith("_gray.mkv"))
         self.assertNotEqual(output, source)
 
     def test_both_colorization_backends_consume_the_guarded_video_input(self) -> None:
@@ -1068,6 +1104,17 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual([key for key, _ in seen], ["outpaint", "shots"])
         self.assertEqual(seen[1][1], "intermediate/outpainted/movie.mp4")
 
+    def test_run_all_stops_when_an_upstream_stage_cannot_start(self) -> None:
+        stages = [stage for stage in app.STAGES if stage.key in {"outpaint", "shots"}]
+        with (
+            mock.patch.object(app.APP, "active_stages", return_value=tuple(stages)),
+            mock.patch.object(app.APP, "run_stage", return_value=(False, "missing input")) as run_stage,
+        ):
+            app.APP._run_all_worker()
+
+        run_stage.assert_called_once_with("outpaint")
+        self.assertIn("Whole remaster stopped before Outpainting", app.APP.log[-1])
+
     def test_deterministic_outpaint_output_path_uses_selected_source(self) -> None:
         app.APP.settings.setdefault("outpaint", {}).update(
             {
@@ -1082,9 +1129,9 @@ class GuiSmokeTests(unittest.TestCase):
 
         output = app.outpaint_output_for("input/My Source.mp4", "16:9", "720")
 
-        # Identity-keyed short name: <sourceword>_<tag>_<key>.mp4 under intermediate/outpainted/.
+        # Identity-keyed short name: <sourceword>_<tag>_<key>.mkv under intermediate/outpainted/.
         self.assertTrue(output.startswith("intermediate/outpainted/My_outpaint_"), output)
-        self.assertTrue(output.endswith(".mp4"))
+        self.assertTrue(output.endswith(".mkv"))
         # The GUI locator and the producer script must name the file identically (no drift).
         args = argparse.Namespace(crop_left=0, crop_right=0, crop_top=0, crop_bottom=0, outpaint_all_black_regions=False)
         producer = outpaint_video.default_output(app.resolve_video_source("input/My Source.mp4"), "16:9", 720, args)
@@ -1215,6 +1262,26 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("trim=start_frame=0,setpts=N/(24.00000000*TB),fps=24.00000000", filter_text)
         self.assertIn("crop=w=1440:h=540:x=0:y=270,scale=w=1280:h=480:flags=lanczos,scale=w=1280:h=470:flags=lanczos", filter_text)
         self.assertNotIn("force_original_aspect_ratio=decrease", filter_text)
+
+    def test_outpaint_source_extension_reserves_canvas_inside_selected_aspect(self) -> None:
+        args = argparse.Namespace(
+            delivery_width=1920,
+            delivery_height=1080,
+            crop_left=0,
+            crop_right=0,
+            crop_top=-180,
+            crop_bottom=-180,
+            black_lift=0.018,
+            gamma=1.06,
+            outpaint_all_black_regions=False,
+        )
+        info = {"width": 1440, "height": 1080, "fps": 24.0}
+
+        self.assertEqual(prepare_outpaint_input.source_placement_size(args, info, 1920, 1088), (1080, 810, 1080, 816))
+        filter_text = prepare_outpaint_input.build_filter(args, info, 1920, 1088)
+
+        self.assertIn("crop=w=1440:h=1080:x=0:y=0,scale=w=1080:h=810:flags=lanczos,scale=w=1080:h=816:flags=lanczos", filter_text)
+        self.assertIn("overlay=x=420:y=136", filter_text)
 
     def test_outpaint_all_black_regions_uses_explicit_mask_without_source_lift(self) -> None:
         args = argparse.Namespace(
@@ -1670,7 +1737,7 @@ class GuiSmokeTests(unittest.TestCase):
                 output = outpaint_video.prepare_ltx25_frame_rate("ffmpeg", prepared, "24")
 
         command = run.call_args.args[0]
-        self.assertEqual(output.name, "prepared_ltx25_24fps.mp4")
+        self.assertEqual(output.name, "prepared_ltx25_24fps.mkv")
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", command)
         self.assertIn("minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,tpad=stop_mode=clone:stop_duration=1", command)
         self.assertEqual(command[command.index("-frames:v") + 1], "49")
@@ -1690,7 +1757,7 @@ class GuiSmokeTests(unittest.TestCase):
                 output = outpaint_video.prepare_ltx25_frame_rate("ffmpeg", prepared, "24-fast")
 
         command = run.call_args.args[0]
-        self.assertEqual(output.name, "prepared_ltx25_24_fastfps.mp4")
+        self.assertEqual(output.name, "prepared_ltx25_24_fastfps.mkv")
         self.assertIn("trim=end_frame=289,setpts=N/(24*TB),fps=24", command)
         self.assertNotIn("minterpolate", " ".join(command))
         self.assertEqual(command[command.index("-frames:v") + 1], "289")
@@ -1982,6 +2049,48 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(mask[:, 156:1124] == 0))
         self.assertTrue(np.all(mask[:, 1124:] == 255))
 
+    def test_outpaint_static_mask_adds_custom_source_regions(self) -> None:
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            prepared = root / "prepared.mp4"
+            custom = root / "custom.png"
+            prepared.write_bytes(b"prepared")
+            outpaint_video.signature_path(prepared).write_text(
+                json.dumps({
+                    "tool": "prepare_outpaint_input.py", "geometry": "crop_then_fit_v1",
+                    "source_width": 640, "source_height": 480, "target_width": 864,
+                    "target_height": 480, "delivery_width": 854, "delivery_height": 480,
+                    "crop_left": 0, "crop_right": 0, "crop_top": 0, "crop_bottom": 0,
+                }), encoding="utf-8",
+            )
+            painted = np.zeros((480, 864), dtype=np.uint8)
+            painted[:40, 112:152] = 255
+            self.assertTrue(cv2.imwrite(str(custom), painted))
+            args = argparse.Namespace(force=True, custom_mask=str(custom))
+            with mock.patch.object(outpaint_video, "ROOT", root):
+                mask_path = outpaint_video.official_mask_image(prepared, args, 864, 480)
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
+        self.assertTrue(np.all(mask[:40, 112:152] == 255))
+        self.assertTrue(np.all(mask[80:400, 152:752] == 0))
+
+    def test_recomposition_custom_mask_keeps_generated_pixels_visible(self) -> None:
+        args = final_composite.build_parser().parse_args([
+            "--outpainted", "outpainted.mp4", "--source", "source.mp4",
+            "--output", "output.mp4", "--custom-mask", "mask.png",
+            "--output-width", "1920", "--output-height", "1080",
+        ])
+        graph = final_composite.build_filter(
+            args, False, 24.0, True, (1440, 1080), (1920, 1080), [],
+        )
+
+        self.assertIn("[2:v]scale=1920:1080:flags=neighbor", graph)
+        self.assertIn("alphaextract", graph)
+        self.assertIn("alphamerge[srcmasked]", graph)
+
     def test_ltx25_chunk_recovers_geometry_through_frame_rate_intermediate(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             root = Path(tmp_text)
@@ -2114,7 +2223,7 @@ class GuiSmokeTests(unittest.TestCase):
                 text=True,
             )
 
-        self.assertEqual(result.stdout.strip(), "aac")
+        self.assertEqual(result.stdout.strip(), "opus")
         self.assertEqual(frame_result.stdout.strip(), "8")
 
     def test_qwen_seed_guides_do_not_overwrite_existing_set_guides(self) -> None:
@@ -2178,6 +2287,71 @@ class GuiSmokeTests(unittest.TestCase):
         command = app.APP.command_for("outpaint")
 
         self.assertEqual(command[command.index("--prompt") + 1], "outpaint with restrained natural edges")
+
+    def test_outpaint_command_converts_gui_trim_extend_signs_for_backend(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({
+            "edge_left": "120",     # extend in the GUI
+            "edge_right": "0",
+            "edge_top": "-24",      # trim in the GUI
+            "edge_bottom": "48",
+        })
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--crop-left") + 1], "-120")
+        self.assertEqual(command[command.index("--crop-right") + 1], "0")
+        self.assertEqual(command[command.index("--crop-top") + 1], "24")
+        self.assertEqual(command[command.index("--crop-bottom") + 1], "-48")
+
+    def test_trim_extend_geometry_change_selects_a_fresh_custom_mask(self) -> None:
+        base = dict(app.APP.settings["outpaint"])
+        base.update({"target_aspect": "16:9", "target_height": "720", "edge_left": "0"})
+        extended = {**base, "edge_left": "120"}
+
+        with mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1280, 704)):
+            original = server.custom_outpaint_mask_for("input/example.mp4", base)
+            changed = server.custom_outpaint_mask_for("input/example.mp4", extended)
+
+        self.assertNotEqual(original, changed)
+
+    def test_outpaint_command_includes_saved_custom_mask(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as folder_text:
+            custom = Path(folder_text) / "custom.png"
+            custom.write_bytes(b"mask")
+            with mock.patch.object(server, "custom_outpaint_mask_for", return_value=custom):
+                command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--custom-mask") + 1], app.rel(custom))
+
+    def test_1080p_runpod_outpaint_filters_24gb_gpu_choices(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({"compute": "runpod", "target_aspect": "16:9", "target_height": "1080"})
+        app.APP.settings["cloud"]["runpod_gpu_types"] = "NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090"
+        with mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1920, 1088)):
+            command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--target-height") + 1], "1080")
+        self.assertEqual(command[command.index("--gpu-types") + 1], "NVIDIA RTX 6000 Ada Generation")
+
+    def test_raw_outpaint_signature_fingerprints_custom_mask(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as folder_text:
+            folder = Path(folder_text)
+            prepared = folder / "prepared.mp4"
+            workflow = folder / "workflow.json"
+            mask = folder / "mask.png"
+            prepared.write_bytes(b"prepared")
+            workflow.write_text("{}", encoding="utf-8")
+            mask.write_bytes(b"first")
+            args = outpaint_video.build_parser().parse_args([
+                "--source", "input/example.mp4", "--custom-mask", str(mask), "--dry-run",
+            ])
+            first = outpaint_video.raw_signature(args, workflow, prepared)
+            mask.write_bytes(b"changed")
+            second = outpaint_video.raw_signature(args, workflow, prepared)
+
+        self.assertNotEqual(first["custom_mask_fingerprint"], second["custom_mask_fingerprint"])
 
     def test_outpaint_command_selects_oumoumad_lora(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
@@ -3374,14 +3548,45 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("0000012000_0000024000", first.name)
         self.assertIn("0000045000_0000060000", second.name)
 
-    def test_webm_source_section_uses_mp4_container_for_h264_aac(self) -> None:
+    def test_webm_source_section_uses_mkv_processing_master(self) -> None:
         app.APP.settings["global"].update(
             {"source": "input/example.webm", "section_start": "12", "section_end": "24"}
         )
 
         output = app.source_section_output_for(app.APP.settings)
 
-        self.assertEqual(output.suffix, ".mp4")
+        self.assertEqual(output.suffix, ".mkv")
+
+    def test_mjpeg_avi_gets_cached_h264_browser_proxy(self) -> None:
+        ffmpeg = common.find_ffmpeg()
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "archival transfer.avi"
+            cache = folder / "playback-cache"
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc2=s=160x120:r=17:d=0.25",
+                    "-c:v", "mjpeg", "-q:v", "3", str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            with mock.patch.object(media, "SOURCE_PLAYBACK_DIR", cache):
+                first = media.browser_playback_for(str(source), create=True)
+                second = media.browser_playback_for(str(source), create=False)
+
+            proxy = app.resolve(first)
+            ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(proxy)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(proxy.suffix, ".mp4")
+        self.assertEqual(result.stdout.strip(), "h264")
 
     def test_pipeline_source_uses_section_when_trim_points_are_set(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
@@ -3432,7 +3637,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(command[command.index("-vf") + 1], "setpts=PTS-STARTPTS")
             self.assertIn("-af", command)
             self.assertEqual(command[command.index("-af") + 1], "asetpts=PTS-STARTPTS")
-            self.assertEqual(command[command.index("-c:a") + 1], "aac")
+            self.assertEqual(command[command.index("-c:a") + 1], "libopus")
             self.assertNotIn("copy", command)
 
     def test_opening_source_resets_trim_to_source_duration(self) -> None:
@@ -3519,7 +3724,7 @@ class GuiSmokeTests(unittest.TestCase):
         app.APP.settings["outpaint"].update({
             "outpaint_all_black_regions": "true",
             "prompt": "custom outpaint prompt",
-            "crop_left": "88",
+            "edge_left": "-88",
         })
         app.APP.settings["references"].update({
             "method": "openai",
@@ -3542,7 +3747,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(app.APP.settings["global"]["last_browse_dir"], "D:/media")
         self.assertEqual(app.APP.settings["outpaint"]["outpaint_all_black_regions"], "false")
         self.assertEqual(app.APP.settings["outpaint"]["prompt"], config.OUTPAINT_PROMPT)
-        self.assertEqual(app.APP.settings["outpaint"]["crop_left"], "0")
+        self.assertEqual(app.APP.settings["outpaint"]["edge_left"], "0")
         self.assertEqual(app.APP.settings["references"]["method"], "qwen")
         self.assertEqual(app.APP.settings["references"]["manifest"], "")
         self.assertEqual(app.APP.settings["references"]["prompt"], config.REFERENCE_PROMPT)
@@ -4551,7 +4756,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotEqual(outputs[0], outputs[1])
         for output in outputs:
             self.assertTrue(output.startswith("intermediate/outpainted_colorized/"), output)
-            self.assertTrue(output.endswith(".mp4"))
+            self.assertTrue(output.endswith(".mkv"))
 
     def test_colorization_command_can_request_both_methods(self) -> None:
         app.APP.settings["colour"].update({"manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "both", "processing_height": "1080"})

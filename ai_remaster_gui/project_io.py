@@ -23,7 +23,10 @@ BUNDLE_EXTS = IMAGE_EXTS | {".csv", ".txt", ".json"}
 
 def bind_context(context: dict) -> None:
     """Bind GUI helpers used to identify the active outpaint chunk manifest."""
-    globals().update({key: context[key] for key in ("outpaint_chunk_manifest_for", "pipeline_source_text") if key in context})
+    globals().update({key: context[key] for key in (
+        "outpaint_chunk_manifest_for", "pipeline_source_text",
+        "outpaint_source_for_settings", "custom_outpaint_mask_for",
+    ) if key in context})
 
 
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
@@ -140,6 +143,16 @@ def project_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
         if asset not in seen:
             seen.add(asset)
             assets.append(asset)
+    outpaint_source = globals().get("outpaint_source_for_settings")
+    custom_mask_for = globals().get("custom_outpaint_mask_for")
+    if outpaint_source and custom_mask_for:
+        try:
+            custom_mask = custom_mask_for(outpaint_source(settings), settings.get("outpaint", {}))
+            if custom_mask not in seen and project_asset_is_bundleable(custom_mask):
+                seen.add(custom_mask)
+                assets.append(custom_mask)
+        except Exception:
+            pass
     return assets
 
 def chunk_guide_image_texts(manifest: Path) -> list[str]:

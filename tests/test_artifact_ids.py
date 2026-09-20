@@ -53,9 +53,15 @@ class IdentityKeyTests(unittest.TestCase):
         self.assertTrue(name.startswith("Metropolis_outpaint_"))
         self.assertTrue(name.endswith(".mp4"))
 
-    def test_outputs_use_crop_first_geometry_identity(self) -> None:
-        self.assertEqual(self.base()["geometry"], "crop_then_fit_v1")
-        self.assertEqual(self.base(crop=[0, 0, 0, 0])["geometry"], "crop_then_fit_v1")
+    def test_outputs_use_signed_trim_extend_geometry_identity(self) -> None:
+        self.assertEqual(self.base()["geometry"], "trim_extend_then_fit_v2")
+        self.assertEqual(self.base(crop=[0, 0, 0, 0])["geometry"], "trim_extend_then_fit_v2")
+
+    def test_extension_values_change_the_identity(self) -> None:
+        self.assertNotEqual(
+            aid.artifact_key(self.base(crop=[0, 0, 0, 0])),
+            aid.artifact_key(self.base(crop=[-120, 0, 0, 0])),
+        )
 
 
 class FindTests(unittest.TestCase):

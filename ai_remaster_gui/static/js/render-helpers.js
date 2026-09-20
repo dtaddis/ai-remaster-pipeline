@@ -233,14 +233,14 @@ const OUTPAINT_FIELD_TOOLTIPS = {
     'Instruction used for every LTX outpaint chunk. Keep the word "outpaint" in it so the IC-LoRA activates; add scene, period, lighting, or style guidance when the generated sides need direction.',
   negative_prompt:
     'Details and failure modes LTX should avoid in every chunk. Chunk-specific negative text is appended to this global list.',
-  crop_left:
-    'Permanently discard this many pixels from the source left edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
-  crop_right:
-    'Permanently discard this many pixels from the source right edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
-  crop_top:
-    'Permanently discard this many pixels from the source top edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
-  crop_bottom:
-    'Permanently discard this many pixels from the source bottom edge before fitting it to the new canvas. Use it for baked-in bars or damaged borders; discarded picture content is not an outpaint target.',
+  edge_left:
+    'Signed left-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+  edge_right:
+    'Signed right-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+  edge_top:
+    'Signed top-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+  edge_bottom:
+    'Signed bottom-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
 };
 
 function fieldDescription(stageKey, key) {
@@ -330,13 +330,17 @@ function selectOptionLabel(key, option) {
 
 const RANGE_FIELD_UNITS = {
   chunk_seconds: ' s',
+  edge_left: ' px',
+  edge_right: ' px',
+  edge_top: ' px',
+  edge_bottom: ' px',
   feather_pixels: ' px',
   saturation: '%',
   temperature: ' K',
   color_opacity: '%',
 };
 
-const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'crop_left', 'crop_right', 'crop_top', 'crop_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
+const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'edge_left', 'edge_right', 'edge_top', 'edge_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
 
 function rangeDisplayValue(key, value) {
   const number = Number(value);

@@ -33,12 +33,13 @@ from reference_sets import (  # noqa: E402
 )
 
 
-def recomposition_output_for(outpainted_text: str) -> str:
+def recomposition_output_for(outpainted_text: str, encoder: str = "h264") -> str:
     if not outpainted_text:
         return ""
     outpainted = resolve(outpainted_text)
     ident = aid.recomp_identity(outpainted.stem)
-    return rel(ROOT / "output" / "reassembled" / aid.artifact_name(aid.source_word(outpainted.name), "recomp", ident, "mp4"))
+    extension = "mov" if str(encoder).lower() == "prores" else "mp4"
+    return rel(ROOT / "output" / "reassembled" / aid.artifact_name(aid.source_word(outpainted.name), "recomp", ident, extension))
 
 def colorized_outputs_for_manifest(manifest_text: str, method: str = "deepexemplar") -> list[str]:
     if method == "both":
@@ -55,7 +56,7 @@ def colorized_output_for_manifest(manifest_text: str, method: str = "deepexempla
     ident = aid.colorized_identity(manifest.stem, method)
     source_video = manifest_source_video(manifest)
     name_src = resolve(source_video).name if source_video else manifest.name
-    return rel(ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4"))
+    return rel(ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mkv"))
 
 def color_reference_outputs(manifest_text: str) -> list[str]:
     if not manifest_text:

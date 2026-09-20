@@ -15,6 +15,7 @@ PREVIEW_DIR = ROOT / ".cache" / "previews"
 FILE_PREVIEW_DIR = ROOT / ".cache" / "file_previews"
 ASPECT_PREVIEW_DIR = ROOT / ".cache" / "aspect_previews"
 MEDIA_CLIP_DIR = ROOT / ".cache" / "media_clips"
+SOURCE_PLAYBACK_DIR = ROOT / ".cache" / "source_playback"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}

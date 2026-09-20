@@ -27,6 +27,20 @@ SECRET_SETTING_KEYS = {
     "huggingface_token",
 }
 
+DEFAULT_HIGH_MEMORY_GPU_TYPES = (
+    "NVIDIA H100 PCIe,NVIDIA H100 SXM,NVIDIA A100 80GB PCIe,"
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition,NVIDIA L40S,"
+    "NVIDIA RTX 6000 Ada Generation,NVIDIA A40,NVIDIA RTX A6000"
+)
+
+
+def high_memory_gpu_types(configured: str) -> str:
+    """Keep configured 48 GB+ cards for 1080p LTX, excluding common 24/32 GB choices."""
+    values = [item.strip() for item in str(configured or "").split(",") if item.strip()]
+    low_memory_markers = ("4090", "5090", "RTX PRO 4500")
+    suitable = [item for item in values if not any(marker.lower() in item.lower() for marker in low_memory_markers)]
+    return ",".join(suitable) or DEFAULT_HIGH_MEMORY_GPU_TYPES
+
 
 def stage_uses_runpod(stage_key: str, values: dict[str, str]) -> bool:
     return values.get("compute", "local") == "runpod"

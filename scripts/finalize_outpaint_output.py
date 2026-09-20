@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, video_info, write_signature
+from intermediate_video import codec_args as intermediate_codec_args, container_args
 
 
 def find_ffmpeg(explicit: str | None) -> str:
@@ -23,6 +24,8 @@ def find_ffmpeg(explicit: str | None) -> str:
 
 
 def encoder_args(args):
+    if getattr(args, 'intermediate_profile', ''):
+        return intermediate_codec_args(args.intermediate_profile)
     if args.encoder == 'prores':
         return ['-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le']
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
@@ -50,13 +53,14 @@ def inverse_filter(args, info: dict) -> str:
     monochrome = ",hue=s=0" if args.monochrome else ""
     rectangle = source_rectangle(args, info)
     restore_tone = bool(args.restore_tone and not args.skip_restore)
+    output_format = 'yuv444p10le' if getattr(args, 'intermediate_profile', '') == 'lossless' else 'yuv420p'
     if rectangle is None:
         if restore_tone:
             lift = max(0.0, min(0.25, args.black_lift))
             gamma = max(0.1, args.gamma)
             expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
-            return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}'{monochrome},format=yuv420p{scale}[v]"
-        return f"[0:v]format=yuv420p{monochrome}{scale}[v]"
+            return f"[0:v]format=rgb24,lutrgb=r='{expr}':g='{expr}':b='{expr}'{monochrome},format={output_format}{scale}[v]"
+        return f"[0:v]format={output_format}{monochrome}{scale}[v]"
 
     x, y, width, height = rectangle
     right, bottom = x + width - 1, y + height - 1
@@ -77,7 +81,7 @@ def inverse_filter(args, info: dict) -> str:
         f'[raw]{sharpen_filter}[generated];'
         f'[original]{centre_filter}[centre];'
         f"[maskbase]format=gray,geq=lum='{mask_expr}'{blur}[sourcemask];"
-        f'[generated][centre][sourcemask]maskedmerge{monochrome},format=yuv420p{scale}[v]'
+        f'[generated][centre][sourcemask]maskedmerge{monochrome},format={output_format}{scale}[v]'
     )
 
 
@@ -100,11 +104,12 @@ def signature(args, source: Path, info: dict) -> dict:
         'encoder': args.encoder,
         'crf': args.crf,
         'preset': args.preset,
+        'intermediate_profile': getattr(args, 'intermediate_profile', ''),
     }
 
 
 def default_output(source: Path) -> Path:
-    return resolve_path(Path('intermediate') / 'outpainted' / f'{source.stem}_restored.mp4')
+    return resolve_path(Path('intermediate') / 'outpainted' / f'{source.stem}_restored.mkv')
 
 
 def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: float = 0.5) -> None:
@@ -127,7 +132,7 @@ def replace_with_retry(partial: Path, output: Path, attempts: int = 20, delay: f
 def build_parser():
     parser = argparse.ArgumentParser(description='Finish an LTX IC-LoRA outpaint render without changing its source tonality.')
     parser.add_argument('--source', required=True, help='ComfyUI/LTX outpainted render made from prepare_outpaint_input.py output.')
-    parser.add_argument('--output', help='Restored clip to write. Defaults to intermediate/outpainted/<stem>_restored.mp4')
+    parser.add_argument('--output', help='Restored clip to write. Defaults to intermediate/outpainted/<stem>_restored.mkv')
     parser.add_argument('--black-lift', type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument('--gamma', type=float, default=1.0, help=argparse.SUPPRESS)
     parser.add_argument('--skip-restore', action='store_true', help=argparse.SUPPRESS)
@@ -144,6 +149,7 @@ def build_parser():
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
     parser.add_argument('--preset', default='medium')
+    parser.add_argument('--intermediate-profile', choices=['low', 'medium', 'high', 'lossless'], default='')
     parser.add_argument('--ffmpeg')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')
@@ -184,6 +190,7 @@ def main():
         *encoder_args(args),
         '-c:a',
         'copy',
+        *(container_args(str(partial), args.intermediate_profile) if args.intermediate_profile else []),
         str(partial),
     ]
     print(' '.join(command))

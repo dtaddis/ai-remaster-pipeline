@@ -156,6 +156,178 @@ function closeImageModal() {
   if (img) img.removeAttribute('src');
 }
 
+const outpaintMaskEditor = {
+  drawing: false,
+  subtract: false,
+  brushSize: 28,
+  lastPoint: null,
+};
+
+function ensureOutpaintMaskModal() {
+  if (document.getElementById('outpaintMaskModal')) return;
+  const modal = document.createElement('div');
+  modal.id = 'outpaintMaskModal';
+  modal.className = 'image-modal hidden';
+  modal.innerHTML = `
+    <div class="image-modal-backdrop" onclick="closeOutpaintMaskEditor()"></div>
+    <div class="outpaint-mask-panel">
+      <div class="image-modal-heading">
+        <strong>Custom Outpaint Mask</strong>
+        <button type="button" onclick="closeOutpaintMaskEditor()">Close</button>
+      </div>
+      <p class="shot-empty">Paint over source pixels that LTX should regenerate on every frame. The existing hatched border is already outpainted and does not need painting.</p>
+      <div class="outpaint-mask-layout">
+        <div class="outpaint-mask-canvas-wrap">
+          <canvas id="outpaintMaskImageCanvas"></canvas>
+          <canvas id="outpaintMaskPaintCanvas"></canvas>
+        </div>
+        <aside>
+          <div class="reference-tool-grid">
+            <button id="outpaintMaskAdd" class="reference-tool-button active" type="button" title="Paint mask" onclick="setOutpaintMaskTool(false)">${referenceIcon('brush-add')}</button>
+            <button id="outpaintMaskSubtract" class="reference-tool-button" type="button" title="Erase mask" onclick="setOutpaintMaskTool(true)">${referenceIcon('brush-subtract')}</button>
+            <button class="reference-tool-button" type="button" title="Clear painted mask" onclick="resetOutpaintMaskCanvas()">${referenceIcon('clear')}</button>
+          </div>
+          <label>Brush size</label>
+          <input id="outpaintMaskBrushSize" type="range" min="2" max="180" value="28" oninput="outpaintMaskEditor.brushSize=Number(this.value)">
+          <div class="actions">
+            <button class="primary" type="button" onclick="saveOutpaintMask()">Save Mask</button>
+          </div>
+          <div id="outpaintMaskStatus" class="shot-empty"></div>
+        </aside>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  const wrap = modal.querySelector('.outpaint-mask-canvas-wrap');
+  wrap.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    outpaintMaskEditor.drawing = true;
+    outpaintMaskEditor.lastPoint = null;
+    drawOutpaintMaskPoint(event);
+    wrap.setPointerCapture?.(event.pointerId);
+  });
+  wrap.addEventListener('pointermove', event => {
+    if (outpaintMaskEditor.drawing && (event.buttons & 1)) drawOutpaintMaskPoint(event);
+  });
+  window.addEventListener('pointerup', () => {
+    outpaintMaskEditor.drawing = false;
+    outpaintMaskEditor.lastPoint = null;
+  });
+}
+
+async function openOutpaintMaskEditor() {
+  const preview = document.getElementById('aspectPreviewImg');
+  if (!preview || !preview.src) return alert('Choose source material before editing the outpaint mask.');
+  ensureOutpaintMaskModal();
+  const modal = document.getElementById('outpaintMaskModal');
+  const imageCanvas = document.getElementById('outpaintMaskImageCanvas');
+  const paintCanvas = document.getElementById('outpaintMaskPaintCanvas');
+  const image = new Image();
+  image.onload = async () => {
+    const scale = Math.min(1, 1400 / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * scale));
+    const height = Math.max(1, Math.round(image.naturalHeight * scale));
+    for (const canvas of [imageCanvas, paintCanvas]) {
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.aspectRatio = `${width}/${height}`;
+    }
+    imageCanvas.getContext('2d').drawImage(image, 0, 0, width, height);
+    paintCanvas.getContext('2d').clearRect(0, 0, width, height);
+    const maskState = state.custom_outpaint_mask || {};
+    if (maskState.exists && maskState.path) {
+      const mask = new Image();
+      mask.onload = () => {
+        const scratch = document.createElement('canvas');
+        scratch.width = width;
+        scratch.height = height;
+        const scratchCtx = scratch.getContext('2d');
+        scratchCtx.drawImage(mask, 0, 0, width, height);
+        const pixels = scratchCtx.getImageData(0, 0, width, height);
+        for (let i = 0; i < pixels.data.length; i += 4) {
+          const selected = pixels.data[i] >= 16;
+          pixels.data[i] = 224;
+          pixels.data[i + 1] = 92;
+          pixels.data[i + 2] = 73;
+          pixels.data[i + 3] = selected ? 156 : 0;
+        }
+        paintCanvas.getContext('2d').putImageData(pixels, 0, 0);
+      };
+      mask.src = media(maskState.path) + '&t=' + (maskState.mtime || Date.now());
+    }
+  };
+  image.src = preview.src;
+  modal.classList.remove('hidden');
+  setOutpaintMaskTool(false);
+}
+
+function closeOutpaintMaskEditor() {
+  document.getElementById('outpaintMaskModal')?.classList.add('hidden');
+}
+
+function setOutpaintMaskTool(subtract) {
+  outpaintMaskEditor.subtract = !!subtract;
+  document.getElementById('outpaintMaskAdd')?.classList.toggle('active', !subtract);
+  document.getElementById('outpaintMaskSubtract')?.classList.toggle('active', !!subtract);
+}
+
+function drawOutpaintMaskPoint(event) {
+  const canvas = document.getElementById('outpaintMaskPaintCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const point = {
+    x: (event.clientX - rect.left) * canvas.width / rect.width,
+    y: (event.clientY - rect.top) * canvas.height / rect.height,
+  };
+  const ctx = canvas.getContext('2d');
+  const last = outpaintMaskEditor.lastPoint || point;
+  ctx.save();
+  ctx.globalCompositeOperation = outpaintMaskEditor.subtract ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = 'rgba(224,92,73,.62)';
+  ctx.fillStyle = 'rgba(224,92,73,.62)';
+  ctx.lineWidth = outpaintMaskEditor.brushSize;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(last.x, last.y);
+  ctx.lineTo(point.x, point.y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, outpaintMaskEditor.brushSize / 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  outpaintMaskEditor.lastPoint = point;
+}
+
+function resetOutpaintMaskCanvas() {
+  const canvas = document.getElementById('outpaintMaskPaintCanvas');
+  canvas?.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+
+async function saveOutpaintMask() {
+  const canvas = document.getElementById('outpaintMaskPaintCanvas');
+  const status = document.getElementById('outpaintMaskStatus');
+  if (!canvas) return;
+  if (status) status.textContent = 'Saving mask...';
+  const result = await postJson('/api/outpaint-custom-mask-save', { image: canvas.toDataURL('image/png') });
+  if (!result.ok) {
+    if (status) status.textContent = result.error || 'Could not save mask.';
+    return;
+  }
+  state = result.state || state;
+  closeOutpaintMaskEditor();
+  draw(false);
+  lastRenderSignature = renderSignature();
+}
+
+async function clearOutpaintMask() {
+  const result = await postJson('/api/outpaint-custom-mask-clear', {});
+  if (!result.ok) return alert(result.error || 'Could not clear custom mask.');
+  state = result.state || state;
+  draw(false);
+  lastRenderSignature = renderSignature();
+}
+
 const referenceEditor = {
   mode: 'reference',
   manifest: '',
@@ -1534,10 +1706,10 @@ async function autoCropOutpaint() {
   const slider = document.getElementById('aspectPreviewTime');
   const time = slider ? slider.value : '0';
   const result = await api('/api/outpaint-auto-crop?time=' + encodeURIComponent(time));
-  if (!result.ok) return alert(result.error || 'Auto Crop failed');
+  if (!result.ok) return alert(result.error || 'Auto Trim failed');
 
   state = result.state || state;
-  ['crop_left', 'crop_right', 'crop_top', 'crop_bottom'].forEach(key => {
+  ['edge_left', 'edge_right', 'edge_top', 'edge_bottom'].forEach(key => {
     const el = document.querySelector(`[data-field="${key}"]`);
     const value = result[key] ?? settings('outpaint')[key] ?? '0';
     if (el) {

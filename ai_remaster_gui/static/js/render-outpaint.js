@@ -641,9 +641,9 @@ function hydratePendingGuidePreviews() {
 
 function drawOutpaint(st, s, expected, sp) {
   const offsetKeys = new Set(['offset_x', 'offset_y']);
-  const mainFields = st.fields.filter(f => !f[0].startsWith('crop_') && !offsetKeys.has(f[0]));
+  const mainFields = st.fields.filter(f => !f[0].startsWith('edge_') && !offsetKeys.has(f[0]));
   const offsetFields = st.fields.filter(f => offsetKeys.has(f[0]));
-  const cropFields = st.fields.filter(f => f[0].startsWith('crop_'));
+  const cropFields = st.fields.filter(f => f[0].startsWith('edge_'));
 
   document.getElementById('app').innerHTML = `
     <div class="editor-page">
@@ -662,14 +662,24 @@ function drawOutpaint(st, s, expected, sp) {
       </section>
       <section class="card preview compact outpaint-composition">
         ${aspectPreviewHtml(st)}
+        <div class="outpaint-mask-summary">
+          <div>
+            <h3>Custom Outpaint Mask</h3>
+            <p class="shot-empty">Paint extra areas for LTX to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically.</p>
+          </div>
+          <div class="actions">
+            <button type="button" onclick="openOutpaintMaskEditor()">${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? 'Edit' : 'Create'} Mask</button>
+            <button type="button" class="warn" onclick="clearOutpaintMask()" ${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? '' : 'disabled'}>Clear Mask</button>
+          </div>
+        </div>
         <div class="outpaint-composition-controls">
           <section class="composition-control-group">
             <div class="crop-head">
               <div>
-                <h3>Source Crop</h3>
-                <p class="shot-empty">Crop away black borders before ARP expands the frame.</p>
+                <h3>Source Trim / Canvas Extend</h3>
+                <p class="shot-empty">Negative values trim source pixels; positive values add outpaint canvas on that edge. The selected target aspect remains the outer frame. Changing these values starts a fresh custom mask for the new geometry.</p>
               </div>
-              <button type="button" onclick="autoCropOutpaint()">Auto Crop</button>
+              <button type="button" onclick="autoCropOutpaint()">Auto Trim</button>
             </div>
             <div class="editor-controls composition-crop-fields">
               ${cropFields.map(f => `<div>${fieldHtml(st, f)}</div>`).join('')}

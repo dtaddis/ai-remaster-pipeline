@@ -35,6 +35,7 @@ from common import (
 from dependency_manager import ensure_cleanup_models
 from outpaint_video import chunk_ranges, patch_workflow, split_chunk, stitch_chunks
 from prepare_outpaint_input import probe_video
+from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, container_args
 import artifact_ids as aid
 
 
@@ -87,7 +88,7 @@ def cleanup_identity(source: Path, args: argparse.Namespace) -> dict[str, Any]:
 
 def default_output(source: Path, args: argparse.Namespace) -> Path:
     ident = cleanup_identity(source, args)
-    return ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mp4")
+    return ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mkv")
 
 
 def model_dimensions(width: int, height: int, processing_height: int | str = 720) -> tuple[int, int]:
@@ -375,6 +376,7 @@ def prepass_signature(source: Path, args: argparse.Namespace, info: dict[str, An
         "frames": int(info.get("frames") or 0),
         "devignette": bool(args.devignette),
         "devignette_version": DEVIGNETTE_VERSION if args.devignette else 0,
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
     }
 
 
@@ -416,12 +418,12 @@ def prepare_devignette(
     frames = int(info.get("frames") or 0)
     signature = prepass_signature(source, args, info)
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-    output = work_dir / f"devignette_{key}.mp4"
+    output = work_dir / f"devignette_{key}.mkv"
     if not args.force and resumable_output(output, signature, width=width, height=height, video_like=source):
         print(f"Reuse DeVignette: {output}", flush=True)
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_suffix(".partial.mp4")
+    partial = output.with_suffix(".partial.mkv")
     partial.unlink(missing_ok=True)
 
     analysis_started = time.perf_counter()
@@ -490,7 +492,7 @@ def prepare_devignette(
     encoder = subprocess.Popen(
         [ffmpeg, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s:v", f"{width}x{height}",
          "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
-         "-c:v", "libx264", "-crf", "14", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(partial)],
+         *intermediate_codec_args(args.intermediate_profile, fast=True), *container_args(str(partial), args.intermediate_profile), str(partial)],
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -701,11 +703,11 @@ def prepare_ai_descratch_input(
     width, height = ai_descratch_dimensions(info, args.ai_descratch_height)
     fps = float(info.get("fps") or 24.0)
     frames = int(info.get("frames") or 0)
-    prepared = work_dir / f"ai_input_{width}x{height}.mp4"
-    prepared_sig = processing_signature(source, width, height, fps, frames)
+    prepared = work_dir / f"ai_input_{width}x{height}.mkv"
+    prepared_sig = processing_signature(source, width, height, fps, frames, args.intermediate_profile)
     if args.force or not resumable_output(prepared, prepared_sig, width=width, height=height, video_like=source):
         prepared.parent.mkdir(parents=True, exist_ok=True)
-        partial = prepared.with_suffix(".partial.mp4")
+        partial = prepared.with_suffix(".partial.mkv")
         partial.unlink(missing_ok=True)
         vf = (
             f"scale={width}:{height}:flags=lanczos,trim=end_frame={frames},"
@@ -714,7 +716,7 @@ def prepare_ai_descratch_input(
         subprocess.run(
             [
                 ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
-                "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "10", "-preset", "veryfast",
+                "-fps_mode", "cfr", *intermediate_codec_args(args.intermediate_profile, fast=True), *container_args(str(partial), args.intermediate_profile),
                 str(partial),
             ],
             check=True,
@@ -722,13 +724,13 @@ def prepare_ai_descratch_input(
         replace_with_retry(partial, prepared, "AI DeScratch input")
         write_signature(prepared, prepared_sig)
 
-    mask = work_dir / f"ai_scratch_mask_{width}x{height}.mp4"
+    mask = work_dir / f"ai_scratch_mask_{width}x{height}.mkv"
     signature = ai_mask_signature(source, args, width, height)
     if not args.force and resumable_output(mask, signature, width=width, height=height, video_like=prepared):
         print(f"Reuse AI DeScratch mask: {mask}", flush=True)
         return prepared, mask, width, height
 
-    partial_mask = mask.with_suffix(".partial.mp4")
+    partial_mask = mask.with_suffix(".partial.mkv")
     partial_mask.unlink(missing_ok=True)
     capture = cv2.VideoCapture(str(prepared))
     if not capture.isOpened():
@@ -736,8 +738,8 @@ def prepare_ai_descratch_input(
     encoder = subprocess.Popen(
         [
             ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-            "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", "-c:v", "libx264", "-crf", "0",
-            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(partial_mask),
+            "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", *intermediate_codec_args("lossless", fast=True),
+            *container_args(str(partial_mask), "lossless"), str(partial_mask),
         ],
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -912,8 +914,8 @@ def composite_ai_descratch(
     encoder = subprocess.Popen(
         [
             ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-            "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", "-c:v", "libx264", "-crf", "10",
-            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(partial),
+            "-r", f"{fps:.8f}", "-i", "pipe:0", "-an", *intermediate_codec_args(args.intermediate_profile, fast=True),
+            *container_args(str(partial), args.intermediate_profile), str(partial),
         ],
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -999,10 +1001,10 @@ def prepare_ai_descratch(
     ensure_node_types(args.comfy_url, AI_DESCRATCH_NODES, "AI DeScratch", comfy_dir)
     raw_chunks: list[Path] = []
     for index, start, end in ranges:
-        video_chunk = work_dir / f"ai_video_{index:04d}_{start:06d}_{end:06d}.mp4"
-        mask_chunk = work_dir / f"ai_mask_{index:04d}_{start:06d}_{end:06d}.mp4"
+        video_chunk = work_dir / f"ai_video_{index:04d}_{start:06d}_{end:06d}.mkv"
+        mask_chunk = work_dir / f"ai_mask_{index:04d}_{start:06d}_{end:06d}.mkv"
         raw = work_dir / f"ai_raw_{index:04d}_{start:06d}_{end:06d}.mp4"
-        normalized = work_dir / f"ai_normalized_{index:04d}_{start:06d}_{end:06d}.mp4"
+        normalized = work_dir / f"ai_normalized_{index:04d}_{start:06d}_{end:06d}.mkv"
         split_chunk(ffmpeg, prepared, video_chunk, start, end, fps, args.force)
         split_chunk(ffmpeg, mask, mask_chunk, start, end, fps, args.force)
         expected = end - start
@@ -1027,14 +1029,14 @@ def prepare_ai_descratch(
                 f"arp_ai_descratch/{safe_stem(source.name)}_{index:04d}",
             )
             write_signature(raw, chunk_sig)
-        normalize_chunk(ffmpeg, raw, normalized, width, height, fps, expected)
+        normalize_chunk(ffmpeg, raw, normalized, width, height, fps, expected, args.intermediate_profile)
         raw_chunks.append(normalized)
         print(f"AI DeScratch chunk {index + 1}/{len(ranges)} complete.", flush=True)
-    stitched = work_dir / f"ai_propainter_stitched_v{AI_DESCRATCH_VERSION}_{width}x{height}.mp4"
-    stitch_chunks(ffmpeg, raw_chunks, ranges, stitched, fps, args.force)
+    stitched = work_dir / f"ai_propainter_stitched_v{AI_DESCRATCH_VERSION}_{width}x{height}.mkv"
+    stitch_chunks(ffmpeg, raw_chunks, ranges, stitched, fps, args.force, args.intermediate_profile)
     if int(probe_video(stitched).get("frames") or 0) < total_frames:
         raise RuntimeError("AI DeScratch stitched output is shorter than the source.")
-    composite = work_dir / "ai_descratch_composite.mp4"
+    composite = work_dir / "ai_descratch_composite.mkv"
     composite_ai_descratch(ffmpeg, source, stitched, mask, composite, info, args)
     return composite, mask
 
@@ -1067,7 +1069,7 @@ def save_scratch_mask_preview(
     return preview
 
 
-def processing_signature(source: Path, width: int, height: int, fps: float, frames: int) -> dict[str, Any]:
+def processing_signature(source: Path, width: int, height: int, fps: float, frames: int, intermediate_profile: str = "high") -> dict[str, Any]:
     return {
         "version": 1,
         "tool": "cleanup_video.py/model_input",
@@ -1077,15 +1079,16 @@ def processing_signature(source: Path, width: int, height: int, fps: float, fram
         "height": height,
         "fps": fps,
         "frames": frames,
+        "intermediate_profile": intermediate_profile,
     }
 
 
-def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[str, Any], processing_height: int | str, force: bool) -> Path:
+def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[str, Any], processing_height: int | str, force: bool, intermediate_profile: str = "high") -> Path:
     width, height = model_dimensions(int(info["width"]), int(info["height"]), processing_height)
     fps = float(info.get("fps") or 24.0)
     frames = int(info.get("frames") or 0)
-    output = work_dir / f"model_input_{width}x{height}.mp4"
-    sig = processing_signature(source, width, height, fps, frames)
+    output = work_dir / f"model_input_{width}x{height}.mkv"
+    sig = processing_signature(source, width, height, fps, frames, intermediate_profile)
     if not force and resumable_output(output, sig, width=width, height=height, video_like=source):
         print(f"Reuse Clean Up model input: {output}", flush=True)
         return output
@@ -1097,7 +1100,7 @@ def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[st
     )
     subprocess.run(
         [ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
-         "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)],
+         "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)],
         check=True,
     )
     replace_with_retry(partial, output, "Clean Up model input")
@@ -1106,7 +1109,7 @@ def prepare_model_input(ffmpeg: str, source: Path, work_dir: Path, info: dict[st
     return output
 
 
-def normalize_chunk(ffmpeg: str, source: Path, output: Path, width: int, height: int, fps: float, frames: int) -> None:
+def normalize_chunk(ffmpeg: str, source: Path, output: Path, width: int, height: int, fps: float, frames: int, intermediate_profile: str = "high") -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
     duration = max(1, frames) / max(fps, 0.001)
@@ -1117,7 +1120,7 @@ def normalize_chunk(ffmpeg: str, source: Path, output: Path, width: int, height:
     )
     subprocess.run(
         [ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}",
-         "-fps_mode", "cfr", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast", str(partial)],
+         "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)],
         check=True,
     )
     replace_with_retry(partial, output, f"Clean Up chunk {output.name}")
@@ -1177,6 +1180,7 @@ def finalize_output(
     output: Path,
     info: dict[str, Any],
     output_dimensions: tuple[int, int] | None = None,
+    intermediate_profile: str = "high",
 ) -> None:
     width, height = output_dimensions or (int(info["width"]), int(info["height"]))
     fps = float(info.get("fps") or 24.0)
@@ -1194,16 +1198,15 @@ def finalize_output(
     command = [
         ffmpeg, "-y", "-i", str(generated), "-i", str(source), "-filter:v", vf,
         "-map", "0:v:0", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
-        "-c:v", "libx264", "-crf", "14", "-preset", "slow", "-pix_fmt", "yuv420p",
+        *intermediate_codec_args(intermediate_profile),
     ]
     if audio_stream is None:
         command.append("-an")
     else:
-        command.extend([
-            "-map", f"1:{audio_stream}", "-af", "aresample=async=1:first_pts=0,apad",
-            "-ac", "2", "-c:a", "aac", "-b:a", "192k", "-shortest",
-        ])
-    command.extend(["-movflags", "+faststart", str(partial)])
+        command.extend(["-map", f"1:{audio_stream}", "-af", "aresample=async=1:first_pts=0,apad", "-ac", "2"])
+        command.extend(intermediate_audio_codec_args(intermediate_profile, bitrate="320k"))
+        command.append("-shortest")
+    command.extend([*container_args(str(partial), intermediate_profile), str(partial)])
     subprocess.run(command, check=True)
     replace_with_retry(partial, output, "Clean Up output")
 
@@ -1223,6 +1226,7 @@ def run_signature(source: Path, workflow: Path, args: argparse.Namespace, info: 
         "devignette_version": DEVIGNETTE_VERSION if args.devignette else 0,
         "chunk_seconds": args.chunk_seconds,
         "overlap_frames": args.overlap_frames,
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
     }
     if args.dearchive:
         signature.update({
@@ -1388,6 +1392,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
     # Stable node/widget IDs in the bundled author workflow; consumed by outpaint_video.patch_workflow.
     parser.set_defaults(
         load_video_node_id="5060", video_widget="video", save_node_id="5076",
@@ -1457,7 +1462,7 @@ def main() -> int:
             comfy_output_root,
         )
     if not args.dearchive:
-        finalize_output(ffmpeg, repaired_source, source, output, info)
+        finalize_output(ffmpeg, repaired_source, source, output, info, intermediate_profile=args.intermediate_profile)
         if args.save_scratch_mask and scratch_mask_preview is not None:
             save_scratch_mask_preview(ffmpeg, scratch_mask_preview, output, info)
         write_signature(output, sig)
@@ -1479,7 +1484,7 @@ def main() -> int:
     )
 
     model_input = prepare_model_input(
-        ffmpeg, repaired_source, work_dir, info, args.dearchive_height, args.force
+        ffmpeg, repaired_source, work_dir, info, args.dearchive_height, args.force, args.intermediate_profile
     )
     model_info = probe_video(model_input)
     fps = float(model_info.get("fps") or info.get("fps") or 24.0)
@@ -1496,10 +1501,10 @@ def main() -> int:
     )
     raw_chunks: list[Path] = []
     for index, start, end in ranges:
-        prepared = work_dir / f"prepared_{index:04d}_{start:06d}_{end:06d}.mp4"
-        raw = work_dir / f"raw_{index:04d}_{start:06d}_{end:06d}.mp4"
+        prepared = work_dir / f"prepared_{index:04d}_{start:06d}_{end:06d}.mkv"
+        raw = work_dir / f"raw_{index:04d}_{start:06d}_{end:06d}.mkv"
         seed = args.seed + index
-        split_chunk(ffmpeg, model_input, prepared, start, end, fps, args.force, prepared_fingerprint=sig["source_fingerprint"])
+        split_chunk(ffmpeg, model_input, prepared, start, end, fps, args.force, prepared_fingerprint=sig["source_fingerprint"], intermediate_profile=args.intermediate_profile)
         chunk_sig = chunk_signature(sig, prepared, index, start, end, seed)
         if not args.force and resumable_output(raw, chunk_sig, width=width, height=height):
             print(f"Reuse Clean Up chunk {index + 1}/{len(ranges)}: {raw}", flush=True)
@@ -1515,13 +1520,13 @@ def main() -> int:
         print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
         produced = newest_output(extract_output_files(history, comfy_output_root), {".mp4", ".mov", ".mkv", ".webm"}, "Clean Up output")
-        normalize_chunk(ffmpeg, produced, raw, width, height, fps, end - start)
+        normalize_chunk(ffmpeg, produced, raw, width, height, fps, end - start, args.intermediate_profile)
         write_signature(raw, chunk_sig)
         raw_chunks.append(raw)
 
-    stitched = work_dir / "stitched.mp4"
-    stitch_chunks(ffmpeg, raw_chunks, ranges, stitched, fps, True)
-    finalize_output(ffmpeg, stitched, source, output, info, (width, height))
+    stitched = work_dir / "stitched.mkv"
+    stitch_chunks(ffmpeg, raw_chunks, ranges, stitched, fps, True, args.intermediate_profile)
+    finalize_output(ffmpeg, stitched, source, output, info, (width, height), args.intermediate_profile)
     if args.save_scratch_mask and scratch_mask_preview is not None:
         save_scratch_mask_preview(ffmpeg, scratch_mask_preview, output, info)
     write_signature(output, sig)

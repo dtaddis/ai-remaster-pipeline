@@ -148,13 +148,21 @@ def base_settings() -> dict[str, dict[str, str]]:
         "runpod_network_volume_id": "",
         "runpod_idle_minutes": "0",
         "huggingface_token": "",
-        "intermediate_format": "hevc_high",
+        "intermediate_format": "high",
     }
     return defaults
 
 
 def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_source: bool = True) -> dict[str, dict[str, str]]:
     cloud = defaults["cloud"]
+    cloud["intermediate_format"] = {
+        "h264_standard": "low",
+        "h264_high": "high",
+        "hevc_high": "high",
+        "hevc_lossless": "lossless",
+    }.get(cloud.get("intermediate_format", "high"), cloud.get("intermediate_format", "high"))
+    if cloud["intermediate_format"] not in {"low", "medium", "high", "lossless"}:
+        cloud["intermediate_format"] = "high"
     legacy_gpu_pool = "NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A6000,NVIDIA GeForce RTX 4090"
     if cloud.get("runpod_gpu_types", "").strip() == legacy_gpu_pool:
         cloud["runpod_gpu_types"] = (
@@ -179,6 +187,18 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["cleanup"]["chunk_seconds"] = "4.04"
     # The former deterministic DeScratch filter was removed in favour of masked AI DeScratch.
     defaults["cleanup"].pop("descratch", None)
+    # Migrate the old positive-only Crop controls to signed Trim / Extend controls.
+    # The new GUI convention is negative=trim and positive=extend.
+    outpaint = defaults["outpaint"]
+    edge_keys = ("edge_left", "edge_right", "edge_top", "edge_bottom")
+    crop_keys = ("crop_left", "crop_right", "crop_top", "crop_bottom")
+    if all(str(outpaint.get(key, "0") or "0") in {"", "0", "0.0"} for key in edge_keys):
+        legacy_crop = [int(float(outpaint.get(key, "0") or 0)) for key in crop_keys]
+        if any(legacy_crop):
+            for edge_key, value in zip(edge_keys, legacy_crop):
+                outpaint[edge_key] = str(-max(0, value))
+    for key in crop_keys:
+        outpaint.pop(key, None)
     old_cleanup_prompts = {
         "",
         "Clean, restored archive footage with sharp detail, clean tonality, and natural cinematography.",

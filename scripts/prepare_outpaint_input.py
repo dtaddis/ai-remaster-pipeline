@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 
 from common import file_fingerprint, format_time, resolve_path, root_relative, resumable_output, write_signature
+from intermediate_video import codec_args as intermediate_codec_args, container_args
 from outpaint_geometry import crop_box, source_placement
 
 
@@ -54,6 +55,8 @@ def find_ffmpeg(explicit: str | None) -> str:
 
 
 def encoder_args(args):
+    if getattr(args, 'intermediate_profile', ''):
+        return intermediate_codec_args(args.intermediate_profile, fast=True)
     if args.encoder == 'prores':
         return ['-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le']
     return ['-c:v', 'libx264', '-crf', str(args.crf), '-preset', args.preset, '-pix_fmt', 'yuv420p']
@@ -81,9 +84,9 @@ def source_placement_size(args, info: dict, target_width: int, target_height: in
 
 def signature(args, source: Path, info: dict, target_width: int, target_height: int) -> dict:
     return {
-        'version': 11,
+        'version': 12,
         'tool': 'prepare_outpaint_input.py',
-        'geometry': 'crop_then_fit_v1',
+        'geometry': 'trim_extend_then_fit_v2',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),
         'source_width': info['width'],
@@ -93,10 +96,10 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
         'delivery_width': int(args.delivery_width or target_width),
         'delivery_height': int(args.delivery_height or target_height),
         'target_aspect': args.target_aspect,
-        'crop_left': max(0, int(args.crop_left)),
-        'crop_right': max(0, int(args.crop_right)),
-        'crop_top': max(0, int(args.crop_top)),
-        'crop_bottom': max(0, int(args.crop_bottom)),
+        'crop_left': int(args.crop_left),
+        'crop_right': int(args.crop_right),
+        'crop_top': int(args.crop_top),
+        'crop_bottom': int(args.crop_bottom),
         'legacy_black_mask': bool(getattr(args, 'legacy_black_mask', False)),
         'black_lift': args.black_lift if getattr(args, 'legacy_black_mask', False) else 0.0,
         'gamma': args.gamma if getattr(args, 'legacy_black_mask', False) else 1.0,
@@ -104,6 +107,7 @@ def signature(args, source: Path, info: dict, target_width: int, target_height: 
         'encoder': args.encoder,
         'crf': args.crf,
         'preset': args.preset,
+        'intermediate_profile': getattr(args, 'intermediate_profile', ''),
     }
 
 
@@ -114,10 +118,10 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
     # at 0.334s instead of 8/23.976 (0.333667s). Sampling by those rounded timestamps randomly
     # picks the previous frame at cuts; frame-index timing keeps the outpaint canvas aligned.
     #
-    # Crop first and treat the remaining frame as the complete source. Fit that
-    # post-trim geometry into the delivery canvas, then map it proportionally
-    # into the model-safe canvas. This leaves exactly one simple pillarbox or
-    # letterbox for LTX; removed trim pixels never become generation bands.
+    # Trim real source pixels, add the requested virtual edge extensions around
+    # the surviving frame, and fit that whole envelope into the delivery canvas.
+    # Mapping the same placement into the model-safe canvas keeps the requested
+    # target aspect fixed while allowing generation room on any combination of edges.
     delivery_w = int(args.delivery_width or target_width)
     delivery_h = int(args.delivery_height or target_height)
     crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
@@ -135,16 +139,17 @@ def build_filter(args, info: dict, target_width: int, target_height: int) -> str
         lut = f"r=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):g=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma})):b=255*({lift}+(1-{lift})*pow(val/255\\,1/{gamma}))"
         source_filters += f",lutrgb={lut}"
     source_filters += "[src]"
+    output_format = 'yuv444p10le' if getattr(args, 'intermediate_profile', '') == 'lossless' else 'yuv420p'
     return ';'.join([
         f"color=c=black:s={target_width}x{target_height}:r={info['fps']:.8f}[bg]",
         source_filters,
-        f'[bg][src]overlay=x={target.x}:y={target.y}:shortest=1:format=auto,format=yuv420p[v]',
+        f'[bg][src]overlay=x={target.x}:y={target.y}:shortest=1:format=auto,format={output_format}[v]',
     ])
 
 
 def default_output(source: Path, target_width: int, target_height: int, delivery_width: int = 0, delivery_height: int = 0) -> Path:
     delivery_tag = f'_from{delivery_width}x{delivery_height}' if (delivery_width and delivery_height and (delivery_width != target_width or delivery_height != target_height)) else ''
-    return resolve_path(Path('intermediate') / 'outpaint_prepared' / f'{source.stem}_{target_width}x{target_height}{delivery_tag}_lifted.mp4')
+    return resolve_path(Path('intermediate') / 'outpaint_prepared' / f'{source.stem}_{target_width}x{target_height}{delivery_tag}_lifted.mkv')
 
 
 def partial_output_path(output: Path) -> Path:
@@ -197,10 +202,10 @@ def build_parser():
     parser.add_argument('--target-height', type=int, help='Output height (model-safe, e.g. 704). Defaults to the source height.')
     parser.add_argument('--delivery-width', type=int, default=0, help='Delivery width for AR-correct scaling (step 1). Source is scaled to fit delivery dims first, then the changed axis is squished to model-safe. Defaults to --target-width.')
     parser.add_argument('--delivery-height', type=int, default=0, help='Delivery height for AR-correct scaling (step 1). Defaults to --target-height.')
-    parser.add_argument('--crop-left', type=int, default=0, help='Pixels to crop from the source before padding.')
-    parser.add_argument('--crop-right', type=int, default=0, help='Pixels to crop from the source before padding.')
-    parser.add_argument('--crop-top', type=int, default=0, help='Pixels to crop from the source before padding.')
-    parser.add_argument('--crop-bottom', type=int, default=0, help='Pixels to crop from the source before padding.')
+    parser.add_argument('--crop-left', type=int, default=0, help='Positive trims source pixels; negative adds virtual outpaint canvas on the left.')
+    parser.add_argument('--crop-right', type=int, default=0, help='Positive trims source pixels; negative adds virtual outpaint canvas on the right.')
+    parser.add_argument('--crop-top', type=int, default=0, help='Positive trims source pixels; negative adds virtual outpaint canvas on the top.')
+    parser.add_argument('--crop-bottom', type=int, default=0, help='Positive trims source pixels; negative adds virtual outpaint canvas on the bottom.')
     # Retained as ignored compatibility arguments for old wrapper commands and saved logs.
     parser.add_argument('--black-lift', type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument('--gamma', type=float, default=1.0, help=argparse.SUPPRESS)
@@ -209,6 +214,7 @@ def build_parser():
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')
     parser.add_argument('--crf', type=int, default=12)
     parser.add_argument('--preset', default='medium')
+    parser.add_argument('--intermediate-profile', choices=['low', 'medium', 'high', 'lossless'], default='')
     parser.add_argument('--ffmpeg')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')
@@ -249,12 +255,13 @@ def main():
         *encoder_args(args),
         '-c:a',
         'copy',
+        *(container_args(str(partial), args.intermediate_profile) if args.intermediate_profile else []),
         str(partial),
     ]
     print(f"Source: {info['width']}x{info['height']} {info['fps']:.6g}fps {format_time(info['duration'])}", flush=True)
     mode = 'all black regions' if args.outpaint_all_black_regions else 'protected source blacks'
     conditioning = f'legacy black mask (lift={args.black_lift}, gamma={args.gamma})' if args.legacy_black_mask else 'explicit mask (no tone lift)'
-    print(f'Prepared canvas: {target_width}x{target_height}, crop LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, mode={mode}, {conditioning}', flush=True)
+    print(f'Prepared canvas: {target_width}x{target_height}, trim/extend backend LRTB={args.crop_left},{args.crop_right},{args.crop_top},{args.crop_bottom}, mode={mode}, {conditioning}', flush=True)
     print(' '.join(command), flush=True)
     if args.dry_run:
         return 0
