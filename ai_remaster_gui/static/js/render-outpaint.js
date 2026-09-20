@@ -432,15 +432,16 @@ function toggleChunkLength(index) {
   const checkbox = document.getElementById(`chunkCustom_${index}`);
   const slider = document.getElementById(`chunkFrames_${index}`);
   const input = document.getElementById(`chunkFramesInput_${index}`);
-  const buttons = slider ? slider.parentElement.querySelectorAll('.shot-tools button') : [];
   const enabled = !!(checkbox && checkbox.checked);
+  // Only the length controls follow the checkbox. This used to disable every button
+  // under the slider's parent too, which once meant the ±1 frame nudges; since those
+  // went it meant Save and Regenerate, so clearing the box could never be saved.
   if (slider && !enabled) {
     slider.value = Math.max(Number(slider.min || 1), Math.min(Number(slider.max || 1), Math.round(Number(slider.dataset.defaultFrames || slider.value) || 1)));
     updateChunkLengthLabel(index);
   }
   if (slider) slider.disabled = !enabled;
   if (input) input.disabled = !enabled;
-  buttons.forEach(button => { button.disabled = !enabled; });
 }
 
 function updateChunkLengthLabel(index) {

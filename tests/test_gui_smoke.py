@@ -6251,6 +6251,33 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn('/static/js/render-cache.js', html)
         self.assertIn('/static/js/app.js', html)
 
+    def test_chunk_length_checkbox_only_disables_the_length_controls(self) -> None:
+        # This once disabled every button under the slider's parent, which meant the
+        # nearby +/-1 frame nudges. Those went, so the selector started hitting Save and
+        # Regenerate instead: clearing "Custom length" could never be saved.
+        source = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-outpaint.js").read_text(encoding="utf-8")
+        body = source.split("function toggleChunkLength(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("slider.disabled = !enabled", body)
+        self.assertIn("input.disabled = !enabled", body)
+        self.assertNotIn("shot-tools", body)
+        self.assertNotIn("button.disabled", body)
+
+    def test_aspect_preview_overlay_is_boxed_like_the_preview_image(self) -> None:
+        # ".preview img" and ".preview.compact img" out-specify the frame rule and never
+        # match the mask overlay, so the picture and its overlay were sized by different
+        # rules and the coral mask covered the whole pane.
+        css = (app.ROOT / "ai_remaster_gui" / "static" / "styles.css").read_text(encoding="utf-8")
+        frame = next(rule for rule in css.split("}") if rule.strip().startswith(".aspect-preview-frame{"))
+        self.assertIn("grid-template-rows", frame)
+        override = "".join(rule for rule in css.split("}") if "max-height:none" in rule)
+        for selector in (
+            ".preview .aspect-preview-frame img",
+            ".preview .aspect-preview-frame canvas",
+            ".preview.compact .aspect-preview-frame img",
+            ".preview.compact .aspect-preview-frame canvas",
+        ):
+            self.assertIn(selector, override)
+
     def test_quit_endpoint_acknowledges_and_stops_server(self) -> None:
         server = app.create_server("127.0.0.1", 0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
