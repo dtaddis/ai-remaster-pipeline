@@ -75,6 +75,16 @@ OUTPAINT_ACCESS_URL = "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-
 RECOMMENDED_OVERLAP_FRAMES = 8
 MODEL_SIZE_MULTIPLE = 32
 LTX_SPATIAL_MASK_CELL = 32
+
+# ARP-owned ComfyUI link IDs.  The imported LTX templates never allocate above 15000,
+# so every edge ARP injects lives above 19000.  patch_link() rewrites whichever edge
+# already carries an ID, so two features that reuse one ID silently steal each other's
+# wiring: keep these ranges disjoint and allocate from them, never ad hoc.
+MASK_LINK_BASE = 19100            # 19100-19109  black-region / broadcast mask chain
+DILATION_LINK_BASE = 19110        # 19110-19119  generation-mask dilation chain
+GUIDE_IMAGE_LINK = 19120          # full-canvas guide frame into the i2v conditioner
+CUSTOM_MASK_LINK_BASE = 19130     # 19130-19139  additive user-painted outpaint mask
+EXTRA_GUIDE_LINK_BASE = 19500     # 19500 + 10*i, one block per extra guide frame
 OUTPAINT_COMMON_NODES = {
     "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
     "ARPLTXEphemeralTextEncode": "ComfyUI-ARP",
@@ -94,6 +104,9 @@ OFFICIAL_OUTPAINT_REQUIRED_NODES = {
 }
 LEGACY_OUTPAINT_REQUIRED_NODES = {
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+    "EmptyImage": "ComfyUI core",
+    "ImageCompositeMasked": "ComfyUI core",
+    "ImageToMask": "ComfyUI core",
 }
 LTX25_OUTPAINT_REQUIRED_NODES = {
     "CLIPLoaderGGUF": "ComfyUI-GGUF",
@@ -698,11 +711,47 @@ def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[
     return (left, top, right, bottom) if left < right and top < bottom else None
 
 
+def custom_mask_array(args, width: int, height: int):
+    """Read the optional user-painted additive mask as a binary canvas, or None.
+
+    White or opaque pixels mark regions the user wants regenerated on every frame:
+    sprocket holes, torn perforations, edge damage. The result is always exactly the
+    prepared canvas size so it can be combined with the geometric bands directly.
+    """
+    custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
+    if not custom_mask_text:
+        return None
+
+    import cv2
+    import numpy as np
+
+    custom = cv2.imread(custom_mask_text, cv2.IMREAD_UNCHANGED)
+    if custom is None:
+        raise RuntimeError(f"Could not read custom outpaint mask: {custom_mask_text}")
+    if custom.ndim == 3 and custom.shape[2] == 4:
+        custom = custom[:, :, 3]
+    elif custom.ndim == 3:
+        custom = cv2.cvtColor(custom, cv2.COLOR_BGR2GRAY)
+    if custom.shape[:2] != (height, width):
+        custom = cv2.resize(custom, (width, height), interpolation=cv2.INTER_NEAREST)
+    return np.where(custom >= 16, 255, 0).astype(np.uint8)
+
+
+def outpaint_source_rectangle(prepared: Path, width: int, height: int) -> tuple[int, int, int, int]:
+    rectangle = prepared_source_rectangle(prepared, width, height)
+    if rectangle is None:
+        raise RuntimeError(
+            "Could not recover trim/expansion geometry from the prepared outpaint signature. "
+            "Rebuild the prepared input; protected-blacks mode never infers masks from pixel values."
+        )
+    return rectangle
+
+
 def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     """Build one geometric mask frame; the LTX nodes broadcast it across the clip."""
     target = ROOT / ".cache" / "outpaint_masks" / f"{safe_stem(prepared.name)}_official_mask.png"
     sig = {
-        "version": 5,
+        "version": 6,
         "tool": "outpaint_video.py/official_mask",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -715,35 +764,12 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     import cv2
     import numpy as np
 
-    rectangle = prepared_source_rectangle(prepared, width, height)
-    if rectangle is None:
-        raise RuntimeError(
-            "Could not recover trim/expansion geometry from the prepared outpaint signature. "
-            "Rebuild the prepared input; protected-blacks mode never infers masks from pixel values."
-        )
-
-    left, top, right, bottom = rectangle
-    horizontal_bands = left > 0 or right < width
-    vertical_bands = top > 0 or bottom < height
-    if horizontal_bands and vertical_bands:
-        raise RuntimeError(
-            "Prepared outpaint geometry produced borders on both axes; expected one "
-            "generation bands after signed trim/extend fitting. Rebuild the prepared input."
-        )
+    left, top, right, bottom = outpaint_source_rectangle(prepared, width, height)
     mask = np.full((height, width), 255, dtype=np.uint8)
     mask[top:bottom, left:right] = 0
-    custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
-    if custom_mask_text:
-        custom = cv2.imread(custom_mask_text, cv2.IMREAD_UNCHANGED)
-        if custom is None:
-            raise RuntimeError(f"Could not read custom outpaint mask: {custom_mask_text}")
-        if custom.ndim == 3 and custom.shape[2] == 4:
-            custom = custom[:, :, 3]
-        elif custom.ndim == 3:
-            custom = cv2.cvtColor(custom, cv2.COLOR_BGR2GRAY)
-        if custom.shape[:2] != (height, width):
-            custom = cv2.resize(custom, (width, height), interpolation=cv2.INTER_NEAREST)
-        mask = np.maximum(mask, np.where(custom >= 16, 255, 0).astype(np.uint8))
+    custom = custom_mask_array(args, width, height)
+    if custom is not None:
+        mask = np.maximum(mask, custom)
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(".partial.png")
     print(f"Building broadcast LTX outpaint mask: {target} (source rectangle {left},{top}-{right},{bottom})", flush=True)
@@ -754,49 +780,37 @@ def official_mask_image(prepared: Path, args, width: int, height: int) -> Path:
     return target
 
 
-def generation_mask_image(exact_mask: Path, args) -> Path:
-    """Extend a geometric pillarbox/letterbox mask beneath protected source pixels.
+def generation_mask_image(exact_mask: Path, args, prepared: Path, width: int, height: int) -> Path:
+    """Extend the geometric outpaint bands beneath protected source pixels.
 
-    The exact delivery mask stays unchanged. The generation-only mask adds the configured
-    context overlap on the same axis and preserves at least one 32px source cell.
+    The exact delivery mask stays unchanged. The generation-only mask grows every
+    geometric band by the configured context overlap while preserving at least one
+    32px source cell per axis, and keeps the user's custom regions, dilated to survive
+    the spatial VAE compression that would otherwise swallow a thin sprocket strip.
+
+    The bands come from the prepared input's own trim/extend signature rather than from
+    the exact mask's bounding box: a custom region touching the edge of the source
+    rectangle is indistinguishable from a band once both are white, and reading it as
+    one would protect the very pixels the user asked to regenerate.
     """
     target = exact_mask.with_name(f"{exact_mask.stem}_generation.png")
     overlap_limit = max(0, int(getattr(args, "generation_mask_overlap", 8)))
     sig = {
-        "version": 3,
+        "version": 4,
         "tool": "outpaint_video.py/generation_mask",
         "exact_mask": root_relative(exact_mask),
         "exact_mask_fingerprint": file_fingerprint(exact_mask),
+        "prepared": root_relative(prepared),
         "spatial_cell": LTX_SPATIAL_MASK_CELL,
         "overlap_limit": overlap_limit,
     }
-    if not getattr(args, "force", False) and resumable_output(target, sig):
+    if not getattr(args, "force", False) and resumable_output(target, sig, width=width, height=height):
         return target
 
     import cv2
     import numpy as np
 
-    exact = cv2.imread(str(exact_mask), cv2.IMREAD_GRAYSCALE)
-    if exact is None:
-        raise RuntimeError(f"Could not read the exact outpaint mask: {exact_mask}")
-    protected = exact < 128
-    protected_columns = np.flatnonzero(protected.any(axis=0))
-    protected_rows = np.flatnonzero(protected.any(axis=1))
-    if not protected_columns.size or not protected_rows.size:
-        raise RuntimeError(f"The exact outpaint mask has no protected source rectangle: {exact_mask}")
-
-    height, width = exact.shape
-    left = int(protected_columns[0])
-    right = int(protected_columns[-1]) + 1
-    top = int(protected_rows[0])
-    bottom = int(protected_rows[-1]) + 1
-    horizontal_bands = left > 0 or right < width
-    vertical_bands = top > 0 or bottom < height
-    if horizontal_bands and vertical_bands:
-        raise RuntimeError(
-            "Exact outpaint mask has borders on both axes; expected one pillarbox "
-            "generation region from signed trim/extend geometry."
-        )
+    left, top, right, bottom = outpaint_source_rectangle(prepared, width, height)
 
     def generation_bounds(start: int, end: int, extent: int) -> tuple[int, int]:
         before = start > 0
@@ -811,15 +825,26 @@ def generation_mask_image(exact_mask: Path, args) -> Path:
     generation_left, generation_right = generation_bounds(left, right, width)
     generation_top, generation_bottom = generation_bounds(top, bottom, height)
 
-    generation = np.full_like(exact, 255)
+    generation = np.full((height, width), 255, dtype=np.uint8)
     generation[generation_top:generation_bottom, generation_left:generation_right] = 0
+    custom = custom_mask_array(args, width, height)
+    custom_note = ""
+    if custom is not None:
+        # Latent safety only: the overlap that widens a band exists to give the sampler
+        # context, but a custom region needs just enough growth to occupy a whole cell.
+        radius = min(overlap_limit, LTX_SPATIAL_MASK_CELL)
+        if radius:
+            kernel = np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8)
+            custom = cv2.dilate(custom, kernel)
+        generation = np.maximum(generation, custom)
+        custom_note = f"; custom regions dilated by {radius}px"
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(".partial.png")
     print(
         "Building latent-safe LTX generation mask: "
         f"{target} (exact source rectangle {left},{top}-{right},{bottom}; "
         f"generation source rectangle {generation_left},{generation_top}-"
-        f"{generation_right},{generation_bottom})",
+        f"{generation_right},{generation_bottom}{custom_note})",
         flush=True,
     )
     if not cv2.imwrite(str(partial), generation):
@@ -874,7 +899,14 @@ def patch_dearchive_video_only_sampling(workflow: dict[str, Any]) -> None:
     set_input_link(workflow, "5013", "latent", crop_latent_link)
 
 
-def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path) -> None:
+def patch_legacy_black_graph(
+    workflow: dict[str, Any],
+    args,
+    prepared: Path,
+    comfy_dir: Path,
+    width: int,
+    height: int,
+) -> None:
     """Use oumoumad's original pure-black sentinel conditioning and direct decode."""
     legacy_guide = node_by_id(workflow, "5114")
     legacy_guide["type"] = "LTXAddVideoICLoRAGuide"
@@ -885,8 +917,84 @@ def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path) -> None:
     legacy_guide["widgets_values"] = list(legacy_guide.get("widgets_values") or [])[:7]
 
     # Prepared frames have the legacy source tone lift while synthetic margins remain exact black.
-    patch_link(workflow, 14372, 5168, 0, 5114, 4, "IMAGE")
-    set_input_link(workflow, "5114", "image", 14372)
+    # Oumoumad has no explicit mask socket: custom inpaint regions must therefore be converted
+    # to the same pure-black sentinel in the temporary guide image. The decoded source itself is
+    # left untouched, and final recomposition still uses the exact user mask to reveal generation.
+    guide_source_id = 5168
+    guide_link = 14372
+    custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
+    if custom_mask_text:
+        custom_mask = Path(custom_mask_text)
+        if not custom_mask.is_file():
+            raise FileNotFoundError(f"Custom outpaint mask not found: {custom_mask}")
+        custom_mask_name = copy_to_comfy_input(custom_mask, comfy_dir, "arp_outpaint_custom_mask")
+        load_link = CUSTOM_MASK_LINK_BASE
+        source_link = CUSTOM_MASK_LINK_BASE + 1
+        sentinel_link = CUSTOM_MASK_LINK_BASE + 2
+        mask_channel_link = CUSTOM_MASK_LINK_BASE + 3
+        composite_link = CUSTOM_MASK_LINK_BASE + 4
+        add_or_replace_node(workflow, {
+            "id": 9120,
+            "type": "LoadImage",
+            "title": "ARP Oumoumad custom outpaint mask",
+            "mode": 0,
+            "inputs": [],
+            "outputs": [
+                {"name": "IMAGE", "type": "IMAGE", "links": [load_link]},
+                {"name": "MASK", "type": "MASK", "links": []},
+            ],
+            "widgets_values": [custom_mask_name, "image"],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9121,
+            "type": "ImageToMask",
+            "title": "ARP Oumoumad custom mask channel",
+            "mode": 0,
+            "inputs": [
+                {"name": "image", "type": "IMAGE", "link": load_link},
+                {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+            ],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_channel_link]}],
+            "widgets_values": ["red"],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9122,
+            "type": "EmptyImage",
+            "title": "ARP Oumoumad pure-black sentinel",
+            "mode": 0,
+            "inputs": [
+                {"name": "width", "type": "INT", "widget": {"name": "width"}},
+                {"name": "height", "type": "INT", "widget": {"name": "height"}},
+                {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}},
+                {"name": "color", "type": "INT", "widget": {"name": "color"}},
+            ],
+            "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [sentinel_link]}],
+            "widgets_values": [width, height, 1, 0],
+        })
+        add_or_replace_node(workflow, {
+            "id": 9123,
+            "type": "ImageCompositeMasked",
+            "title": "ARP apply black-sentinel custom mask",
+            "mode": 0,
+            "inputs": [
+                {"name": "destination", "type": "IMAGE", "link": source_link},
+                {"name": "source", "type": "IMAGE", "link": sentinel_link},
+                {"name": "x", "type": "INT", "widget": {"name": "x"}},
+                {"name": "y", "type": "INT", "widget": {"name": "y"}},
+                {"name": "resize_source", "type": "BOOLEAN", "widget": {"name": "resize_source"}},
+                {"name": "mask", "type": "MASK", "link": mask_channel_link},
+            ],
+            "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [composite_link]}],
+            "widgets_values": [0, 0, False],
+        })
+        patch_link(workflow, load_link, 9120, 0, 9121, 0, "IMAGE")
+        patch_link(workflow, source_link, 5168, 0, 9123, 0, "IMAGE")
+        patch_link(workflow, sentinel_link, 9122, 0, 9123, 1, "IMAGE")
+        patch_link(workflow, mask_channel_link, 9121, 0, 9123, 5, "MASK")
+        guide_source_id = 9123
+        guide_link = composite_link
+    patch_link(workflow, guide_link, guide_source_id, 0, 5114, 4, "IMAGE")
+    set_input_link(workflow, "5114", "image", guide_link)
     size_link = input_link(workflow, "5054", "image")
     if size_link is None:
         raise ValueError("Official outpaint template has no Stage 1 image-size link.")
@@ -899,8 +1007,8 @@ def patch_legacy_black_graph(workflow: dict[str, Any], prepared: Path) -> None:
     set_input_link(workflow, "5227", "images", 13934)
     patch_link(workflow, 14433, 5168, 1, 5227, 1, "AUDIO")
     set_input_link(workflow, "5227", "audio", 14433)
-    patch_link(workflow, 19120, 2004, 0, 3159, 1, "IMAGE")
-    set_input_link(workflow, "3159", "image", 19120)
+    patch_link(workflow, GUIDE_IMAGE_LINK, 2004, 0, 3159, 1, "IMAGE")
+    set_input_link(workflow, "3159", "image", GUIDE_IMAGE_LINK)
 
 
 def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int) -> None:
@@ -930,7 +1038,8 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     if getattr(args, "outpaint_all_black_regions", False):
         # Reuse the already-decoded source frames. This mode needs a time-varying mask, but it
         # does not need the former second 480-frame RGB video allocation.
-        image_mask_link, threshold_link = 19100, 19101
+        image_mask_link, threshold_link = MASK_LINK_BASE, MASK_LINK_BASE + 1
+        invert_link = MASK_LINK_BASE + 2
         add_or_replace_node(workflow, {
             "id": 9100,
             "type": "ImageToMask",
@@ -952,7 +1061,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 {"name": "mask", "type": "MASK", "link": threshold_link},
                 {"name": "value", "type": "FLOAT", "widget": {"name": "value"}},
             ],
-            "outputs": [{"name": "MASK", "type": "MASK", "links": [19102]}],
+            "outputs": [{"name": "MASK", "type": "MASK", "links": [invert_link]}],
             "widgets_values": [int(getattr(args, "black_mask_threshold", 12)) / 255.0],
         })
         add_or_replace_node(workflow, {
@@ -960,17 +1069,20 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
             "type": "InvertMask",
             "title": "ARP outpaint black pixels",
             "mode": 0,
-            "inputs": [{"name": "mask", "type": "MASK", "link": 19102}],
+            "inputs": [{"name": "mask", "type": "MASK", "link": invert_link}],
             "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_link]}],
             "widgets_values": [],
         })
         patch_link(workflow, image_mask_link, 5168, 0, 9100, 0, "IMAGE")
         patch_link(workflow, threshold_link, 9100, 0, 9101, 0, "MASK")
-        patch_link(workflow, 19102, 9101, 0, 9102, 0, "MASK")
+        patch_link(workflow, invert_link, 9101, 0, 9102, 0, "MASK")
         mask_source_id = 9102
         custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
         if custom_mask_text:
             custom_mask_name = copy_to_comfy_input(Path(custom_mask_text), comfy_dir, "arp_outpaint_custom_mask")
+            load_link = CUSTOM_MASK_LINK_BASE
+            dynamic_link = CUSTOM_MASK_LINK_BASE + 1
+            custom_channel_link = CUSTOM_MASK_LINK_BASE + 2
             add_or_replace_node(workflow, {
                 "id": 9120,
                 "type": "LoadImage",
@@ -978,7 +1090,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 "mode": 0,
                 "inputs": [],
                 "outputs": [
-                    {"name": "IMAGE", "type": "IMAGE", "links": [19120]},
+                    {"name": "IMAGE", "type": "IMAGE", "links": [load_link]},
                     {"name": "MASK", "type": "MASK", "links": []},
                 ],
                 "widgets_values": [custom_mask_name, "image"],
@@ -989,10 +1101,10 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 "title": "ARP custom mask channel",
                 "mode": 0,
                 "inputs": [
-                    {"name": "image", "type": "IMAGE", "link": 19120},
+                    {"name": "image", "type": "IMAGE", "link": load_link},
                     {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
                 ],
-                "outputs": [{"name": "MASK", "type": "MASK", "links": [19122]}],
+                "outputs": [{"name": "MASK", "type": "MASK", "links": [custom_channel_link]}],
                 "widgets_values": ["red"],
             })
             add_or_replace_node(workflow, {
@@ -1001,8 +1113,8 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 "title": "ARP combine dynamic and custom outpaint masks",
                 "mode": 0,
                 "inputs": [
-                    {"name": "destination", "type": "MASK", "link": 19121},
-                    {"name": "source", "type": "MASK", "link": 19122},
+                    {"name": "destination", "type": "MASK", "link": dynamic_link},
+                    {"name": "source", "type": "MASK", "link": custom_channel_link},
                     {"name": "x", "type": "INT", "widget": {"name": "x"}},
                     {"name": "y", "type": "INT", "widget": {"name": "y"}},
                     {"name": "operation", "type": "COMBO", "widget": {"name": "operation"}},
@@ -1010,9 +1122,11 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 "outputs": [{"name": "MASK", "type": "MASK", "links": []}],
                 "widgets_values": [0, 0, "add"],
             })
-            patch_link(workflow, 19120, 9120, 0, 9121, 0, "IMAGE")
-            patch_link(workflow, 19121, 9102, 0, 9122, 0, "MASK")
-            patch_link(workflow, 19122, 9121, 0, 9122, 1, "MASK")
+            patch_link(workflow, load_link, 9120, 0, 9121, 0, "IMAGE")
+            patch_link(workflow, dynamic_link, 9102, 0, 9122, 0, "MASK")
+            patch_link(workflow, custom_channel_link, 9121, 0, 9122, 1, "MASK")
+            # 9102 now feeds the compositor instead of the exact-mask consumer below.
+            node_by_id(workflow, "9102")["outputs"][0]["links"] = [dynamic_link]
             mask_source_id = 9122
         generation_source_id = mask_source_id
 
@@ -1025,7 +1139,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         while remaining_overlap > 0:
             radius = min(30, remaining_overlap)
             node_id = 9103 + dilation_index
-            input_link = 19110 + dilation_index
+            input_link = DILATION_LINK_BASE + dilation_index
             if first_dilation_link is None:
                 first_dilation_link = input_link
             add_or_replace_node(workflow, {
@@ -1052,14 +1166,14 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
             [first_dilation_link] if first_dilation_link is not None else [mask_link]
         )
         for index in range(dilation_index):
-            output_link = mask_link if index == dilation_index - 1 else 19110 + index + 1
+            output_link = mask_link if index == dilation_index - 1 else DILATION_LINK_BASE + index + 1
             node_by_id(workflow, str(9103 + index))["outputs"][0]["links"] = [output_link]
     else:
         mask = official_mask_image(prepared, args, width, height)
-        generation_mask = generation_mask_image(mask, args)
+        generation_mask = generation_mask_image(mask, args, prepared, width, height)
         mask_name = copy_to_comfy_input(mask, comfy_dir, "arp_outpaint_mask")
         generation_mask_name = copy_to_comfy_input(generation_mask, comfy_dir, "arp_outpaint_generation_mask")
-        load_link = 19100
+        load_link = MASK_LINK_BASE
         add_or_replace_node(workflow, {
             "id": 9100,
             "type": "LoadImage",
@@ -1086,6 +1200,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         })
         patch_link(workflow, load_link, 9100, 0, 9101, 0, "IMAGE")
         mask_source_id = 9101
+        generation_load_link = MASK_LINK_BASE + 3
         add_or_replace_node(workflow, {
             "id": 9103,
             "type": "LoadImage",
@@ -1093,7 +1208,7 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
             "mode": 0,
             "inputs": [],
             "outputs": [
-                {"name": "IMAGE", "type": "IMAGE", "links": [19103]},
+                {"name": "IMAGE", "type": "IMAGE", "links": [generation_load_link]},
                 {"name": "MASK", "type": "MASK", "links": []},
             ],
             "widgets_values": [generation_mask_name, "image"],
@@ -1104,13 +1219,13 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
             "title": "ARP generation mask channel",
             "mode": 0,
             "inputs": [
-                {"name": "image", "type": "IMAGE", "link": 19103},
+                {"name": "image", "type": "IMAGE", "link": generation_load_link},
                 {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
             ],
             "outputs": [{"name": "MASK", "type": "MASK", "links": [mask_link]}],
             "widgets_values": ["red"],
         })
-        patch_link(workflow, 19103, 9103, 0, 9104, 0, "IMAGE")
+        patch_link(workflow, generation_load_link, 9103, 0, 9104, 0, "IMAGE")
         generation_source_id = 9104
         node_by_id(workflow, str(mask_source_id))["outputs"][0]["links"] = [14377]
 
@@ -1140,9 +1255,8 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
     set_input_link(workflow, "5227", "audio", 14433)
 
     # Full-canvas ARP guides should not be resized to the official demo's 1024px guide size.
-    guide_link = 19120
-    patch_link(workflow, guide_link, 2004, 0, 3159, 1, "IMAGE")
-    set_input_link(workflow, "3159", "image", guide_link)
+    patch_link(workflow, GUIDE_IMAGE_LINK, 2004, 0, 3159, 1, "IMAGE")
+    set_input_link(workflow, "3159", "image", GUIDE_IMAGE_LINK)
 
 
 # The LTX example workflow is a frontend graph with stable-but-opaque node IDs.
@@ -1282,9 +1396,12 @@ def _patch_extra_guides(
 ) -> None:
     """Chain one LTXVAddGuideAdvanced node per extra guide frame.
 
-    Nodes are assigned IDs starting at 9050 (LoadImage) and 9060 (LTXVAddGuideAdvanced),
+    Nodes are assigned IDs starting at 9400 (LoadImage) and 9060 (LTXVAddGuideAdvanced),
     incrementing by 1 per guide.  The first guide node redirects the IC guide's downstream
     consumers; each subsequent guide node redirects the previous guide node's consumers.
+    Link IDs come from EXTRA_GUIDE_LINK_BASE, which sits above every fixed ARP link ID:
+    this routine deletes whatever already holds an ID it reserves, so an overlapping
+    range would strip the mask wiring out of the graph.
     """
     from pathlib import Path as _Path
     comfy_dir = _Path(args.comfy_dir)
@@ -1319,10 +1436,9 @@ def _patch_extra_guides(
     reserved_ids = set()
 
     for i, gf in enumerate(extra_guides):
-        load_id = 9050 + i
+        load_id = 9400 + i
         guide_id = 9060 + i
-        # Link ID base: 19050 + i*10
-        lb = 19050 + i * 10
+        lb = EXTRA_GUIDE_LINK_BASE + i * 10
         img_link, vae_link, pos_link, neg_link, lat_link = lb, lb+1, lb+2, lb+3, lb+4
         reserved_ids.update({img_link, vae_link, pos_link, neg_link, lat_link})
 
@@ -1487,7 +1603,7 @@ def patch_ltx25_workflow(
     # LoadImage has an all-zero mask and would silently tell LTX to preserve the black
     # margins (and reduce GetImageSize's frame count to one).
     exact_mask = official_mask_image(prepared, args, width, height)
-    generation_mask = generation_mask_image(exact_mask, args)
+    generation_mask = generation_mask_image(exact_mask, args, prepared, width, height)
     generation_mask_name = copy_to_comfy_input(
         generation_mask, comfy_dir, "arp_outpaint_generation_mask_ltx25"
     )
@@ -1576,7 +1692,9 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     if is_official_outpaint_template(workflow):
         validate_official_outpaint_workflow(workflow)
         if uses_legacy_black_outpaint(args.outpaint_lora):
-            patch_legacy_black_graph(workflow, prepared)
+            patch_legacy_black_graph(
+                workflow, args, prepared, comfy_dir, canvas_width, canvas_height
+            )
         else:
             patch_official_masked_graph(
                 workflow,
@@ -1783,7 +1901,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 42,
+        "version": 44,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),

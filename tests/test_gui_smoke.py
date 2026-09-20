@@ -1932,6 +1932,114 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["5227"]["inputs"]["audio"], ["5168", 1])
         self.assertNotIn("9100", prompt)
 
+    def test_oumoumad_custom_mask_is_applied_as_black_guide_pixels(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            custom_mask = Path(tmp_text) / "custom-mask.png"
+            custom_mask.write_bytes(b"mask")
+            args = outpaint_video.build_parser().parse_args([
+                "--source", "input/example.mp4",
+                "--comfy-dir", str(app.ROOT),
+                "--outpaint-lora", outpaint_video.OUMOUMAD_OUTPAINT_LORA,
+                "--custom-mask", str(custom_mask),
+                "--dry-run",
+            ])
+            with (
+                mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=["arp_outpaint/prepared.mp4", "arp_outpaint_custom_mask/mask.png"]),
+                mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+                mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            ):
+                prompt = outpaint_video.patch_workflow(
+                    args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                    args.prompt, args.negative_prompt, 42,
+                )
+
+        self.assertEqual(prompt["9120"]["class_type"], "LoadImage")
+        self.assertEqual(prompt["9120"]["inputs"]["image"], "arp_outpaint_custom_mask/mask.png")
+        self.assertEqual(prompt["9121"]["inputs"]["image"], ["9120", 0])
+        self.assertEqual(prompt["9122"]["inputs"], {"width": 864, "height": 480, "batch_size": 1, "color": 0})
+        self.assertEqual(prompt["9123"]["inputs"]["destination"], ["5168", 0])
+        self.assertEqual(prompt["9123"]["inputs"]["source"], ["9122", 0])
+        self.assertEqual(prompt["9123"]["inputs"]["mask"], ["9121", 0])
+        self.assertEqual(prompt["5114"]["inputs"]["image"], ["9123", 0])
+        self.assertEqual(prompt["5054"]["inputs"]["image"], ["5168", 0])
+        # The full-canvas guide keeps its own edge: sharing a link ID with the custom
+        # mask made ImageToMask read the guide frame and black out the whole picture.
+        self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
+
+    def test_official_black_region_custom_mask_adds_to_the_dynamic_mask(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            custom_mask = Path(tmp_text) / "custom-mask.png"
+            custom_mask.write_bytes(b"mask")
+            args = outpaint_video.build_parser().parse_args([
+                "--source", "input/example.mp4",
+                "--comfy-dir", str(app.ROOT),
+                "--outpaint-all-black-regions",
+                "--custom-mask", str(custom_mask),
+                "--generation-mask-overlap", "0",
+                "--dry-run",
+            ])
+            with (
+                mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=["arp_outpaint/prepared.mp4", "arp_outpaint_custom_mask/mask.png"]),
+                mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+                mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            ):
+                prompt = outpaint_video.patch_workflow(
+                    args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                    args.prompt, args.negative_prompt, 42,
+                )
+
+        self.assertEqual(prompt["9120"]["inputs"]["image"], "arp_outpaint_custom_mask/mask.png")
+        self.assertEqual(prompt["9121"]["inputs"]["image"], ["9120", 0])
+        self.assertEqual(prompt["9122"]["class_type"], "MaskComposite")
+        self.assertEqual(prompt["9122"]["inputs"]["destination"], ["9102", 0])
+        self.assertEqual(prompt["9122"]["inputs"]["source"], ["9121", 0])
+        # Both the sentinel preprocessor and the final blend see the combined mask.
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9122", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9122", 0])
+        self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
+
+    def test_many_extra_guides_do_not_overwrite_the_mask_wiring(self) -> None:
+        # Extra guides reserve ten link IDs each and delete whatever already holds them.
+        # Six guides used to land on the mask chain's own IDs and strip it from the graph.
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            guide = Path(tmp_text) / "guide.png"
+            guide.write_bytes(b"guide")
+            custom_mask = Path(tmp_text) / "custom-mask.png"
+            custom_mask.write_bytes(b"mask")
+            args = outpaint_video.build_parser().parse_args([
+                "--source", "input/example.mp4",
+                "--comfy-dir", str(app.ROOT),
+                "--custom-mask", str(custom_mask),
+                "--dry-run",
+            ])
+            with (
+                mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+                mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+                mock.patch.object(outpaint_video, "copy_guide_image_to_comfy_input", return_value="arp_outpaint/extra.png"),
+                mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+                mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+                mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+            ):
+                prompt = outpaint_video.patch_workflow(
+                    args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                    args.prompt, args.negative_prompt, 42,
+                    extra_guides=[
+                        {"frame_idx": idx, "strength": 0.5, "image": guide}
+                        for idx in (8, 16, 24, 32, 40, 48)
+                    ],
+                )
+
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9104", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9101", 0])
+        self.assertEqual(prompt["9101"]["inputs"]["image"], ["9100", 0])
+        self.assertEqual(prompt["9104"]["inputs"]["image"], ["9103", 0])
+        self.assertEqual(prompt["3159"]["inputs"]["image"], ["2004", 0])
+        guide_nodes = sorted(nid for nid, n in prompt.items() if n["class_type"] == "LTXVAddGuideAdvanced")
+        self.assertEqual(len(guide_nodes), 6)
+
     def test_outpaint_extra_guides_remain_in_video_only_sampler_chain(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
         args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(app.ROOT), "--dry-run"])
@@ -2137,18 +2245,38 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(rectangle, (168, 0, 1112, 704))
 
+    @staticmethod
+    def _pillarbox_prepared(root: Path) -> Path:
+        """A prepared input whose signature places 1456x1080 source at columns 156-1124."""
+        prepared = root / "prepared.mp4"
+        prepared.write_bytes(b"prepared")
+        outpaint_video.signature_path(prepared).write_text(
+            json.dumps({
+                "tool": "prepare_outpaint_input.py", "geometry": "crop_then_fit_v1",
+                "source_width": 1456, "source_height": 1080,
+                "target_width": 1280, "target_height": 704,
+                "delivery_width": 1280, "delivery_height": 720,
+                "crop_left": 10, "crop_right": 10, "crop_top": 6, "crop_bottom": 6,
+            }),
+            encoding="utf-8",
+        )
+        return prepared
+
     def test_outpaint_generation_mask_adds_overlap_only_to_pillarbox(self) -> None:
         import cv2
         import numpy as np
 
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
-            exact_path = Path(tmp_text) / "exact.png"
+            root = Path(tmp_text)
+            prepared = self._pillarbox_prepared(root)
+            exact_path = root / "exact.png"
             exact = np.full((704, 1280), 255, dtype=np.uint8)
             exact[:, 156:1124] = 0
             self.assertTrue(cv2.imwrite(str(exact_path), exact))
-            args = argparse.Namespace(force=True, generation_mask_overlap=64)
+            args = argparse.Namespace(force=True, generation_mask_overlap=64, custom_mask="")
 
-            generation_path = outpaint_video.generation_mask_image(exact_path, args)
+            with mock.patch.object(outpaint_video, "ROOT", root):
+                generation_path = outpaint_video.generation_mask_image(exact_path, args, prepared, 1280, 704)
             generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
             exact_after = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
 
@@ -2156,6 +2284,69 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(np.all(generation[:, :220] == 255))
         self.assertTrue(np.all(generation[:, 220:1060] == 0))
         self.assertTrue(np.all(generation[:, 1060:] == 255))
+
+    def test_outpaint_generation_mask_keeps_custom_regions(self) -> None:
+        # The generation mask drives what LTX actually paints. A custom region that
+        # survives only in the exact delivery mask is never generated, so the user sees
+        # the untouched sprocket hole (LTX 2.5) or a resurrected source patch (LTX 2.3).
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            prepared = self._pillarbox_prepared(root)
+            custom_path = root / "custom.png"
+            painted = np.zeros((704, 1280), dtype=np.uint8)
+            painted[300:340, 400:440] = 255
+            self.assertTrue(cv2.imwrite(str(custom_path), painted))
+            args = argparse.Namespace(force=True, generation_mask_overlap=8, custom_mask=str(custom_path))
+
+            with mock.patch.object(outpaint_video, "ROOT", root):
+                exact_path = outpaint_video.official_mask_image(prepared, args, 1280, 704)
+                generation_path = outpaint_video.generation_mask_image(exact_path, args, prepared, 1280, 704)
+            exact = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
+            generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
+
+        self.assertTrue(np.all(exact[300:340, 400:440] == 255))
+        # Generated everywhere the delivery mask reveals generation, plus latent headroom.
+        self.assertTrue(np.all(generation[300:340, 400:440] == 255))
+        self.assertTrue(np.all(generation[292:348, 392:448] == 255))
+        # Source outside the painted region and the pillarbox stays protected.
+        self.assertTrue(np.all(generation[300:340, 500:900] == 0))
+
+    def test_outpaint_masks_allow_bands_on_both_axes(self) -> None:
+        # Signed trim/extend geometry can add border on every edge at once; the mask
+        # builders must not reject it as impossible crop-first geometry.
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            prepared = root / "prepared.mp4"
+            prepared.write_bytes(b"prepared")
+            outpaint_video.signature_path(prepared).write_text(
+                json.dumps({
+                    "tool": "prepare_outpaint_input.py", "geometry": "trim_extend_then_fit_v2",
+                    "source_width": 640, "source_height": 480,
+                    "target_width": 1280, "target_height": 704,
+                    "delivery_width": 1280, "delivery_height": 704,
+                    "crop_left": -64, "crop_right": -64, "crop_top": -32, "crop_bottom": -32,
+                }),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(force=True, generation_mask_overlap=8, custom_mask="")
+            with mock.patch.object(outpaint_video, "ROOT", root):
+                exact_path = outpaint_video.official_mask_image(prepared, args, 1280, 704)
+                generation_path = outpaint_video.generation_mask_image(exact_path, args, prepared, 1280, 704)
+            exact = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
+            generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
+
+        for mask in (exact, generation):
+            self.assertTrue(np.all(mask[0, :] == 255))
+            self.assertTrue(np.all(mask[-1, :] == 255))
+            self.assertTrue(np.all(mask[:, 0] == 255))
+            self.assertTrue(np.all(mask[:, -1] == 255))
+            self.assertTrue(np.any(mask == 0))
 
     def test_ltx_laplacian_blend_keeps_fully_masked_thin_bands_exact(self) -> None:
         import importlib
