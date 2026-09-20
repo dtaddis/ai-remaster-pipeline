@@ -1628,6 +1628,23 @@ def patch_ltx25_workflow(
                 node["inputs"][name] = ["9056", 0] if int(value[1]) == 0 else ["9191", 0]
     for node_id in pad_ids:
         prompt.pop(node_id, None)
+
+    # Blend the generated frames against the clean source, never against the inpaint
+    # preprocessor's own output. Inside the mask those pixels are the #66ff00 sentinel,
+    # and LTXVLaplacianPyramidBlend mixes a Gaussian pyramid of image_b at every scale:
+    # the coarsest level spreads that green as a low-frequency wash over the whole
+    # picture, well outside the mask. The 2.3 graph already blends against the source
+    # for the same reason; protected pixels are identical in both images either way.
+    for node in prompt.values():
+        if node.get("class_type") != "LTXVLaplacianPyramidBlend":
+            continue
+        protected = node["inputs"].get("image_b")
+        if not (isinstance(protected, list) and len(protected) == 2):
+            continue
+        preprocess = prompt.get(str(protected[0]))
+        if preprocess and preprocess.get("class_type") == "LTXVInpaintPreprocess":
+            node["inputs"]["image_b"] = preprocess["inputs"]["images"]
+
     for node in prompt.values():
         class_type = node.get("class_type")
         title = str(node.get("_meta", {}).get("title", ""))
@@ -1901,7 +1918,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 44,
+        "version": 45,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),

@@ -2205,6 +2205,42 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("alphaextract", graph)
         self.assertIn("alphamerge[srcmasked]", graph)
 
+    def test_ltx25_blend_protects_with_clean_frames_not_the_green_sentinel(self) -> None:
+        # LTXVLaplacianPyramidBlend mixes a Gaussian pyramid of image_b at every scale, so
+        # a #66ff00 sentinel there washes green across the whole picture, not just the mask.
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-2.5.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4",
+            "--comfy-dir", str(app.ROOT),
+            "--ltx-version", "2.5",
+            "--dry-run",
+        ])
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mkv"),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 1280, "height": 704, "frames": 33, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mkv", app.ROOT, "arp_outpaint/test",
+                args.prompt, args.negative_prompt, 42,
+            )
+
+        blends = {nid: node for nid, node in prompt.items() if node["class_type"] == "LTXVLaplacianPyramidBlend"}
+        self.assertTrue(blends)
+        for node in blends.values():
+            protected = node["inputs"]["image_b"]
+            source = prompt.get(str(protected[0]), {})
+            self.assertNotEqual(source.get("class_type"), "LTXVInpaintPreprocess")
+        # The sampler still receives the sentinel conditioning it needs to inpaint.
+        guides = [n for n in prompt.values() if n["class_type"] == "LTXAddVideoICLoRAGuideAdvanced"]
+        self.assertTrue(guides)
+        self.assertEqual(
+            {prompt[str(g["inputs"]["image"][0])]["class_type"] for g in guides},
+            {"LTXVInpaintPreprocess"},
+        )
+
     def test_ltx25_chunk_recovers_geometry_through_frame_rate_intermediate(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             root = Path(tmp_text)

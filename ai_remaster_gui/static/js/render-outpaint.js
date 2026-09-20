@@ -668,8 +668,8 @@ function drawOutpaint(st, s, expected, sp) {
             <p class="shot-empty">Paint extra areas for LTX to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically; saved painted areas appear in coral on the preview.</p>
           </div>
           <div class="actions">
-            <button type="button" onclick="openOutpaintMaskEditor()">${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? 'Edit' : 'Create'} Mask</button>
-            <button type="button" class="warn" onclick="clearOutpaintMask()" ${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? '' : 'disabled'}>Clear Mask</button>
+            <button id="outpaintMaskEditButton" type="button" onclick="openOutpaintMaskEditor()">${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? 'Edit' : 'Create'} Mask</button>
+            <button id="outpaintMaskClearButton" type="button" class="warn" onclick="clearOutpaintMask()" ${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? '' : 'disabled'}>Clear Mask</button>
           </div>
         </div>
         <div class="outpaint-composition-controls">
@@ -704,7 +704,7 @@ function drawOutpaint(st, s, expected, sp) {
 
   bindStageFields('outpaint');
   showCommand('outpaint');
-  hydrateOutpaintMaskPreview();
+  syncOutpaintMaskPreview();
   hydratePendingOutpaintPreviews();
   hydratePendingGuidePreviews();
 }

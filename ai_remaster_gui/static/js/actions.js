@@ -1721,12 +1721,7 @@ async function autoCropOutpaint() {
 
   const img = document.getElementById('aspectPreviewImg');
   if (result.preview && img) img.src = media(result.preview) + '&t=' + Date.now();
-  if (state.custom_outpaint_mask && !state.custom_outpaint_mask.exists) {
-    document.getElementById('outpaintMaskPreviewOverlay')?.remove();
-    document.querySelector('.outpaint-mask-preview-badge')?.remove();
-  } else {
-    hydrateOutpaintMaskPreview();
-  }
+  syncOutpaintMaskPreview();
   showCommand('outpaint');
   lastRenderSignature = renderSignature();
   lastOutpaintVisualSignature = outpaintVisualSignature();

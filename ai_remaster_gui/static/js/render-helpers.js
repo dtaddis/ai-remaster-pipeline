@@ -462,11 +462,58 @@ function aspectPreviewHtml(st) {
     <h3>Target Preview</h3>
     <div class="aspect-preview-frame">
       ${img ? `<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">` : '<p>Choose source material on the Overview tab to preview the target frame.</p>'}
-      ${img && mask.exists && mask.path ? `<canvas id="outpaintMaskPreviewOverlay" data-mask-src="${esc(media(mask.path) + '&t=' + (mask.mtime || Date.now()))}" aria-label="Custom outpaint mask overlay"></canvas><span class="outpaint-mask-preview-badge">Custom mask</span>` : ''}
+      ${img && outpaintMaskPreviewSource(mask) ? `<canvas id="outpaintMaskPreviewOverlay" data-mask-src="${esc(outpaintMaskPreviewSource(mask))}" aria-label="Custom outpaint mask overlay"></canvas><span class="outpaint-mask-preview-badge">Custom mask</span>` : ''}
     </div>
     ${range.duration ? aspectPreviewSlider(range) : ''}
     ${shotOutputList(outputs, null)}
   `;
+}
+
+// The mask is keyed by outpaint geometry, so its URL changes whenever the trim or
+// extend values do. Deriving it in one place keeps a first render and a later in-place
+// refresh from disagreeing about which file the overlay is showing.
+function outpaintMaskPreviewSource(mask) {
+  const current = mask || state.custom_outpaint_mask || {};
+  if (!current.exists || !current.path) return '';
+  return media(current.path) + '&t=' + (current.mtime || Date.now());
+}
+
+// Reconcile the overlay, the badge, and the mask buttons with the current state
+// without redrawing the tab. Auto Trim replaces the geometry in place, which can mean
+// the painted mask now lives at a different path, at no path at all, or at one the
+// page has no canvas for yet.
+function syncOutpaintMaskPreview() {
+  const mask = state.custom_outpaint_mask || {};
+  const source = outpaintMaskPreviewSource(mask);
+  const frame = document.querySelector('.aspect-preview-frame');
+  const hasPreview = !!document.getElementById('aspectPreviewImg');
+  let canvas = document.getElementById('outpaintMaskPreviewOverlay');
+  let badge = document.querySelector('.outpaint-mask-preview-badge');
+
+  if (!source || !frame || !hasPreview) {
+    canvas?.remove();
+    badge?.remove();
+  } else {
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.id = 'outpaintMaskPreviewOverlay';
+      canvas.setAttribute('aria-label', 'Custom outpaint mask overlay');
+      frame.appendChild(canvas);
+    }
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'outpaint-mask-preview-badge';
+      badge.textContent = 'Custom mask';
+      frame.appendChild(badge);
+    }
+    canvas.dataset.maskSrc = source;
+    hydrateOutpaintMaskPreview();
+  }
+
+  const edit = document.getElementById('outpaintMaskEditButton');
+  if (edit) edit.textContent = `${mask.exists ? 'Edit' : 'Create'} Mask`;
+  const clear = document.getElementById('outpaintMaskClearButton');
+  if (clear) clear.disabled = !mask.exists;
 }
 
 function hydrateOutpaintMaskPreview() {
