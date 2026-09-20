@@ -179,7 +179,8 @@ class GuiSmokeTests(unittest.TestCase):
     def test_intermediate_profile_is_passed_into_video_producers(self) -> None:
         self._populate_full_pipeline_settings()
         app.APP.settings["cloud"]["intermediate_format"] = "lossless"
-        for stage in ("cleanup", "outpaint", "colour", "upscale"):
+        self.assertNotIn("encoder", app.default_settings()["stabilize"])
+        for stage in ("cleanup", "stabilize", "outpaint", "colour", "upscale"):
             command = app.APP.command_for(stage)
             self.assertIn("--intermediate-profile", command, stage)
             self.assertEqual(command[command.index("--intermediate-profile") + 1], "lossless", stage)
@@ -227,6 +228,7 @@ class GuiSmokeTests(unittest.TestCase):
         command = app.APP.command_for("stabilize")
 
         self.assertEqual(command[command.index("--source") + 1], "input/example.mp4")
+        self.assertEqual(command[command.index("--intermediate-profile") + 1], "high")
 
     def test_stabilization_output_name_matches_gui_and_producer(self) -> None:
         source = app.resolve_video_source("input/example.mp4")
@@ -1728,7 +1730,7 @@ class GuiSmokeTests(unittest.TestCase):
             prepared = Path(tmp_text) / "prepared.mp4"
             prepared.write_bytes(b"video")
             with (
-                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 33}, {"frames": 49}]),
+                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 33}, {"frames": 50}]),
                 mock.patch.object(outpaint_video, "video_has_audio", return_value=False),
                 mock.patch.object(outpaint_video, "resumable_output", return_value=False),
                 mock.patch.object(outpaint_video.subprocess, "run") as run,
@@ -1740,7 +1742,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(output.name, "prepared_ltx25_24fps.mkv")
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", command)
         self.assertIn("minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,tpad=stop_mode=clone:stop_duration=1", command)
-        self.assertEqual(command[command.index("-frames:v") + 1], "49")
+        self.assertEqual(command[command.index("-frames:v") + 1], "50")
         self.assertIn("-shortest", command)
 
     def test_ltx25_fast_frame_rate_retimes_only_existing_frames(self) -> None:
@@ -1748,7 +1750,7 @@ class GuiSmokeTests(unittest.TestCase):
             prepared = Path(tmp_text) / "prepared.mp4"
             prepared.write_bytes(b"video")
             with (
-                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 294}, {"frames": 289}]),
+                mock.patch.object(outpaint_video, "probe_video", side_effect=[{"fps": 16.0, "frames": 294}, {"frames": 294}]),
                 mock.patch.object(outpaint_video, "video_has_audio", return_value=False),
                 mock.patch.object(outpaint_video, "resumable_output", return_value=False),
                 mock.patch.object(outpaint_video.subprocess, "run") as run,
@@ -1758,14 +1760,18 @@ class GuiSmokeTests(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertEqual(output.name, "prepared_ltx25_24_fastfps.mkv")
-        self.assertIn("trim=end_frame=289,setpts=N/(24*TB),fps=24", command)
+        self.assertIn("trim=end_frame=294,setpts=N/(24*TB),fps=24", command)
         self.assertNotIn("minterpolate", " ".join(command))
-        self.assertEqual(command[command.index("-frames:v") + 1], "289")
+        self.assertEqual(command[command.index("-frames:v") + 1], "294")
         self.assertEqual(command[command.index("-r") + 1], "24.00000000")
 
     def test_outpaint_chunk_lengths_follow_ltx_8n_plus_1_rule(self) -> None:
         self.assertEqual(outpaint_video.ltx_valid_frame_count(2.0, 24.0), 49)
         self.assertEqual(outpaint_video.ltx_valid_frame_count(4.04, 24.0), 97)
+        self.assertEqual(outpaint_video.ltx_padded_frame_count(1), 1)
+        self.assertEqual(outpaint_video.ltx_padded_frame_count(8), 9)
+        self.assertEqual(outpaint_video.ltx_padded_frame_count(9), 9)
+        self.assertEqual(outpaint_video.ltx_padded_frame_count(10), 17)
         ranges = outpaint_video.chunk_ranges_from_manifest(100, 24.0, 2.0, 8, {})
         self.assertEqual(ranges, [(0, 0, 49), (1, 41, 90), (2, 75, 100)])
         self.assertTrue(all((end - start) % 8 == 1 for _, start, end in ranges))
@@ -2224,7 +2230,39 @@ class GuiSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.stdout.strip(), "opus")
-        self.assertEqual(frame_result.stdout.strip(), "8")
+        self.assertEqual(frame_result.stdout.strip(), "9")
+
+    def test_outpaint_stitch_trims_ltx_padding_back_to_real_frame_count(self) -> None:
+        ffmpeg = outpaint_video.find_ffmpeg()
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            padded = folder / "padded.mkv"
+            stitched = folder / "stitched.mkv"
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=8:d=1.25",
+                    "-frames:v", "10", "-c:v", "ffv1", str(source),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            outpaint_video.split_chunk(ffmpeg, source, padded, 0, 10, 8.0, True, intermediate_profile="lossless")
+            outpaint_video.stitch_chunks(ffmpeg, [padded], [(0, 0, 10)], stitched, 8.0, True, "lossless")
+            counts = []
+            for video in (padded, stitched):
+                result = subprocess.run(
+                    [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1", str(video)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                counts.append(int(result.stdout.strip()))
+
+        self.assertEqual(counts, [17, 10])
 
     def test_qwen_seed_guides_do_not_overwrite_existing_set_guides(self) -> None:
         args = argparse.Namespace(
@@ -2767,7 +2805,7 @@ class GuiSmokeTests(unittest.TestCase):
             source = app.outpaint_source_for_settings(settings)
 
         self.assertEqual(source, "intermediate/stabilized/example.mkv")
-        stabilized.assert_called_once_with("input/example.mp4", settings["stabilize"])
+        stabilized.assert_called_once_with("input/example.mp4", settings["stabilize"], "high")
 
     def test_outpaint_chunk_preview_falls_back_to_finished_render(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

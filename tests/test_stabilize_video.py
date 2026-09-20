@@ -17,6 +17,10 @@ from common import find_ffmpeg  # noqa: E402
 
 
 class StabilizeVideoTests(unittest.TestCase):
+    def test_encoder_follows_global_intermediate_profile(self) -> None:
+        self.assertIn("libvpx-vp9", stabilize_video.encoder_args("high", "yuv420p"))
+        self.assertIn("ffv1", stabilize_video.encoder_args("lossless", "yuv422p10le"))
+
     def test_scene_ranges_are_preserved_in_signature(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             source = Path(tmp_text) / "source.mp4"
@@ -173,7 +177,10 @@ class StabilizeVideoTests(unittest.TestCase):
                 check=True,
             )
             args = stabilize_video.build_parser().parse_args(
-                ["--source", str(source), "--output", str(output), "--smoothing", "3", "--zoom", "1"]
+                [
+                    "--source", str(source), "--output", str(output), "--smoothing", "3", "--zoom", "1",
+                    "--intermediate-profile", "lossless",
+                ]
             )
             info = SimpleNamespace(width=160, height=96, fps=12.0, frame_count=24)
             with mock.patch.object(stabilize_video, "detect_shot_ranges", return_value=(info, [(0, 12), (12, 24)])):

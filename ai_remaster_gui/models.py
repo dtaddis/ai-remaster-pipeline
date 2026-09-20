@@ -88,7 +88,6 @@ STAGES = (
             ("scene_aware", "Reset stabilization at detected cuts", "checkbox", "true"),
             ("shot_threshold", "Shot detection threshold", "range:0.01|0.5|0.005", "0.075"),
             ("min_shot_seconds", "Minimum shot length (seconds)", "number", "1.0"),
-            ("encoder", "Lossless intermediate", "select:ffv1|prores", "ffv1"),
         ),
         (),
     ),

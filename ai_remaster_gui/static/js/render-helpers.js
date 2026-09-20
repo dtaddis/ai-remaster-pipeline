@@ -91,8 +91,6 @@ const FIELD_DESCRIPTIONS = {
     'Uses the same visual shot detector as Reference Generation. Lower values detect subtler cuts and dissolves; values that are too low can split energetic camera movement into false shots.',
   'stabilize.min_shot_seconds':
     'Prevents closely spaced detections from creating tiny stabilization spans. Tracking and camera smoothing restart at every accepted boundary.',
-  'stabilize.encoder':
-    'FFV1 is mathematically lossless and recommended for pipeline intermediates. ProRes HQ is larger and visually lossless, but more convenient in editing applications.',
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
@@ -456,6 +454,7 @@ function aspectPreviewHtml(st) {
   if (st.key !== 'outpaint') return '';
 
   const img = state.aspect_preview;
+  const mask = state.custom_outpaint_mask || {};
   const outputs = (state.expected_outputs && state.expected_outputs.outpaint) || [];
   const range = aspectPreviewRange();
 
@@ -463,10 +462,47 @@ function aspectPreviewHtml(st) {
     <h3>Target Preview</h3>
     <div class="aspect-preview-frame">
       ${img ? `<img id="aspectPreviewImg" src="${media(img)}" alt="Target aspect preview">` : '<p>Choose source material on the Overview tab to preview the target frame.</p>'}
+      ${img && mask.exists && mask.path ? `<canvas id="outpaintMaskPreviewOverlay" data-mask-src="${esc(media(mask.path) + '&t=' + (mask.mtime || Date.now()))}" aria-label="Custom outpaint mask overlay"></canvas><span class="outpaint-mask-preview-badge">Custom mask</span>` : ''}
     </div>
     ${range.duration ? aspectPreviewSlider(range) : ''}
     ${shotOutputList(outputs, null)}
   `;
+}
+
+function hydrateOutpaintMaskPreview() {
+  const canvas = document.getElementById('outpaintMaskPreviewOverlay');
+  if (!canvas) return;
+  const source = canvas.dataset.maskSrc || '';
+  if (!source || canvas.dataset.loadedSrc === source) return;
+  const image = new Image();
+  image.onload = () => {
+    const base = document.getElementById('aspectPreviewImg');
+    const paint = () => {
+      if (!canvas.isConnected || canvas.dataset.maskSrc !== source) return;
+      // The saved mask uses LTX's factor-safe working size (for example
+      // 1280x704), while the preview uses the requested delivery aspect
+      // (1280x720). Stretch back to the preview dimensions exactly as the
+      // editor does, so painted corners stay registered with the picture.
+      canvas.width = Math.max(1, base?.naturalWidth || image.naturalWidth);
+      canvas.height = Math.max(1, base?.naturalHeight || image.naturalHeight);
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      for (let i = 0; i < pixels.data.length; i += 4) {
+        const selected = Math.max(pixels.data[i], pixels.data[i + 1], pixels.data[i + 2]) >= 16;
+        pixels.data[i] = 224;
+        pixels.data[i + 1] = 92;
+        pixels.data[i + 2] = 73;
+        pixels.data[i + 3] = selected ? 170 : 0;
+      }
+      ctx.putImageData(pixels, 0, 0);
+      canvas.dataset.loadedSrc = source;
+    };
+    if (base && !base.complete) base.addEventListener('load', paint, {once: true});
+    else paint();
+  };
+  image.src = source;
 }
 
 function aspectPreviewRange() {

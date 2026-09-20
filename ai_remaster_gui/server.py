@@ -499,7 +499,11 @@ class PipelineApp:
 
     def stabilization_output(self) -> str:
         source = self.cleaned_source_for_downstream()
-        return stabilize_output_for(source, self.settings.get("stabilize", {})) if source else ""
+        return stabilize_output_for(
+            source,
+            self.settings.get("stabilize", {}),
+            self.settings.get("cloud", {}).get("intermediate_format", "high"),
+        ) if source else ""
 
     def stabilized_source_for_downstream(self) -> str:
         """Expected stabilized output, or the cleaned/selected source when stabilization is off."""
@@ -1448,12 +1452,14 @@ class PipelineApp:
 
     def _stabilize_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
         source = self.cleaned_source_for_downstream()
-        output = stabilize_output_for(source, values) if source else ""
+        intermediate_profile = self.settings.get("cloud", {}).get("intermediate_format", "high")
+        output = stabilize_output_for(source, values, intermediate_profile) if source else ""
         cmd = [sys.executable, "-u", str(SCRIPTS / "stabilize_video.py"), "--source", source, "--output", output]
+        cmd.extend(["--intermediate-profile", intermediate_profile])
         add_value_args(
             cmd,
             values,
-            ("smoothing", "max_shift", "max_angle", "zoom", "shot_threshold", "min_shot_seconds", "encoder"),
+            ("smoothing", "max_shift", "max_angle", "zoom", "shot_threshold", "min_shot_seconds"),
         )
         if not is_true(values, "scene_aware", "true"):
             cmd.append("--single-shot")
@@ -2599,7 +2605,7 @@ def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
     return rel(ROOT / "intermediate" / "cleaned" / aid.artifact_name(aid.source_word(source.name), "cleanup", ident, "mkv"))
 
 
-def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
+def stabilize_output_for(source_text: str, values: dict[str, str], intermediate_profile: str = "high") -> str:
     if not source_text:
         return ""
     source = resolve_video_source(source_text)
@@ -2613,7 +2619,6 @@ def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
     except ValueError:
         smoothing, max_shift, max_angle, zoom = 12, 48, 3.0, 3.0
         shot_threshold, min_shot_seconds = 0.075, 1.0
-    encoder = values.get("encoder", "ffv1") or "ffv1"
     scene_aware = is_true(values, "scene_aware", "true")
     identity = aid.stabilize_identity(
         source.name,
@@ -2624,10 +2629,9 @@ def stabilize_output_for(source_text: str, values: dict[str, str]) -> str:
         shot_threshold=shot_threshold,
         min_shot_seconds=min_shot_seconds,
         scene_aware=scene_aware,
-        encoder=encoder,
+        intermediate_profile=intermediate_profile,
     )
-    extension = "mov" if encoder == "prores" else "mkv"
-    return rel(ROOT / "intermediate" / "stabilized" / aid.artifact_name(aid.source_word(source.name), "stabilized", identity, extension))
+    return rel(ROOT / "intermediate" / "stabilized" / aid.artifact_name(aid.source_word(source.name), "stabilized", identity, "mkv"))
 
 
 def outpaint_source_for_settings(settings: dict) -> str:
@@ -2643,7 +2647,11 @@ def outpaint_source_for_settings(settings: dict) -> str:
     if source_text and is_true(global_values, "cleanup"):
         source_text = cleanup_output_for(source_text, settings.get("cleanup", {}))
     if source_text and is_true(global_values, "stabilize"):
-        source_text = stabilize_output_for(source_text, settings.get("stabilize", {}))
+        source_text = stabilize_output_for(
+            source_text,
+            settings.get("stabilize", {}),
+            settings.get("cloud", {}).get("intermediate_format", "high"),
+        )
     return source_text
 
 

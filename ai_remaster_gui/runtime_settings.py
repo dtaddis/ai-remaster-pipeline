@@ -187,6 +187,8 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
         defaults["cleanup"]["chunk_seconds"] = "4.04"
     # The former deterministic DeScratch filter was removed in favour of masked AI DeScratch.
     defaults["cleanup"].pop("descratch", None)
+    # Stabilization now inherits the global Intermediate Stage Video profile.
+    defaults["stabilize"].pop("encoder", None)
     # Migrate the old positive-only Crop controls to signed Trim / Extend controls.
     # The new GUI convention is negative=trim and positive=extend.
     outpaint = defaults["outpaint"]

@@ -186,19 +186,23 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
     source_frames = int(info.get("frames") or 0)
     has_audio = video_has_audio(ffmpeg, prepared)
     output_fps = source_fps if mode == "source" else 24.0
-    if mode == "24-fast" and source_frames:
-        # Keep only real input frames.  Retime the nearest lower valid 8n+1 count
-        # to 24 fps instead of motion-interpolating or duplicating anything.
-        expected_frames = source_frames - ((source_frames - 1) % 8)
+    if not source_frames:
+        expected_frames = 0
+    elif mode in {"source", "24-fast"}:
+        # Keep every source frame here. Each individual LTX chunk is padded to 8n+1
+        # later, where the synthetic tail can be removed again during stitching.
+        expected_frames = source_frames
     else:
-        expected_frames = ltx_valid_frame_count(source_frames / source_fps, output_fps) if source_frames else 0
+        # Cadence conversion preserves the complete source duration. It deliberately
+        # does not round down to an LTX temporal length; chunk preparation owns that.
+        expected_frames = max(1, int(round((source_frames / source_fps) * output_fps)))
     if (mode == "source" or abs(source_fps - 24.0) < 0.01) and has_audio and source_frames == expected_frames:
         print(f"LTX 2.5 generation cadence: source {source_fps:g} fps", flush=True)
         return prepared
     fps_tag = f"{output_fps:g}".replace(".", "p") + ("_fast" if mode == "24-fast" else "")
     output = prepared.with_name(f"{prepared.stem}_ltx25_{fps_tag}fps.mkv")
     signature = {
-        "version": 4,
+        "version": 5,
         "tool": "outpaint_video.py/ltx25_fps",
         "source": root_relative(prepared),
         "source_fingerprint": file_fingerprint(prepared),
@@ -223,7 +227,7 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
     if mode == "24-fast":
         duration = expected_frames / output_fps if output_fps else 0.0
         print(
-            f"LTX 2.5 fast cadence: using {expected_frames} untouched source frames at 24 fps "
+            f"LTX 2.5 fast cadence: using all {expected_frames} untouched source frames at 24 fps "
             f"({duration:.3f}s); no interpolation or duplicate frames.",
             flush=True,
         )
@@ -261,8 +265,7 @@ def prepare_ltx25_frame_rate(ffmpeg: str, prepared: Path, mode: str, force: bool
     converted = probe_video(output)
     print(
         f"Wrote LTX 2.5 {output_fps:g} fps input: {output} "
-        f"({int(converted.get('frames') or 0)} frames; frame-count rule remainder "
-        f"{int(converted.get('frames') or 0) % 8})",
+        f"({int(converted.get('frames') or 0)} frames; every LTX chunk will be padded independently)",
         flush=True,
     )
     return output
@@ -1780,7 +1783,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
     return {
-        "version": 41,
+        "version": 42,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
         "prepared_fingerprint": file_fingerprint(prepared),
@@ -1912,6 +1915,12 @@ def ltx_valid_frame_count(seconds: float, fps: float) -> int:
     lower = max(1, ((requested - 1) // 8) * 8 + 1)
     upper = lower + 8
     return lower if requested - lower <= upper - requested else upper
+
+
+def ltx_padded_frame_count(frame_count: int) -> int:
+    """Round a real frame count upward to the next valid LTX length (8n + 1)."""
+    requested = max(1, int(frame_count))
+    return ((requested - 1 + 7) // 8) * 8 + 1
 
 
 def valid_final_chunk_start(total_frames: int, start: int, ranges: list[tuple[int, int, int]]) -> int:
@@ -2221,13 +2230,24 @@ def apply_qwen_seed_guides(args, prepared: Path, ranges: list[tuple[int, int, in
 
 
 def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int, end_frame: int, fps: float, force: bool, offset_x: int = 0, offset_y: int = 0, prepared_fingerprint: dict[str, Any] | None = None, intermediate_profile: str = "high") -> None:
+    real_frames = max(1, end_frame - start_frame)
+    generation_frames = ltx_padded_frame_count(real_frames)
+    padding_frames = generation_frames - real_frames
     has_audio = video_has_audio(ffmpeg, prepared)
     if chunk_path.exists() and not force and (prepared_fingerprint is None or split_matches_source(chunk_path, prepared_fingerprint)):
-        if not has_audio or video_has_audio(ffmpeg, chunk_path):
+        cached_frames = int(probe_video(chunk_path).get("frames") or 0)
+        if cached_frames == generation_frames and (not has_audio or video_has_audio(ffmpeg, chunk_path)):
             return
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
     partial = chunk_path.with_suffix(chunk_path.suffix + ".partial" + chunk_path.suffix)
     trim = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
+    if padding_frames:
+        trim += f",tpad=stop_mode=clone:stop={padding_frames},trim=end_frame={generation_frames}"
+        print(
+            f"Pad outpaint chunk frames {start_frame}-{end_frame}: {real_frames} real + "
+            f"{padding_frames} repeated final frame(s) = {generation_frames} (LTX 8n+1)",
+            flush=True,
+        )
     if offset_x or offset_y:
         info = probe_video(prepared)
         width = int(info["width"])
@@ -2249,7 +2269,13 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     if has_audio:
         start_seconds = start_frame / fps
         end_seconds = end_frame / fps
-        filters = f"[0:v]{vf}[v];[0:a:0]atrim=start={start_seconds:.8f}:end={end_seconds:.8f},asetpts=PTS-STARTPTS[a]"
+        audio_filter = f"atrim=start={start_seconds:.8f}:end={end_seconds:.8f},asetpts=PTS-STARTPTS"
+        if padding_frames:
+            audio_filter += (
+                f",apad=pad_dur={padding_frames / fps:.8f},"
+                f"atrim=duration={generation_frames / fps:.8f}"
+            )
+        filters = f"[0:v]{vf}[v];[0:a:0]{audio_filter}[a]"
         command.extend(["-filter_complex", filters, "-map", "[v]", "-map", "[a]"])
     else:
         command.extend(["-vf", vf, "-an"])
@@ -2258,7 +2284,7 @@ def split_chunk(ffmpeg: str, prepared: Path, chunk_path: Path, start_frame: int,
     # the temporal VAE then rounded down to 41.  Pin the video frame count and let
     # the already-trimmed audio stream carry its normal encoder padding instead.
     command.extend([
-        "-frames:v", str(max(1, end_frame - start_frame)),
+        "-frames:v", str(generation_frames),
         "-r", f"{fps:.8f}", "-fps_mode", "cfr",
         *intermediate_codec_args(intermediate_profile, fast=True),
     ])
@@ -2388,7 +2414,8 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
                 previous_piece = gap_piece
                 cursor = start_frame
             trim_start = max(0, cursor - start_frame)
-            available = max(0, raw_frames - trim_start)
+            needed = max(0, min(end_frame, total_frames) - cursor)
+            available = min(max(0, raw_frames - trim_start), needed)
             if available <= 0:
                 print(f"Skipping exhausted outpaint chunk {index + 1}: trim_start={trim_start}, raw_frames={raw_frames}", flush=True)
                 continue
@@ -2408,7 +2435,7 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             cursor = total_frames
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], check=True)
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"trim=end_frame={total_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-frames:v", str(total_frames), "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], check=True)
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 
@@ -2422,7 +2449,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="24",
         help=(
             "LTX 2.5 generation cadence. 24 motion-interpolates lower-rate input without changing duration; "
-            "24-fast retimes untouched source frames and trims to the nearest lower 8n+1 count."
+            "24-fast retimes every untouched source frame. Final LTX chunks are padded to 8n+1 and trimmed after generation."
         ),
     )
     parser.add_argument("--source", required=True)

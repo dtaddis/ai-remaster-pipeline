@@ -665,7 +665,7 @@ function drawOutpaint(st, s, expected, sp) {
         <div class="outpaint-mask-summary">
           <div>
             <h3>Custom Outpaint Mask</h3>
-            <p class="shot-empty">Paint extra areas for LTX to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically.</p>
+            <p class="shot-empty">Paint extra areas for LTX to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically; saved painted areas appear in coral on the preview.</p>
           </div>
           <div class="actions">
             <button type="button" onclick="openOutpaintMaskEditor()">${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? 'Edit' : 'Create'} Mask</button>
@@ -704,6 +704,7 @@ function drawOutpaint(st, s, expected, sp) {
 
   bindStageFields('outpaint');
   showCommand('outpaint');
+  hydrateOutpaintMaskPreview();
   hydratePendingOutpaintPreviews();
   hydratePendingGuidePreviews();
 }

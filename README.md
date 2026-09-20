@@ -186,7 +186,7 @@ When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps
 
 ### Stabilization
 
-Optional and off by default. Stabilization uses FFmpeg's two-pass libvidstab filters to estimate and correct translation and rotation. ARP first detects shot boundaries with the same detector used by Reference Generation, then analyses every shot independently so cuts and dissolves are not interpreted as camera movement. An existing user-reviewed shot manifest takes precedence when available. Smoothing, maximum translation/rotation, fixed safety zoom, and shot sensitivity are adjustable; ARP does not use automatic zoom, so framing cannot pulse or silently crop much more than requested. FFV1 is the default mathematically lossless intermediate; ProRes HQ is available for editing workflows. Stabilization runs after Clean Up and before Outpainting or Colorization.
+Optional and off by default. Stabilization uses FFmpeg's two-pass libvidstab filters to estimate and correct translation and rotation. ARP first detects shot boundaries with the same detector used by Reference Generation, then analyses every shot independently so cuts and dissolves are not interpreted as camera movement. An existing user-reviewed shot manifest takes precedence when available. Smoothing, maximum translation/rotation, fixed safety zoom, and shot sensitivity are adjustable; ARP does not use automatic zoom, so framing cannot pulse or silently crop much more than requested. Stabilized masters inherit the global Intermediate Stage Video profile from Settings. Stabilization runs after Clean Up and before Outpainting or Colorization.
 
 ### Outpainting
 

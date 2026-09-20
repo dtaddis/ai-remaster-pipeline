@@ -114,6 +114,7 @@ function renderSignature() {
     source_info: state.source_info,
     source_monochrome: state.source_monochrome,
     aspect_preview: state.aspect_preview,
+    custom_outpaint_mask: state.custom_outpaint_mask,
     shot_views: state.shot_views,
     outpaint_chunks: state.outpaint_chunks,
     audio_stems: state.audio_stems,

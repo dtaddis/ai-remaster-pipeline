@@ -3,8 +3,7 @@
 
 The source is divided at detected shot boundaries before motion analysis.  Each shot gets its own
 transform file, preventing a cut or dissolve from being interpreted as camera movement.  The
-intermediate and default output codec is FFV1 so this early pipeline phase does not add another
-lossy H.264 generation.
+intermediate codec follows ARP's global Intermediate Stage Video setting.
 """
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ import artifact_ids as aid
 from common import ROOT, file_fingerprint, find_ffmpeg, resolve_path, resumable_output, root_relative, write_signature
 from generate_references import build_parser as shot_parser
 from generate_references import detect_shots, probe_video, sample_video
+from intermediate_video import canonical_profile, codec_args as intermediate_codec_args, container_args
 
 
 DEFAULT_OUTPUT_ROOT = ROOT / "intermediate" / "stabilized"
@@ -41,14 +41,13 @@ def stabilization_identity(source: Path, args: argparse.Namespace) -> dict[str, 
         shot_threshold=float(args.shot_threshold),
         min_shot_seconds=float(args.min_shot_seconds),
         scene_aware=not bool(args.single_shot),
-        encoder=str(args.encoder),
+        intermediate_profile=canonical_profile(args.intermediate_profile),
     )
 
 
 def default_output(source: Path, args: argparse.Namespace) -> Path:
-    extension = "mov" if args.encoder == "prores" else "mkv"
     return DEFAULT_OUTPUT_ROOT / aid.artifact_name(
-        aid.source_word(source.name), "stabilized", stabilization_identity(source, args), extension
+        aid.source_word(source.name), "stabilized", stabilization_identity(source, args), "mkv"
     )
 
 
@@ -121,11 +120,9 @@ def run(command: list[str], *, cwd: Path, label: str) -> None:
         raise RuntimeError(f"{label} failed with exit code {result.returncode}.")
 
 
-def encoder_args(encoder: str, pix_fmt: str) -> list[str]:
-    if encoder == "prores":
-        return ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]
-    args = ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1", "-g", "1"]
-    if pix_fmt:
+def encoder_args(profile: str, pix_fmt: str) -> list[str]:
+    args = intermediate_codec_args(profile)
+    if canonical_profile(profile) == "lossless" and pix_fmt:
         args.extend(["-pix_fmt", pix_fmt])
     return args
 
@@ -217,7 +214,7 @@ def stabilize_shot(
     frames = max(1, end - start)
     smoothing = min(max(1, int(args.smoothing)), max(1, (frames - 1) // 2))
     transform_name = f"shot_{index:04d}.trf"
-    chunk = work_dir / f"shot_{index:04d}.{'mov' if args.encoder == 'prores' else 'mkv'}"
+    chunk = work_dir / f"shot_{index:04d}.mkv"
     trim = f"trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS,format={pix_fmt}"
     detect = (
         f"{trim},vidstabdetect=result='{filter_path(transform_name)}':"
@@ -241,7 +238,8 @@ def stabilize_shot(
     motion_report.unlink(missing_ok=True)
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(source), "-map", "0:v:0", "-vf", transform,
-        "-an", "-fps_mode", "cfr", "-r", f"{fps:.10f}", *encoder_args(args.encoder, pix_fmt), str(chunk),
+        "-an", "-fps_mode", "cfr", "-r", f"{fps:.10f}",
+        *encoder_args(args.intermediate_profile, pix_fmt), *container_args(str(chunk), args.intermediate_profile), str(chunk),
     ]
     run(command, cwd=work_dir, label=f"Shot {index + 1}: stabilizing {frames} frames")
     unreliable = unreliable_motion_report(motion_report, frames)
@@ -256,7 +254,8 @@ def stabilize_shot(
             [
                 ffmpeg, "-hide_banner", "-y", "-i", str(source), "-map", "0:v:0", "-vf", passthrough,
                 "-an", "-fps_mode", "cfr", "-r", f"{fps:.10f}",
-                *encoder_args(args.encoder, pix_fmt), str(chunk),
+                *encoder_args(args.intermediate_profile, pix_fmt),
+                *container_args(str(chunk), args.intermediate_profile), str(chunk),
             ],
             cwd=work_dir,
             label=f"Shot {index + 1}: writing safe unstabilized fallback",
@@ -327,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shot-threshold", type=float, default=0.075, help="Shot detector sensitivity threshold.")
     parser.add_argument("--min-shot-seconds", type=float, default=1.0, help="Minimum detected shot length.")
     parser.add_argument("--single-shot", action="store_true", help="Treat the entire clip as one continuous camera move and do not reset stabilization at detected cuts.")
-    parser.add_argument("--encoder", choices=("ffv1", "prores"), default="ffv1")
+    parser.add_argument("--intermediate-profile", choices=("low", "medium", "high", "lossless"), default="high")
     parser.add_argument("--shot-manifest", type=Path, help="Optional user-reviewed reference manifest whose frame spans override automatic detection.")
     parser.add_argument("--ffmpeg")
     parser.add_argument("--force", action="store_true")
@@ -380,7 +379,7 @@ def main_with_args(args: argparse.Namespace) -> int:
 
     ffmpeg = find_ffmpeg(args.ffmpeg)
     streams = probe_streams(ffmpeg, source)
-    pix_fmt = "yuv422p10le" if args.encoder == "prores" else stabilization_pix_fmt(streams["pix_fmt"])
+    pix_fmt = stabilization_pix_fmt(streams["pix_fmt"])
     cache_root = ROOT / ".cache" / "stabilize"
     cache_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"{aid.source_word(source.name)}_", dir=cache_root) as temp_text:

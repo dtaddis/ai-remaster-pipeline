@@ -29,8 +29,9 @@ venv/
 !/output/**/
 !/output/**/.gitkeep
 
-# Generated local manifests
-/manifests/**/*.csv
+# Generated local manifests and project-owned masks
+/manifests/**
+!/manifests/**/
 !/manifests/**/.gitkeep
 
 # Signatures, ledgers, temp files
