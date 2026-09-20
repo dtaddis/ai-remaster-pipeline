@@ -2202,8 +2202,77 @@ class GuiSmokeTests(unittest.TestCase):
         )
 
         self.assertIn("[2:v]scale=1920:1080:flags=neighbor", graph)
-        self.assertIn("alphaextract", graph)
-        self.assertIn("alphamerge[srcmasked]", graph)
+        # The custom mask multiplies into the source alpha before it is merged, so the
+        # masked-out regions stay transparent and the generated pixels below show through.
+        self.assertIn("[srcalphamask][customkeep]blend=all_mode=multiply[srcalphacustom]", graph)
+        self.assertIn("[srcrgba][srcalphacustom]alphamerge[srcm]", graph)
+        # The alpha is built as its own stream; the source is never split and
+        # re-alphaextracted per frame just to reach it.
+        self.assertNotIn("alphaextract", graph)
+
+    def test_recomposition_progress_tracks_the_ffmpeg_frame_counter(self) -> None:
+        from ai_remaster_gui.process_utils import recomp_progress
+
+        # The composite is one long ffmpeg pass, so the bar is driven by the frame
+        # count the script announces plus ffmpeg's own running counter.
+        log = "\n".join([
+            "Composite frames: 175 at 25.000000 fps",
+            "frame=   13 fps=0.0 q=-0.0 size=N/A time=00:00:00.52",
+            "frame=   96 fps= 28 q=-0.0 size=N/A time=00:00:03.84",
+        ])
+        self.assertEqual(recomp_progress(log), {"current": 96, "total": 175})
+
+        # ffmpeg writes status updates with carriage returns, so several can land on
+        # one line: take the furthest along, not the first.
+        packed = "Composite frames: 175 at 25 fps\nframe=  10 q=1 frame=  99 q=1 frame= 140 q=2"
+        self.assertEqual(recomp_progress(packed), {"current": 140, "total": 175})
+
+        self.assertEqual(recomp_progress("nothing yet"), {"current": 0, "total": 0})
+
+    def test_recomposition_custom_mask_input_is_never_looped(self) -> None:
+        # -loop 1 on the mask makes it an endless input, so blend's frame sync keeps
+        # producing frames after the video ends and the encode never terminates: a 7s
+        # clip grew past 500MB. -shortest cannot bound it when the source is silent.
+        inputs, audio_input = final_composite.input_args(
+            Path("outpainted.mp4"), Path("source.mp4"), None, Path("mask.png"),
+        )
+
+        self.assertNotIn("-loop", inputs)
+        self.assertEqual(inputs.count("-i"), 3)
+        self.assertEqual(inputs[-1], "mask.png")
+        self.assertEqual(audio_input, "1:a?")
+
+    def test_recomposition_alpha_avoids_per_frame_geq_when_matte_is_static(self) -> None:
+        args = final_composite.build_parser().parse_args([
+            "--outpainted", "outpainted.mp4", "--source", "source.mp4",
+            "--output", "output.mp4",
+            "--output-width", "1920", "--output-height", "1080",
+        ])
+        graph = final_composite.build_filter(
+            args, False, 24.0, True, (1440, 1080), (1920, 1080), [],
+        )
+
+        # A feather-only matte depends on X/Y alone, so geq runs once on a still frame
+        # that alphamerge reuses, instead of once per pixel per plane per frame.
+        self.assertIn("trim=end_frame=1,format=gray,geq=lum=", graph)
+        self.assertNotIn("geq=r=", graph)
+
+    def test_recomposition_black_matte_runs_on_a_single_luma_plane(self) -> None:
+        args = final_composite.build_parser().parse_args([
+            "--outpainted", "outpainted.mp4", "--source", "source.mp4",
+            "--output", "output.mp4", "--source-black-transparent",
+            "--source-black-threshold", "12",
+            "--output-width", "1920", "--output-height", "1080",
+        ])
+        graph = final_composite.build_filter(
+            args, False, 24.0, True, (1440, 1080), (1920, 1080), [],
+        )
+
+        # max(r,g,b) is folded down by native filters first, so the content-dependent
+        # matte walks one plane sampling lum() rather than four sampling r()/g()/b().
+        self.assertIn("blend=all_mode=lighten", graph)
+        self.assertIn("lum(", graph)
+        self.assertNotIn("geq=r=", graph)
 
     def test_ltx25_blend_protects_with_clean_frames_not_the_green_sentinel(self) -> None:
         # LTXVLaplacianPyramidBlend mixes a Gaussian pyramid of image_b at every scale, so

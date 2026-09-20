@@ -71,6 +71,7 @@ from .process_utils import (
     install_progress_status,
     outpaint_chunk_progress,
     outpaint_eta_label,
+    recomp_progress,
     upscale_chunk_progress,
     terminate_process_tree,
 )
@@ -397,6 +398,11 @@ class PipelineApp:
         self.running_reference_manifest = ""
         self.running_reference_index: int | None = None
         self.run_started_at = 0.0
+        # The composite's frame count is announced once, before thousands of ffmpeg
+        # status lines push it out of the log window the estimator reads, so remember
+        # it for the rest of the run.
+        self.recomp_total_frames = 0
+        self.recomp_progress_run = 0.0
         self.lock = threading.Lock()
         self.source_analysis_lock = threading.Lock()
         self.source_analysis_status: dict[str, dict[str, str | int | bool]] = {}
@@ -781,10 +787,20 @@ class PipelineApp:
                 percent = max(percent, min(35, 30 + int(install_percent * 0.05)))
                 label = f"Installing model {install_percent}%"
         elif self.running_stage_key == "recomp":
+            label = "Compositing"
+            if self.recomp_progress_run != self.run_started_at:
+                self.recomp_progress_run = self.run_started_at
+                self.recomp_total_frames = 0
+            composite = recomp_progress(log_text)
+            if composite["total"]:
+                self.recomp_total_frames = composite["total"]
+            total = self.recomp_total_frames
+            if total and composite["current"]:
+                current = min(composite["current"], total)
+                percent = max(percent, min(99, 5 + int((current / total) * 94)))
+                label = f"Compositing frame {current}/{total}"
             if "wrote composite" in lower:
                 percent, label = 100, "Composite written"
-            else:
-                label = "Compositing"
         elif self.running_stage_key == "audio":
             label = "Creating audio track"
             milestones = [

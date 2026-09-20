@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
+
+FFMPEG_FRAME_PATTERN = re.compile(r"frame=\s*(\d+)")
 
 
 def first_int_after(text: str, marker: str) -> int:
@@ -92,6 +95,24 @@ def outpaint_chunk_progress(text: str) -> dict[str, int]:
     if total:
         current = max(1, min(total, current or min(done + 1, total)))
     return {"done": done, "current": current, "total": total}
+
+
+def recomp_progress(text: str) -> dict[str, int]:
+    """Track the composite, which is one long ffmpeg pass with no chunk milestones.
+
+    final_composite.py announces the frame count it is working towards before the
+    encode starts; ffmpeg's own status lines carry the running count on the same
+    stream. Status updates are written with carriage returns, so several can share
+    a line -- take the highest count seen rather than the first.
+    """
+    total = first_int_after(text, "Composite frames: ")
+    current = 0
+    for match in FFMPEG_FRAME_PATTERN.finditer(text):
+        try:
+            current = max(current, int(match.group(1)))
+        except ValueError:
+            pass
+    return {"current": current, "total": total}
 
 
 def upscale_chunk_progress(text: str) -> dict[str, int]:

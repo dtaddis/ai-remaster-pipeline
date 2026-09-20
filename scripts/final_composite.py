@@ -39,7 +39,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 12
+    values['version'] = 13
     return values
 
 
@@ -87,6 +87,20 @@ def probe_fps(ffmpeg: str, source: Path) -> float:
         return 24.0
 
 
+def probe_duration(ffmpeg: str, source: Path) -> float:
+    ffprobe = Path(ffmpeg).with_name("ffprobe.exe") if Path(ffmpeg).suffix.lower() == ".exe" else Path("ffprobe")
+    try:
+        result = subprocess.run(
+            [str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return max(0.0, float(json.loads(result.stdout).get("format", {}).get("duration") or 0.0))
+    except Exception:
+        return 0.0
+
+
 def probe_dimensions(ffmpeg: str, source: Path) -> tuple[int, int]:
     ffprobe = Path(ffmpeg).with_name("ffprobe.exe") if Path(ffmpeg).suffix.lower() == ".exe" else Path("ffprobe")
     result = subprocess.run(
@@ -126,7 +140,17 @@ def source_rgb_max_expr(x_expr: str = "X", y_expr: str = "Y") -> str:
     return f"max(max(r({x_expr},{y_expr}),g({x_expr},{y_expr})),b({x_expr},{y_expr}))"
 
 
-def source_black_matte_expr(threshold: int, shrink: int) -> str:
+def source_luma_max_expr(x_expr: str = "X", y_expr: str = "Y") -> str:
+    """Sample a gray plane that already holds max(r,g,b) for every pixel.
+
+    Folding the three channels down with native filters first lets the matte run
+    as a one-plane expression instead of an rgba one, which is the difference
+    between three pixel fetches per sample and one.
+    """
+    return f"lum({x_expr},{y_expr})"
+
+
+def source_black_matte_expr(threshold: int, shrink: int, sampler=source_rgb_max_expr) -> str:
     radius = max(0, min(8, int(shrink)))
     offsets = [(0, 0)]
     if radius:
@@ -144,11 +168,11 @@ def source_black_matte_expr(threshold: int, shrink: int) -> str:
     for dx, dy in offsets:
         x = "X" if dx == 0 else f"min(max(X{dx:+d},0),W-1)"
         y = "Y" if dy == 0 else f"min(max(Y{dy:+d},0),H-1)"
-        samples.append(source_rgb_max_expr(x, y))
+        samples.append(sampler(x, y))
     return f"lte({nested_expr('min', samples)},{threshold})"
 
 
-def source_alpha_expr(args, feather: int, *, horizontal: bool, vertical: bool) -> str:
+def source_alpha_expr(args, feather: int, *, horizontal: bool, vertical: bool, sampler=source_rgb_max_expr) -> str:
     edge_alphas = []
     if horizontal:
         edge_alphas.append(
@@ -165,7 +189,7 @@ def source_alpha_expr(args, feather: int, *, horizontal: bool, vertical: bool) -
         return edge_alpha
     threshold = max(0, min(255, int(getattr(args, "source_black_threshold", 24))))
     shrink = max(0, min(8, int(getattr(args, "source_black_matte_shrink_pixels", 2))))
-    return f"if({source_black_matte_expr(threshold, shrink)},0,{edge_alpha})"
+    return f"if({source_black_matte_expr(threshold, shrink, sampler)},0,{edge_alpha})"
 
 
 def normalized_percent(value: float, default: float = 1.0) -> float:
@@ -221,6 +245,40 @@ def append_reference_luminance_filter(filters: list[str], input_label: str, plan
     return 'lumamerged'
 
 
+def append_source_alpha_mask(filters: list[str], args, feather: int, *, horizontal: bool, vertical: bool, width: int, height: int, source_label: str) -> tuple[str, str]:
+    """Build the source overlay's alpha as its own gray stream.
+
+    Computing the alpha inside an rgba geq costs one interpreted expression per
+    pixel per plane for every frame, which dominates the whole composite. Two
+    cheaper shapes replace it:
+
+    * The feather ramp depends only on X/Y, so it is evaluated once on a still
+      frame and reused for the clip by alphamerge's frame sync. The still needs
+      its own source -- a one-frame branch taken off a split of the source
+      stream loses a frame at the head of the clip.
+    * The black-region matte does depend on picture content, but its per-sample
+      max(r,g,b) can be folded down by native filters first, leaving geq a
+      single plane to walk instead of four.
+
+    Returns the labels of the colour stream and of the gray alpha mask.
+    """
+    if getattr(args, 'source_black_transparent', False):
+        expr = source_alpha_expr(args, feather, horizontal=horizontal, vertical=vertical, sampler=source_luma_max_expr)
+        filters.extend([
+            f'[{source_label}]split[srcrgb][srckey]',
+            '[srckey]format=gbrp,extractplanes=g+b+r[srckeyg][srckeyb][srckeyr]',
+            '[srckeyg][srckeyb]blend=all_mode=lighten[srckeygb]',
+            '[srckeygb][srckeyr]blend=all_mode=lighten,format=gray[srcluma]',
+            f"[srcluma]geq=lum='{expr}'[srcalphamask]",
+        ])
+        return 'srcrgb', 'srcalphamask'
+    expr = source_alpha_expr(args, feather, horizontal=horizontal, vertical=vertical)
+    filters.append(
+        f"color=c=black:s={width}x{height}:d=1,trim=end_frame=1,format=gray,geq=lum='{expr}'[srcalphamask]"
+    )
+    return source_label, 'srcalphamask'
+
+
 def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
@@ -244,19 +302,28 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}scale={placement.width}:{placement.height}:flags=lanczos,setsar=1[src]',
-                f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather, horizontal=feather_horizontal, vertical=feather_vertical)}'[srcm]",
             ]
-            source_label = 'srcm'
+            rgb_label, alpha_label = append_source_alpha_mask(
+                filters,
+                args,
+                feather,
+                horizontal=feather_horizontal,
+                vertical=feather_vertical,
+                width=placement.width,
+                height=placement.height,
+                source_label='src',
+            )
             if custom_mask_input is not None:
+                # Fold the custom mask into the alpha before it is merged, so the
+                # source never has to be split and re-alphaextracted per frame.
                 filters.extend([
                     f'[{custom_mask_input}:v]scale={base_size[0]}:{base_size[1]}:flags=neighbor,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray,negate[customkeep]',
-                    '[srcm]split[srcmc][srcma0]',
-                    '[srcma0]alphaextract[srcalpha]',
-                    '[srcalpha][customkeep]blend=all_mode=multiply[srcalphacustom]',
-                    '[srcmc][srcalphacustom]alphamerge[srcmasked]',
+                    f'[{alpha_label}][customkeep]blend=all_mode=multiply[srcalphacustom]',
                 ])
-                source_label = 'srcmasked'
-            filters.append(f'[base][{source_label}]overlay=x={placement.x}:y={placement.y}[merged]')
+                alpha_label = 'srcalphacustom'
+            filters.append(f'[{rgb_label}]format=rgba[srcrgba]')
+            filters.append(f'[srcrgba][{alpha_label}]alphamerge[srcm]')
+            filters.append(f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]')
         else:
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
@@ -294,6 +361,30 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     return ';'.join(filters)
 
 
+def input_args(outpainted: Path | None, source: Path, colorized: Path | None, custom_mask: Path | None) -> tuple[list[str], str]:
+    """Build ffmpeg's input list for the composite, plus the audio stream to map.
+
+    The custom mask is a single still frame and is deliberately not passed with
+    -loop 1. An endless image input keeps blend's frame sync emitting frames long
+    after the video streams have ended, so the encode never terminates and the
+    output file grows without bound -- and -shortest cannot rescue it when the
+    source carries no audio track to bound the output against. Frame sync already
+    repeats the last mask frame for every video frame, which is what we want.
+    """
+    inputs: list[str] = []
+    if outpainted:
+        inputs += ['-i', str(outpainted), '-i', str(source)]
+        audio_input = '1:a?'
+    else:
+        inputs += ['-i', str(source)]
+        audio_input = '0:a?'
+    if colorized:
+        inputs += ['-i', str(colorized)]
+    if custom_mask:
+        inputs += ['-i', str(custom_mask)]
+    return inputs, audio_input
+
+
 def run(args):
     outpainted = resolve_path(args.outpainted) if args.outpainted else None
     source = resolve_path(args.source)
@@ -320,16 +411,8 @@ def run(args):
     if outpainted:
         base_size = (int(args.output_width), int(args.output_height)) if args.output_width and args.output_height else probe_dimensions(ffmpeg, outpainted)
     cmd = [ffmpeg, '-y']
-    if outpainted:
-        cmd += ['-i', str(outpainted), '-i', str(source)]
-        audio_input = '1:a?'
-    else:
-        cmd += ['-i', str(source)]
-        audio_input = '0:a?'
-    if colorized:
-        cmd += ['-i', str(colorized)]
-    if args.custom_mask:
-        cmd += ['-loop', '1', '-i', str(resolve_path(args.custom_mask))]
+    inputs, audio_input = input_args(outpainted, source, colorized, resolve_path(args.custom_mask) if args.custom_mask else None)
+    cmd += inputs
     cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
@@ -341,6 +424,12 @@ def run(args):
     print(' '.join(cmd))
     if args.dry_run:
         return 0
+    # The composite is one long ffmpeg pass with no natural milestones, so publish the
+    # frame count the encode is working towards. ARP pairs it with ffmpeg's own
+    # "frame=" counter to drive the Recomposition progress bar.
+    duration = probe_duration(ffmpeg, outpainted or source)
+    if duration > 0:
+        print(f'Composite frames: {max(1, int(round(duration * fps)))} at {fps:.6f} fps', flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(cmd, check=True)
     replace_with_retry(partial, output)
