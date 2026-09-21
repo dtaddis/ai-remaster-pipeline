@@ -10,7 +10,7 @@ from .config import IMAGE_EXTS, ROOT, VIDEO_EXTS
 from . import state
 from .manifests import read_manifest, read_outpaint_chunk_rows
 from .paths import resolve, resolve_video_source, safe_stem
-from .runtime_settings import default_settings, load_settings
+from .runtime_settings import default_settings, load_settings, normalize_settings
 from .cloud import SECRET_SETTING_KEYS
 
 PROJECT_SCHEMA_VERSION = 2
@@ -107,7 +107,7 @@ def load_project_payload(data: dict) -> dict[str, dict[str, str]]:
     if not loaded.get("global", {}).get("source"):
         loaded.setdefault("global", {})["expand_outpaint"] = "true"
     loaded.setdefault("global", {}).setdefault("upscale", "false")
-    return loaded
+    return normalize_settings(loaded, include_newest_source=False)
 
 def project_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
     candidates: list[str] = []

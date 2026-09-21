@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import signal
@@ -116,13 +117,37 @@ def recomp_progress(text: str) -> dict[str, int]:
 
 
 def upscale_chunk_progress(text: str) -> dict[str, int]:
-    done = count_lines_matching(text, ("Wrote upscaled chunk", "Reuse upscaled chunk"))
+    done = count_lines_matching(
+        text,
+        (
+            "Wrote upscaled chunk",
+            "Reuse upscaled chunk",
+            "Wrote LTX 2.5 upscaled chunk",
+            "Reuse LTX 2.5 upscaled chunk",
+            "Reuse LTX 2.5 chunk from compatible cache",
+        ),
+    )
     total = 0
     current = 0
+    active_percent = 0
+    active_value = 0
+    active_total = 0
     for line in text.splitlines():
         marker = "Upscale chunk "
         if marker not in line:
+            progress_marker = "ComfyUI upscale pass:"
+            if progress_marker in line and "%" in line:
+                try:
+                    value_text, total_text = line.split(progress_marker, 1)[1].strip().split(None, 1)[0].split("/", 1)
+                    active_value = int(float(value_text))
+                    active_total = int(float(total_text))
+                    active_percent = max(0, min(100, int(line.rsplit("(", 1)[1].split("%", 1)[0])))
+                except (IndexError, ValueError):
+                    pass
             continue
+        active_percent = 0
+        active_value = 0
+        active_total = 0
         tail = line.split(marker, 1)[1].split(":", 1)[0]
         if "/" not in tail:
             continue
@@ -134,7 +159,25 @@ def upscale_chunk_progress(text: str) -> dict[str, int]:
             pass
     if total:
         current = max(1, min(total, current or min(done + 1, total)))
-    return {"done": done, "current": current, "total": total}
+    return {
+        "done": done,
+        "current": current,
+        "total": total,
+        "active_percent": active_percent,
+        "active_value": active_value,
+        "active_total": active_total,
+    }
+
+
+def spatial_tile_grid(width: int, height: int, tile_size: int, overlap: int) -> tuple[int, int]:
+    """Return the number of overlapping spatial tiles needed to cover a frame."""
+    tile = max(1, int(tile_size))
+    step = max(1, tile - max(0, min(int(overlap), tile - 1)))
+
+    def count(length: int) -> int:
+        return max(1, 1 + math.ceil((max(1, int(length)) - tile) / step))
+
+    return count(width), count(height)
 
 
 def outpaint_eta_label(elapsed: float, done: int, current: int, total: int) -> str:

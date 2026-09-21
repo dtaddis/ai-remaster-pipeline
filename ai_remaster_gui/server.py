@@ -72,6 +72,7 @@ from .process_utils import (
     outpaint_chunk_progress,
     outpaint_eta_label,
     recomp_progress,
+    spatial_tile_grid,
     upscale_chunk_progress,
     terminate_process_tree,
 )
@@ -157,7 +158,7 @@ from .outpaint_guides import (
     bind_context as bind_outpaint_guides_context,
 )
 from .cache import cache_state, delete_cache_category, delete_cache_file, human_size
-from .runtime_settings import APP_VERSION, default_qwen_workflow, default_settings, load_settings, qwen_masked_workflow_for, qwen_workflow_for
+from .runtime_settings import APP_VERSION, canonical_intermediate_profile, default_qwen_workflow, default_settings, load_settings, qwen_masked_workflow_for, qwen_workflow_for
 from .system_status import flashvsr_hardware_warning, system_status
 from .media import (
     aspect_preview,
@@ -829,6 +830,17 @@ class PipelineApp:
                 percent = max(percent, min(22, 17 + int(install_percent * 0.05)))
                 label = f"Installing audio model {install_percent}%"
         elif self.running_stage_key == "upscale":
+            # Keep the full current upscale run in view. Long FFmpeg/ComfyUI output can push the
+            # original chunk plan outside the generic 300-line window, while older upscale runs
+            # must not contribute completed chunks to this one.
+            upscale_log = "\n".join(self.log)
+            start = max(
+                upscale_log.rfind("scripts\\upscale_video.py"),
+                upscale_log.rfind("scripts/upscale_video.py"),
+            )
+            if start >= 0:
+                upscale_log = upscale_log[start:]
+            upscale_lower = upscale_log.lower()
             label = "Upscaling"
             milestones = [
                 ("splitting upscaling into", 8, "Splitting into chunks"),
@@ -844,21 +856,56 @@ class PipelineApp:
                 ("reuse upscaled video", 100, "Upscaled video ready"),
             ]
             for token, value, text in milestones:
-                if token in lower and value >= percent:
+                if token in upscale_lower and value >= percent:
                     percent, label = value, text
-            chunk = upscale_chunk_progress(log_text)
+            chunk = upscale_chunk_progress(upscale_log)
             if chunk["total"] and percent < 100:
-                rendering = chunk["current"] > chunk["done"] and ("queued comfyui prompt" in lower or "sending prompt nodes" in lower)
-                active_fraction = 0.5 if rendering else 0.2 if chunk["current"] > chunk["done"] else 0.0
+                rendering = chunk["current"] > chunk["done"] and ("queued comfyui prompt" in upscale_lower or "sending prompt nodes" in upscale_lower)
+                # A finite chunk plan is more trustworthy than the elapsed-time fallback. The old
+                # max() made any run longer than a few minutes jump to 90%, even on its first chunk.
+                # Credit completed chunks plus live tile/node progress from ComfyUI. Keep a small
+                # active minimum for older servers where that finer-grained signal is unavailable.
+                reported_fraction = chunk.get("active_percent", 0) / 100.0
+                active_fraction = max(0.08, reported_fraction) if rendering else 0.02 if chunk["current"] > chunk["done"] else 0.0
                 chunk_fraction = min(1.0, (chunk["done"] + active_fraction) / chunk["total"])
-                percent = max(percent, min(95, 10 + int(chunk_fraction * 85)))
+                percent = min(94, 10 + int(chunk_fraction * 84))
                 eta = outpaint_eta_label(elapsed, chunk["done"], chunk["current"], chunk["total"])
+                values = self.settings.get("upscale", {})
+                active_note = ""
+                if chunk.get("active_total", 0):
+                    active_note = f"; live pass {chunk['active_value']}/{chunk['active_total']}"
+                tile_note = active_note
+                try:
+                    method = values.get("method", "flashvsr")
+                    if method == "flashvsr" and is_true(values, "flashvsr_tiled_dit", "true"):
+                        columns, rows = spatial_tile_grid(
+                            int(values.get("target_width", "0") or 0),
+                            int(values.get("target_height", "0") or 0),
+                            int(values.get("flashvsr_tile_size", "256") or 256),
+                            int(values.get("flashvsr_tile_overlap", "24") or 24),
+                        )
+                        tile_note += f"; {columns}x{rows} spatial tiles/pass"
+                    elif method == "seedvr2" and is_true(values, "seedvr2_tiled_vae", "true"):
+                        columns, rows = spatial_tile_grid(
+                            int(values.get("target_width", "0") or 0),
+                            int(values.get("target_height", "0") or 0),
+                            int(values.get("seedvr2_vae_tile_size", "512") or 512),
+                            int(values.get("seedvr2_vae_tile_overlap", "64") or 64),
+                        )
+                        tile_note += f"; {columns}x{rows} VAE tiles/pass"
+                except (TypeError, ValueError):
+                    tile_note = ""
                 if chunk["done"] >= chunk["total"]:
-                    label = "Upscale chunks complete, stitching"
+                    percent = 94
+                    label = "Upscale chunks complete, preparing stitch"
+                    if "stitching upscaled chunks" in upscale_lower:
+                        percent, label = 96, "Upscale chunks complete, stitching"
+                    if "muxing original audio" in upscale_lower:
+                        percent, label = 98, "Muxing original audio"
                 elif rendering:
-                    label = f"Upscale chunk {chunk['current']}/{chunk['total']} rendering in ComfyUI ({chunk['done']} done){eta}"
+                    label = f"Upscale chunk {chunk['current']}/{chunk['total']} rendering in ComfyUI ({chunk['done']} done{tile_note}){eta}"
                 else:
-                    label = f"Upscale chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done){eta}"
+                    label = f"Upscale chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done{tile_note}){eta}"
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
     def state(self, view: str = "", generate_shot_previews: bool = True) -> dict:
@@ -1444,7 +1491,7 @@ class PipelineApp:
         source = pipeline_source_text(self.settings)
         output = cleanup_output_for(source, values) if source else ""
         cmd = [sys.executable, "-u", str(SCRIPTS / "cleanup_video.py"), "--source", source, "--output", output]
-        cmd.extend(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
+        cmd.extend(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
         if is_true(values, "ai_descratch"):
             cmd.append("--ai-descratch")
             if is_true(values, "save_scratch_mask", "true"):
@@ -1468,7 +1515,7 @@ class PipelineApp:
 
     def _stabilize_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
         source = self.cleaned_source_for_downstream()
-        intermediate_profile = self.settings.get("cloud", {}).get("intermediate_format", "high")
+        intermediate_profile = canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))
         output = stabilize_output_for(source, values, intermediate_profile) if source else ""
         cmd = [sys.executable, "-u", str(SCRIPTS / "stabilize_video.py"), "--source", source, "--output", output]
         cmd.extend(["--intermediate-profile", intermediate_profile])
@@ -1496,7 +1543,7 @@ class PipelineApp:
         add(["--offset-y", str(outpaint_offset_value(values.get("offset_y", "0")))])
         add(["--chunk-seconds", values.get("chunk_seconds", "20")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
-        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
+        add(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
         add(["--generation-mask-overlap", values.get("generation_mask_overlap", "8")])
         add(["--mask-blend-dilation", values.get("mask_blend_dilation", "2")])
         add(["--black-mask-threshold", values.get("black_mask_threshold", "12")])
@@ -1607,7 +1654,7 @@ class PipelineApp:
         if output:
             add(["--output", output])
         add(["--processing-height", values.get("processing_height", "source")])
-        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
+        add(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
         add(["--crf", values.get("crf", "18")])
         if method == "openai":
             reference_settings = self.settings.get("references", {})
@@ -2047,7 +2094,7 @@ class PipelineApp:
         add(["--input", source])
         add(["--target-width", str(values.get("target_width", "3840")), "--target-height", str(values.get("target_height", "2160"))])
         add(["--output", output])
-        add(["--intermediate-profile", self.settings.get("cloud", {}).get("intermediate_format", "high")])
+        add(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])

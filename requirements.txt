@@ -8,3 +8,4 @@ sam2
 scikit-image
 einops
 tqdm
+websockets

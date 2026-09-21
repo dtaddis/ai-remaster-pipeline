@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt, wait_for_comfy, wait_for_prompt
+from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt_with_progress, wait_for_comfy
 from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
 from dependency_manager import (
     LTX25_GGUF_MODEL,
@@ -39,7 +39,7 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
     "text, compression artifacts, film damage, dust, scratches"
 )
-from intermediate_video import codec_args as intermediate_codec_args, container_args
+from intermediate_video import codec_args as intermediate_codec_args, container_args, migrate_profile_name
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25"}
 DEFAULT_SEEDVR2_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
@@ -305,7 +305,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shot-manifest", default="", help="Optional shot CSV containing per-row upscale_strength plus fade_to_next/crossfade_seconds tween metadata.")
     parser.add_argument("--fps", type=float, default=0.0)
     parser.add_argument("--ffmpeg", default="")
-    parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
+    parser.add_argument(
+        "--intermediate-profile",
+        type=migrate_profile_name,
+        choices=["low", "medium", "high", "lossless"],
+        default="high",
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -533,9 +538,7 @@ def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_w
     fps = args.fps or float(video_info(source)["fps"])
     prefix = f"arp_upscale/{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}"
     prompt = flashvsr_prompt(video_name, fps, args, prefix, info)
-    prompt_id = queue_prompt(args.comfy_url, prompt)
-    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    history = queue_prompt_with_progress(args.comfy_url, prompt, args.poll_seconds, {"3"})
     produced = newest_comfy_output(extract_output_files(history, comfy_output_root), {".mp4", ".mov", ".mkv", ".webm"}, "FlashVSR video")
     partial.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(produced, partial)
@@ -745,9 +748,7 @@ def seedvr2_run(args: argparse.Namespace, source: Path, partial: Path, output_wi
     prefix = f"arp_upscale/{safe_stem(source.name)}_seedvr2_{output_width}x{output_height}"
     prompt = seedvr2_prompt(video_name, fps, output_width, output_height, args, prefix, info)
     print(f"Sending SeedVR2 prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
-    prompt_id = queue_prompt(args.comfy_url, prompt)
-    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    history = queue_prompt_with_progress(args.comfy_url, prompt, args.poll_seconds, {"4"})
     produced = newest_comfy_output(
         extract_output_files(history, comfy_output_root),
         {".mp4", ".mov", ".mkv", ".webm"},
@@ -921,9 +922,7 @@ def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_widt
     prefix = f"arp_upscale/{safe_stem(source.name)}_ltx25_{generation_width}x{generation_height}"
     prompt = ltx25_prompt(video_name, fps, frames, generation_width, generation_height, args, prefix)
     print(f"Sending LTX 2.5 upscale prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
-    prompt_id = queue_prompt(args.comfy_url, prompt)
-    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    history = queue_prompt_with_progress(args.comfy_url, prompt, args.poll_seconds, {"15", "17"})
     produced = newest_comfy_output(
         extract_output_files(history, comfy_output_root),
         {".mp4", ".mov", ".mkv", ".webm"},
@@ -1170,6 +1169,7 @@ def chunked_standard_upscale_run(
         for path in (raw_partial, final_partial):
             if path.exists():
                 path.unlink()
+        print(f"Upscale chunk 1/1: frames 0-{int(info['frames'])}, trim 0", flush=True)
         print(f"Queueing {label} in ComfyUI: {source}", flush=True)
         runner(args, source, raw_partial, output_width, output_height)
         if not raw_partial.exists():
@@ -1180,6 +1180,7 @@ def chunked_standard_upscale_run(
         else:
             scale_video(ffmpeg, raw_partial, final_partial, output_width, output_height)
             raw_partial.unlink(missing_ok=True)
+        print(f"Wrote upscaled chunk: {final_partial}", flush=True)
         if output.exists():
             output.unlink()
         mux_audio(ffmpeg, final_partial, audio_source, output)

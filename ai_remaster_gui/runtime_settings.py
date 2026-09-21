@@ -26,6 +26,21 @@ from .models import (
 from .paths import newest, rel, resolve
 
 
+INTERMEDIATE_PROFILES = {"low", "medium", "high", "lossless"}
+LEGACY_INTERMEDIATE_PROFILES = {
+    "h264_standard": "low",
+    "h264_high": "high",
+    "hevc_high": "high",
+    "hevc_lossless": "lossless",
+}
+
+
+def canonical_intermediate_profile(profile: object) -> str:
+    value = str(profile or "high").strip().lower()
+    value = LEGACY_INTERMEDIATE_PROFILES.get(value, value)
+    return value if value in INTERMEDIATE_PROFILES else "high"
+
+
 def app_version() -> str:
     version_file = ROOT / "VERSION"
     base = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else "0.0.0"
@@ -155,14 +170,7 @@ def base_settings() -> dict[str, dict[str, str]]:
 
 def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_source: bool = True) -> dict[str, dict[str, str]]:
     cloud = defaults["cloud"]
-    cloud["intermediate_format"] = {
-        "h264_standard": "low",
-        "h264_high": "high",
-        "hevc_high": "high",
-        "hevc_lossless": "lossless",
-    }.get(cloud.get("intermediate_format", "high"), cloud.get("intermediate_format", "high"))
-    if cloud["intermediate_format"] not in {"low", "medium", "high", "lossless"}:
-        cloud["intermediate_format"] = "high"
+    cloud["intermediate_format"] = canonical_intermediate_profile(cloud.get("intermediate_format"))
     legacy_gpu_pool = "NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A6000,NVIDIA GeForce RTX 4090"
     if cloud.get("runpod_gpu_types", "").strip() == legacy_gpu_pool:
         cloud["runpod_gpu_types"] = (

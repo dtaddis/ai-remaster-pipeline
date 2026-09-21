@@ -186,6 +186,15 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(command[command.index("--intermediate-profile") + 1], "lossless", stage)
         self.assertNotIn("--intermediate-profile", app.APP.command_for("recomp"))
 
+    def test_legacy_intermediate_profile_is_canonicalized_for_video_producers(self) -> None:
+        self._populate_full_pipeline_settings()
+        app.APP.settings["cloud"]["intermediate_format"] = "hevc_high"
+        for stage in ("cleanup", "stabilize", "outpaint", "colour", "upscale"):
+            command = app.APP.command_for(stage)
+            self.assertEqual(command[command.index("--intermediate-profile") + 1], "high", stage)
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--intermediate-profile", "hevc_high"])
+        self.assertEqual(args.intermediate_profile, "high")
+
     def test_cleanup_is_optional_and_runs_before_outpainting(self) -> None:
         app.APP.settings["global"].update(
             {"cleanup": "true", "expand_outpaint": "true", "colorize": "true", "upscale": "false", "add_soundtrack": "false"}
@@ -1679,6 +1688,21 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 3)
         self.assertEqual(history["status"]["completed"], True)
+
+    def test_comfy_progress_event_reports_selected_upscale_node(self) -> None:
+        message = json.dumps({
+            "type": "progress_state",
+            "data": {
+                "prompt_id": "prompt-id",
+                "nodes": {
+                    "2": {"state": "finished", "value": 1, "max": 1},
+                    "3": {"state": "running", "value": 17, "max": 50},
+                },
+            },
+        })
+
+        self.assertEqual(comfy_api.prompt_progress_fraction(message, "prompt-id", {"3"}), (17.0, 50.0))
+        self.assertIsNone(comfy_api.prompt_progress_fraction(message, "other-prompt", {"3"}))
 
     def test_bundled_outpaint_template_contains_official_two_stage_nodes(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
@@ -5958,9 +5982,87 @@ class GuiSmokeTests(unittest.TestCase):
             app.APP.run_started_at = 0.0
             app.APP.log = original_log
 
-        self.assertIn("Upscale chunk 2/12 rendering in ComfyUI (1 done), ETA", progress["label"])
+        self.assertIn("Upscale chunk 2/12 rendering in ComfyUI (1 done", progress["label"])
+        self.assertIn("ETA", progress["label"])
         self.assertGreater(progress["percent"], 10)
-        self.assertLess(progress["percent"], 100)
+        self.assertLess(progress["percent"], 25)
+
+    def test_upscale_progress_does_not_jump_to_ninety_from_elapsed_time(self) -> None:
+        original_log = app.APP.log
+        app.APP.settings["upscale"].update({
+            "method": "flashvsr",
+            "target_width": "4412",
+            "target_height": "1888",
+            "flashvsr_tiled_dit": "true",
+            "flashvsr_tile_size": "512",
+            "flashvsr_tile_overlap": "64",
+        })
+        app.APP.running_stage_key = "upscale"
+        app.APP.running_stage = "Upscaling"
+        app.APP.run_started_at = time.time() - 3600
+        app.APP.log = [
+            "Splitting upscaling into 12 chunk(s): 6s chunks, 8 overlap frame(s)",
+            "Upscale chunk 1/12: frames 0-144, trim 0",
+            "Queued ComfyUI prompt: prompt-id",
+        ]
+
+        try:
+            progress = app.APP.estimate_running_progress()
+        finally:
+            app.APP.running_stage_key = ""
+            app.APP.running_stage = ""
+            app.APP.run_started_at = 0.0
+            app.APP.log = original_log
+
+        self.assertLess(progress["percent"], 20)
+        self.assertIn("10x5 spatial tiles/pass", progress["label"])
+
+    def test_ltx_upscale_chunk_completions_are_counted(self) -> None:
+        chunk = server.upscale_chunk_progress("\n".join([
+            "Upscale chunk 1/3: frames 0-97, trim 0",
+            "Wrote LTX 2.5 upscaled chunk: first.mkv",
+            "Upscale chunk 2/3: frames 89-186, trim 8",
+            "Reuse LTX 2.5 chunk from compatible cache: second.mkv",
+        ]))
+
+        self.assertEqual(chunk, {
+            "done": 2, "current": 2, "total": 3,
+            "active_percent": 0, "active_value": 0, "active_total": 0,
+        })
+
+    def test_upscale_progress_uses_live_comfy_tile_progress_inside_chunk(self) -> None:
+        chunk = server.upscale_chunk_progress("\n".join([
+            "Upscale chunk 1/3: frames 0-144, trim 0",
+            "ComfyUI upscale pass: 17/50 (34%)",
+        ]))
+
+        self.assertEqual(chunk["active_percent"], 34)
+        self.assertEqual((chunk["active_value"], chunk["active_total"]), (17, 50))
+
+    def test_upscale_progress_ignores_completed_chunks_from_an_older_run(self) -> None:
+        original_log = app.APP.log
+        app.APP.running_stage_key = "upscale"
+        app.APP.running_stage = "Upscaling"
+        app.APP.run_started_at = time.time() - 60
+        app.APP.log = [
+            "Upscale chunk 1/1: frames 0-24, trim 0",
+            "Wrote upscaled chunk: old.mkv",
+            "Wrote upscaled video: old.mp4",
+            "> python -u scripts\\upscale_video.py --input new.mp4",
+            "Upscale chunk 1/12: frames 0-144, trim 0",
+            "Queued ComfyUI prompt: new-prompt-id",
+        ]
+
+        try:
+            progress = app.APP.estimate_running_progress()
+        finally:
+            app.APP.running_stage_key = ""
+            app.APP.running_stage = ""
+            app.APP.run_started_at = 0.0
+            app.APP.log = original_log
+
+        self.assertLess(progress["percent"], 20)
+        self.assertIn("Upscale chunk 1/12", progress["label"])
 
     def test_upscale_progress_reports_stitching_after_chunks_complete(self) -> None:
         original_log = app.APP.log

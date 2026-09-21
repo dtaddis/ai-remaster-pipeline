@@ -12,9 +12,13 @@ _LEGACY_PROFILES = {
 }
 
 
-def canonical_profile(profile: str | None) -> str:
+def migrate_profile_name(profile: str | None) -> str:
     value = str(profile or "high").strip().lower()
-    value = _LEGACY_PROFILES.get(value, value)
+    return _LEGACY_PROFILES.get(value, value)
+
+
+def canonical_profile(profile: str | None) -> str:
+    value = migrate_profile_name(profile)
     return value if value in INTERMEDIATE_PROFILES else "high"
 
 

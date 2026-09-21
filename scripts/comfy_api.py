@@ -5,6 +5,7 @@ import json
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -163,18 +164,118 @@ def wait_for_prompt(comfy_url: str, prompt_id: str, poll_seconds: float, transie
             print(f"Waiting for ComfyUI prompt {prompt_id}; polling temporarily failed: {last_transient_error}", flush=True)
             time.sleep(max(poll_seconds, 5.0))
             continue
-        entry = history.get(prompt_id)
-        if entry:
-            status = entry.get('status', {})
-            if status.get('completed'):
-                return entry
-            if status.get('status_str') == 'error':
-                messages = status.get('messages') or []
-                raise RuntimeError(json.dumps(messages[-1] if messages else status, ensure_ascii=False))
-            for message in status.get('messages') or []:
-                if isinstance(message, list) and message and message[0] == 'execution_error':
-                    raise RuntimeError(json.dumps(message[1], ensure_ascii=False))
+        entry = completed_prompt_entry(history, prompt_id)
+        if entry is not None:
+            return entry
         time.sleep(poll_seconds)
+
+
+def completed_prompt_entry(history: dict[str, Any], prompt_id: str) -> dict[str, Any] | None:
+    entry = history.get(prompt_id)
+    if not entry:
+        return None
+    status = entry.get('status', {})
+    if status.get('completed'):
+        return entry
+    if status.get('status_str') == 'error':
+        messages = status.get('messages') or []
+        raise RuntimeError(json.dumps(messages[-1] if messages else status, ensure_ascii=False))
+    for message in status.get('messages') or []:
+        if isinstance(message, list) and message and message[0] == 'execution_error':
+            raise RuntimeError(json.dumps(message[1], ensure_ascii=False))
+    return None
+
+
+def prompt_progress_fraction(message: object, prompt_id: str, node_ids: set[str]) -> tuple[float, float] | None:
+    """Extract a live value/max pair for selected nodes from a ComfyUI progress event."""
+    if not isinstance(message, str):
+        return None
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if payload.get("type") != "progress_state":
+        return None
+    data = payload.get("data") or {}
+    if str(data.get("prompt_id") or "") != str(prompt_id):
+        return None
+    nodes = data.get("nodes") or {}
+    candidates = []
+    for node_id in node_ids:
+        state = nodes.get(str(node_id)) or {}
+        try:
+            value = float(state.get("value", 0))
+            maximum = float(state.get("max", 0))
+        except (TypeError, ValueError):
+            continue
+        if maximum > 0 and state.get("state") == "running":
+            candidates.append((value, maximum))
+    return max(candidates, key=lambda item: item[0] / item[1]) if candidates else None
+
+
+def queue_prompt_with_progress(
+    comfy_url: str,
+    prompt: dict[str, Any],
+    poll_seconds: float,
+    progress_node_ids: set[str],
+) -> dict[str, Any]:
+    """Queue a prompt while forwarding selected ComfyUI node progress to stdout."""
+    try:
+        from websockets.sync.client import connect
+    except ImportError:
+        prompt_id = queue_prompt(comfy_url, prompt)
+        print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+        return wait_for_prompt(comfy_url, prompt_id, poll_seconds)
+
+    client_id = str(uuid.uuid4())
+    parsed = urllib.parse.urlsplit(comfy_url.rstrip("/"))
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    ws_path = parsed.path.rstrip("/") + "/ws"
+    ws_url = urllib.parse.urlunsplit((ws_scheme, parsed.netloc, ws_path, f"clientId={client_id}", ""))
+    prompt_id = ""
+    last_percent = -1
+    try:
+        with connect(ws_url, open_timeout=10, close_timeout=1) as websocket:
+            prompt_id = queue_prompt(comfy_url, prompt, client_id=client_id)
+            print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+            while True:
+                try:
+                    message = websocket.recv(timeout=max(0.1, float(poll_seconds)))
+                except TimeoutError:
+                    try:
+                        history = http_json('GET', f"{comfy_url.rstrip('/')}/history/{prompt_id}", timeout=30)
+                    except RuntimeError as exc:
+                        print(f"Waiting for ComfyUI prompt {prompt_id}; polling temporarily failed: {exc}", flush=True)
+                        continue
+                    entry = completed_prompt_entry(history, prompt_id)
+                    if entry is not None:
+                        return entry
+                    continue
+                progress = prompt_progress_fraction(message, prompt_id, progress_node_ids)
+                if progress is not None:
+                    value, maximum = progress
+                    percent = max(0, min(100, int(round(value * 100 / maximum))))
+                    if percent != last_percent:
+                        print(f"ComfyUI upscale pass: {value:g}/{maximum:g} ({percent}%)", flush=True)
+                        last_percent = percent
+                if isinstance(message, str):
+                    try:
+                        event = json.loads(message)
+                    except json.JSONDecodeError:
+                        event = {}
+                    data = event.get("data") or {}
+                    if event.get("type") == "execution_error" and str(data.get("prompt_id") or "") == prompt_id:
+                        raise RuntimeError(json.dumps(data, ensure_ascii=False))
+                    if event.get("type") == "executing" and str(data.get("prompt_id") or "") == prompt_id and data.get("node") is None:
+                        return wait_for_prompt(comfy_url, prompt_id, poll_seconds)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        print(f"Live ComfyUI progress unavailable ({exc}); continuing with chunk progress.", flush=True)
+        if not prompt_id:
+            prompt_id = queue_prompt(comfy_url, prompt)
+            print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+        return wait_for_prompt(comfy_url, prompt_id, poll_seconds)
 
 
 def extract_output_files(history_entry: dict[str, Any], output_root: Path) -> list[Path]:
