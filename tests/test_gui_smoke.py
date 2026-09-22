@@ -498,6 +498,28 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(normalized["cleanup"]["prompt"], app.CLEANUP_PROMPT)
         self.assertEqual(normalized["cleanup"]["negative_prompt"], app.CLEANUP_NEGATIVE_PROMPT)
 
+    def test_outpaint_ui_exposes_a_persistent_custom_output_height(self) -> None:
+        outpaint_stage = next(stage for stage in app.STAGES if stage.key == "outpaint")
+        height_field = next(field for field in outpaint_stage.fields if field[0] == "target_height")
+        helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            height_field,
+            ("target_height", "Output height", "select:source|480|544|576|720|768|1080|custom", "source"),
+        )
+        self.assertEqual(app.default_settings()["outpaint"]["custom_target_height"], "960")
+        self.assertIn('id="outpaintCustomHeightField"', helpers)
+        self.assertIn('data-field="custom_target_height"', helpers)
+        self.assertIn("function selectOutpaintHeightMode(mode)", helpers)
+        self.assertIn("function syncCustomOutpaintHeight(value)", helpers)
+
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({"target_aspect": "21:9", "target_height": "960"})
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(app.outpaint_work_size_for_source("input/example.mp4", "21:9", "960"), (2240, 960))
+        self.assertEqual(command[command.index("--target-height") + 1], "960")
+
     def test_legacy_outpaint_crop_settings_migrate_to_negative_trim_values(self) -> None:
         settings = app.default_settings()
         settings["outpaint"].update({
@@ -1748,6 +1770,48 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(prompt["9066"]["inputs"]["input"], ["9056", 0])
         self.assertEqual(prompt["9067"]["inputs"]["input"], ["9191", 0])
         self.assertEqual(prompt["9191"]["inputs"]["image"], ["9190", 0])
+
+    def test_ltx25_default_uses_the_full_resolution_official_graph(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--comfy-dir", str(app.ROOT),
+            "--ltx-version", "2.5", "--dry-run",
+        ])
+        outpaint_video.configure_ltx25_model_args(args)
+
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=[
+                "arp_outpaint_ltx25/prepared.mp4",
+                "arp_outpaint_mask/mask.png",
+                "arp_outpaint_generation_mask/mask.png",
+            ]),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint_ltx25/frame.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "exact-mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 2240, "height": 960, "frames": 294, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint_ltx25/test",
+                "preserve the archival street scene", args.negative_prompt, 42,
+            )
+
+        classes = [node["class_type"] for node in prompt.values()]
+        self.assertEqual(args.gguf_model, outpaint_video.LTX25_GGUF_MODEL)
+        self.assertEqual(prompt["3940"]["inputs"]["unet_name"], outpaint_video.LTX25_GGUF_MODEL)
+        self.assertEqual(prompt["9001"]["inputs"]["vae_name"], outpaint_video.LTX25_VIDEO_VAE)
+        self.assertEqual(prompt["5023"]["class_type"], "CLIPLoaderGGUF")
+        self.assertEqual(prompt["5023"]["inputs"]["clip_name"], outpaint_video.LTX25_TEXT_ENCODER)
+        self.assertEqual(classes.count("SamplerCustomAdvanced"), 1)
+        self.assertEqual(classes.count("LTXVLaplacianPyramidBlend"), 1)
+        self.assertNotIn("LatentUpscaleModelLoader", classes)
+        self.assertEqual(prompt["5227"]["inputs"]["images"], ["5266", 0])
+
+    def test_outpaint_model_labels_name_model_and_lora(self) -> None:
+        helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
+
+        self.assertIn("'2.3 - Oumoumad LoRA'", helpers)
+        self.assertIn("'2.3 - Official LoRA'", helpers)
+        self.assertIn("'2.5 - Official LoRA'", helpers)
 
     def test_ltx25_frame_rate_preparation_adds_silence_for_archival_video(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

@@ -137,6 +137,10 @@ def qwen_masked_workflow_for(values: dict[str, str], config: dict[str, str]) -> 
 
 def base_settings() -> dict[str, dict[str, str]]:
     defaults = {stage.key: {key: default for key, _label, _kind, default in stage.fields} for stage in STAGES}
+    # The executable setting remains target_height ("source" or a number).  This
+    # companion value only remembers the user's last custom number while they
+    # temporarily switch the dropdown back to a preset.
+    defaults["outpaint"]["custom_target_height"] = "960"
     defaults["global"] = {
         "source": "",
         "source_images": "",
@@ -200,6 +204,7 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     # Migrate the old positive-only Crop controls to signed Trim / Extend controls.
     # The new GUI convention is negative=trim and positive=extend.
     outpaint = defaults["outpaint"]
+    outpaint.setdefault("custom_target_height", "960")
     edge_keys = ("edge_left", "edge_right", "edge_top", "edge_bottom")
     crop_keys = ("crop_left", "crop_right", "crop_top", "crop_bottom")
     if all(str(outpaint.get(key, "0") or "0") in {"", "0", "0.0"} for key in edge_keys):

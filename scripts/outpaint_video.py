@@ -121,6 +121,17 @@ LTX25_OUTPAINT_REQUIRED_NODES = {
 
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
+
+
+def configure_ltx25_model_args(args: Any) -> None:
+    """Use LTX 2.5 weights without changing ARP's full-resolution graph topology."""
+    if getattr(args, "ltx_version", "2.3") != "2.5":
+        return
+    args.gguf_model = LTX25_GGUF_MODEL
+    args.video_vae = LTX25_VIDEO_VAE
+    args.text_encoder = LTX25_TEXT_ENCODER
+
+
 def outpaint_access_error_message(exc: HuggingFaceAccessError) -> str:
     access_url = exc.model_url or OUTPAINT_ACCESS_URL
     try:
@@ -1275,7 +1286,7 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
         {
             "id": 9001,
             "type": "VAELoader",
-            "title": "LTX 2.3 Video VAE",
+            "title": "LTX Video VAE",
             "mode": 0,
             "inputs": [{"name": "vae_name", "type": "COMBO", "widget": {"name": "vae_name"}}],
             "outputs": [{"name": "VAE", "type": "VAE", "links": []}],
@@ -1687,7 +1698,13 @@ def patch_ltx25_workflow(
 
 
 def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None) -> dict[str, Any]:
-    if getattr(args, "ltx_version", "2.3") == "2.5":
+    # Keep support for explicitly supplied copies of Lightricks' legacy two-stage
+    # 2.5 workflow. ARP's default 2.5 path now uses the same full-resolution graph
+    # as 2.3 Official and changes only the model, VAE, and text encoder weights.
+    if (
+        getattr(args, "ltx_version", "2.3") == "2.5"
+        and not is_official_outpaint_template(workflow)
+    ):
         return patch_ltx25_workflow(
             args, workflow, prepared, comfy_dir, output_prefix,
             prompt_text, negative_text, seed, guide_image, extra_guides,
@@ -1845,9 +1862,36 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # Keep this outpaint-specific memory policy out of that separate pipeline.
     if hasattr(args, "cleanup_lora"):
         return prompt
-    return patch_ephemeral_ltx_text_encoder(
-        prompt, args, prompt_text, negative_text
-    )
+    if getattr(args, "ltx_version", "2.3") == "2.5":
+        return patch_ltx25_gguf_text_encoder(prompt, args)
+    return patch_ephemeral_ltx_text_encoder(prompt, args, prompt_text, negative_text)
+
+
+def patch_ltx25_gguf_text_encoder(prompt: dict[str, Any], args) -> dict[str, Any]:
+    """Load Gemma 4 GGUF in the full-resolution 2.3-style graph."""
+    positive = prompt.get(str(args.positive_node_id))
+    negative = prompt.get(str(args.negative_node_id))
+    if not positive or not negative:
+        return prompt
+    positive_clip = positive.get("inputs", {}).get("clip")
+    negative_clip = negative.get("inputs", {}).get("clip")
+    if not (
+        isinstance(positive_clip, list)
+        and len(positive_clip) == 2
+        and isinstance(negative_clip, list)
+        and len(negative_clip) == 2
+        and str(positive_clip[0]) == str(negative_clip[0])
+    ):
+        return prompt
+    loader_id = str(positive_clip[0])
+    if loader_id not in prompt:
+        return prompt
+    prompt[loader_id] = {
+        "class_type": "CLIPLoaderGGUF",
+        "inputs": {"clip_name": args.text_encoder, "type": "ltxv"},
+        "_meta": {"title": "LTX 2.5 Gemma 4 text encoder (GGUF)"},
+    }
+    return prompt
 
 
 def patch_ephemeral_ltx_text_encoder(
@@ -1969,14 +2013,22 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "text_encoder_device": getattr(args, "text_encoder_device", "cpu"),
         "outpaint_pipeline": (
             "ltx25_official_two_stage_24fps_v2"
-            if getattr(args, "ltx_version", "2.3") == "2.5"
-            else "crop_first_pillarbox_letterbox_video_only_v1"
+            if getattr(args, "ltx25_two_stage", False)
+            else (
+                "ltx25_official_single_pass_fullres_v1"
+                if getattr(args, "ltx_version", "2.3") == "2.5"
+                else "crop_first_pillarbox_letterbox_video_only_v1"
+            )
         ),
         "ltx_runtime_adapter": getattr(args, "ltx_runtime_adapter", "unchecked"),
         "ltx_workflow_adapter": (
             "official_ltx25_subgraph_v2"
-            if getattr(args, "ltx_version", "2.3") == "2.5"
-            else LTX_WORKFLOW_ADAPTER
+            if getattr(args, "ltx25_two_stage", False)
+            else (
+                "official_ltx23_fullres_graph_ltx25_models_v1"
+                if getattr(args, "ltx_version", "2.3") == "2.5"
+                else LTX_WORKFLOW_ADAPTER
+            )
         ),
         "generation_mask_overlap": int(getattr(args, "generation_mask_overlap", 8)),
         "mask_blend_dilation": int(getattr(args, "mask_blend_dilation", 2)),
@@ -2659,8 +2711,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    configure_ltx25_model_args(args)
     source = resolve_path(args.source)
-    workflow_path = resolve_path(args.workflow or (LTX25_WORKFLOW if args.ltx_version == "2.5" else DEFAULT_WORKFLOW))
+    workflow_path = resolve_path(args.workflow or DEFAULT_WORKFLOW)
     comfy_dir = resolve_path(args.comfy_dir)
     comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
 
@@ -2668,6 +2721,10 @@ def main() -> int:
         raise FileNotFoundError(f"Source video not found: {source}")
     if not workflow_path.exists():
         raise FileNotFoundError(f"Outpainting workflow not found: {workflow_path}")
+    workflow_template = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
+    args.ltx25_two_stage = bool(
+        args.ltx_version == "2.5" and not is_official_outpaint_template(workflow_template)
+    )
     if not (comfy_dir / "main.py").exists():
         raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
     if args.model_backend == "gguf" and not (comfy_dir / "custom_nodes" / "ComfyUI-GGUF").exists():
@@ -2696,15 +2753,17 @@ def main() -> int:
             )
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-        if args.ltx_version == "2.5":
+        if args.ltx25_two_stage:
             required_nodes = dict(LTX25_OUTPAINT_REQUIRED_NODES)
         else:
             required_nodes = dict(OUTPAINT_COMMON_NODES)
             required_nodes.update(LEGACY_OUTPAINT_REQUIRED_NODES if uses_legacy_black_outpaint(args.outpaint_lora) else OFFICIAL_OUTPAINT_REQUIRED_NODES)
             if args.model_backend == "gguf":
                 required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
+            if args.ltx_version == "2.5":
+                required_nodes["CLIPLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
-        if args.ltx_version == "2.3":
+        if not args.ltx25_two_stage:
             compatibility = ensure_arp_ltx_compatible(args.comfy_url)
             args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
             print(f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}", flush=True)

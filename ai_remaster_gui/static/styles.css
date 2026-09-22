@@ -48,6 +48,7 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 .checkbox-feature-text strong{font-size:15px}
 .checkbox-feature-text small{color:var(--muted);line-height:1.45}
 .field-help{display:block;color:var(--muted);font-size:11.5px;line-height:1.45;margin:4px 0 2px}
+.custom-height-field{margin:7px 0 2px;padding:9px 10px;border:1px solid var(--line);border-radius:6px;background:#11181d}.custom-height-field label{margin-top:0}
 .checkbox-described{display:flex;gap:10px;align-items:flex-start;margin:12px 0;cursor:pointer}
 .checkbox-described input{flex:0 0 auto;margin-top:2px;width:16px;height:16px;accent-color:var(--accent)}
 .checkbox-described-text{display:flex;flex-direction:column;gap:3px}

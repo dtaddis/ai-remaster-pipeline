@@ -94,7 +94,7 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
-    'LTX 2.5 uses Lightricks\' newer two-stage model with a memory-conscious Q4_K_M transformer, Q5 text encoder, latent upscaler, and exact source blend. Official is the prior LTX 2.3 v0.9 graph. Oumoumad is the earlier pure-black IC-LoRA with legacy tone-lift conditioning.',
+    'All three choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA.',
   'outpaint.generation_fps':
     'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
@@ -208,7 +208,7 @@ const OUTPAINT_FIELD_TOOLTIPS = {
   target_aspect:
     'Shape of the expanded canvas. The cropped source is fitted inside it and LTX generates the new pillarbox or letterbox regions.',
   target_height:
-    'Requested delivery height. Source keeps the source height; numbered choices set a new height. LTX may render at a nearby model-safe multiple of 32 before Recomposition scales to the requested size.',
+    'Requested delivery height. Source keeps the source height; numbered choices set a preset height; Custom reveals a numeric field. LTX may render at a nearby model-safe multiple of 32 before Recomposition scales to the requested size.',
   offset_x:
     'Shift the fitted source horizontally before outpainting. Positive values move it right and create more room on the left; negative values move it left. Chunks inherit this unless overridden.',
   offset_y:
@@ -264,6 +264,9 @@ function fieldHtml(st, field) {
   const tooltip = fieldTooltip(st.key, key);
   const title = tooltipTitle(tooltip);
 
+  if (st.key === 'outpaint' && key === 'target_height') {
+    return outpaintHeightFieldHtml(label, kind, value, tooltip) + fieldHelpHtml(help);
+  }
   if (kind.startsWith('select:')) return selectFieldHtml(key, label, kind, value, tooltip) + fieldHelpHtml(help);
   if (kind.startsWith('range:')) return rangeFieldHtml(key, label, kind, value, tooltip) + fieldHelpHtml(help);
   if (kind === 'checkbox') return checkboxFieldHtml(key, label, value, help, tooltip);
@@ -286,6 +289,71 @@ function fieldHtml(st, field) {
   return `<label${title}>${label}</label>${input}${fieldHelpHtml(help)}`;
 }
 
+function outpaintHeightFieldHtml(label, kind, value, tooltip = '') {
+  const options = kind.slice(7).split('|');
+  const presets = options.filter(option => option !== 'custom');
+  const storedHeight = String(value || 'source');
+  const isCustom = !presets.includes(storedHeight);
+  const selectedMode = isCustom ? 'custom' : storedHeight;
+  const remembered = String(settings('outpaint').custom_target_height || '960');
+  const customHeight = isCustom && /^\d+$/.test(storedHeight) ? storedHeight : remembered;
+  const optionHtml = options
+    .map(option => `<option value="${esc(option)}" ${selectedMode === option ? 'selected' : ''}>${esc(selectOptionLabel('target_height', option))}</option>`)
+    .join('');
+  const title = tooltipTitle(tooltip);
+  return `
+    <label${title}>${label}</label>
+    <select id="outpaintTargetHeightMode"${title} onchange="selectOutpaintHeightMode(this.value)">${optionHtml}</select>
+    <input id="outpaintTargetHeightValue" data-field="target_height" type="hidden" value="${esc(storedHeight)}">
+    <div id="outpaintCustomHeightField" class="custom-height-field ${isCustom ? '' : 'hidden'}">
+      <label for="outpaintCustomHeightInput">Custom output height (px)</label>
+      <input
+        id="outpaintCustomHeightInput"
+        data-field="custom_target_height"
+        data-kind="number"
+        type="number"
+        min="64"
+        max="4320"
+        step="2"
+        value="${esc(customHeight)}"
+        onchange="syncCustomOutpaintHeight(this.value)"
+      >
+      <small class="field-help">LTX renders at the nearest model-safe multiple of 32, then Recomposition restores this requested delivery height.</small>
+    </div>
+  `;
+}
+
+function normalizedCustomOutpaintHeight(value) {
+  const parsed = Math.round(Number(value));
+  if (!Number.isFinite(parsed)) return 960;
+  return Math.max(64, Math.min(4320, parsed));
+}
+
+function syncCustomOutpaintHeight(value) {
+  const height = normalizedCustomOutpaintHeight(value);
+  const input = document.getElementById('outpaintCustomHeightInput');
+  const target = document.getElementById('outpaintTargetHeightValue');
+  if (input) input.value = String(height);
+  if (target) target.value = String(height);
+}
+
+async function selectOutpaintHeightMode(mode) {
+  const customField = document.getElementById('outpaintCustomHeightField');
+  const customInput = document.getElementById('outpaintCustomHeightInput');
+  const target = document.getElementById('outpaintTargetHeightValue');
+  if (!target) return;
+
+  if (mode === 'custom') {
+    customField?.classList.remove('hidden');
+    syncCustomOutpaintHeight(customInput?.value || '960');
+    customInput?.focus();
+  } else {
+    customField?.classList.add('hidden');
+    target.value = mode;
+  }
+  await saveStage('outpaint', false);
+}
+
 function selectFieldHtml(key, label, kind, value, tooltip = '') {
   const options = kind.slice(7).split('|')
     .map(option => `<option value="${esc(option)}" ${value === option ? 'selected' : ''}>${esc(selectOptionLabel(key, option))}</option>`)
@@ -297,9 +365,9 @@ function selectFieldHtml(key, label, kind, value, tooltip = '') {
 function selectOptionLabel(key, option) {
   if (key === 'compute' && option === 'local') return 'This computer';
   if (key === 'compute' && option === 'runpod') return 'RunPod cloud worker';
-  if (key === 'outpaint_model' && option === 'official') return 'LTX 2.3 (official)';
-  if (key === 'outpaint_model' && option === 'ltx25') return 'LTX 2.5 (two-stage)';
-  if (key === 'outpaint_model' && option === 'oumoumad') return 'LTX 2.3 (Oumoumad LoRA)';
+  if (key === 'outpaint_model' && option === 'official') return '2.3 - Official LoRA';
+  if (key === 'outpaint_model' && option === 'ltx25') return '2.5 - Official LoRA';
+  if (key === 'outpaint_model' && option === 'oumoumad') return '2.3 - Oumoumad LoRA';
   if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
@@ -321,6 +389,7 @@ function selectOptionLabel(key, option) {
     return match ? `Source height (${match[1]}p)` : 'Source height';
   }
   if (key === 'target_height' && /^\d+$/.test(option)) return `${option}p`;
+  if (key === 'target_height' && option === 'custom') return 'Custom';
   if (key === 'processing_height' && option === 'source') return 'Original / source';
   if (key === 'processing_height' && /^\d+$/.test(option)) return `${option}p max height`;
   return option;
