@@ -100,7 +100,7 @@ STAGES = (
             ("compute", "Compute", "select:local|runpod", "local"),
             ("target_aspect", "Target aspect ratio", "select:16:9|9:16|4:3|3:4|1:1|21:9|2.39:1|2.35:1|1.85:1|3:2|2:3|5:4|4:5", "16:9"),
             ("target_height", "Output height", "select:source|480|544|576|720|768|1080|custom", "source"),
-            ("outpaint_model", "Outpaint model", "select:official|ltx25|oumoumad", "official"),
+            ("outpaint_model", "Outpaint model", "select:oumoumad|official|ltx25", "oumoumad"),
             ("generation_fps", "LTX 2.5 generation FPS", "select:24-fast|24|source", "24-fast"),
             ("offset_x", "Horizontal offset (px)", "number", "0"),
             ("offset_y", "Vertical offset (px)", "number", "0"),

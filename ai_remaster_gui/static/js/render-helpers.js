@@ -94,7 +94,7 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
-    'All three choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA.',
+    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. All three choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA.',
   'outpaint.generation_fps':
     'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
