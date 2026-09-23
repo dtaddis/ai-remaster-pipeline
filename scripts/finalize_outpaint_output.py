@@ -68,18 +68,18 @@ def inverse_filter(args, info: dict) -> str:
     sharpen = max(0.0, min(1.5, float(args.edge_sharpen)))
     blur = f',gblur=sigma={feather:.4f}' if feather else ''
     sharpen_filter = f'unsharp=5:5:{sharpen:.4f}:5:5:0.0' if sharpen else 'null'
+    # The model paints the generated edges to match the lifted source, so the whole frame
+    # is in lifted tone and must be restored, not just the source rectangle.
+    tone_filter = ''
     if restore_tone:
         lift = max(0.0, min(0.25, args.black_lift))
         gamma = max(0.1, args.gamma)
         expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
-        centre_filter = f"lutrgb=r='{expr}':g='{expr}':b='{expr}'"
-    else:
-        centre_filter = 'null'
+        tone_filter = f",lutrgb=r='{expr}':g='{expr}':b='{expr}'"
     mask_expr = f"if(between(X\\,{x}\\,{right})*between(Y\\,{y}\\,{bottom})\\,255\\,0)"
     return (
-        '[0:v]format=rgb24,split=3[raw][original][maskbase];'
+        f'[0:v]format=rgb24{tone_filter},split=3[raw][centre][maskbase];'
         f'[raw]{sharpen_filter}[generated];'
-        f'[original]{centre_filter}[centre];'
         f"[maskbase]format=gray,geq=lum='{mask_expr}'{blur}[sourcemask];"
         f'[generated][centre][sourcemask]maskedmerge{monochrome},format={output_format}{scale}[v]'
     )
@@ -87,7 +87,7 @@ def inverse_filter(args, info: dict) -> str:
 
 def signature(args, source: Path, info: dict) -> dict:
     return {
-        'version': 8,
+        'version': 9,
         'tool': 'finalize_outpaint_output.py',
         'source': root_relative(source),
         'source_fingerprint': file_fingerprint(source),

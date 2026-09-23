@@ -119,8 +119,21 @@ LTX25_OUTPAINT_REQUIRED_NODES = {
 }
 
 
+# Oumoumad treats pure black as "outpaint here", so source frames are lifted off black
+# before generation and restored afterwards.
+LEGACY_BLACK_LIFT = 0.018
+LEGACY_GAMMA = 1.06
+
+
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
+
+
+def legacy_tone_lift_table() -> list[int]:
+    return [
+        round(255 * (LEGACY_BLACK_LIFT + (1 - LEGACY_BLACK_LIFT) * (value / 255) ** (1 / LEGACY_GAMMA)))
+        for value in range(256)
+    ]
 
 
 def configure_ltx25_model_args(args: Any) -> None:
@@ -377,8 +390,12 @@ def copy_guide_image_to_comfy_input(
     comfy_dir: Path,
     canvas_width: int = 0,
     canvas_height: int = 0,
+    tone_lift: bool = False,
 ) -> str:
     """Copy a guide image to ComfyUI's input folder, stretched to exactly the LTX canvas size.
+
+    tone_lift applies the Oumoumad source lift so a display-tone guide matches the lifted
+    prepared frames; guides taken from a raw chunk are already lifted and must not use it.
 
     Always stretches to (canvas_width × canvas_height) — no letterboxing, no cropping.
     This ensures the guide is pixel-aligned with the prepared canvas so LTXVImgToVideoConditionOnly
@@ -398,8 +415,11 @@ def copy_guide_image_to_comfy_input(
     # chunking), so the digest is what stops a cached copy from feeding another guide's
     # frames to LTX.
     digest = file_fingerprint(guide)["sha256"][:12]
+    lifted = "_lifted" if tone_lift else ""
     if canvas_width > 0 and canvas_height > 0:
-        target = target_dir / f"guide_{guide.stem}_{digest}_{canvas_width}x{canvas_height}.png"
+        target = target_dir / f"guide_{guide.stem}_{digest}_{canvas_width}x{canvas_height}{lifted}.png"
+    elif tone_lift:
+        target = target_dir / f"guide_{guide.stem}_{digest}{lifted}.png"
     else:
         target = target_dir / f"guide_{guide.stem}_{digest}{guide.suffix.lower()}"
 
@@ -409,7 +429,13 @@ def copy_guide_image_to_comfy_input(
     except OSError:
         pass
 
-    if canvas_width > 0 and canvas_height > 0:
+    if tone_lift:
+        with PILImage.open(guide) as img:
+            image = img.convert("RGB")
+        if canvas_width > 0 and canvas_height > 0 and image.size != (canvas_width, canvas_height):
+            image = image.resize((canvas_width, canvas_height), getattr(PILImage, "Resampling", PILImage).LANCZOS)
+        image.point(legacy_tone_lift_table() * 3).save(target, format="PNG")
+    elif canvas_width > 0 and canvas_height > 0:
         with PILImage.open(guide) as img:
             img_w, img_h = img.size
             if img_w == canvas_width and img_h == canvas_height:
@@ -1458,7 +1484,8 @@ def _patch_extra_guides(
         image_path = gf["image"]
 
         image_name = copy_guide_image_to_comfy_input(
-            image_path, comfy_dir, canvas_width, canvas_height
+            image_path, comfy_dir, canvas_width, canvas_height,
+            tone_lift=uses_legacy_black_outpaint(getattr(args, "outpaint_lora", "")),
         )
 
         add_or_replace_node(workflow, {
@@ -1697,7 +1724,7 @@ def patch_ltx25_workflow(
     return prune_api_prompt(prompt, args.output_node_id)
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, auto_guide: bool = False) -> dict[str, Any]:
     # Keep support for explicitly supplied copies of Lightricks' legacy two-stage
     # 2.5 workflow. ARP's default 2.5 path now uses the same full-resolution graph
     # as 2.3 Official and changes only the model, VAE, and text encoder weights.
@@ -1740,7 +1767,10 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
             )
         patch_video_only_sampling(workflow)
     if guide_image and guide_image.exists():
-        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
+        image_name = copy_guide_image_to_comfy_input(
+            guide_image, comfy_dir, canvas_width, canvas_height,
+            tone_lift=uses_legacy_black_outpaint(getattr(args, "outpaint_lora", "")) and not auto_guide,
+        )
         # Official v0.9 uses node 5088; the legacy workflow used 5019.
         for bypass_id in ("5088", "5019"):
             try:
@@ -1994,6 +2024,12 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         ],
         "guide_via_i2v_conditioning": bool(guide_image),
         "auto_guide_from_previous_chunk": auto_guide,
+        # Only chunks that fed a user guide to Oumoumad changed when guides started being lifted.
+        **(
+            {"legacy_guide_tone_lift": True}
+            if uses_legacy_black_outpaint(args.outpaint_lora) and ((guide_image and not auto_guide) or extra_guides)
+            else {}
+        ),
         "seed": seed,
         "negative_prompt": negative_text,
         "load_video_node_id": args.load_video_node_id,
@@ -2787,7 +2823,7 @@ def main() -> int:
         str(args.crop_bottom),
     ]
     if uses_legacy_black_outpaint(args.outpaint_lora):
-        prepare_command.extend(["--legacy-black-mask", "--black-lift", "0.018", "--gamma", "1.06"])
+        prepare_command.extend(["--legacy-black-mask", "--black-lift", str(LEGACY_BLACK_LIFT), "--gamma", str(LEGACY_GAMMA)])
     if args.outpaint_all_black_regions:
         prepare_command.append("--outpaint-all-black-regions")
     prepare_command += ["--target-height", str(work_height)]
@@ -2958,7 +2994,7 @@ def main() -> int:
                     print(f"Chunk {chunk_index + 1} start guide ({source}): {guide_image}", flush=True)
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, auto_guide)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
@@ -2992,7 +3028,8 @@ def main() -> int:
             elif args.only_chunk is not None:
                 return 0
 
-    # Finalize applies generated-edge detail recovery but does NOT alter gamma or upscale.
+    # Finalize applies generated-edge detail recovery and, for Oumoumad, undoes the source
+    # tone lift across the whole frame. It does not upscale.
     # The outpainted and colorised layers stay at model-safe dimensions (e.g. 1280×704)
     # all the way through to recomposition, where final_composite.py scales up to delivery.
     finalize_command = [
@@ -3006,7 +3043,7 @@ def main() -> int:
         args.intermediate_profile,
     ]
     if uses_legacy_black_outpaint(args.outpaint_lora):
-        finalize_command.extend(["--restore-tone", "--black-lift", "0.018", "--gamma", "1.06"])
+        finalize_command.extend(["--restore-tone", "--black-lift", str(LEGACY_BLACK_LIFT), "--gamma", str(LEGACY_GAMMA)])
     source_rect = prepared_source_rectangle(prepared, work_width, work_height)
     if source_rect and not args.outpaint_all_black_regions:
         left, top, right, bottom = source_rect

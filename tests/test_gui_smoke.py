@@ -2173,7 +2173,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("between(X\\,168\\,1111)", filter_graph)
         self.assertNotIn("lutrgb", filter_graph)
 
-    def test_oumoumad_finish_restores_only_protected_centre_tone(self) -> None:
+    def test_oumoumad_finish_restores_tone_across_generated_edges_too(self) -> None:
         args = finalize_outpaint_output.build_parser().parse_args([
             "--source", "input.mp4", "--restore-tone", "--black-lift", "0.018", "--gamma", "1.06",
             "--source-x", "168", "--source-y", "0", "--source-width", "944", "--source-height", "704",
@@ -2181,9 +2181,55 @@ class GuiSmokeTests(unittest.TestCase):
 
         filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 1280, "height": 704})
 
-        self.assertIn("[original]lutrgb=", filter_graph)
+        # LTX paints the edges to match the lifted source, so the restore precedes the split.
+        self.assertTrue(filter_graph.startswith("[0:v]format=rgb24,lutrgb="))
+        self.assertEqual(filter_graph.count("lutrgb="), 1)
+        self.assertIn("split=3[raw][centre][maskbase]", filter_graph)
         self.assertIn("[generated][centre][sourcemask]maskedmerge", filter_graph)
-        self.assertNotIn("[raw]lutrgb=", filter_graph)
+
+    def test_oumoumad_lifts_user_guides_but_not_previous_chunk_guides(self) -> None:
+        workflow_path = app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4",
+            "--comfy-dir", str(app.ROOT),
+            "--outpaint-lora", outpaint_video.OUMOUMAD_OUTPAINT_LORA,
+            "--dry-run",
+        ])
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            guide = Path(tmp_text) / "guide.png"
+            guide.write_bytes(b"guide")
+            lifts = {}
+            for auto_guide in (False, True):
+                workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
+                with (
+                    mock.patch.object(outpaint_video, "copy_to_comfy_input", return_value="arp_outpaint/prepared.mp4"),
+                    mock.patch.object(outpaint_video, "copy_guide_image_to_comfy_input", return_value="arp_outpaint/guide.png") as copy_guide,
+                    mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 24, "fps": 24.0}),
+                ):
+                    outpaint_video.patch_workflow(
+                        args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint/test",
+                        args.prompt, args.negative_prompt, 42, guide, None, auto_guide,
+                    )
+                lifts[auto_guide] = copy_guide.call_args.kwargs["tone_lift"]
+
+        self.assertEqual(lifts, {False: True, True: False})
+
+    def test_guide_tone_lift_raises_black_off_the_outpaint_trigger(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            guide = folder / "guide.png"
+            Image.new("RGB", (8, 4), (0, 0, 0)).save(guide)
+
+            plain = outpaint_video.copy_guide_image_to_comfy_input(guide, folder, 8, 4)
+            lifted = outpaint_video.copy_guide_image_to_comfy_input(guide, folder, 8, 4, tone_lift=True)
+
+            self.assertNotEqual(plain, lifted)
+            with Image.open(folder / "input" / plain) as image:
+                self.assertEqual(image.getpixel((0, 0)), (0, 0, 0))
+            with Image.open(folder / "input" / lifted) as image:
+                self.assertEqual(image.getpixel((0, 0)), (5, 5, 5))
 
     def test_outpaint_all_black_mode_reuses_source_frames_for_dynamic_mask(self) -> None:
         workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
