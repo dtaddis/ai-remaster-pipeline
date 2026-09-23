@@ -4601,6 +4601,52 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual((folder / "input" / Path(first)).read_bytes(), b"first reference")
             self.assertEqual((folder / "input" / Path(second)).read_bytes(), b"changed reference")
 
+    def test_loading_older_project_adopts_its_work_under_current_names(self) -> None:
+        chunk_header = "chunk_index,start_frame,end_frame,seed,guide_frames,auto_start_guide\n"
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            old_chunks, new_chunks = folder / "The_chunks_old.csv", folder / "The_chunks_new.csv"
+            old_video, new_video = folder / "The_outpaint_old.mkv", folder / "The_outpaint_new.mkv"
+            old_shots, new_shots = folder / "The_shots_old.csv", folder / "The_shots_new.csv"
+            old_chunks.write_text(chunk_header + '0,0,480,42,"[{""frame_idx"": 9, ""image"": ""g.png""}]",true\n', encoding="utf-8")
+            # A default plan written under the new name by an earlier open of the project.
+            new_chunks.write_text(chunk_header + "0,0,480,42,,true\n", encoding="utf-8")
+            old_video.write_bytes(b"finished outpaint")
+            old_shots.write_text(f"# source_video={server.rel(old_video)}\nenabled,start_frame\ntrue,0\n", encoding="utf-8")
+
+            settings = copy.deepcopy(app.APP.settings)
+            settings["outpaint"]["manifest"] = server.rel(old_chunks)
+            settings["recomp"]["outpainted_video"] = server.rel(old_video)
+            settings["references"]["manifest"] = server.rel(old_shots)
+            app.APP.settings = settings
+            with (
+                mock.patch.object(app.APP, "outpaint_enabled", return_value=True),
+                mock.patch.object(app.APP, "outpaint_source_for", return_value="input/section.mkv"),
+                mock.patch.object(server, "outpaint_chunk_manifest_for", return_value=server.rel(new_chunks)),
+                mock.patch.object(server, "outpaint_output_for", return_value=server.rel(new_video)),
+                mock.patch.object(server, "manifest_for_outpainted", return_value=server.rel(new_shots)),
+                mock.patch.object(server, "colorized_outputs_for_manifest", return_value=[]),
+            ):
+                app.APP.adopt_saved_project_artifacts()
+
+            self.assertIn("g.png", new_chunks.read_text(encoding="utf-8"))
+            self.assertIn(",42,,true", (folder / "The_chunks_new.csv.bak").read_text(encoding="utf-8"))
+            self.assertEqual(new_video.read_bytes(), b"finished outpaint")
+            self.assertEqual(server.manifest_source_video(new_shots), server.rel(new_video))
+            self.assertEqual(server.read_manifest(new_shots), [{"enabled": "true", "start_frame": "0"}])
+
+    def test_adopting_older_work_never_overwrites_edited_current_files(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            saved, current = folder / "old.csv", folder / "new.csv"
+            saved.write_text("older", encoding="utf-8")
+            current.write_text("newer", encoding="utf-8")
+
+            self.assertEqual(server.adopt_saved_artifact(server.rel(saved), server.rel(current)), "")
+            self.assertEqual(current.read_text(encoding="utf-8"), "newer")
+            self.assertEqual(server.adopt_saved_artifact(server.rel(folder / "missing.csv"), server.rel(folder / "other.csv")), "")
+            self.assertFalse((folder / "other.csv").exists())
+
     def test_guide_copy_names_are_content_keyed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             folder = Path(tmp_text)
