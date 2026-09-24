@@ -116,6 +116,60 @@ class SparseGuideAttentionTests(unittest.TestCase):
                 self.assertTrue(hasattr(block, attribute))
                 self.assertTrue(hasattr(block, f"{attribute}_comfy_model_dtype"))
 
+    def test_video_only_clone_keeps_comfy_leaf_state_off_the_cached_model(self) -> None:
+        spec = importlib.util.spec_from_file_location("arp_video_only_leaf_test", PATCH_PATH)
+        assert spec is not None and spec.loader is not None
+        patch_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch_module)
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn1 = torch.nn.Sequential(torch.nn.Linear(2, 2))
+                self.ff = torch.nn.Sequential(torch.nn.Linear(2, 2))
+                self.audio_ff = torch.nn.Linear(2, 2)
+
+        class Diffusion(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patchify_proj = torch.nn.Linear(2, 2)
+                self.transformer_blocks = torch.nn.ModuleList([Block()])
+
+        class BaseModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.diffusion_model = Diffusion()
+                self.memory_usage_factor = 0.077
+
+        cached = BaseModel()
+        patcher = types.SimpleNamespace(model=cached, size=1, patches={})
+        patcher.clone = lambda: types.SimpleNamespace(model=cached, size=1, patches={})
+        first = patch_module.prune_ltxav_audio_transformer_blocks(patcher)
+
+        # ComfyUI marks loaded leaves on the module itself. Those marks must stay on
+        # the clone so a later LoRA clone of the cached model re-patches every leaf.
+        first_leaves = [
+            first.model.diffusion_model.patchify_proj,
+            first.model.diffusion_model.transformer_blocks[0].attn1[0],
+            first.model.diffusion_model.transformer_blocks[0].ff[0],
+        ]
+        for leaf in first_leaves:
+            leaf.comfy_patched_weights = True
+            leaf.prev_comfy_cast_weights = False
+        first.model.diffusion_model.patchify_proj.weight = torch.nn.Parameter(torch.ones(2, 2))
+
+        for leaf in cached.modules():
+            self.assertFalse(hasattr(leaf, "comfy_patched_weights"))
+            self.assertFalse(hasattr(leaf, "prev_comfy_cast_weights"))
+        self.assertFalse(torch.equal(cached.diffusion_model.patchify_proj.weight, torch.ones(2, 2)))
+        self.assertTrue(hasattr(cached.diffusion_model.transformer_blocks[0], "audio_ff"))
+
+        second = patch_module.prune_ltxav_audio_transformer_blocks(patcher)
+        second_ff = second.model.diffusion_model.transformer_blocks[0].ff[0]
+        self.assertFalse(hasattr(second_ff, "comfy_patched_weights"))
+        # Weights are shared, never duplicated.
+        self.assertIs(second_ff.weight, cached.diffusion_model.transformer_blocks[0].ff[0].weight)
+
     def test_video_only_pruning_rejects_unknown_registered_audio_state(self) -> None:
         spec = importlib.util.spec_from_file_location("arp_video_only_guard_test", PATCH_PATH)
         assert spec is not None and spec.loader is not None

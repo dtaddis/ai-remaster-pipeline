@@ -50,37 +50,51 @@ def _copy_module_structure(module):
     return cloned
 
 
+def _copy_module_tree(module, copies: dict[int, object]):
+    """Privatize a module and every registered submodule, sharing their tensors."""
+    cloned = copies.get(id(module))
+    if cloned is None:
+        cloned = _copy_module_structure(module)
+        copies[id(module)] = copies[id(cloned)] = cloned
+        children = getattr(cloned, "_modules", None)
+        if isinstance(children, dict):
+            for name, child in children.items():
+                if child is not None:
+                    children[name] = _copy_module_tree(child, copies)
+    return cloned
+
+
 def _video_only_model_structure(base_model):
-    """Privatize only containers that ARP mutates; never duplicate model weights."""
+    """Privatize the diffusion module tree; never duplicate model weights.
+
+    ComfyUI keeps load and LoRA state on each leaf module (patched weights,
+    ``comfy_patched_weights``, ``prev_comfy_cast_weights``) and unpatches only
+    a model it can still reach. This clone's private base dies with it, so any
+    leaf shared with the cached GGUF model kept the dropped clone's LoRA: after
+    switching LoRA in one ComfyUI session, every leaf looked "already loaded",
+    the new patches were skipped and the old LoRA ran instead.
+    """
     diffusion_model = getattr(base_model, "diffusion_model", None)
     blocks = getattr(diffusion_model, "transformer_blocks", None)
     if blocks is None:
         raise ValueError("ARP video-only mode requires an LTXAV diffusion model")
 
+    copies: dict[int, object] = {}
     private_base = _copy_module_structure(base_model)
-    private_diffusion = _copy_module_structure(diffusion_model)
+    private_diffusion = _copy_module_tree(diffusion_model, copies)
     if hasattr(blocks, "_modules"):
-        private_blocks = _copy_module_structure(blocks)
-        for index, block in enumerate(blocks):
-            private_block = _copy_module_structure(block)
-            # These are the only video modules whose forward methods ARP
-            # specializes. Privatizing them keeps every override on this model
-            # clone instead of mutating ComfyUI's global classes.
-            for attribute in ("attn1", "ff"):
-                child = getattr(block, attribute, None)
-                if child is not None:
-                    setattr(private_block, attribute, _copy_module_structure(child))
-            private_blocks._modules[str(index)] = private_block
+        private_blocks = private_diffusion.transformer_blocks
     else:
-        private_blocks = []
-        for block in blocks:
-            private_block = _copy_module_structure(block)
-            for attribute in ("attn1", "ff"):
-                child = getattr(block, attribute, None)
-                if child is not None:
-                    setattr(private_block, attribute, _copy_module_structure(child))
-            private_blocks.append(private_block)
-    setattr(private_diffusion, "transformer_blocks", private_blocks)
+        private_blocks = [_copy_module_tree(block, copies) for block in blocks]
+        setattr(private_diffusion, "transformer_blocks", private_blocks)
+    for block in private_blocks:
+        # These are the only video modules whose forward methods ARP
+        # specializes. Privatizing them keeps every override on this model
+        # clone instead of mutating ComfyUI's global classes.
+        for attribute in ("attn1", "ff"):
+            child = getattr(block, attribute, None)
+            if child is not None:
+                setattr(block, attribute, _copy_module_tree(child, copies))
     setattr(private_base, "diffusion_model", private_diffusion)
     return private_base, private_diffusion, private_blocks
 
