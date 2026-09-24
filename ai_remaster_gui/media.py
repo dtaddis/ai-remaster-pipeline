@@ -500,8 +500,12 @@ def extract_video_frame_at_frame(source: Path, target_dir: Path, suffix: str, fr
             return rel(target)
     except OSError:
         pass
-    vf = f"trim=start_frame={frame}:end_frame={frame + 1},setpts=PTS-STARTPTS"
-    command = [ffmpeg, "-y", "-i", str(source), "-vf", vf, "-frames:v", "1", "-q:v", str(quality), str(target)]
+    # Seek the input to half a frame before the wanted one: ffmpeg's accurate seek then
+    # decodes forward from the nearest keyframe and emits exactly that frame. Decoding from
+    # the start with trim=start_frame cost seconds per thumbnail late in a long video.
+    fps = video_frame_rate(source)
+    seek = max(0.0, (frame - 0.5) / fps) if frame else 0.0
+    command = [ffmpeg, "-y", "-v", "error", "-ss", f"{seek:.6f}", "-i", str(source), "-frames:v", "1", "-q:v", str(quality), str(target)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0 and frame != 0:
         return extract_video_frame_at_frame(source, target_dir, suffix, 0, quality)
@@ -618,7 +622,29 @@ def ffprobe_info_from_data(data: dict) -> dict[str, str]:
         out["overall_bitrate"] = human_bitrate(fmt["bit_rate"])
     return out
 
+def video_frame_rate(source: Path) -> float:
+    return float(video_metrics(source).get("fps") or 24.0)
+
+
+_video_metrics_cache: dict[tuple[str, int, int], dict[str, float]] = {}
+
+
 def video_metrics(source: Path) -> dict[str, float]:
+    """Probe results per file version; the GUI asks about the same videos on every poll."""
+    try:
+        stat = source.stat()
+    except OSError:
+        return _probe_video_metrics(source)
+    key = (str(source.resolve()), stat.st_size, stat.st_mtime_ns)
+    cached = _video_metrics_cache.get(key)
+    if cached is None:
+        cached = _probe_video_metrics(source)
+        if cached:
+            _video_metrics_cache[key] = cached
+    return dict(cached)
+
+
+def _probe_video_metrics(source: Path) -> dict[str, float]:
     found = local_tool("ffprobe")
     if found:
         command = [

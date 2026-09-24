@@ -13,11 +13,7 @@ const mediaClip = (path, start, end, key) => (
   + '&clip_end=' + encodeURIComponent(end)
   + '&clip_key=' + encodeURIComponent(key || '')
 );
-const stateUrl = (options = {}) => {
-  const params = new URLSearchParams({ active: active || '' });
-  if (options.shotPreviews) params.set('shot_previews', options.shotPreviews);
-  return '/api/state?' + params.toString();
-};
+const stateUrl = () => '/api/state?' + new URLSearchParams({ active: active || '' }).toString();
 
 async function api(path, opts = {}) {
   const response = await fetch(path, {
@@ -33,9 +29,7 @@ async function refresh(force = false) {
   const editing = isEditingField();
   const mediaActive = hasMediaOnPage();
 
-  const appHasContent = !!document.getElementById('app')?.children.length;
-  const useCachedShotPreviews = !force && active === 'shots' && appHasContent;
-  state = await api(stateUrl({ shotPreviews: useCachedShotPreviews ? 'cached' : 'generate' }));
+  state = await api(stateUrl());
   pruneSelected();
   if (!availableTabs().includes(active)) active = 'global';
   notifyNewLogErrors();
@@ -64,6 +58,16 @@ async function refresh(force = false) {
     updateOutpaintRawPreviews();
     updateRunLogs();
     updateOutpaintRuntimeControls();
+    lastRenderSignature = sig;
+    lastOutpaintVisualSignature = currentOutpaintVisualSignature;
+    return;
+  }
+
+  // Polling never rebuilds the Shots page wholesale: that destroyed sliders mid-drag and
+  // lost the edit. It only redraws for structural changes, and only when the user is idle.
+  if (!force && active === 'shots' && document.getElementById('app')?.children.length) {
+    updateShotsDynamicStatus();
+    updateRunLogs();
     lastRenderSignature = sig;
     lastOutpaintVisualSignature = currentOutpaintVisualSignature;
     return;
@@ -446,7 +450,9 @@ function settings(key) {
 function pruneSelected() {
   if (!state || !state.stages) return;
 
+  // The server only lists files for the open tab, so other tabs' selections are kept.
   for (const st of state.stages) {
+    if (st.key !== active) continue;
     if (selected[st.key] && !st.files.some(f => f.path === selected[st.key])) {
       delete selected[st.key];
     }

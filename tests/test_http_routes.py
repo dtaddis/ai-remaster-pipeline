@@ -28,6 +28,7 @@ EXPECTED_GET_ROUTES = {
     "/api/logfile",
     "/api/openai-models",
     "/api/shot-preview",
+    "/api/shot-sheets",
     "/api/upscale-shot-comparison",
     "/api/aspect-preview",
     "/api/outpaint-auto-crop",
@@ -139,13 +140,13 @@ class HelperBehaviourTests(unittest.TestCase):
         boundary.assert_called_once_with("m.csv", 0, "end", 0.0, 12)
         rows.assert_called_once_with("m.csv", (-2, -1, 0, 1))
 
-    def test_state_route_can_request_cached_shot_previews(self) -> None:
+    def test_state_route_passes_active_view(self) -> None:
         state.APP.state = mock.Mock(return_value={"ok": True})
-        handler = _Handler("/api/state?active=shots&shot_previews=cached")
+        handler = _Handler("/api/state?active=shots")
         handler.do_GET()
 
         self.assertEqual(handler.responses["json"], {"ok": True})
-        state.APP.state.assert_called_once_with("shots", generate_shot_previews=False)
+        state.APP.state.assert_called_once_with("shots")
 
     def test_upscale_shot_comparison_returns_cached_frame_pair(self) -> None:
         state.APP.upscale_shot_comparison_frames = mock.Mock(
@@ -215,7 +216,7 @@ class StateLockTests(unittest.TestCase):
         app.upscale_preview_state = MethodType(lambda self: {}, app)
         app.output_selection_state = MethodType(lambda self: {}, app)
 
-        def fake_shot_views(settings, generate_previews=True):
+        def fake_shot_views(settings, view):
             self.assertTrue(app.lock.acquire(blocking=False))
             app.lock.release()
             return {"shots": [{"index": 0}], "shots_manifest": "m.csv"}

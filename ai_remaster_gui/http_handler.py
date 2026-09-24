@@ -12,7 +12,7 @@ from . import state
 from .cache import delete_cache_category, delete_cache_file
 from .config import STATIC_DIR
 from .file_dialogs import browse_path, browse_source_paths
-from .manifests import update_manifest_row
+from .manifests import manifest_source_video, update_manifest_row
 from .media import (
     aspect_preview_at_for_settings,
     auto_crop_for_settings,
@@ -51,6 +51,7 @@ from .references import (
     update_shot_boundary,
     update_shot_fade,
 )
+from .scrub_sheets import SHEETS_ROOT, sheet_status
 
 
 def redact_command_arguments(command: list[str]) -> list[str]:
@@ -158,9 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/api/state":
             query = parse_qs(parsed.query)
-            view = query.get("active", [""])[0]
-            generate_shot_previews = query.get("shot_previews", ["generate"])[0] != "cached"
-            self.send_json(state.APP.state(view, generate_shot_previews=generate_shot_previews))
+            self.send_json(state.APP.state(query.get("active", [""])[0]))
         elif parsed.path == "/api/command":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"command": redact_command_arguments(state.APP.command_for(stage)) if stage else []})
@@ -223,6 +222,14 @@ class Handler(BaseHTTPRequestHandler):
                 frame = int(frame_text) if str(frame_text).strip() != "" else None
                 path = preview_reference_frame(query.get("manifest", [""])[0], int(query.get("index", ["0"])[0]), float(query.get("time", ["0"])[0]), frame=frame)
                 self.send_json({"ok": True, "path": path})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/shot-sheets":
+            try:
+                source_text = manifest_source_video(resolve(parse_qs(parsed.query).get("manifest", [""])[0]))
+                if not source_text or not resolve(source_text).is_file():
+                    raise FileNotFoundError("The shot manifest's source video is missing.")
+                self.send_json({"ok": True, **sheet_status(resolve(source_text))})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/upscale-shot-comparison":
@@ -626,6 +633,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
+        if path.is_relative_to(SHEETS_ROOT):
+            # Sheet folders are keyed by the video's size and mtime, so a URL never changes content.
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.end_headers()

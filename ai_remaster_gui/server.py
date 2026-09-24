@@ -385,6 +385,8 @@ def source_defaults_for(source: Path, monochrome: bool | None = None, info: dict
 
 
 DEFAULT_ANCHOR_PROMPT = "Replace the black bars."
+# Tabs with their own page renderer; they never show the generic stage file list.
+CUSTOM_PAGE_VIEWS = {"shots", "references", "colour", "recomp", "upscale", "output"}
 
 
 class PipelineApp:
@@ -908,7 +910,7 @@ class PipelineApp:
                     label = f"Upscale chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done{tile_note}){eta}"
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
-    def state(self, view: str = "", generate_shot_previews: bool = True) -> dict:
+    def state(self, view: str = "") -> dict:
         with self.lock:
             running = self.process is not None and self.process.poll() is None
             settings_snapshot = json.loads(json.dumps(self.settings))
@@ -921,7 +923,12 @@ class PipelineApp:
             payload = {
                 "root": str(ROOT),
                 "version": APP_VERSION,
-                "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in (*self.active_stages(), output_stage())],
+                # Only the open tab's generic stage page (drawStage) shows a file list; walking
+                # every stage's folders on each poll cost seconds on large projects.
+                "stages": [
+                    stage.__dict__ | {"files": self.files_for(stage) if stage.key == view and view not in CUSTOM_PAGE_VIEWS else []}
+                    for stage in (*self.active_stages(), output_stage())
+                ],
                 "settings": settings_snapshot,
                 "progress": self.progress(),
                 "phase_progress": self.phase_progress(),
@@ -957,10 +964,7 @@ class PipelineApp:
                 "log_count": len(self.log),
             }
         if view in {"shots", "references", "colour", "upscale"}:
-            payload["shot_views"] = shot_views(
-                settings_snapshot,
-                generate_previews=generate_shot_previews if view != "upscale" else False,
-            )
+            payload["shot_views"] = shot_views(settings_snapshot, view)
         if view == "recomp":
             values = settings_snapshot.get("recomp", {})
             manifest_text = values.get("manifest", "")

@@ -67,7 +67,8 @@ def color_reference_outputs(manifest_text: str) -> list[str]:
     rows = read_manifest(manifest)
     return [item.get("color_reference", "") for row in rows for item in reference_items(row) if item.get("color_reference")]
 
-def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = True) -> dict[str, object]:
+def shot_views(settings: dict[str, dict[str, str]], view: str) -> dict[str, object]:
+    """Manifest paths for every shot tab, but rows only for the open one (view)."""
     shots_settings = settings.get("shots", {})
     references_manifest = settings.get("references", {}).get("manifest", "")
     colour_manifest = settings.get("colour", {}).get("manifest", "") or references_manifest
@@ -80,13 +81,15 @@ def shot_views(settings: dict[str, dict[str, str]], generate_previews: bool = Tr
     upscale_manifest = colour_manifest or references_manifest or shots_manifest
     return {
         "shots_manifest": shots_manifest,
-        "shots": shot_rows(shots_manifest, include_previews=True, generate_previews=generate_previews),
+        # The browser paints shot thumbnails from whole-video sheets (scrub_sheets.py); state
+        # only reports previews that already exist, so it never waits on ffmpeg.
+        "shots": shot_rows(shots_manifest, include_previews=True, generate_previews=False) if view == "shots" else [],
         "references_manifest": references_manifest,
-        "references": shot_rows(references_manifest),
+        "references": shot_rows(references_manifest) if view == "references" else [],
         "colour_manifest": colour_manifest,
-        "colour": shot_rows(colour_manifest),
+        "colour": shot_rows(colour_manifest) if view == "colour" else [],
         "upscale_manifest": upscale_manifest,
-        "upscale": shot_rows(upscale_manifest),
+        "upscale": shot_rows(upscale_manifest) if view == "upscale" else [],
     }
 
 def shot_rows(
@@ -199,7 +202,7 @@ def shot_rows_for_indices(manifest_text: str, indices: Iterable[int], include_pr
     wanted = {index for index in indices if index >= 0}
     if not wanted:
         return []
-    rows = shot_rows(manifest_text, include_previews=include_previews, preview_indices=wanted)
+    rows = shot_rows(manifest_text, include_previews=include_previews, preview_indices=wanted, generate_previews=False)
     return [row for row in rows if int(row.get("index", -1)) in wanted]
 
 def recent_color_references(rows: list[dict[str, str]], row_index: int, limit: int = 8) -> list[str]:

@@ -1339,7 +1339,19 @@ async function splitShot(manifest, index, button = null) {
   await redrawWithState(result.state, snap, true);
 }
 
-async function setShotBoundary(manifest, index, edge, frame) {
+// Boundary saves run strictly in order: rapid nudges or quick successive drags must not
+// let an older response overwrite a newer edit.
+let shotBoundarySaveChain = Promise.resolve();
+
+function setShotBoundary(manifest, index, edge, frame) {
+  shotBoundarySavesInFlight += 1;
+  shotBoundarySaveChain = shotBoundarySaveChain
+    .then(() => saveShotBoundary(manifest, index, edge, frame))
+    .finally(() => { shotBoundarySavesInFlight -= 1; });
+  return shotBoundarySaveChain;
+}
+
+async function saveShotBoundary(manifest, index, edge, frame) {
   const rows = (state.shot_views && state.shot_views.shots) || [];
   const row = rows[index] || {};
   const fps = Math.max(1, Number(row.fps || 24));
@@ -1347,20 +1359,20 @@ async function setShotBoundary(manifest, index, edge, frame) {
   const result = await postJson('/api/shot-boundary', { manifest, index, edge, frame: numericFrame, time: numericFrame / fps });
   if (!result.ok) return alert(result.error || 'Could not update shot boundary');
 
-  if (result.state) {
-    state = result.state;
-  } else if (Array.isArray(result.rows)) {
-    mergeShotRows('shots', result.rows);
-    if (typeof result.log === 'string') state.log = result.log;
-    if (Number.isFinite(Number(result.log_count))) state.log_count = Number(result.log_count);
-  } else {
+  if (!Array.isArray(result.rows)) {
     state = await api(stateUrl());
+    pruneSelected();
+    draw(false);
+    lastRenderSignature = renderSignature();
+    return;
   }
-  pruneSelected();
-  const refreshed = Array.isArray(result.rows)
-    ? result.rows.map(row => Number(row.index)).filter(Number.isInteger)
-    : [index, edge === 'start' ? index - 1 : index + 1];
-  refreshShotRows('shots', refreshed);
+  mergeShotRows('shots', result.rows);
+  if (typeof result.log === 'string') state.log = result.log;
+  if (Number.isFinite(Number(result.log_count))) state.log_count = Number(result.log_count);
+  result.rows.forEach(updated => {
+    if (!patchShotBoundaryCard(manifest, updated)) refreshShotRows('shots', [Number(updated.index)]);
+  });
+  lastShotsStructure = shotsStructureSignature();
   updateRunLogs();
   lastRenderSignature = renderSignature();
 }
@@ -1391,12 +1403,15 @@ async function saveShotUpscaleStrength(manifest, index, strength) {
 }
 
 function nudgeShotBoundary(manifest, index, edge, frames) {
-  const rows = (state.shot_views && state.shot_views.shots) || [];
-  const row = rows[index];
-  if (!row) return;
-
-  const base = edge === 'start' ? Number(row.start_frame) : Number(row.end_boundary_frame || (Number(row.end_frame) + 1));
-  setShotBoundary(manifest, index, edge, base + (Number(frames) || 0));
+  // Nudge from the slider's live value, not the last server response, so several quick
+  // clicks accumulate instead of all resolving to the same frame.
+  const input = document.getElementById(`shotBoundaryRange_${edge}_${index}`);
+  if (!input) return;
+  const next = Math.max(Number(input.min), Math.min(Number(input.max), Number(input.value) + (Number(frames) || 0)));
+  if (next === Number(input.value)) return;
+  input.value = String(next);
+  updateShotBoundaryPreview(manifest, index, next, `shotBoundaryImg_${edge}_${index}`, `shotBoundaryLabel_${edge}_${index}`, input.dataset);
+  setShotBoundary(manifest, index, edge, next);
 }
 
 const previewTimers = {};
@@ -1418,7 +1433,8 @@ async function runQueuedShotPreview(imgId) {
   previewInFlight[imgId] = true;
   try {
     const result = await api('/api/shot-preview' + buildQuery());
-    const img = document.getElementById(imgId);
+    const el = document.getElementById(imgId);
+    const img = el && el.tagName !== 'IMG' ? el.querySelector('img') : el;
     if (result.ok && result.path && img) img.src = media(result.path);
   } finally {
     previewInFlight[imgId] = false;
@@ -1439,6 +1455,19 @@ function updateShotPreview(manifest, index, time, imgId, labelId, frame = null) 
   ), 250);
 }
 
+function requestShotThumb(manifest, elementId, frame) {
+  const index = Number(String(elementId).split('_').pop());
+  const row = ((state.shot_views && state.shot_views.shots) || [])[index] || {};
+  const fps = Math.max(1, Number(row.fps || 24));
+  const target = Math.max(0, Math.round(Number(frame) || 0));
+  queueShotPreview(elementId, () => (
+    '?manifest=' + encodeURIComponent(manifest)
+      + '&index=' + index
+      + '&time=' + encodeURIComponent(target / fps)
+      + '&frame=' + encodeURIComponent(target)
+  ), 60);
+}
+
 function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, dataset) {
   const label = document.getElementById(labelId);
   const edge = dataset && dataset.edge === 'end' ? 'End' : 'Start';
@@ -1447,6 +1476,10 @@ function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, datas
   const displayFrame = edge === 'End' ? Math.max(0, boundaryFrame - 1) : boundaryFrame;
   if (label) label.textContent = `${edge} frame ${displayFrame}`;
 
+  if (readyShotSheets(manifest)) {
+    paintShotThumb(manifest, imgId, displayFrame, '', true);
+    return;
+  }
   queueShotPreview(imgId, () => {
     const previewFrame = Math.max(0, boundaryFrame + Number((dataset && dataset.previewOffsetFrames) || 0));
     const previewTime = previewFrame / fps;
@@ -1454,7 +1487,7 @@ function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, datas
       + '&index=' + index
       + '&time=' + encodeURIComponent(previewTime)
       + '&frame=' + encodeURIComponent(previewFrame);
-  }, 250);
+  }, 80);
 }
 
 async function regenerateReference(manifest, index, referenceIndex = 0) {

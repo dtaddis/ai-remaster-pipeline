@@ -30,7 +30,7 @@ class ReferenceScrubTests(unittest.TestCase):
                     "shots": {"outpainted_video": "intermediate/outpainted/renamed.mp4"},
                     "references": {"manifest": loaded_text},
                     "colour": {"manifest": loaded_text},
-                })
+                }, "shots")
 
         self.assertEqual(views["shots_manifest"], loaded_text)
         self.assertEqual(views["shots"], [{"manifest": loaded_text}])

@@ -75,6 +75,192 @@ function drawShotStage({ key, heading, runLabel, outputLimit, afterRender }) {
   bindStageFields(key);
   if (afterRender) afterRender();
   showCommand(key);
+  if (key === 'shots') {
+    lastShotsStructure = shotsStructureSignature();
+    ensureShotSheets((state.shot_views || {}).shots_manifest || '');
+  }
+}
+
+// ── Scrub sheets ────────────────────────────────────────────────────────────
+// The server tiles every frame of the shot video into small contact sheets once
+// (scrub_sheets.py). Scrubbing then only moves a background window over a sheet
+// the browser already holds, so a slider drag never waits on a request.
+
+const shotSheets = {};
+let lastShotsStructure = '';
+let shotPointerDown = false;
+let shotBoundarySavesInFlight = 0;
+
+document.addEventListener('pointerdown', event => {
+  if (event.target && event.target.matches && event.target.matches('input[type=range]')) shotPointerDown = true;
+}, true);
+['pointerup', 'pointercancel'].forEach(type => document.addEventListener(type, () => { shotPointerDown = false; }, true));
+
+function shotInteractionActive() {
+  return shotPointerDown || shotBoundarySavesInFlight > 0 || isEditingField();
+}
+
+function shotsStructureSignature() {
+  const view = state.shot_views || {};
+  return JSON.stringify({
+    manifest: view.shots_manifest || '',
+    rows: (view.shots || []).map(row => [row.start_frame, row.end_boundary_frame, row.enabled, row.fade_to_next, row.crossfade_seconds]),
+    running: state.running,
+    running_stage: state.running_stage,
+  });
+}
+
+function updateShotsDynamicStatus() {
+  const sp = stageProgress('shots');
+  const progressEl = document.querySelector('.shot-page > section:first-child .phase-progress');
+  if (progressEl) progressEl.outerHTML = progressHtml(sp.percent, sp.label);
+  if (shotsStructureSignature() === lastShotsStructure || shotInteractionActive()) return;
+  const snap = captureScrollState();
+  draw(false);
+  restoreScrollState(snap);
+}
+
+async function ensureShotSheets(manifest) {
+  if (!manifest) return;
+  const known = shotSheets[manifest];
+  if (known && (known.ready || known.error)) return paintAllShotThumbs(manifest);
+  if (known && known.polling) return;
+  shotSheets[manifest] = { polling: true };
+  try {
+    for (;;) {
+      const result = await api('/api/shot-sheets?manifest=' + encodeURIComponent(manifest));
+      if (!result.ok || result.error) {
+        shotSheets[manifest] = { error: result.error || 'Scrub previews unavailable' };
+        break;
+      }
+      if (result.ready) {
+        shotSheets[manifest] = result;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+  } catch (error) {
+    shotSheets[manifest] = { error: String(error) };
+  }
+  paintAllShotThumbs(manifest);
+}
+
+function readyShotSheets(manifest) {
+  const info = shotSheets[manifest];
+  return info && info.ready ? info : null;
+}
+
+function sheetUrl(info, sheet) {
+  return media(`${info.directory}/sheet_${String(sheet).padStart(5, '0')}.jpg`);
+}
+
+// Sheets decoded ahead for a slider being dragged. Bounded: a decoded 5x5 sheet is ~8 MB.
+const SCRUB_DECODED_SHEETS = 8;
+const decodedSheets = new Map();
+const prefetchedSheets = new Set();
+
+function decodedSheet(url) {
+  let image = decodedSheets.get(url);
+  if (image) {
+    decodedSheets.delete(url);
+  } else {
+    image = new Image();
+    image.decoding = 'async';
+    image.src = url;
+    image.ready = image.decode().catch(() => {});
+  }
+  decodedSheets.set(url, image);
+  while (decodedSheets.size > SCRUB_DECODED_SHEETS) decodedSheets.delete(decodedSheets.keys().next().value);
+  return image;
+}
+
+function prefetchSheet(url) {
+  // Downloads into the HTTP cache (sheets are served immutable) without forcing a decode.
+  if (prefetchedSheets.has(url)) return;
+  prefetchedSheets.add(url);
+  new Image().src = url;
+}
+
+function paintShotThumb(manifest, elementId, frame, fallbackPath = '', scrubbing = false) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  const target = Math.max(0, Math.round(Number(frame) || 0));
+  el.dataset.frame = String(target);
+  const info = readyShotSheets(manifest);
+  if (!info) {
+    const img = el.querySelector('img');
+    if (img && fallbackPath) {
+      const url = media(fallbackPath);
+      if (img.getAttribute('src') !== url) img.src = url;
+    } else if ((shotSheets[manifest] || {}).error) {
+      requestShotThumb(manifest, elementId, target);
+    }
+    return;
+  }
+  const per = info.frames_per_sheet;
+  const sheet = Math.min(info.sheet_count - 1, Math.floor(target / per));
+  const tile = target - sheet * per;
+  const col = tile % info.columns;
+  const row = Math.floor(tile / info.columns);
+  const url = sheetUrl(info, sheet);
+  const apply = () => {
+    if (el.dataset.frame !== String(target)) return;
+    el.style.backgroundImage = `url("${url}")`;
+    el.style.backgroundSize = `${info.columns * 100}% ${info.rows * 100}%`;
+    el.style.backgroundPosition = `${info.columns > 1 ? (col / (info.columns - 1)) * 100 : 0}% ${info.rows > 1 ? (row / (info.rows - 1)) * 100 : 0}%`;
+    el.style.aspectRatio = `${info.tile_width} / ${info.tile_height}`;
+    el.classList.add('sheet-ready');
+  };
+  if (!scrubbing) return apply();
+  // While dragging, keep showing the previous tile until a newly needed sheet has decoded,
+  // so crossing a sheet boundary never flashes an empty box; fetch the neighbours ahead.
+  const image = decodedSheet(url);
+  if (image.complete && image.naturalWidth) apply();
+  else image.ready.then(apply);
+  for (const neighbour of [sheet - 2, sheet - 1, sheet + 1, sheet + 2]) {
+    if (neighbour >= 0 && neighbour < info.sheet_count) prefetchSheet(sheetUrl(info, neighbour));
+  }
+}
+
+function shotThumbFrames(row) {
+  const start = Number(row.start_frame || 0);
+  const endExclusive = Number(row.end_boundary_frame || (Number(row.end_frame || 0) + 1));
+  return {
+    start,
+    middle: start + Math.max(0, Math.floor((endExclusive - start - 1) / 2)),
+    end: Math.max(start, endExclusive - 1),
+  };
+}
+
+function paintShotRowThumbs(manifest, row) {
+  const frames = shotThumbFrames(row);
+  paintShotThumb(manifest, `shotBoundaryImg_start_${row.index}`, frames.start, row.start_preview);
+  paintShotThumb(manifest, `shotMiddleImg_${row.index}`, frames.middle, row.middle_preview);
+  paintShotThumb(manifest, `shotBoundaryImg_end_${row.index}`, frames.end, row.end_preview);
+}
+
+let shotThumbObserver = null;
+
+// Paint cards as they approach the viewport, so a long shot list only downloads the
+// sheets someone actually looks at.
+function paintAllShotThumbs(manifest) {
+  if (active !== 'shots') return;
+  const view = state.shot_views || {};
+  if ((view.shots_manifest || '') !== manifest) return;
+  if (shotThumbObserver) shotThumbObserver.disconnect();
+  shotThumbObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      shotThumbObserver.unobserve(entry.target);
+      const row = ((state.shot_views || {}).shots || [])[Number(entry.target.dataset.shotCardIndex)];
+      if (row) paintShotRowThumbs(manifest, row);
+    }
+  }, { rootMargin: '800px 0px' });
+  document.querySelectorAll('[data-shot-card-mode="shots"]').forEach(card => shotThumbObserver.observe(card));
+}
+
+function scrubThumbHtml(elementId, frame, fallbackPath) {
+  return `<div class="scrub-thumb" id="${elementId}" data-frame="${Number(frame) || 0}">${fallbackPath ? `<img src="${media(fallbackPath)}" alt="">` : '<img alt="">'}</div>`;
 }
 
 function shotStageVisibleFields(st, s = {}) {
@@ -206,7 +392,7 @@ function shotBoundaryCard(context) {
       ${boundaryFrameCard(context, 'start')}
       <div>
         <label>Middle</label>
-        ${row.middle_preview ? `<img src="${media(row.middle_preview)}" alt="">` : missingImage('Image not present')}
+        ${scrubThumbHtml(`shotMiddleImg_${idx}`, shotThumbFrames(row).middle, row.middle_preview)}
       </div>
       ${boundaryFrameCard(context, 'end')}
     </article>
@@ -244,15 +430,23 @@ function shotTransitionControl(mode, manifest, row) {
   `;
 }
 
-function boundaryFrameCard({ manifest, row, idx }, edge) {
+function boundaryGeometry(row, edge) {
   const isStart = edge === 'start';
   const frame = isStart ? Number(row.start_frame || 0) : Number(row.end_boundary_frame || (Number(row.end_frame || 0) + 1));
-  const displayFrame = isStart ? frame : Math.max(0, frame - 1);
+  return {
+    frame,
+    displayFrame: isStart ? frame : Math.max(0, frame - 1),
+    min: isStart ? Math.max(0, Number(row.previous_start_frame ?? (Number(row.start_frame || 0) - 1)) + 1) : Number(row.start_frame || 0) + 1,
+    max: isStart ? Number(row.end_boundary_frame || (Number(row.end_frame || 0) + 1)) - 1 : Number(row.next_end_boundary_frame ?? (frame + 1)) - 1,
+    label: isStart ? 'Start' : 'End',
+  };
+}
+
+function boundaryFrameCard({ manifest, row, idx }, edge) {
+  const isStart = edge === 'start';
+  const { frame, displayFrame, min, max, label } = boundaryGeometry(row, edge);
   const preview = isStart ? row.start_preview : row.end_preview;
-  const min = isStart ? Math.max(0, Number(row.previous_start_frame ?? (Number(row.start_frame || 0) - 1)) + 1) : Number(row.start_frame || 0) + 1;
-  const max = isStart ? Number(row.end_boundary_frame || (Number(row.end_frame || 0) + 1)) - 1 : Number(row.next_end_boundary_frame ?? (frame + 1)) - 1;
   const disabled = isStart && idx === 0 ? 'disabled' : '';
-  const label = isStart ? 'Start' : 'End';
   const fps = Math.max(1, Number(row.fps || 24));
   const imgId = `shotBoundaryImg_${edge}_${idx}`;
   const labelId = `shotBoundaryLabel_${edge}_${idx}`;
@@ -261,8 +455,9 @@ function boundaryFrameCard({ manifest, row, idx }, edge) {
   return `
     <div>
       <label id="${labelId}">${label} frame ${displayFrame}</label>
-      ${preview ? `<img id="${imgId}" src="${media(preview)}" alt="">` : missingImage('Image not present')}
+      ${scrubThumbHtml(imgId, displayFrame, preview)}
       <input
+        id="shotBoundaryRange_${edge}_${idx}"
         type="range"
         min="${min}"
         max="${max}"
@@ -421,6 +616,7 @@ function refreshShotRows(mode, indices) {
     const card = document.querySelector(`[data-shot-card-mode="${mode}"][data-shot-card-index="${index}"]`);
     if (card) {
       card.outerHTML = shotCard(mode, manifest, row);
+      if (mode === 'shots') paintShotRowThumbs(manifest, row);
     }
 
     const transition = document.querySelector(`[data-shot-transition-mode="${mode}"][data-shot-transition-index="${index}"]`);
@@ -436,6 +632,31 @@ function refreshShotRows(mode, indices) {
   }
 
   if (mode === 'references') wireReferenceTimeControls();
+}
+
+// Update a shot card's boundaries without replacing its DOM, so a slider the user is
+// dragging (or has focused) survives a save of a neighbouring edge.
+function patchShotBoundaryCard(manifest, row) {
+  const card = document.querySelector(`[data-shot-card-mode="shots"][data-shot-card-index="${row.index}"]`);
+  if (!card) return false;
+  const time = card.querySelector('.shot-time');
+  if (time) time.textContent = `${row.start_label} to ${row.end_label}`;
+  const frames = shotThumbFrames(row);
+  for (const edge of ['start', 'end']) {
+    const geometry = boundaryGeometry(row, edge);
+    const input = document.getElementById(`shotBoundaryRange_${edge}_${row.index}`);
+    if (input) {
+      input.min = String(geometry.min);
+      input.max = String(geometry.max);
+    }
+    if (input && shotPointerDown && document.activeElement === input) continue;
+    if (input) input.value = String(geometry.frame);
+    const label = document.getElementById(`shotBoundaryLabel_${edge}_${row.index}`);
+    if (label) label.textContent = `${geometry.label} frame ${geometry.displayFrame}`;
+    paintShotThumb(manifest, `shotBoundaryImg_${edge}_${row.index}`, frames[edge], row[edge + '_preview']);
+  }
+  paintShotThumb(manifest, `shotMiddleImg_${row.index}`, frames.middle, row.middle_preview);
+  return true;
 }
 
 function updateReferencesDynamicStatus() {
