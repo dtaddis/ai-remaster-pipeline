@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Shared open-codec profiles for files that remain in the processing chain."""
 
+from pathlib import Path
+
 INTERMEDIATE_PROFILES = ("low", "medium", "high", "lossless")
 
 _LEGACY_PROFILES = {
@@ -43,6 +45,44 @@ def codec_args(profile: str | None, *, fast: bool = False) -> list[str]:
             "-g", "1", "-slicecrc", "1",
         ]
     return ["-c:v", "libvpx-vp9", "-crf", "18", "-b:v", "0", "-deadline", "good", "-cpu-used", cpu_used, "-row-mt", "1", "-pix_fmt", "yuv420p10le"]
+
+
+# ARP re-encodes every ComfyUI render into the working codec, so lossy profiles save
+# those renders a step above their own quality and the profile's encode stays the
+# only visible generation loss.
+_COMFY_H264_CRF = {"low": 20, "medium": 16, "high": 12}
+
+
+def comfy_video_combine_inputs(profile: str | None) -> dict[str, object]:
+    """VHS_VideoCombine format inputs for a ComfyUI render that feeds the processing chain."""
+
+    selected = canonical_profile(profile)
+    if selected == "lossless":
+        return {
+            "format": "video/ffv1-mkv", "level": "3", "coder": "1", "context": "1",
+            "gop_size": 1, "slices": "16", "slicecrc": "1", "pix_fmt": "bgra",
+        }
+    return {"format": "video/h264-mp4", "pix_fmt": "yuv420p10le", "crf": _COMFY_H264_CRF[selected]}
+
+
+_VHS_ENCODER_INPUTS = {
+    "format", "pix_fmt", "crf", "bitrate", "megabit",
+    "level", "coder", "context", "gop_size", "slices", "slicecrc",
+}
+
+
+def vhs_inputs_for_profile(inputs: dict, profile: str | None) -> dict:
+    """Replace a VHS_VideoCombine API node's encoder settings with the profile's."""
+
+    kept = {key: value for key, value in inputs.items() if key not in _VHS_ENCODER_INPUTS}
+    return {**kept, **comfy_video_combine_inputs(profile)}
+
+
+def existing_comfy_render(path: Path) -> Path:
+    """A cached ComfyUI render is .mkv (lossless profile) or .mp4 (lossy profiles, older caches)."""
+
+    other = path.with_suffix(".mp4" if path.suffix.lower() == ".mkv" else ".mkv")
+    return other if not path.exists() and other.exists() else path
 
 
 def container_args(path: str, profile: str | None) -> list[str]:

@@ -163,3 +163,23 @@ class PatchExtraGuidesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComfyChunkSaveTests(unittest.TestCase):
+    def test_both_templates_save_chunks_in_the_intermediate_profile(self) -> None:
+        for name in ("outpaint_LTX-IC.json", "outpaint_LTX-2.5.json"):
+            for profile, video_format, pix_fmt in (("lossless", "video/ffv1-mkv", "bgra"), ("high", "video/h264-mp4", "yuv420p10le")):
+                with self.subTest(template=name, profile=profile):
+                    workflow = json.loads((WORKFLOW.parent / name).read_text(encoding="utf-8-sig"))
+                    prompt = workflow_to_prompt(workflow, "5228")
+                    create_inputs = prompt[str(prompt["5228"]["inputs"]["video"][0])]["inputs"]
+
+                    patched = ov.save_chunk_for_profile(prompt, "5228", profile)
+
+                    save = patched["5228"]
+                    self.assertEqual(save["class_type"], "VHS_VideoCombine")
+                    self.assertEqual(save["inputs"]["format"], video_format)
+                    self.assertEqual(save["inputs"]["pix_fmt"], pix_fmt)
+                    self.assertEqual(save["inputs"]["images"], create_inputs["images"])
+                    self.assertEqual(save["inputs"]["frame_rate"], create_inputs["fps"])
+                    self.assertNotIn("CreateVideo", {node["class_type"] for node in patched.values()})

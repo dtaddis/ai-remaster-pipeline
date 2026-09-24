@@ -162,6 +162,11 @@ def is_windows() -> bool:
     return os.name == "nt"
 
 
+def ffprobe_for(ffmpeg: str) -> str:
+    path = Path(ffmpeg)
+    return str(path.with_name("ffprobe.exe")) if path.suffix.lower() == ".exe" else "ffprobe"
+
+
 def find_ffmpeg(explicit: str | None = None) -> str:
     candidates: list[Path] = []
     if explicit:

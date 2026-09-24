@@ -1708,7 +1708,6 @@ class PipelineApp:
             add(["--output", output])
         add(["--processing-height", values.get("processing_height", "source")])
         add(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
-        add(["--crf", values.get("crf", "18")])
         if method == "openai":
             reference_settings = self.settings.get("references", {})
             add(["--api-key", reference_settings.get("openai_api_key", "")])
@@ -2881,7 +2880,9 @@ def soundtrack_output_for(source_text: str, values: dict[str, str]) -> str:
     music = is_true(values, "create_music", "true")
     sfx = is_true(values, "create_sfx", "true")
     ident = aid.soundtrack_identity(source.stem, music, sfx)
-    return rel(ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, "mp4"))
+    # The video stream is copied, so a ProRes recomposition needs a .mov (MP4 cannot hold ProRes).
+    extension = "mov" if source.suffix.lower() == ".mov" else "mp4"
+    return rel(ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, extension))
 
 
 def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
@@ -2977,6 +2978,12 @@ def migrate_legacy_outpaint_chunk_manifest(source_text: str, values: dict[str, s
     APP.log.append(
         f"Recovered outpaint chunk settings and guide frames from legacy LTX 2.5 manifest: {rel(legacy)}"
     )
+
+
+def outpaint_raw_chunk(path: Path) -> Path:
+    """Raw chunks are .mkv (lossless profile) or .mp4 (lossy profiles and older chunks)."""
+    other = path.with_suffix(".mp4" if path.suffix.lower() == ".mkv" else ".mkv")
+    return other if not path.exists() and other.exists() else path
 
 
 def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
@@ -3122,7 +3129,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         apply_outpaint_chunk_offsets(row, default_offset_x, default_offset_y)
         offset_slug = outpaint_chunk_offset_slug(row)
         prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv"
-        raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
+        raw = outpaint_raw_chunk(chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv")
         row.update({
             "chunk_index": str(index),
             "start_frame": str(start_frame),
@@ -3215,7 +3222,7 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
         offset = duration / 2
 
     if kind == "raw":
-        raw = resolve(str(row.get("raw_path", "")))
+        raw = outpaint_raw_chunk(resolve(str(row.get("raw_path", ""))))
         raw_is_chunk = raw.exists()
         if not raw_is_chunk:
             source_text = outpaint_source_for_settings(settings)

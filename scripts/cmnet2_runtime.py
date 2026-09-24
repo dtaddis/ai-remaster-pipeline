@@ -104,7 +104,6 @@ class CMNet2Session:
         height: int,
         fps: float,
         ffmpeg: str,
-        crf: int = 18,
         intermediate_profile: str = "high",
     ) -> None:
         try:

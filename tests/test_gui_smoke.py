@@ -5420,6 +5420,18 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("FlashVSR upscaling requires NVIDIA compute capability 7.5+", message)
         self.assertEqual(system_status.flashvsr_hardware_warning("NVIDIA GeForce RTX 2080", (7, 5)), "")
 
+    def test_soundtrack_output_keeps_a_prores_recomposition_in_mov(self) -> None:
+        values = {"create_music": "true", "create_sfx": "true"}
+        self.assertTrue(app.soundtrack_output_for("output/reassembled/film_recomp_abc.mov", values).endswith(".mov"))
+        self.assertTrue(app.soundtrack_output_for("output/reassembled/film_recomp_abc.mp4", values).endswith(".mp4"))
+
+    def test_outpaint_raw_chunk_prefers_mkv_and_keeps_finished_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mkv = Path(tmp) / "raw_0000_000000_000100.mkv"
+            self.assertEqual(app.outpaint_raw_chunk(mkv), mkv)
+            mkv.with_suffix(".mp4").write_bytes(b"x")
+            self.assertEqual(app.outpaint_raw_chunk(mkv), mkv.with_suffix(".mp4"))
+
     def test_outpaint_hydration_does_not_pick_stale_newest_output_for_new_source(self) -> None:
         app.APP.settings["global"].update({"source": "input/new-source.mp4", "expand_outpaint": "true", "colorize": "false", "upscale": "false", "section_start": "0", "section_end": ""})
         stale = app.ROOT / "intermediate" / "outpainted" / "old-source_16x9_1280x704_outpainted.mp4"

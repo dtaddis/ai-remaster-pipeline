@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt_with_progress, wait_for_comfy
-from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
+from common import ROOT, copy_to_comfy_input, ffprobe_for, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
 from dependency_manager import (
     LTX25_GGUF_MODEL,
     LTX25_PIXEL_UPSCALER_LORA,
@@ -39,7 +39,7 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
     "text, compression artifacts, film damage, dust, scratches"
 )
-from intermediate_video import codec_args as intermediate_codec_args, container_args, migrate_profile_name
+from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, migrate_profile_name
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25"}
 DEFAULT_SEEDVR2_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
@@ -56,6 +56,24 @@ def working_container_args(path: Path) -> list[str]:
 
 def delivery_codec_args() -> list[str]:
     return ["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p"]
+
+
+def delivery_audio_args(ffmpeg: str, media: Path) -> list[str]:
+    """Copy an AAC track (such as the soundtrack stage's) instead of encoding it a second time."""
+    probe = subprocess.run(
+        [ffprobe_for(ffmpeg), "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(media)],
+        capture_output=True, text=True, check=False,
+    )
+    return ["-c:a", "copy"] if probe.stdout.strip() == "aac" else ["-c:a", "aac", "-b:a", "320k"]
+
+
+def encode_upscale_delivery(ffmpeg: str, ai_upscale: Path, output: Path) -> None:
+    partial = output.with_suffix(output.suffix + ".full.partial" + output.suffix)
+    subprocess.run([
+        ffmpeg, "-y", "-i", str(ai_upscale), "-map", "0:v:0", "-map", "0:a?",
+        *delivery_codec_args(), *delivery_audio_args(ffmpeg, ai_upscale), "-movflags", "+faststart", str(partial),
+    ], check=True)
+    replace_with_retry(partial, output, "Full-strength upscaled output")
 
 
 def upscale_method(args: argparse.Namespace) -> str:
@@ -423,7 +441,7 @@ def blend_upscale_delivery(
         ffmpeg, "-y", "-i", str(source), "-i", str(ai_upscale),
         "-filter_complex", filters, "-map", "[vout]", "-map", "0:a?", "-shortest",
         "-r", f"{fps:.8f}", "-fps_mode", "cfr", *delivery_codec_args(),
-        "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", str(partial),
+        *delivery_audio_args(ffmpeg, source), "-movflags", "+faststart", str(partial),
     ]
     print("Blending source motion/detail with AI upscale by shot", flush=True)
     subprocess.run(command, check=True)
@@ -509,9 +527,7 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": prefix,
-                "format": "video/h264-mp4",
-                "pix_fmt": "yuv420p",
-                "crf": 16,
+                **comfy_video_combine_inputs(CURRENT_INTERMEDIATE_PROFILE),
                 "save_metadata": True,
                 "pingpong": False,
                 "save_output": True,
@@ -637,9 +653,7 @@ def seedvr2_prompt(
                     "frame_rate": fps,
                     "loop_count": 0,
                     "filename_prefix": prefix,
-                    "format": "video/h264-mp4",
-                    "pix_fmt": "yuv420p",
-                    "crf": 16,
+                    **comfy_video_combine_inputs(CURRENT_INTERMEDIATE_PROFILE),
                     "save_metadata": True,
                     "pingpong": False,
                     "save_output": True,
@@ -709,9 +723,7 @@ def seedvr2_prompt(
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": prefix,
-                "format": "video/h264-mp4",
-                "pix_fmt": "yuv420p",
-                "crf": 16,
+                **comfy_video_combine_inputs(CURRENT_INTERMEDIATE_PROFILE),
                 "save_metadata": True,
                 "pingpong": False,
                 "save_output": True,
@@ -882,9 +894,7 @@ def ltx25_prompt(
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": prefix,
-                "format": "video/h264-mp4",
-                "pix_fmt": "yuv420p",
-                "crf": 16,
+                **comfy_video_combine_inputs(CURRENT_INTERMEDIATE_PROFILE),
                 "save_metadata": True,
                 "pingpong": False,
                 "save_output": True,
@@ -1115,12 +1125,9 @@ def mux_audio(ffmpeg: str, video_source: Path, audio_source: Path, output: Path)
         "-c:v",
         "copy",
         "-c:a",
-        "aac",
-        "-b:a",
-        "320k",
+        "copy",
         "-shortest",
-        "-movflags",
-        "+faststart",
+        *working_container_args(partial),
         str(partial),
     ]
     subprocess.run(command, check=True)
@@ -1138,7 +1145,7 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: P
         print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
         subprocess.run([
             ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-an", *delivery_codec_args(), "-movflags", "+faststart", str(video_partial),
+            "-an", *working_codec_args(), *working_container_args(video_partial), str(video_partial),
         ], check=True)
     mux_audio(ffmpeg, video_partial, audio_source, output)
     video_partial.unlink(missing_ok=True)
@@ -1318,8 +1325,8 @@ def scale_video(ffmpeg: str, source: Path, output: Path, width: int, height: int
         str(source),
         "-vf",
         f"scale={width}:{height}:flags=lanczos,setsar=1",
-        *delivery_codec_args(),
-        "-movflags", "+faststart",
+        *working_codec_args(),
+        *working_container_args(output),
         str(output),
     ]
     subprocess.run(command, check=True)
@@ -1453,7 +1460,7 @@ def run(args: argparse.Namespace) -> int:
         processing_source = pre_downscale_source(ffmpeg, args, source, output_width, output_height, info)
         processing_info = video_info(processing_source)
         processing_fingerprint = file_fingerprint(processing_source)
-    ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mp4"
+    ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mkv"
     ai_output.parent.mkdir(parents=True, exist_ok=True)
     if args.force or not resumable_output(
         ai_output, sig, video_like=source, width=delivery_width, height=delivery_height
@@ -1476,9 +1483,7 @@ def run(args: argparse.Namespace) -> int:
     shots = read_upscale_shots(manifest, int(info["frames"]), float(info["fps"]), default_strength)
     strengths = [float(shot["strength"]) for shot in shots] or [default_strength]
     if all(abs(strength - 1.0) < 1e-9 for strength in strengths):
-        full_partial = output.with_suffix(output.suffix + ".full.partial" + output.suffix)
-        shutil.copy2(ai_output, full_partial)
-        replace_with_retry(full_partial, output, "Full-strength upscaled output")
+        encode_upscale_delivery(ffmpeg, ai_output, output)
     else:
         blend_upscale_delivery(
             ffmpeg, source, ai_output, output, delivery_width, delivery_height,

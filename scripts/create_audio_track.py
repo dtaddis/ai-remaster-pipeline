@@ -57,11 +57,6 @@ MMAUDIO_FPS = 25
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
 
-def ffprobe_for(ffmpeg: str) -> str:
-    path = Path(ffmpeg)
-    return str(path.with_name("ffprobe.exe")) if path.suffix.lower() == ".exe" else "ffprobe"
-
-
 def run_ffmpeg(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 

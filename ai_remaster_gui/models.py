@@ -172,7 +172,6 @@ STAGES = (
             ("colormnet_memory_mode", "ColorMNet memory", "select:balanced|low_memory|high_quality", "balanced"),
             ("colormnet_feature_encoder", "ColorMNet encoder", "select:resnet50|vgg19|dinov2_vits|dinov2_vitb|dinov2_vitl|clip_vitb", "resnet50"),
             ("colormnet_text_guidance", "ColorMNet text guidance", "text", ""),
-            ("crf", "CRF", "number", "18"),
         ),
         ("manifest",),
     ),

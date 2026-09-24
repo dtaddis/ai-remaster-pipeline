@@ -30,12 +30,13 @@ from common import (
     resumable_output,
     root_relative,
     safe_stem,
+    signature_path,
     write_signature,
 )
 from dependency_manager import ensure_cleanup_models
 from outpaint_video import chunk_ranges, patch_workflow, split_chunk, stitch_chunks
 from prepare_outpaint_input import probe_video
-from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, container_args
+from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, existing_comfy_render, vhs_inputs_for_profile
 import artifact_ids as aid
 
 
@@ -845,11 +846,9 @@ def propainter_prompt(
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": output_prefix,
-                "format": "video/h264-mp4",
+                **comfy_video_combine_inputs(args.intermediate_profile),
                 "pingpong": False,
                 "save_output": True,
-                "pix_fmt": "yuv420p",
-                "crf": 10,
                 "save_metadata": False,
             },
         },
@@ -867,7 +866,7 @@ def run_propainter_chunk(
     fps: float,
     args: argparse.Namespace,
     output_prefix: str,
-) -> None:
+) -> Path:
     prompt = propainter_prompt(video, mask, width, height, fps, output_prefix, args)
     prompt_id = queue_prompt(comfy_url, prompt)
     print(f"Queued AI DeScratch ProPainter job {prompt_id}.", flush=True)
@@ -879,11 +878,17 @@ def run_propainter_chunk(
     if not candidates:
         raise RuntimeError(f"ProPainter prompt {prompt_id} completed without a video output.")
     generated = max(candidates, key=lambda path: path.stat().st_mtime_ns)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_suffix(".partial.mp4")
+    target = output.with_suffix(generated.suffix.lower())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".partial" + target.suffix)
     partial.unlink(missing_ok=True)
     shutil.copy2(generated, partial)
-    replace_with_retry(partial, output, "AI DeScratch ProPainter chunk")
+    replace_with_retry(partial, target, "AI DeScratch ProPainter chunk")
+    if target != output:
+        # Lookups fall back between .mkv and .mp4, so a stale sibling must not survive.
+        output.unlink(missing_ok=True)
+        signature_path(output).unlink(missing_ok=True)
+    return target
 
 
 def composite_ai_descratch(
@@ -1003,7 +1008,7 @@ def prepare_ai_descratch(
     for index, start, end in ranges:
         video_chunk = work_dir / f"ai_video_{index:04d}_{start:06d}_{end:06d}.mkv"
         mask_chunk = work_dir / f"ai_mask_{index:04d}_{start:06d}_{end:06d}.mkv"
-        raw = work_dir / f"ai_raw_{index:04d}_{start:06d}_{end:06d}.mp4"
+        raw = existing_comfy_render(work_dir / f"ai_raw_{index:04d}_{start:06d}_{end:06d}.mp4")
         normalized = work_dir / f"ai_normalized_{index:04d}_{start:06d}_{end:06d}.mkv"
         split_chunk(ffmpeg, prepared, video_chunk, start, end, fps, args.force)
         split_chunk(ffmpeg, mask, mask_chunk, start, end, fps, args.force)
@@ -1016,7 +1021,7 @@ def prepare_ai_descratch(
             "frames": int(args.ai_chunk_frames),
         }
         if args.force or not resumable_output(raw, chunk_sig, width=width, height=height):
-            run_propainter_chunk(
+            raw = run_propainter_chunk(
                 args.comfy_url,
                 comfy_output_root,
                 video_chunk,
@@ -1516,6 +1521,8 @@ def main() -> int:
         prompt = patch_workflow(
             args, workflow, prepared, comfy_dir, prefix, args.prompt, args.negative_prompt, seed
         )
+        save = prompt[args.output_node_id]
+        save["inputs"] = vhs_inputs_for_profile(save["inputs"], args.intermediate_profile)
         prompt_id = queue_prompt(args.comfy_url, prompt)
         print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)

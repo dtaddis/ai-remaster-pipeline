@@ -267,7 +267,7 @@ function shotStageVisibleFields(st, s = {}) {
   if (st.key === 'shots') return st.fields.filter(field => field[0] !== 'outpainted_video');
   if (st.key === 'references') return st.fields.filter(field => field[0] !== 'manifest');
   if (st.key === 'colour') {
-    const common = new Set(['compute', 'manifest', 'method', 'processing_height', 'crf']);
+    const common = new Set(['compute', 'manifest', 'method', 'processing_height']);
     const cloud = new Set(['openai_image_model', 'openai_previous_frames', 'openai_image_size', 'openai_image_quality', 'openai_prompt']);
     const deep = new Set(['frame_propagate', 'use_half_resolution', 'use_torch_compile', 'use_sage_attention']);
     const legacyColorMNet = new Set(['use_torch_compile', 'colormnet_memory_mode', 'colormnet_feature_encoder', 'colormnet_text_guidance', 'colormnet_text_guidance_weight']);

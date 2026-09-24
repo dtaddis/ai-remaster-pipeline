@@ -2,7 +2,6 @@ function drawSettings() {
   const refs = settings('references');
   const cloud = settings('cloud');
   const outpaint = settings('outpaint');
-  const colour = settings('colour');
   const recomp = settings('recomp');
 
   document.getElementById('app').innerHTML = `
@@ -13,7 +12,7 @@ function drawSettings() {
       ${cloudSettingsHtml(cloud)}
       ${qwenSettingsHtml(refs)}
       ${openAISettingsHtml(refs)}
-      ${pipelineDefaultsHtml(outpaint, colour, recomp)}
+      ${pipelineDefaultsHtml(outpaint, recomp)}
       ${logFileSettingsHtml()}
     </section>
   `;
@@ -143,13 +142,12 @@ function openAISettingsHtml(refs) {
   `;
 }
 
-function pipelineDefaultsHtml(outpaint, colour, recomp) {
+function pipelineDefaultsHtml(outpaint, recomp) {
   return `
     <h3>Pipeline Defaults</h3>
     <div class="source-info">
       <div><span>Outpaint aspect</span><strong>${esc(outpaint.target_aspect || '16:9')}</strong></div>
       <div><span>Outpaint height</span><strong>${esc(outpaint.target_height || '720')}</strong></div>
-      <div><span>Color CRF</span><strong>${esc(colour.crf || '18')}</strong></div>
       <div><span>Feather pixels</span><strong>${esc(recomp.feather_pixels || '80')}</strong></div>
     </div>
   `;

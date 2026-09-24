@@ -47,7 +47,7 @@ from dependency_manager import (
 )
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
-from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, container_args
+from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, existing_comfy_render
 from outpaint_geometry import source_placement
 from ltx_outpaint_workflow_adapter import (
     ADAPTER_ID as LTX_WORKFLOW_ADAPTER,
@@ -1582,6 +1582,38 @@ def prune_api_prompt(prompt: dict[str, Any], output_node_id: str) -> dict[str, A
     return {node_id: node for node_id, node in prompt.items() if node_id in needed}
 
 
+def save_chunk_for_profile(prompt: dict[str, Any], output_node_id: str, profile: str) -> dict[str, Any]:
+    """Save LTX's decoded frames in the intermediate profile instead of through core SaveVideo.
+
+    SaveVideo always writes 8-bit 4:2:0 H.264 at libx264's default CRF 23, so every
+    raw chunk lost detail and chroma before ARP's intermediate profile ever applied.
+    """
+    save = prompt.get(str(output_node_id))
+    if not save or save.get("class_type") != "SaveVideo":
+        return prompt
+    create_id = str(save["inputs"]["video"][0])
+    create = prompt.get(create_id, {})
+    if create.get("class_type") != "CreateVideo":
+        raise ValueError(f"Outpaint SaveVideo node {output_node_id} is not fed by CreateVideo.")
+    inputs = {
+        "images": create["inputs"]["images"],
+        "frame_rate": create["inputs"]["fps"],
+        "loop_count": 0,
+        "filename_prefix": save["inputs"]["filename_prefix"],
+        **comfy_video_combine_inputs(profile),
+        "save_metadata": False,
+        "trim_to_audio": False,
+        "pingpong": False,
+        "save_output": True,
+    }
+    if "audio" in create["inputs"]:
+        inputs["audio"] = create["inputs"]["audio"]
+    patched = dict(prompt)
+    patched[str(output_node_id)] = {"class_type": "VHS_VideoCombine", "inputs": inputs}
+    return prune_api_prompt(patched, output_node_id)
+
+
+
 def patch_ltx25_workflow(
     args,
     workflow: dict[str, Any],
@@ -2325,7 +2357,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
                 "start_seconds": f"{start_frame / fps:.6f}",
                 "end_seconds": f"{end_frame / fps:.6f}",
                 "prepared_path": root_relative(chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv"),
-                "raw_path": root_relative(chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"),
+                "raw_path": root_relative(chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mkv"),
             }
         )
         row["offset_mode"] = offset_mode
@@ -2902,7 +2934,7 @@ def main() -> int:
                 chunk_offset_x = int(float(chunk_row.get("offset_x", "0") or 0))
                 chunk_offset_y = int(float(chunk_row.get("offset_y", "0") or 0))
                 chunk_prepared = resolve_path(chunk_row.get("prepared_path", "")) if chunk_row.get("prepared_path") else chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mkv"
-                chunk_raw = resolve_path(chunk_row.get("raw_path", "")) if chunk_row.get("raw_path") else chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
+                chunk_raw = existing_comfy_render(resolve_path(chunk_row.get("raw_path", "")) if chunk_row.get("raw_path") else chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mkv")
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
                 force_this_split = args.force and (args.only_chunk is None or chunk_index == args.only_chunk)
                 split_chunk(ffmpeg, generation_prepared, chunk_prepared, start_frame, end_frame, float(prepared_info["fps"] or 24.0), force_this_split, chunk_offset_x, chunk_offset_y, raw_sig["prepared_fingerprint"], args.intermediate_profile)
@@ -2995,15 +3027,22 @@ def main() -> int:
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
                 prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, auto_guide)
+                prompt = save_chunk_for_profile(prompt, args.output_node_id, args.intermediate_profile)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
                 produced = newest_output(extract_output_files(history, comfy_output_root))
+                superseded = chunk_raw
+                chunk_raw = chunk_raw.with_suffix(produced.suffix.lower())
                 chunk_raw.parent.mkdir(parents=True, exist_ok=True)
                 chunk_tmp = chunk_raw.with_suffix(chunk_raw.suffix + ".partial")
                 shutil.copy2(produced, chunk_tmp)
                 replace_with_retry(chunk_tmp, chunk_raw, f"Outpaint chunk {chunk_index + 1}")
                 write_signature(chunk_raw, chunk_sig)
+                if superseded != chunk_raw:
+                    # Lookups fall back between .mkv and .mp4, so a stale sibling must not survive.
+                    superseded.unlink(missing_ok=True)
+                    signature_path(superseded).unlink(missing_ok=True)
                 print(f"Wrote raw Comfy chunk: {chunk_raw}", flush=True)
                 warning = black_margin_warning(chunk_raw)
                 if warning:

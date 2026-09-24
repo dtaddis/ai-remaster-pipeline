@@ -28,7 +28,7 @@ from common import (
     video_info,
     write_signature,
 )
-from intermediate_video import codec_args as intermediate_codec_args, container_args
+from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 REFERENCE_INPUT_COPY_STRATEGY = "content-keyed-v1"
@@ -259,8 +259,10 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
     settings = {
         "method": args.method,
         "use_torch_compile": args.use_torch_compile,
-        "video_format": args.video_format,
-        "crf": args.crf,
+        # Retired ComfyUI encoder settings, frozen at their last defaults so existing
+        # segments stay valid; ComfyUI renders now follow the intermediate profile.
+        "video_format": "video/h264-mp4",
+        "crf": 18,
         "processing_height": getattr(args, "processing_height", "source"),
         "intermediate_profile": getattr(args, "intermediate_profile", "high"),
     }
@@ -379,9 +381,7 @@ def build_prompt(
                 "frame_rate": fps,
                 "loop_count": 0,
                 "filename_prefix": prefix,
-                "format": args.video_format,
-                "pix_fmt": "yuv420p",
-                "crf": args.crf,
+                **comfy_video_combine_inputs(args.intermediate_profile),
                 "save_metadata": True,
                 "pingpong": False,
                 "save_output": True,
@@ -787,7 +787,7 @@ def openai_frame_signature(
     }
 
 
-def assemble_openai_frames(ffmpeg: str, frame_dir: Path, output: Path, fps: float, total_frames: int, crf: int) -> None:
+def assemble_openai_frames(ffmpeg: str, frame_dir: Path, output: Path, fps: float, total_frames: int) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
     cmd = [
@@ -898,7 +898,7 @@ def run_openai_colorization(
             f"shot {shot_index + 1}/{len(rows)}; cached {reused}",
             flush=True,
         )
-    assemble_openai_frames(ffmpeg, generated_dir, output, fps, total_frames, args.crf)
+    assemble_openai_frames(ffmpeg, generated_dir, output, fps, total_frames)
     write_signature(output, output_sig)
     print(f"Wrote OpenAI Cloud colorized video: {output}", flush=True)
     return 0
@@ -984,7 +984,6 @@ def run_cmnet2_colorization(
             height=height,
             fps=fps,
             ffmpeg=ffmpeg,
-            crf=args.crf,
             intermediate_profile=args.intermediate_profile,
         )
         write_signature(chunk, chunk_sig)
@@ -1036,8 +1035,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openai-quality", default="auto")
     parser.add_argument("--openai-timeout", type=float, default=900.0)
     parser.add_argument("--openai-max-retries", type=int, default=5)
-    parser.add_argument("--video-format", default="video/h264-mp4")
-    parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--ffmpeg")
