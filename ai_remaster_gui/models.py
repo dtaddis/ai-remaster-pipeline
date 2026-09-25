@@ -190,7 +190,7 @@ STAGES = (
             ("saturation", "Saturation", "range:0|200|1", "82"),
             ("temperature", "Temperature", "range:2500|9500|1", "6500"),
             ("color_opacity", "Color opacity", "range:0|100|1", "100"),
-            ("reference_luminance_match", "Match luminance to colour references", "checkbox", "true"),
+            ("reference_luminance_match", "Match luminance to colour references", "checkbox", "false"),
             ("reference_luminance_strength", "Reference luminance strength (%)", "range:0|100|1", "70"),
             ("encoder", "Encoder", "select:h264|prores", "h264"),
         ),

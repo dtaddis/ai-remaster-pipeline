@@ -458,7 +458,7 @@ def build_parser():
     parser.add_argument('--temperature', type=float, default=6500.0, help='Color temperature in Kelvin. 6500 is neutral; lower warms, higher cools.')
     parser.add_argument('--color-opacity', type=float, default=100.0, help='Color layer opacity. Values above 4 are treated as percentages.')
     parser.add_argument('--manifest', help='Shot manifest containing source_reference and color_reference pairs.')
-    parser.add_argument('--reference-luminance-match', action=argparse.BooleanOptionalAction, default=True, help='Match each shot luminance to its colour reference using one stable tonal curve per shot.')
+    parser.add_argument('--reference-luminance-match', action=argparse.BooleanOptionalAction, default=False, help='Match each shot luminance to its colour reference using one stable tonal curve per shot.')
     parser.add_argument('--reference-luminance-strength', type=float, default=70.0, help='Strength of the shot-level reference luminance curve, from 0 to 100 percent.')
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')

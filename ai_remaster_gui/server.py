@@ -968,7 +968,7 @@ class PipelineApp:
         if view == "recomp":
             values = settings_snapshot.get("recomp", {})
             manifest_text = values.get("manifest", "")
-            enabled = is_true(values, "reference_luminance_match", "true")
+            enabled = is_true(values, "reference_luminance_match", "false")
             plan = []
             error = ""
             if enabled and manifest_text:
@@ -1745,7 +1745,7 @@ class PipelineApp:
             add(["--colorized", values["colorized_video"]])
             if values.get("manifest"):
                 add(["--manifest", values["manifest"]])
-            add_bool_flags(cmd, values, ("reference_luminance_match",), default="true")
+            add_bool_flags(cmd, values, ("reference_luminance_match",), default="false")
             add(["--reference-luminance-strength", values.get("reference_luminance_strength", "70")])
         if outpainted:
             add(["--feather-pixels", values.get("feather_pixels", "80")])

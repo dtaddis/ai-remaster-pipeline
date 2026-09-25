@@ -95,7 +95,7 @@ function recompControlFields(st) {
 
 function referenceLuminanceStatusHtml() {
   const s = settings('recomp');
-  if (s.reference_luminance_match === 'false') {
+  if (s.reference_luminance_match !== 'true') {
     return '<p class="shot-empty">Reference luminance matching is off; the original monochrome luminance will be retained exactly.</p>';
   }
   const analysis = state.reference_luminance || {};
@@ -675,7 +675,7 @@ function drawSourceLayerToContext(ctx, sourceVideo, width, height) {
 }
 
 function referenceLuminanceCurveAt(seconds) {
-  if (settings('recomp').reference_luminance_match === 'false') return null;
+  if (settings('recomp').reference_luminance_match !== 'true') return null;
   const plan = (state.reference_luminance && state.reference_luminance.plan) || [];
   const item = plan.find(span => seconds >= Number(span.start_seconds || 0)
     && (span.end_seconds == null || seconds < Number(span.end_seconds)));
