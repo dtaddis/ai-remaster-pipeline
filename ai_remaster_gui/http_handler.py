@@ -16,6 +16,7 @@ from .manifests import manifest_source_video, update_manifest_row
 from .media import (
     aspect_preview_at_for_settings,
     auto_crop_for_settings,
+    existing_browser_playback,
     export_media_file,
     media_clip_path,
     pipeline_source_text,
@@ -312,6 +313,9 @@ class Handler(BaseHTTPRequestHandler):
                     state.APP.log.append(f"Shot video preview failed: {exc}")
                     self.send_error(404)
                     return
+            else:
+                # UI playback only: processing reads the original file from disk, never via /media.
+                path = existing_browser_playback(path) or path
             self.send_media(path)
         else:
             self.send_error(404)

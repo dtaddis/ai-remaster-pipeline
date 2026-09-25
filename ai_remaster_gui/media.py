@@ -88,6 +88,27 @@ def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple
         return ()
 
 
+def browser_playback_proxy_path(source: Path, size: int, mtime_ns: int) -> Path:
+    digest = hashlib.sha1(
+        f"{source.resolve()}|{size}|{mtime_ns}|browser-h264-v1".encode("utf-8", errors="ignore")
+    ).hexdigest()[:20]
+    return SOURCE_PLAYBACK_DIR / f"{safe_stem(source.name)[:64]}_{digest}_preview.mp4"
+
+def existing_browser_playback(path: Path) -> Path | None:
+    """Return the cached browser proxy for ``path`` if one was already made, else None.
+
+    Stat-only (no ffprobe) so the /media endpoint can call it on every range request and
+    let every tab's <video> play sources Chromium cannot decode (e.g. AVI/MJPEG).
+    """
+    if path.suffix.lower() not in VIDEO_EXTS:
+        return None
+    try:
+        stat = path.stat()
+        target = browser_playback_proxy_path(path, stat.st_size, stat.st_mtime_ns)
+        return target if target.is_file() and target.stat().st_size > 0 else None
+    except OSError:
+        return None
+
 def browser_playback_for(
     source_text: str,
     create: bool = False,
@@ -110,10 +131,7 @@ def browser_playback_for(
     if suffix == ".webm" and codec in {"vp8", "vp9", "av1"}:
         return rel(source)
 
-    digest = hashlib.sha1(
-        f"{source.resolve()}|{signature[1]}|{signature[2]}|browser-h264-v1".encode("utf-8", errors="ignore")
-    ).hexdigest()[:20]
-    target = SOURCE_PLAYBACK_DIR / f"{safe_stem(source.name)[:64]}_{digest}_preview.mp4"
+    target = browser_playback_proxy_path(source, signature[1], signature[2])
     if target.is_file() and target.stat().st_size > 0:
         return rel(target)
     if not create:

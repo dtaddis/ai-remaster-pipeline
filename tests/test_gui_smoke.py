@@ -4040,10 +4040,17 @@ class GuiSmokeTests(unittest.TestCase):
                 capture_output=True,
             )
             with mock.patch.object(media, "SOURCE_PLAYBACK_DIR", cache):
+                untouched = folder / "no proxy.avi"
+                shutil.copy2(source, untouched)
                 first = media.browser_playback_for(str(source), create=True)
                 second = media.browser_playback_for(str(source), create=False)
+                # Every tab's /media request resolves to the proxy without re-probing.
+                served = media.existing_browser_playback(source)
+                unproxied = media.existing_browser_playback(untouched)
 
             proxy = app.resolve(first)
+            self.assertEqual(served, proxy)
+            self.assertIsNone(unproxied)
             ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
             result = subprocess.run(
                 [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(proxy)],
