@@ -41,9 +41,14 @@ from dependency_manager import (
     LTX25_TEXT_ENCODER,
     LTX25_VIDEO_VAE,
     OUMOUMAD_OUTPAINT_LORA,
+    WAN_DISTILL_LORA,
+    WAN_TEXT_ENCODER,
+    WAN_VACE_GGUF_MODEL,
+    WAN_VAE,
     HuggingFaceAccessError,
     ensure_ltx25_outpaint_models,
     ensure_outpaint_models,
+    ensure_wan_vace_outpaint_models,
 )
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
@@ -54,8 +59,9 @@ from ltx_outpaint_workflow_adapter import (
     is_official_outpaint_template,
     validate_official_outpaint_workflow,
 )
-from qwen_seed_guides import DEFAULT_SEED_PROMPT, seed_guides
+from qwen_seed_guides import DEFAULT_SEED_PROMPT, detect_shot_start_frames, seed_guides
 import artifact_ids as aid
+import wan_vace_outpaint as wan
 
 
 def _crop_black(args: Any | None) -> tuple[list[int], bool]:
@@ -125,6 +131,10 @@ LEGACY_BLACK_LIFT = 0.018
 LEGACY_GAMMA = 1.06
 
 
+def uses_wan_vace(args: Any | None) -> bool:
+    return getattr(args, "outpaint_backend", "ltx") == "wan-vace"
+
+
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 
@@ -184,6 +194,8 @@ def crop_slug(args: Any) -> str:
 
 
 def outpaint_artifact_tag(args: Any | None, base: str) -> str:
+    if uses_wan_vace(args):
+        return f"{base}wan"
     return f"{base}25" if getattr(args, "ltx_version", "2.3") == "2.5" else base
 
 
@@ -2023,7 +2035,7 @@ def patch_ephemeral_ltx_text_encoder(
 def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
-    return {
+    signature = {
         "version": 45,
         "tool": "outpaint_video.py/raw_comfy",
         "prepared": root_relative(prepared),
@@ -2107,6 +2119,32 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
         "chunk_manifest_fingerprint": file_fingerprint(chunk_manifest) if chunk_manifest and chunk_manifest.exists() else None,
     }
+    if uses_wan_vace(args):
+        # Wan builds its graph in code: no LTX template, node IDs or LTX weights take part.
+        signature.update({
+            "workflow": "",
+            "workflow_fingerprint": None,
+            "load_video_node_id": "",
+            "save_node_id": "",
+            "extra_save_node_id": [],
+            "output_node_id": wan.WAN_OUTPUT_NODE_ID,
+            "model_backend": "gguf",
+            "ltx_version": "",
+            "generation_fps": "source",
+            "gguf_model": WAN_VACE_GGUF_MODEL,
+            "video_vae": WAN_VAE,
+            "text_encoder": WAN_TEXT_ENCODER,
+            "audio_vae": "",
+            "latent_upscaler": "",
+            "outpaint_lora": WAN_DISTILL_LORA,
+            "text_encoder_device": "default",
+            "outpaint_pipeline": "wan21_vace14b_windowed_v1",
+            "ltx_runtime_adapter": "",
+            "ltx_workflow_adapter": "",
+            "wan_vace": wan_settings(args).signature(),
+            "wan_shot_detection": wan_shot_detection_settings(args),
+        })
+    return signature
 
 
 def newest_output(files: list[Path]) -> Path:
@@ -2694,9 +2732,176 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 
+def wan_settings(args: Any) -> "wan.WanSettings":
+    return wan.WanSettings(
+        steps=int(getattr(args, "wan_steps", 6)),
+        cfg=float(getattr(args, "wan_cfg", 1.0)),
+        shift=float(getattr(args, "wan_shift", 8.0)),
+        sampler=str(getattr(args, "wan_sampler", "euler")),
+        scheduler=str(getattr(args, "wan_scheduler", "simple")),
+        lora_strength=float(getattr(args, "wan_lora_strength", 1.0)),
+        control_strength=float(getattr(args, "wan_control_strength", 1.0)),
+        window_frames=int(getattr(args, "wan_window_frames", wan.WAN_WINDOW_FRAMES)),
+        context_frames=int(getattr(args, "wan_context_frames", wan.WAN_CONTEXT_FRAMES)),
+    )
+
+
+def wan_chunk_masks(args, chunk_prepared: Path, width: int, height: int) -> "wan.StaticMasks | wan.BlackRegionMasks":
+    """The same exact/generation masks the official LTX graph uses, as per-frame arrays."""
+    import cv2
+
+    feather = wan.seam_feather_pixels(int(getattr(args, "mask_blend_dilation", 2)), width, height)
+    if getattr(args, "outpaint_all_black_regions", False):
+        return wan.BlackRegionMasks(
+            int(getattr(args, "black_mask_threshold", 12)),
+            custom_mask_array(args, width, height),
+            int(getattr(args, "generation_mask_overlap", 8)),
+            feather,
+        )
+    exact_path = official_mask_image(chunk_prepared, args, width, height)
+    generation_path = generation_mask_image(exact_path, args, chunk_prepared, width, height)
+    exact = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
+    generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
+    if exact is None or generation is None:
+        raise RuntimeError(f"Could not read the Wan outpaint masks for {chunk_prepared}")
+    return wan.StaticMasks(generation, exact, feather)
+
+
+def wan_shot_detection_settings(args) -> dict[str, float]:
+    # The same Shot Detection values that seed Qwen guides.
+    return {
+        "sample_seconds": float(getattr(args, "seed_sample_seconds", 0.0)),
+        "shot_threshold": float(getattr(args, "seed_shot_threshold", 0.075)),
+        "min_shot_seconds": float(getattr(args, "seed_min_shot_seconds", 1.0)),
+    }
+
+
+def wan_shot_cuts(prepared: Path, settings: dict[str, float]) -> list[int]:
+    """Frames where a new shot starts in the whole prepared video (cached).
+
+    Detection runs once over the full video rather than per chunk: the detector treats
+    frame 0 as a shot start and enforces the minimum shot length from there, so it would
+    miss a cut that falls just after a chunk's overlap frames.
+    """
+    target = ROOT / ".cache" / "outpaint_shots" / f"{safe_stem(prepared.name)}_cuts.json"
+    signature = {"version": 1, "prepared_fingerprint": file_fingerprint(prepared), **settings}
+    try:
+        cached = json.loads(target.read_text(encoding="utf-8"))
+        if cached.get("signature") == signature:
+            return [int(cut) for cut in cached.get("cuts", [])]
+    except (OSError, ValueError, TypeError):
+        pass
+    print("Wan VACE: detecting shot changes so no window spans a cut...", flush=True)
+    cuts = [frame for frame in detect_shot_start_frames(prepared, **settings) if frame > 0]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"signature": signature, "cuts": cuts}, indent=2) + "\n", encoding="utf-8")
+    print(f"Wan VACE: {len(cuts)} shot change(s) detected.", flush=True)
+    return cuts
+
+
+
+def wan_previous_chunk_frames(ffmpeg: str, previous_raw: Path, first_frame: int, count: int, width: int, height: int) -> list:
+    if count <= 0:
+        return []
+    frames = []
+    with wan.FrameReader(ffmpeg, previous_raw, width, height, start_frame=first_frame) as reader:
+        for frame in reader:
+            frames.append(frame)
+            if len(frames) >= count:
+                break
+    return frames
+
+
+def render_wan_vace_chunk(
+    args,
+    comfy_dir: Path,
+    comfy_output_root: Path,
+    chunk_prepared: Path,
+    chunk_raw: Path,
+    output_prefix: str,
+    prompt_text: str,
+    negative_text: str,
+    seed: int,
+    start_guide: Path | None,
+    start_guide_strength: float,
+    extra_guides: "list[dict]",
+    previous_context: "tuple[Path, int, int] | None",
+    cuts: "list[int]" = (),
+) -> None:
+    """Outpaint one chunk with Wan VACE, continuing the previous chunk when it is supplied.
+
+    previous_context is (previous raw chunk, index of this chunk's frame 0 in it, number of
+    shared overlap frames). Those frames are finished, so they seed VACE's first window
+    exactly instead of the single-frame start guide the LTX graphs use.
+    """
+    ffmpeg = find_ffmpeg()
+    info = probe_video(chunk_prepared)
+    width, height = int(info["width"]), int(info["height"])
+    fps = float(info.get("fps") or 24.0)
+    total_frames = int(info.get("frames") or 0)
+    settings = wan_settings(args)
+
+    known_prefix: list = []
+    if previous_context is not None:
+        previous_raw, first_frame, shared = previous_context
+        known_prefix = wan_previous_chunk_frames(ffmpeg, previous_raw, first_frame, shared, width, height)
+
+    guides: dict[int, tuple[Any, float]] = {}
+    if start_guide is not None and not known_prefix and start_guide.exists():
+        guides[0] = (wan.load_guide_rgb(start_guide, width, height), float(start_guide_strength))
+    for guide in extra_guides:
+        index = int(guide.get("frame_idx", -1))
+        if index < 0:
+            index += total_frames
+        if not 0 <= index < total_frames:
+            print(f"Warning: Wan VACE guide frame_idx={guide.get('frame_idx')} is outside the chunk; skipping it.", flush=True)
+            continue
+        if index in guides:
+            print(f"Warning: Wan VACE guide at frame {index} duplicates another guide; skipping the duplicate.", flush=True)
+            continue
+        guides[index] = (wan.load_guide_rgb(Path(guide["image"]), width, height), float(guide.get("strength", 1.0)))
+
+    input_subfolder = "arp_outpaint_wan"
+    work_dir = comfy_dir / "input" / input_subfolder
+
+    def render_window(control: Path, mask: Path, length: int, window_index: int) -> Path:
+        prompt = wan.build_wan_vace_prompt(
+            f"{input_subfolder}/{control.name}",
+            f"{input_subfolder}/{mask.name}",
+            width, height, length, fps, prompt_text, negative_text,
+            seed + window_index, settings, f"{output_prefix}_w{window_index:02d}",
+        )
+        prompt_id = queue_prompt(args.comfy_url, prompt)
+        print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+        history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+        # LoadVideo reports its own input files in the history too; read only the save node.
+        saved = {"outputs": {wan.WAN_OUTPUT_NODE_ID: history.get("outputs", {}).get(wan.WAN_OUTPUT_NODE_ID, {})}}
+        return newest_output(extract_output_files(saved, comfy_output_root))
+
+    wan.render_chunk(
+        ffmpeg=ffmpeg,
+        chunk_video=chunk_prepared,
+        output=chunk_raw,
+        width=width,
+        height=height,
+        fps=fps,
+        total_frames=total_frames,
+        masks=wan_chunk_masks(args, chunk_prepared, width, height),
+        known_prefix=known_prefix,
+        guides=guides,
+        render_window=render_window,
+        work_dir=work_dir,
+        settings=settings,
+        intermediate_profile=args.intermediate_profile,
+        has_audio=video_has_audio(ffmpeg, chunk_prepared),
+        cuts=cuts,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
     parser = argparse.ArgumentParser(description="Run the LTX IC-LoRA outpainting stage end to end.")
+    parser.add_argument("--outpaint-backend", choices=["ltx", "wan-vace"], default="ltx", help="Outpainting model family. wan-vace uses Wan 2.1 VACE 14B instead of an LTX IC-LoRA.")
     parser.add_argument("--ltx-version", choices=["2.3", "2.5"], default="2.3", help="LTX outpainting generation backend.")
     parser.add_argument(
         "--generation-fps",
@@ -2771,6 +2976,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-sample-seconds", type=float, default=0.0, help="Shot-detection sampling interval for seeding (0 = every frame).")
     parser.add_argument("--seed-shot-threshold", type=float, default=0.075)
     parser.add_argument("--seed-min-shot-seconds", type=float, default=1.0)
+    # Wan VACE sampling. Defaults suit the lightx2v step-distill LoRA (CFG-free, few steps).
+    parser.add_argument("--wan-steps", type=int, default=6)
+    parser.add_argument("--wan-cfg", type=float, default=1.0)
+    parser.add_argument("--wan-shift", type=float, default=8.0)
+    parser.add_argument("--wan-sampler", default="euler")
+    parser.add_argument("--wan-scheduler", default="simple")
+    parser.add_argument("--wan-lora-strength", type=float, default=1.0)
+    parser.add_argument("--wan-control-strength", type=float, default=1.0)
+    parser.add_argument("--wan-window-frames", type=int, default=wan.WAN_WINDOW_FRAMES, help="Frames per Wan VACE pass (4n+1; Wan is trained on 81).")
+    parser.add_argument("--wan-context-frames", type=int, default=wan.WAN_CONTEXT_FRAMES, help="Finished frames that open each subsequent Wan VACE window.")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -2779,6 +2994,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if uses_wan_vace(args):
+        # Wan takes the official explicit-mask input: never Oumoumad's lifted-black canvas,
+        # and none of the LTX 2.5 cadence/model switches.
+        args.outpaint_lora = DEFAULT_OUTPAINT_LORA
+        args.ltx_version = "2.3"
     configure_ltx25_model_args(args)
     source = resolve_path(args.source)
     workflow_path = resolve_path(args.workflow or DEFAULT_WORKFLOW)
@@ -2798,6 +3018,11 @@ def main() -> int:
     if args.model_backend == "gguf" and not (comfy_dir / "custom_nodes" / "ComfyUI-GGUF").exists():
         raise FileNotFoundError(f"ComfyUI-GGUF is required for lightweight outpainting. Re-run install_windows.bat, then restart ComfyUI: {comfy_dir / 'custom_nodes' / 'ComfyUI-GGUF'}")
 
+    if uses_wan_vace(args):
+        wan_text = wan.wan_prompt(args.prompt)
+        if wan_text != args.prompt:
+            print(f"Wan VACE: removed the LTX trigger word from the prompt: {json.dumps(wan_text)}", flush=True)
+        args.prompt = wan_text
     source_monochrome = not args.allow_color_outpaint and video_is_monochrome(source)
     if source_monochrome:
         args.prompt = combine_prompt(args.prompt, MONOCHROME_PROMPT_SUFFIX)
@@ -2811,7 +3036,9 @@ def main() -> int:
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
-        if args.ltx_version == "2.5":
+        if uses_wan_vace(args):
+            ensure_wan_vace_outpaint_models(comfy_dir)
+        elif args.ltx_version == "2.5":
             ensure_ltx25_outpaint_models(comfy_dir)
         else:
             ensure_outpaint_models(
@@ -2821,7 +3048,9 @@ def main() -> int:
             )
         print(f"Checking ComfyUI outpainting nodes at {args.comfy_url}...", flush=True)
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-        if args.ltx25_two_stage:
+        if uses_wan_vace(args):
+            required_nodes = dict(wan.WAN_VACE_REQUIRED_NODES)
+        elif args.ltx25_two_stage:
             required_nodes = dict(LTX25_OUTPAINT_REQUIRED_NODES)
         else:
             required_nodes = dict(OUTPAINT_COMMON_NODES)
@@ -2831,7 +3060,7 @@ def main() -> int:
             if args.ltx_version == "2.5":
                 required_nodes["CLIPLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
-        if not args.ltx25_two_stage:
+        if not args.ltx25_two_stage and not uses_wan_vace(args):
             compatibility = ensure_arp_ltx_compatible(args.comfy_url)
             args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
             print(f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}", flush=True)
@@ -2874,7 +3103,11 @@ def main() -> int:
             flush=True,
         )
     mode = "all black regions" if args.outpaint_all_black_regions else "protected source blacks"
-    conditioning = "oumoumad legacy black mask" if uses_legacy_black_outpaint(args.outpaint_lora) else "official explicit mask"
+    conditioning = (
+        "Wan VACE explicit mask" if uses_wan_vace(args)
+        else "oumoumad legacy black mask" if uses_legacy_black_outpaint(args.outpaint_lora)
+        else "official explicit mask"
+    )
     print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, mode={mode}, conditioning={conditioning}", flush=True)
     run_command(prepare_command, False)
 
@@ -2929,10 +3162,13 @@ def main() -> int:
             base_guide_strength = getattr(args, "guide_strength", 0.7)
             raw_chunks: list[Path] = []
             effective_ranges: list[tuple[int, int, int]] = []
+            chunk_offsets: dict[int, tuple[int, int]] = {}
+            shot_cuts = wan_shot_cuts(generation_prepared, wan_shot_detection_settings(args)) if uses_wan_vace(args) else []
             for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_offset_x = int(float(chunk_row.get("offset_x", "0") or 0))
                 chunk_offset_y = int(float(chunk_row.get("offset_y", "0") or 0))
+                chunk_offsets[chunk_index] = (chunk_offset_x, chunk_offset_y)
                 chunk_prepared = resolve_path(chunk_row.get("prepared_path", "")) if chunk_row.get("prepared_path") else chunk_dir / f"prepared_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mkv"
                 chunk_raw = existing_comfy_render(resolve_path(chunk_row.get("raw_path", "")) if chunk_row.get("raw_path") else chunk_dir / f"raw_{chunk_index:04d}_{start_frame:06d}_{end_frame:06d}.mkv")
                 print(f"Outpaint chunk {chunk_index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}", flush=True)
@@ -3010,7 +3246,6 @@ def main() -> int:
                     raw_chunks.append(chunk_raw)
                     effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
-                workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
                 chunk_prefix = f"{output_prefix}_chunk_{chunk_index:04d}"
                 prompt_text = combine_prompt(args.prompt, chunk_prompt_suffix)
                 negative_text = combine_prompt(args.negative_prompt, chunk_negative_suffix)
@@ -3026,18 +3261,36 @@ def main() -> int:
                     print(f"Chunk {chunk_index + 1} start guide ({source}): {guide_image}", flush=True)
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, auto_guide)
-                prompt = save_chunk_for_profile(prompt, args.output_node_id, args.intermediate_profile)
-                prompt_id = queue_prompt(args.comfy_url, prompt)
-                print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-                history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
-                produced = newest_output(extract_output_files(history, comfy_output_root))
                 superseded = chunk_raw
-                chunk_raw = chunk_raw.with_suffix(produced.suffix.lower())
-                chunk_raw.parent.mkdir(parents=True, exist_ok=True)
-                chunk_tmp = chunk_raw.with_suffix(chunk_raw.suffix + ".partial")
-                shutil.copy2(produced, chunk_tmp)
-                replace_with_retry(chunk_tmp, chunk_raw, f"Outpaint chunk {chunk_index + 1}")
+                if uses_wan_vace(args):
+                    previous_context = None
+                    if auto_guide and previous_raw is not None and effective_ranges:
+                        previous_index, previous_start, previous_end = effective_ranges[-1]
+                        shared = previous_end - start_frame
+                        if chunk_offsets.get(previous_index) != (chunk_offset_x, chunk_offset_y):
+                            print(f"Chunk {chunk_index + 1}: offset differs from chunk {previous_index + 1}; starting Wan VACE without its overlap frames.", flush=True)
+                        elif shared > 0:
+                            previous_context = (previous_raw, start_frame - previous_start, shared)
+                    chunk_raw = chunk_raw.with_suffix(".mkv")
+                    render_wan_vace_chunk(
+                        args, comfy_dir, comfy_output_root, chunk_prepared, chunk_raw, chunk_prefix,
+                        prompt_text, negative_text, chunk_seed,
+                        None if auto_guide else guide_image, args.guide_strength, extra_guides, previous_context,
+                        [cut - start_frame for cut in shot_cuts if start_frame < cut < end_frame],
+                    )
+                else:
+                    workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
+                    prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, auto_guide)
+                    prompt = save_chunk_for_profile(prompt, args.output_node_id, args.intermediate_profile)
+                    prompt_id = queue_prompt(args.comfy_url, prompt)
+                    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+                    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+                    produced = newest_output(extract_output_files(history, comfy_output_root))
+                    chunk_raw = chunk_raw.with_suffix(produced.suffix.lower())
+                    chunk_raw.parent.mkdir(parents=True, exist_ok=True)
+                    chunk_tmp = chunk_raw.with_suffix(chunk_raw.suffix + ".partial")
+                    shutil.copy2(produced, chunk_tmp)
+                    replace_with_retry(chunk_tmp, chunk_raw, f"Outpaint chunk {chunk_index + 1}")
                 write_signature(chunk_raw, chunk_sig)
                 if superseded != chunk_raw:
                     # Lookups fall back between .mkv and .mp4, so a stale sibling must not survive.

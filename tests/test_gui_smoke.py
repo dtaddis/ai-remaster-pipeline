@@ -1210,6 +1210,12 @@ class GuiSmokeTests(unittest.TestCase):
         }
         official = {**base, "outpaint_model": "official"}
         ltx25 = {**base, "outpaint_model": "ltx25"}
+        wanvace = {**base, "outpaint_model": "wanvace"}
+        self.assertEqual(
+            app.outpaint_chunk_manifest_for("input/My Source.mp4", official),
+            app.outpaint_chunk_manifest_for("input/My Source.mp4", wanvace),
+        )
+        self.assertIn("_chunkswan_", app.outpaint_chunk_dir_for("input/My Source.mp4", wanvace).name)
 
         official_manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", official)
         ltx25_manifest = app.outpaint_chunk_manifest_for("input/My Source.mp4", ltx25)
@@ -1812,6 +1818,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("'2.3 - Oumoumad LoRA'", helpers)
         self.assertIn("'2.3 - Official LoRA'", helpers)
         self.assertIn("'2.5 - Official LoRA'", helpers)
+        self.assertIn("'Wan 2.1 VACE (14B)'", helpers)
 
     def test_ltx25_frame_rate_preparation_adds_silence_for_archival_video(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
@@ -2841,6 +2848,21 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--ltx-version") + 1], "2.5")
         self.assertEqual(command[command.index("--generation-fps") + 1], "24")
         self.assertIn("outpaint25", Path(app.APP.expected_outputs("outpaint")[0]).name)
+
+    def test_outpaint_command_selects_wan_vace_backend(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update({"outpaint_model": "wanvace"})
+
+        command = app.APP.command_for("outpaint")
+
+        self.assertEqual(command[command.index("--outpaint-backend") + 1], "wan-vace")
+        self.assertNotIn("--ltx-version", command)
+        self.assertEqual(command[command.index("--outpaint-lora") + 1], outpaint_video.DEFAULT_OUTPAINT_LORA)
+        # The GUI locates exactly the files outpaint_video.py writes for this backend.
+        expected = Path(app.APP.expected_outputs("outpaint")[0]).name
+        self.assertIn("outpaintwan", expected)
+        args = outpaint_video.build_parser().parse_args(command[3:])
+        self.assertEqual(outpaint_video.outpaint_artifact_tag(args, "outpaint"), "outpaintwan")
 
     def test_outpaint_command_uses_whole_video_offsets(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

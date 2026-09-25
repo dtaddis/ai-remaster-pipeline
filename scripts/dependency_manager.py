@@ -90,6 +90,20 @@ LTX25_PIXEL_UPSCALE_MODELS = [
     ),
 ]
 
+# Wan 2.1 VACE 14B outpainting. Q4_K_M keeps the transformer near 12 GB on a 24 GB card; the
+# lightx2v step-distill LoRA (VACE is built on the T2V 14B base) lets it sample in a few
+# CFG-free steps instead of ~20 guided ones.
+WAN_VACE_GGUF_MODEL = "Wan2.1_14B_VACE-Q4_K_M.gguf"
+WAN_TEXT_ENCODER = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+WAN_VAE = "wan_2.1_vae.safetensors"
+WAN_DISTILL_LORA = "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"
+WAN_VACE_OUTPAINT_MODELS = [
+    HfModel("QuantStack/Wan2.1_14B_VACE-GGUF", WAN_VACE_GGUF_MODEL, f"models/diffusion_models/{WAN_VACE_GGUF_MODEL}"),
+    HfModel("Comfy-Org/Wan_2.1_ComfyUI_repackaged", f"split_files/text_encoders/{WAN_TEXT_ENCODER}", f"models/text_encoders/{WAN_TEXT_ENCODER}"),
+    HfModel("Comfy-Org/Wan_2.1_ComfyUI_repackaged", f"split_files/vae/{WAN_VAE}", f"models/vae/{WAN_VAE}"),
+    HfModel("Kijai/WanVideo_comfy", f"Lightx2v/{WAN_DISTILL_LORA}", f"models/loras/{WAN_DISTILL_LORA}"),
+]
+
 OUTPAINT_LORA_FILES = [
     HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
     HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
@@ -428,6 +442,10 @@ def ensure_ltx25_outpaint_models(comfy_dir: Path) -> None:
     # The in/outpainting IC-LoRA remains the official 2.3 v0.9 adapter used by
     # Lightricks' 2.5 workflow; do not download a redundant or unrelated LoRA.
     ensure_hf_models(comfy_dir, [*LTX25_OUTPAINT_MODELS, OUTPAINT_LORA_FILES[0]])
+
+
+def ensure_wan_vace_outpaint_models(comfy_dir: Path) -> None:
+    ensure_hf_models(comfy_dir, WAN_VACE_OUTPAINT_MODELS)
 
 
 def ensure_ltx25_upscale_models(comfy_dir: Path) -> None:

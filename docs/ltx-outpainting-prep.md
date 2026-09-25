@@ -38,6 +38,17 @@ outpaint_video.bat ^
 
 ARP uses the Q4_K_M distilled transformer on 24 GB GPUs and motion-interpolates lower-rate input without changing duration. LTX 2.5 retains the official 2.3 in/outpainting IC-LoRA and adds its official latent two-stage upscaler.
 
+To use Wan 2.1 VACE instead of LTX:
+
+```bat
+outpaint_video.bat ^
+  --source input\movie_4x3.mp4 ^
+  --target-aspect 16:9 ^
+  --outpaint-backend wan-vace
+```
+
+Wan builds its ComfyUI graph in `scripts/wan_vace_outpaint.py` (following ComfyUI's own Wan VACE outpainting template) rather than from a workflow file. Each chunk is rendered as overlapping 81-frame VACE windows. `--wan-window-frames` and `--wan-context-frames` control the window size and the number of finished frames each window continues from. `--wan-steps`, `--wan-cfg`, `--wan-shift`, `--wan-sampler`, and `--wan-scheduler` tune sampling; the defaults suit the lightx2v step-distill LoRA.
+
 ## Prepare The Comfy Input Manually
 
 ```bat

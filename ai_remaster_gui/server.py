@@ -1609,6 +1609,8 @@ class PipelineApp:
             add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
         outpaint_lora = OUMOUMAD_OUTPAINT_LORA if values.get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
         add(["--outpaint-lora", outpaint_lora])
+        if values.get("outpaint_model") == "wanvace":
+            add(["--outpaint-backend", "wan-vace"])
         if values.get("outpaint_model") == "ltx25":
             add(["--ltx-version", "2.5"])
             add(["--generation-fps", values.get("generation_fps", "24-fast")])
@@ -1629,6 +1631,12 @@ class PipelineApp:
             add(["--qwen-load-image-node-id", ref.get("load_image_node_id", "auto")])
             add(["--qwen-save-node-id", ref.get("save_node_id", "auto")])
             add(["--comfy-output-root", comfy_output_root_for(config)])
+            shot_values = self.settings.get("shots", {})
+            add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
+            add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
+            add(["--seed-min-shot-seconds", shot_values.get("min_shot_seconds", "1.0") or "1.0"])
+        elif values.get("outpaint_model") == "wanvace":
+            # Wan never lets a window span a cut; find cuts with the Shot Detection settings.
             shot_values = self.settings.get("shots", {})
             add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
             add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
@@ -1839,7 +1847,12 @@ class PipelineApp:
             stabilized_output = self.stabilization_output()
             if not stabilized_output or not resolve(stabilized_output).exists():
                 return False, "Run Stabilization first so this phase has its upstream video."
-        if stage_key == "outpaint" and self.settings.get("outpaint", {}).get("compute", "local") != "runpod":
+        # Only the official LTX LoRA is gated; Oumoumad and Wan VACE download without approval.
+        if (
+            stage_key == "outpaint"
+            and self.settings.get("outpaint", {}).get("compute", "local") != "runpod"
+            and self.settings.get("outpaint", {}).get("outpaint_model") != "wanvace"
+        ):
             selected_lora = OUMOUMAD_OUTPAINT_LORA if self.settings.get("outpaint", {}).get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
             ok, message = outpaint_browser_handoff(selected_lora)
             if not ok:
@@ -2820,6 +2833,11 @@ def adopt_saved_artifact(saved_text: str, current_text: str, replace_existing: b
     return rel(current)
 
 
+def outpaint_model_tag_suffix(values: dict[str, str]) -> str:
+    """Render caches are model-specific; must match outpaint_video.outpaint_artifact_tag."""
+    return {"ltx25": "25", "wanvace": "wan"}.get(values.get("outpaint_model", ""), "")
+
+
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
     if not source_text:
         return ""
@@ -2829,7 +2847,7 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crop, black = _outpaint_crop_black(values)
-    tag = "outpaint25" if values.get("outpaint_model") == "ltx25" else "outpaint"
+    tag = f"outpaint{outpaint_model_tag_suffix(values)}"
     return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, tag, "mkv"))
 
 
@@ -2842,7 +2860,7 @@ def outpaint_render_outputs_for_settings(source_text: str, values: dict[str, str
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
     folder = ROOT / "intermediate" / "outpainted"
-    suffix = "25" if values.get("outpaint_model") == "ltx25" else ""
+    suffix = outpaint_model_tag_suffix(values)
     return [
         folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"outpaint{suffix}", "mkv"),
         folder / aid.outpaint_name(source.name, aspect, width, height, crop, black, f"rawcomfy{suffix}", "mkv"),
@@ -2933,7 +2951,7 @@ def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    tag = "chunks25" if values.get("outpaint_model") == "ltx25" else "chunks"
+    tag = f"chunks{outpaint_model_tag_suffix(values)}"
     return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, tag)
 
 

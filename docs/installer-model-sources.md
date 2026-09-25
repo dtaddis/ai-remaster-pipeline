@@ -24,6 +24,15 @@ The quantized text encoder is also gated. Accept its terms in the browser, then 
 local downloader with `hf auth login --force` from the activated ARP environment (or set `HF_TOKEN`)
 using the same account. Browser approval by itself does not provide credentials to the local process.
 
+## Wan 2.1 VACE (outpainting)
+
+Downloaded on first use when the Wan 2.1 VACE outpaint model is selected; none are gated.
+
+- Transformer: `QuantStack/Wan2.1_14B_VACE-GGUF/Wan2.1_14B_VACE-Q4_K_M.gguf` → `models/diffusion_models/Wan2.1_14B_VACE-Q4_K_M.gguf`
+- Text encoder: `Comfy-Org/Wan_2.1_ComfyUI_repackaged/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors`
+- VAE: `Comfy-Org/Wan_2.1_ComfyUI_repackaged/split_files/vae/wan_2.1_vae.safetensors`
+- Step-distill LoRA: `Kijai/WanVideo_comfy/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors` → `models/loras/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors`
+
 ## SeedVR2
 
 The `numz/ComfyUI-SeedVR2_VideoUpscaler` custom node downloads the selected model and shared VAE
