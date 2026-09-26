@@ -106,3 +106,33 @@ def source_placement(
         x = int(round(x * scale_x))
         y = int(round(y * scale_y))
     return SourcePlacement(x, y, placed_width, placed_height)
+
+
+def native_source_layout(
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    crops: tuple[int, int, int, int],
+) -> tuple[tuple[int, int], SourcePlacement]:
+    """Resize the outpaint canvas so the trimmed source lands on it 1:1.
+
+    The source is placed on the target canvas exactly as ``source_placement``
+    would, then the whole canvas is scaled by the factor that turns the placed
+    source back into its native trimmed size. Only the outpainted base gets
+    resampled; the source pixels pass through unscaled. Trims and extends are
+    honoured because they are already baked into the working placement.
+    """
+
+    placement = source_placement(source_width, source_height, target_width, target_height, crops)
+    *_offsets, crop_width, crop_height = crop_box(source_width, source_height, *crops)
+    scale_x = crop_width / placement.width
+    scale_y = crop_height / placement.height
+    canvas_width = max(crop_width, even(target_width * scale_x))
+    canvas_height = max(crop_height, even(target_height * scale_y))
+    x = min(max(0, int(round(placement.x * scale_x))), canvas_width - crop_width)
+    y = min(max(0, int(round(placement.y * scale_y))), canvas_height - crop_height)
+    # Even offsets keep the source aligned with 4:2:0 chroma; all sizes here are even too.
+    x -= x % 2
+    y -= y % 2
+    return (canvas_width, canvas_height), SourcePlacement(x, y, crop_width, crop_height)

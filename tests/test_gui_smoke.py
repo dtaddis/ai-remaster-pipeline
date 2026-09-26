@@ -1469,6 +1469,10 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("--source-black-transparent", command)
         self.assertEqual(command[command.index("--source-black-threshold") + 1], "12")
         self.assertNotIn("--source-black-transparent", protected_command)
+        # Native-resolution recomposition is opt-in: off unless the box is ticked.
+        self.assertNotIn("--native-source-resolution", command)
+        app.APP.settings["recomp"]["native_source_resolution"] = "true"
+        self.assertIn("--native-source-resolution", app.APP.command_for("recomp"))
 
     def test_portable_comfy_parent_resolves_to_inner_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

@@ -127,6 +127,8 @@ const FIELD_DESCRIPTIONS = {
     'Blend between the original film luminance and the colour-reference luminance. 70% retains most source shadow detail while giving the references a clear influence; 100% applies the complete bounded curve.',
   'recomp.feather_pixels':
     'Only used when an outpainted video is present. It softens the original source edge over the generated sides.',
+  'recomp.native_source_resolution':
+    'Off: the composite comes out at the outpainting resolution, which is the usual way to keep working. On: the outpainted canvas is scaled up (or down) around the original source instead, so the source overlays it pixel for pixel at its native resolution, with any trim or extend taken into account. Only the generated sides are resampled; the source loses nothing but the re-encode. The feather width scales with the canvas.',
   'upscale.method':
     'FlashVSR is the fast refiner. SeedVR2 is a higher-quality one-step video restoration model with heavier VRAM requirements. LTX 2.5 uses a creative 2x Pixel Spatial Upscaler IC-LoRA; preview identity-critical archival shots before a full run.',
   'upscale.flashvsr_mode':

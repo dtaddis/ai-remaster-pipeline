@@ -78,7 +78,7 @@ function recompPathFields(st) {
 function recompControlFields(st) {
   const hasOutpainted = !!settings('recomp').outpainted_video;
   const controls = [
-    ...(hasOutpainted ? ['feather_pixels'] : []),
+    ...(hasOutpainted ? ['feather_pixels', 'native_source_resolution'] : []),
     'saturation',
     'temperature',
     'color_opacity',

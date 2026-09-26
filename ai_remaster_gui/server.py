@@ -1777,6 +1777,8 @@ class PipelineApp:
         delivery_w, delivery_h = outpaint_size_for_source(source_text, aspect, height_text)
         if outpainted:
             add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
+            if is_true(values, "native_source_resolution"):
+                add(["--native-source-resolution"])
         return cmd
 
     def _audio_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:

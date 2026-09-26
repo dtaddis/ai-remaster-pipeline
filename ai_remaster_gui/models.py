@@ -188,6 +188,7 @@ STAGES = (
             ("colorization_method", "Colorization layer", "select:deepexemplar|colormnet|cmnet2|openai", "deepexemplar"),
             ("colorized_video", "Colorized video", "file", ""),
             ("feather_pixels", "Feather pixels", "range:0|240|1", "80"),
+            ("native_source_resolution", "Recomposite at source resolution", "checkbox", "false"),
             ("saturation", "Saturation", "range:0|200|1", "82"),
             ("temperature", "Temperature", "range:2500|9500|1", "6500"),
             ("color_opacity", "Color opacity", "range:0|100|1", "100"),

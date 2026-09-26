@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
-from outpaint_geometry import source_placement
+from outpaint_geometry import crop_box, native_source_layout, source_placement
 from reference_luminance import ffmpeg_curve, identity_curve, reference_luminance_plan
 
 
@@ -38,6 +38,9 @@ def signature(args):
             values[key] = root_relative(path)
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
+    # Leave the flag out while it is off so composites made before it existed stay reusable.
+    if not values.get('native_source_resolution'):
+        values.pop('native_source_resolution', None)
     values['tool'] = 'final_composite.py'
     values['version'] = 13
     return values
@@ -296,12 +299,23 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     if has_outpainted:
         if source_size and base_size:
             crops = tuple(int(getattr(args, key)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))
-            placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
+            if getattr(args, 'native_source_resolution', False):
+                # Grow (or shrink) the outpainted canvas around the source instead of
+                # resampling the source onto it, so the original pixels survive 1:1.
+                canvas, placement = native_source_layout(source_size[0], source_size[1], base_size[0], base_size[1], crops)
+                feather = max(1, int(round(feather * canvas[0] / base_size[0])))
+                base_size = canvas
+                scale_base = f",scale={canvas[0]}:{canvas[1]}:flags=lanczos"
+                left, _right, top, _bottom, _w, _h = crop_box(source_size[0], source_size[1], *crops)
+                source_fit = f"crop=w={placement.width}:h={placement.height}:x={left}:y={top},"
+            else:
+                placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
+                source_fit = f"{crop}scale={placement.width}:{placement.height}:flags=lanczos,"
             feather_horizontal = placement.x > 0 or placement.x + placement.width < base_size[0]
             feather_vertical = placement.y > 0 or placement.y + placement.height < base_size[1]
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
-                f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}scale={placement.width}:{placement.height}:flags=lanczos,setsar=1[src]',
+                f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{source_fit}setsar=1[src]',
             ]
             rgb_label, alpha_label = append_source_alpha_mask(
                 filters,
@@ -391,11 +405,24 @@ def run(args):
     colorized = resolve_path(args.colorized) if args.colorized else None
     output = resolve_path(args.output)
     sig = signature(args)
-    video_like = outpainted or source
-    if not args.force and resumable_output(output, sig, video_like=video_like):
+    ffmpeg = find_ffmpeg(args.ffmpeg)
+    source_size = probe_dimensions(ffmpeg, source)
+    base_size = None
+    expected_size = None
+    if outpainted:
+        base_size = (int(args.output_width), int(args.output_height)) if args.output_width and args.output_height else probe_dimensions(ffmpeg, outpainted)
+        expected_size = base_size
+        if args.native_source_resolution:
+            crops = (args.crop_left, args.crop_right, args.crop_top, args.crop_bottom)
+            expected_size, placement = native_source_layout(*source_size, *base_size, crops)
+            print(f'Native source resolution: {expected_size[0]}x{expected_size[1]} canvas, source placed 1:1 '
+                  f'({placement.width}x{placement.height} at {placement.x},{placement.y}) instead of {base_size[0]}x{base_size[1]}')
+    # Check the size the composite should come out at, not the outpainted clip's: delivery
+    # and native-resolution composites are deliberately a different size from their base.
+    width, height = expected_size if expected_size else (None, None)
+    if not args.force and resumable_output(output, sig, video_like=outpainted or source, width=width, height=height):
         print(f'Reuse composite: {output}')
         return 0
-    ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = probe_fps(ffmpeg, source)
     luminance_plan = []
     if colorized and args.reference_luminance_match:
@@ -406,10 +433,6 @@ def run(args):
             print(f'Reference luminance matching: {matched}/{len(luminance_plan)} shot span(s), strength {args.reference_luminance_strength:g}%')
         else:
             print('Reference luminance matching requested without a manifest; using original source luminance.')
-    source_size = probe_dimensions(ffmpeg, source)
-    base_size = None
-    if outpainted:
-        base_size = (int(args.output_width), int(args.output_height)) if args.output_width and args.output_height else probe_dimensions(ffmpeg, outpainted)
     cmd = [ffmpeg, '-y']
     inputs, audio_input = input_args(outpainted, source, colorized, resolve_path(args.custom_mask) if args.custom_mask else None)
     cmd += inputs
@@ -462,6 +485,7 @@ def build_parser():
     parser.add_argument('--reference-luminance-strength', type=float, default=70.0, help='Strength of the shot-level reference luminance curve, from 0 to 100 percent.')
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
+    parser.add_argument('--native-source-resolution', action='store_true', help='Composite at the original source resolution: scale the outpainted canvas so the (trimmed) source overlays it 1:1 instead of resampling the source down or up to the outpaint size.')
     parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')
     parser.add_argument('--source-black-threshold', type=int, default=24, help='Maximum RGB channel value considered source black when --source-black-transparent is enabled.')
     parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')

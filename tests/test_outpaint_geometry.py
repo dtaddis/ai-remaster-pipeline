@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import final_composite  # noqa: E402
-from outpaint_geometry import source_envelope_size, source_placement  # noqa: E402
+from outpaint_geometry import native_source_layout, source_envelope_size, source_placement  # noqa: E402
 
 
 class OutpaintGeometryTests(unittest.TestCase):
@@ -127,6 +128,66 @@ class OutpaintGeometryTests(unittest.TestCase):
         self.assertIn("scale=1080:810", filter_text)
         self.assertIn("overlay=x=420:y=135", filter_text)
         self.assertNotIn("crop=w=", filter_text)
+
+    def test_native_layout_scales_the_canvas_around_an_unscaled_source(self) -> None:
+        # 1440x1080 outpainted to 1280x720: the source sat at 960x720, so the canvas
+        # grows by 1.5x and the source goes back on at its own size.
+        canvas, placement = native_source_layout(1440, 1080, 1280, 720, (0, 0, 0, 0))
+
+        self.assertEqual(canvas, (1920, 1080))
+        self.assertEqual((placement.x, placement.y, placement.width, placement.height), (240, 0, 1440, 1080))
+
+    def test_native_layout_compensates_for_trims_and_extends(self) -> None:
+        trimmed_canvas, trimmed = native_source_layout(1440, 1080, 1280, 720, (20, 20, 10, 10))
+        extended_canvas, extended = native_source_layout(1440, 1080, 1920, 1080, (0, 0, -180, -180))
+
+        # The trimmed source keeps its native trimmed size and the canvas follows it.
+        self.assertEqual((trimmed.width, trimmed.height), (1400, 1060))
+        self.assertEqual(trimmed_canvas, (1882, 1060))
+        self.assertEqual((trimmed.x % 2, trimmed.y % 2), (0, 0))
+        # Virtual border added around the source scales up with the rest of the canvas.
+        self.assertEqual(extended_canvas, (2560, 1440))
+        self.assertEqual((extended.x, extended.y, extended.width, extended.height), (560, 180, 1440, 1080))
+
+    def test_final_composite_native_resolution_overlays_the_source_without_scaling_it(self) -> None:
+        args = final_composite.build_parser().parse_args(
+            [
+                "--outpainted", "outpainted.mp4",
+                "--source", "source.mp4",
+                "--output", "final.mp4",
+                "--crop-left", "20",
+                "--crop-right", "20",
+                "--output-width", "1280",
+                "--output-height", "720",
+                "--native-source-resolution",
+            ]
+        )
+
+        filter_text = final_composite.build_filter(
+            args,
+            has_color=False,
+            fps=24.0,
+            source_size=(1440, 1080),
+            base_size=(1280, 720),
+        )
+
+        src_chain = next(part for part in filter_text.split(";") if part.endswith("[src]"))
+        self.assertIn("crop=w=1400:h=1080:x=20:y=0", src_chain)
+        self.assertNotIn("scale=", src_chain)
+        self.assertIn("scale=1920:1080:flags=lanczos[base]", filter_text)
+        self.assertIn("overlay=x=258:y=0", filter_text)
+        # 80px of feather at 720p becomes 120px at 1080p so the blend looks the same.
+        self.assertIn("lt(X,120)", filter_text)
+
+    def test_native_resolution_flag_stays_out_of_the_signature_when_off(self) -> None:
+        # Composites made before the option existed must keep matching their signature.
+        base = ["--outpainted", "o.mp4", "--source", "s.mp4", "--output", "f.mp4"]
+        with mock.patch.object(final_composite, "file_fingerprint", return_value={}):
+            off = final_composite.signature(final_composite.build_parser().parse_args(base))
+            on = final_composite.signature(final_composite.build_parser().parse_args(base + ["--native-source-resolution"]))
+
+        self.assertNotIn("native_source_resolution", off)
+        self.assertTrue(on["native_source_resolution"])
 
 
 if __name__ == "__main__":
