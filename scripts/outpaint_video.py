@@ -2743,6 +2743,9 @@ def wan_settings(args: Any) -> "wan.WanSettings":
         control_strength=float(getattr(args, "wan_control_strength", 1.0)),
         window_frames=int(getattr(args, "wan_window_frames", wan.WAN_WINDOW_FRAMES)),
         context_frames=int(getattr(args, "wan_context_frames", wan.WAN_CONTEXT_FRAMES)),
+        sampling=str(getattr(args, "wan_sampling", "sequential")),
+        context_overlap=int(getattr(args, "wan_context_overlap", 30)),
+        max_pass_frames=int(getattr(args, "wan_max_pass_frames", wan.WAN_MAX_PASS_FRAMES)),
     )
 
 
@@ -2986,6 +2989,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wan-control-strength", type=float, default=1.0)
     parser.add_argument("--wan-window-frames", type=int, default=wan.WAN_WINDOW_FRAMES, help="Frames per Wan VACE pass (4n+1; Wan is trained on 81).")
     parser.add_argument("--wan-context-frames", type=int, default=wan.WAN_CONTEXT_FRAMES, help="Finished frames that open each subsequent Wan VACE window.")
+    parser.add_argument("--wan-sampling", choices=["sequential", "context"], default="sequential", help="sequential renders one Wan window per ComfyUI pass; context samples each shot (up to --wan-max-pass-frames) in one pass with overlapping context windows, giving every frame look-ahead across the shot.")
+    parser.add_argument("--wan-context-overlap", type=int, default=30, help="Overlap between context windows in context sampling.")
+    parser.add_argument("--wan-max-pass-frames", type=int, default=wan.WAN_MAX_PASS_FRAMES, help="Longest span sampled in one context-sampling pass (bounded by RAM).")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")

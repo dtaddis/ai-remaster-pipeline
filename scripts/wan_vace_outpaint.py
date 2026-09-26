@@ -27,8 +27,21 @@ from common import replace_with_retry
 from dependency_manager import WAN_DISTILL_LORA, WAN_TEXT_ENCODER, WAN_VACE_GGUF_MODEL, WAN_VAE
 from intermediate_video import audio_codec_args, codec_args, comfy_video_combine_inputs, container_args
 
-WAN_WINDOW_FRAMES = 81
+# Wan is trained on 81 frames, but at 720p one 161-frame window (6.7s of look-ahead at 24 fps)
+# fits in 24 GB (21.6 GB peak) and kept invented surroundings steadier than 81-frame windows
+# in side-by-side tests, for about 1.6x the render time.
+WAN_WINDOW_FRAMES = 161
+WAN_NATIVE_WINDOW_FRAMES = 81
+# Windows are capped by the largest one measured to fit in 24 GB, so higher resolutions get
+# shorter windows instead of running out of VRAM. Wan's native 81 frames is the floor.
+WAN_MAX_WINDOW_PIXELS = 161 * 1280 * 704
 WAN_CONTEXT_FRAMES = 13
+# Context-window passes hold the whole span in system RAM as float frames (control, mask and
+# VACE's inactive/reactive copies). Measured on a 481-frame 1280x704 pass (20s at 24 fps):
+# about 24 GB of frame tensors on top of the model weights. Passes are capped by that pixel
+# budget, so 1080p passes are shorter rather than exhausting a 64 GB machine.
+WAN_MAX_PASS_FRAMES = 481
+WAN_MAX_PASS_PIXELS = 481 * 1280 * 704
 # ComfyUI's ImagePadForOutpaint fills new canvas with 0.5 grey. WanVaceToVideo centres the
 # control video on 0.5, so grey is the "no information" value in both VACE control streams.
 WAN_UNKNOWN_GREY = 128
@@ -51,6 +64,7 @@ WAN_VACE_REQUIRED_NODES = {
     "LoadVideo": "ComfyUI core",
     "GetVideoComponents": "ComfyUI core",
     "ImageToMask": "ComfyUI core",
+    "WanContextWindowsManual": "ComfyUI core",
 }
 
 
@@ -65,9 +79,38 @@ class WanSettings:
     control_strength: float = 1.0
     window_frames: int = WAN_WINDOW_FRAMES
     context_frames: int = WAN_CONTEXT_FRAMES
+    # "sequential": each window is its own ComfyUI pass, continuing from the previous one.
+    # "context": a whole shot is one pass; ComfyUI's Wan context windows sample overlapping
+    # windows and blend them at every step, so each frame sees the entire shot (look-ahead)
+    # while VRAM stays at one window's worth.
+    sampling: str = "sequential"
+    context_overlap: int = 30
+    max_pass_frames: int = WAN_MAX_PASS_FRAMES
+
+    def window_frames_for(self, width: int, height: int) -> int:
+        """Attention window at this canvas size (4n + 1 frames), within the VRAM budget."""
+        by_pixels = WAN_MAX_WINDOW_PIXELS // max(1, int(width) * int(height))
+        floor = min(int(self.window_frames), WAN_NATIVE_WINDOW_FRAMES)
+        frames = max(floor, min(int(self.window_frames), by_pixels))
+        return ((frames - 1) // 4) * 4 + 1
+
+    def pass_frames(self, width: int, height: int) -> int:
+        """Longest span sampled in one ComfyUI pass at this canvas size (4n + 1 frames)."""
+        window = self.window_frames_for(width, height)
+        if self.sampling != "context":
+            return window
+        by_pixels = WAN_MAX_PASS_PIXELS // max(1, int(width) * int(height))
+        frames = max(window, min(int(self.max_pass_frames), by_pixels))
+        return ((frames - 1) // 4) * 4 + 1
 
     def signature(self) -> dict[str, Any]:
+        extra = (
+            {"sampling": "context", "context_overlap": self.context_overlap, "max_pass_frames": self.max_pass_frames}
+            if self.sampling == "context"
+            else {}
+        )
         return {
+            **extra,
             "model": WAN_VACE_GGUF_MODEL,
             "text_encoder": WAN_TEXT_ENCODER,
             "vae": WAN_VAE,
@@ -281,8 +324,8 @@ def build_wan_vace_prompt(
     settings: WanSettings,
     output_prefix: str,
 ) -> dict[str, Any]:
-    """API prompt for one VACE window, following ComfyUI's own Wan VACE outpainting template."""
-    return {
+    """API prompt for one VACE pass, following ComfyUI's own Wan VACE outpainting template."""
+    prompt: dict[str, Any] = {
         "1": {"class_type": "LoadVideo", "inputs": {"file": control_name}, "_meta": {"title": "ARP Wan control video"}},
         "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
         "3": {"class_type": "LoadVideo", "inputs": {"file": mask_name}, "_meta": {"title": "ARP Wan control mask"}},
@@ -346,6 +389,26 @@ def build_wan_vace_prompt(
             },
         },
     }
+    window = settings.window_frames_for(width, height)
+    if settings.sampling == "context" and length > window:
+        prompt["22"] = {
+            "class_type": "WanContextWindowsManual",
+            "inputs": {
+                "model": ["12", 0],
+                "context_length": int(window),
+                "context_overlap": int(settings.context_overlap),
+                "context_schedule": "standard_uniform",
+                "context_stride": 1,
+                "closed_loop": False,
+                "fuse_method": "pyramid",
+                "freenoise": True,
+                "retain_first_frame": False,
+                "split_conds_to_windows": False,
+            },
+            "_meta": {"title": "ARP Wan context windows (whole-shot look-ahead)"},
+        }
+        prompt["18"]["inputs"]["model"] = ["22", 0]
+    return prompt
 
 
 WAN_OUTPUT_NODE_ID = "21"
@@ -384,11 +447,17 @@ def render_chunk(
     import numpy as np
 
     prefix = known_prefix[:total_frames]
-    windows = plan_windows(total_frames, len(prefix), settings.window_frames, settings.context_frames, cuts)
+    pass_frames = settings.pass_frames(width, height)
+    windows = plan_windows(total_frames, len(prefix), pass_frames, settings.context_frames, cuts)
     inner_cuts = sorted(int(cut) for cut in cuts if 0 < int(cut) < total_frames)
+    window = settings.window_frames_for(width, height)
+    if window < settings.window_frames:
+        log(f"Wan VACE: {width}x{height} limits windows to {window} frames (requested {settings.window_frames}) to stay within 24 GB of VRAM.")
     log(
-        f"Wan VACE: {total_frames} frame(s) as {len(windows)} window(s) of up to {settings.window_frames} "
-        f"frames, {settings.context_frames} context frame(s) each"
+        f"Wan VACE ({settings.sampling}): {total_frames} frame(s) as {len(windows)} pass(es) of up to "
+        f"{pass_frames} frames, {settings.context_frames} context frame(s) each"
+        + (f", sampled in {window}-frame context windows overlapping by {settings.context_overlap}"
+           if settings.sampling == "context" else "")
         + (f"; {len(prefix)} frame(s) continue the previous chunk" if prefix else "")
         + (f"; new shot(s) start at chunk frame(s) {', '.join(map(str, inner_cuts))}" if inner_cuts else "")
     )
@@ -411,8 +480,8 @@ def render_chunk(
         *codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile),
     ]
     writer = FrameWriter(ffmpeg, partial, width, height, fps, output_args, extra_inputs)
-    # Finished frames still needed as context: at most one window's worth.
-    finished: deque[tuple[int, "np.ndarray"]] = deque(maxlen=max(settings.window_frames, 1))
+    # Finished frames still needed as context: plan_windows never takes more than context_frames.
+    finished: deque[tuple[int, "np.ndarray"]] = deque(maxlen=max(settings.context_frames, 1))
     try:
         for index, frame in enumerate(prefix):
             writer.write(frame)

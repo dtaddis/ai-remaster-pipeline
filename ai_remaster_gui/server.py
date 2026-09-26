@@ -1611,6 +1611,7 @@ class PipelineApp:
         add(["--outpaint-lora", outpaint_lora])
         if values.get("outpaint_model") == "wanvace":
             add(["--outpaint-backend", "wan-vace"])
+            add(["--wan-window-frames", "81" if values.get("wan_window_frames") == "81" else "161"])
         if values.get("outpaint_model") == "ltx25":
             add(["--ltx-version", "2.5"])
             add(["--generation-fps", values.get("generation_fps", "24-fast")])

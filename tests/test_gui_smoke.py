@@ -2863,6 +2863,22 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("outpaintwan", expected)
         args = outpaint_video.build_parser().parse_args(command[3:])
         self.assertEqual(outpaint_video.outpaint_artifact_tag(args, "outpaint"), "outpaintwan")
+        self.assertEqual(command[command.index("--wan-window-frames") + 1], "161")
+        app.APP.settings["outpaint"]["wan_window_frames"] = "81"
+        command = app.APP.command_for("outpaint")
+        self.assertEqual(command[command.index("--wan-window-frames") + 1], "81")
+
+    def test_new_projects_default_to_oumoumad_with_161_frame_wan_windows(self) -> None:
+        defaults = runtime_settings.base_settings()["outpaint"]
+
+        self.assertEqual(defaults["outpaint_model"], "oumoumad")
+        self.assertEqual(defaults["wan_window_frames"], "161")
+        # The Wan-only setting is hidden for the LTX models and never sent to them.
+        outpaint_js = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-outpaint.js").read_text(encoding="utf-8")
+        self.assertIn("s.outpaint_model === 'wanvace' ? [] : ['wan_window_frames']", outpaint_js)
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"]["outpaint_model"] = "oumoumad"
+        self.assertNotIn("--wan-window-frames", app.APP.command_for("outpaint"))
 
     def test_outpaint_command_uses_whole_video_offsets(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

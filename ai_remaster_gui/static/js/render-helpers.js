@@ -94,7 +94,9 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
-    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). It renders each chunk as overlapping 81-frame windows, each continuing from the previous window\'s finished frames, so chunk length does not change what the model sees, but a chunk takes longer. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting.',
+    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). It renders each chunk as overlapping windows (see Wan window length), each continuing from the previous window\'s finished frames, so chunk length does not change what the model sees, but a chunk takes longer. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting.',
+  'outpaint.wan_window_frames':
+    'How many frames Wan VACE sees at once. Each window continues from the previous window\'s finished frames, so a longer window lets every frame "look ahead" further and kept invented surroundings steadier in tests, at about 1.6x the render time of 81 frames at 720p. 161 frames fits in 24 GB at 720p; larger canvases automatically use shorter windows to stay within VRAM.',
   'outpaint.generation_fps':
     'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
@@ -369,6 +371,8 @@ function selectOptionLabel(key, option) {
   if (key === 'outpaint_model' && option === 'ltx25') return '2.5 - Official LoRA';
   if (key === 'outpaint_model' && option === 'oumoumad') return '2.3 - Oumoumad LoRA';
   if (key === 'outpaint_model' && option === 'wanvace') return 'Wan 2.1 VACE (14B)';
+  if (key === 'wan_window_frames' && option === '161') return '161 frames (steadier, ~6.7s look-ahead)';
+  if (key === 'wan_window_frames' && option === '81') return '81 frames (faster)';
   if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';

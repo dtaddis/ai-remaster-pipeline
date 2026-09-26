@@ -642,7 +642,9 @@ function hydratePendingGuidePreviews() {
 
 function drawOutpaint(st, s, expected, sp) {
   const offsetKeys = new Set(['offset_x', 'offset_y']);
-  const mainFields = st.fields.filter(f => !f[0].startsWith('edge_') && !offsetKeys.has(f[0]));
+  // The window length only applies to Wan VACE; the LTX models render each chunk in one pass.
+  const hiddenKeys = new Set(s.outpaint_model === 'wanvace' ? [] : ['wan_window_frames']);
+  const mainFields = st.fields.filter(f => !f[0].startsWith('edge_') && !offsetKeys.has(f[0]) && !hiddenKeys.has(f[0]));
   const offsetFields = st.fields.filter(f => offsetKeys.has(f[0]));
   const cropFields = st.fields.filter(f => f[0].startsWith('edge_'));
 

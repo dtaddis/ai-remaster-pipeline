@@ -59,6 +59,13 @@ class WanWindowPlanTests(unittest.TestCase):
         self.assertEqual(windows[0][0], 8)
         self.assert_plan_covers(windows, 100, 8, 81, 13, cuts=[8])
 
+    def test_default_windows_are_161_frames_within_the_measured_vram_budget(self) -> None:
+        self.assertEqual(wan.WanSettings().window_frames_for(1280, 704), 161)
+        self.assertEqual(wan.WanSettings().window_frames_for(864, 480), 161)
+        # 1080p exceeds what was measured to fit in 24 GB: fall back to Wan's native 81.
+        self.assertEqual(wan.WanSettings().window_frames_for(1920, 1088), 81)
+        self.assertEqual(wan.WanSettings(window_frames=81).window_frames_for(1280, 704), 81)
+
     def test_ltx_trigger_word_is_removed_from_wan_prompts(self) -> None:
         self.assertEqual(wan.wan_prompt("outpaint"), "")
         self.assertEqual(wan.wan_prompt("Outpaint, a crowded hall"), "a crowded hall")
@@ -117,6 +124,26 @@ class WanPromptTests(unittest.TestCase):
             for value in node["inputs"].values():
                 if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
                     self.assertIn(value[0], prompt)
+
+
+    def test_context_sampling_patches_the_model_only_for_passes_longer_than_a_window(self) -> None:
+        settings = wan.WanSettings(sampling="context", window_frames=81, context_overlap=30)
+        args = ("c.mkv", "m.mkv", 1280, 704)
+        tail = (24.0, "", "", 1, settings, "x")
+
+        long_pass = wan.build_wan_vace_prompt(*args, 481, *tail)
+        short_pass = wan.build_wan_vace_prompt(*args, 61, *tail)
+
+        self.assertEqual(long_pass["18"]["inputs"]["model"], ["22", 0])
+        self.assertEqual(long_pass["22"]["class_type"], "WanContextWindowsManual")
+        self.assertEqual(long_pass["22"]["inputs"]["context_length"], 81)
+        self.assertNotIn("22", short_pass)
+        self.assertEqual(settings.pass_frames(1280, 704), 481)
+        # 1080p passes shrink to the same RAM budget instead of growing 2.3x.
+        self.assertEqual(settings.pass_frames(1920, 1088), 205)
+        self.assertEqual(wan.WanSettings().pass_frames(1920, 1088), 81)
+        # One pass per shot, never across a cut.
+        self.assertEqual(wan.plan_windows(481, 0, settings.pass_frames(1280, 704), 13, cuts=[208]), [(0, 208), (208, 481)])
 
 
 def write_video(ffmpeg: str, path: Path, frames: list[np.ndarray], fps: float = 24.0) -> None:

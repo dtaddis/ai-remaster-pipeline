@@ -102,6 +102,7 @@ STAGES = (
             ("target_height", "Output height", "select:source|480|544|576|720|768|1080|custom", "source"),
             ("outpaint_model", "Outpaint model", "select:oumoumad|official|ltx25|wanvace", "oumoumad"),
             ("generation_fps", "LTX 2.5 generation FPS", "select:24-fast|24|source", "24-fast"),
+            ("wan_window_frames", "Wan window length", "select:161|81", "161"),
             ("offset_x", "Horizontal offset (px)", "number", "0"),
             ("offset_y", "Vertical offset (px)", "number", "0"),
             ("chunk_seconds", "Chunk seconds", "number", "20"),

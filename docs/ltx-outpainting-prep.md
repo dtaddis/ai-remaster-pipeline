@@ -47,7 +47,9 @@ outpaint_video.bat ^
   --outpaint-backend wan-vace
 ```
 
-Wan builds its ComfyUI graph in `scripts/wan_vace_outpaint.py` (following ComfyUI's own Wan VACE outpainting template) rather than from a workflow file. Each chunk is rendered as overlapping 81-frame VACE windows. `--wan-window-frames` and `--wan-context-frames` control the window size and the number of finished frames each window continues from. `--wan-steps`, `--wan-cfg`, `--wan-shift`, `--wan-sampler`, and `--wan-scheduler` tune sampling; the defaults suit the lightx2v step-distill LoRA.
+Wan builds its ComfyUI graph in `scripts/wan_vace_outpaint.py` (following ComfyUI's own Wan VACE outpainting template) rather than from a workflow file. Each chunk is rendered as overlapping VACE windows of up to 161 frames (`--wan-window-frames`; 81 is Wan's native length and faster), each continuing from `--wan-context-frames` finished frames. Windows larger than the measured 24 GB budget (161 frames at 1280x704) shrink automatically at higher resolutions.
+
+`--wan-sampling context` is experimental: it samples a whole shot (up to 20 seconds at 720p) in one pass using ComfyUI's Wan context windows, blending overlapping windows at every step. It fits in 24 GB of VRAM but needs roughly 24 GB of system RAM for frames at 720p, and in testing the blended windows sometimes morphed invented surroundings between different objects, so sequential windows remain the default. `--wan-steps`, `--wan-cfg`, `--wan-shift`, `--wan-sampler`, and `--wan-scheduler` tune sampling; the defaults suit the lightx2v step-distill LoRA.
 
 ## Prepare The Comfy Input Manually
 
