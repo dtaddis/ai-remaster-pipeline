@@ -1822,7 +1822,9 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("'2.3 - Oumoumad LoRA'", helpers)
         self.assertIn("'2.3 - Official LoRA'", helpers)
         self.assertIn("'2.5 - Official LoRA'", helpers)
-        self.assertIn("'Wan 2.1 VACE (14B)'", helpers)
+        # Wan and H3 stay available but are flagged: neither produced usable archive outpaints.
+        self.assertIn("'Wan 2.1 VACE (14B) - experimental'", helpers)
+        self.assertIn("'MiniMax H3 - experimental, licence required'", helpers)
 
     def test_ltx25_frame_rate_preparation_adds_silence_for_archival_video(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

@@ -94,7 +94,7 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
-    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). Wan compresses video far less than LTX, so its chunks are capped at 161 frames (6.7s at 24 fps; shorter above 720p to stay within 24 GB of VRAM) and overlap by at least 13 frames, each chunk continuing from the previous chunk\'s finished frames. Switching back to an LTX model restores the full Chunk seconds. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting. MiniMax H3 uses its Fun ControlNet inpainting on the same masks, one pass per chunk, as long as fits in 24 GB (about 3.75 s at 1536x640), on a canvas of at most 1344x768 pixels; its open weights need a licence in the EU, UK, South Korea and USA (about 38 GB downloaded once licensed, plus 1.4 GB for the optional PDD 8-step distillation).',
+    'Oumoumad is the default and recommended: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE and MiniMax H3 are experimental: neither produced usable outpaints on real archive footage in testing. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). Wan compresses video far less than LTX, so its chunks are capped at 161 frames (6.7s at 24 fps; shorter above 720p to stay within 24 GB of VRAM) and overlap by at least 13 frames, each chunk continuing from the previous chunk\'s finished frames. Switching back to an LTX model restores the full Chunk seconds. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting. MiniMax H3 uses its Fun ControlNet inpainting on the same masks, one pass per chunk, as long as fits in 24 GB (about 3.75 s at 1536x640), on a canvas of at most 1344x768 pixels; its open weights need a licence in the EU, UK, South Korea and USA (about 38 GB downloaded once licensed, plus 1.4 GB for the optional PDD 8-step distillation).',
   'outpaint.generation_fps':
     'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
@@ -390,8 +390,8 @@ function selectOptionLabel(key, option) {
   if (key === 'outpaint_model' && option === 'official') return '2.3 - Official LoRA';
   if (key === 'outpaint_model' && option === 'ltx25') return '2.5 - Official LoRA';
   if (key === 'outpaint_model' && option === 'oumoumad') return '2.3 - Oumoumad LoRA';
-  if (key === 'outpaint_model' && option === 'wanvace') return 'Wan 2.1 VACE (14B)';
-  if (key === 'outpaint_model' && option === 'h3') return 'MiniMax H3 (licence required)';
+  if (key === 'outpaint_model' && option === 'wanvace') return 'Wan 2.1 VACE (14B) - experimental';
+  if (key === 'outpaint_model' && option === 'h3') return 'MiniMax H3 - experimental, licence required';
   if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
@@ -673,6 +673,9 @@ function outpaintOverlapWarning(s) {
   const warnings = [];
   // Wan and H3 drop the trigger word and continue across a long overlap, so these are LTX-only.
   const wan = ['wanvace', 'h3'].includes(s.outpaint_model);
+  if (wan) {
+    warnings.push(`${outpaintModelName()} is experimental: on real archive footage it painted unusable surroundings (Wan framed the picture with borders and panels; H3 invented unrelated objects and people). 2.3 - Oumoumad LoRA is recommended.`);
+  }
   if (!wan && !String(s.prompt || '').toLowerCase().includes('outpaint')) {
     warnings.push('The global Outpainting prompt does not contain "outpaint". The LTX IC-LoRA usually needs that word to activate.');
   }
