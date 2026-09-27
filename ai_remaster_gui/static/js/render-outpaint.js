@@ -46,8 +46,10 @@ function outpaintRawFramesHtml(row) {
 function outpaintChunkSummary(row) {
   const idx = row.index;
   const fps = Math.max(1, Number(row.fps || 24));
-  const projectFrames = Math.max(1, Math.round(Number(settings('outpaint').chunk_seconds || 20) * fps));
-  const frameCount = Math.max(1, Number(row.custom_seconds ? Math.round(Number(row.custom_seconds) * fps) : row.length_frames || projectFrames));
+  // Wan VACE caps every chunk at what one pass holds (max_chunk_frames; 0 = no cap).
+  const cap = Number(row.max_chunk_frames || 0) || Infinity;
+  const projectFrames = Math.max(1, Math.min(cap, Math.round(Number(settings('outpaint').chunk_seconds || 20) * fps)));
+  const frameCount = Math.max(1, Math.min(cap, Number(row.custom_seconds ? Math.round(Number(row.custom_seconds) * fps) : row.length_frames || projectFrames)));
   const defaultFrames = Math.max(1, Math.min(Number(row.max_length_frames || projectFrames), projectFrames));
   const maxFrames = Math.max(frameCount, Number(row.max_length_frames || frameCount));
   const custom = !!row.custom_seconds;
@@ -83,9 +85,8 @@ function outpaintChunkGuide(row) {
   const autoStartGuideAvailable = !!row.auto_start_guide_available;
   const autoStartGuideActive = autoStartGuideAvailable && String(row.auto_start_guide || '').toLowerCase() !== 'false';
 
-  // Warn about duplicate effective positions, mirroring resolve_guide_coords in
-  // outpaint_video.py: negatives resolve from the chunk's latent count, and positions
-  // 1 above a multiple of 8 shift down 1 at render (IC-LoRA coordinate clash).
+  // Warn about duplicate effective positions, mirroring where the render places each guide
+  // (resolveGuideCoord).
   const resolvedIdxs = guides.map(g => resolveGuideCoord(Number(g.frame_idx), lengthFrames));
   const dupIdxs = new Set(resolvedIdxs.filter((v, i, a) => a.indexOf(v) !== i));
   const guideLabelOffset = autoStartGuideActive ? 1 : 0;
@@ -102,10 +103,11 @@ function outpaintChunkGuide(row) {
   )).join('');
 
   const empty = guides.length === 0
-    ? `<p class="shot-empty guide-empty${autoStartGuideActive ? ' hidden' : ''}">No guide frames set. Add one below to steer LTX at specific points in the chunk.</p>`
+    ? `<p class="shot-empty guide-empty${autoStartGuideActive ? ' hidden' : ''}">No guide frames set. Add one below to steer ${outpaintModelName()} at specific points in the chunk.</p>`
     : '';
 
-  const tooMany = guides.length > Math.floor(lengthFrames / 8) + 1
+  // LTX places guides on an 8-frame latent grid; Wan keeps every frame's guide separately.
+  const tooMany = !outpaintUsesMaskedModel() && guides.length > Math.floor(lengthFrames / 8) + 1
     ? `<p class="shot-time guide-warn">⚠ More guides than 8-frame positions in this chunk — duplicate positions are skipped at render.</p>`
     : '';
 
@@ -120,13 +122,19 @@ function outpaintChunkGuide(row) {
         <button type="button" data-outpaint-disable-running="true"
           onclick="addGuideFrame(${idx})" ${state.running ? 'disabled' : ''}>+ Add Guide Frame</button>
       </div>
-      <p class="shot-time chunk-guide-hint">💡 frame_idx 0 = chunk start (i2v), −1 = last frame (FLF2V), multiples of 8 in between. Positions 1 above a multiple of 8 shift down 1 at render; other non-multiples sit between LTX's 8-frame grid and pin less strongly.</p>
+      <p class="shot-time chunk-guide-hint">${outpaintUsesMaskedModel()
+        ? '💡 frame_idx 0 = chunk start, −1 = last frame; any frame in between is pinned exactly. Guides in the frames this chunk shares with the previous one are ignored while it continues from that chunk.' +
+          (settings('outpaint').outpaint_model === 'h3' ? ' H3 keeps a guide as painted at strength 0.5 or more and ignores it below that.' : '')
+        : '💡 frame_idx 0 = chunk start (i2v), −1 = last frame (FLF2V), multiples of 8 in between. Positions 1 above a multiple of 8 shift down 1 at render; other non-multiples sit between LTX\'s 8-frame grid and pin less strongly.'}</p>
     </div>
   `;
 }
 
 function resolveGuideCoord(fi, lengthFrames) {
-  // Mirrors resolve_guide_coords in scripts/outpaint_video.py.
+  // Wan pins the exact frame; negatives count back from the chunk's last frame
+  // (render_wan_vace_chunk in scripts/outpaint_video.py).
+  if (outpaintUsesMaskedModel()) return fi < 0 ? Math.max(0, lengthFrames + fi) : fi;
+  // LTX mirrors resolve_guide_coords in scripts/outpaint_video.py.
   let coord = fi;
   if (fi < 0) {
     const latentCount = Math.floor((Math.max(1, lengthFrames) - 1) / 8) + 1;
@@ -141,6 +149,10 @@ function guideUsesStartPosition(g, lengthFrames) {
 }
 
 function guideFrameLabel(fi, maxFrame) {
+  if (outpaintUsesMaskedModel()) {
+    if (fi === 0) return '0 — chunk start';
+    return fi >= maxFrame ? `${fi} — last frame` : `${fi}`;
+  }
   if (fi === 0) return '0 — chunk start (i2v)';
   if (fi >= maxFrame) return `${fi} — last frame (FLF2V)`;
   if (fi % 8 === 1) return `${fi} → renders at ${fi - 1}`;
@@ -170,7 +182,9 @@ function autoStartGuideCard(row, visible) {
       </div>
       <div>
         <label>Frame: ${esc(guideFrameLabel(0, maxFrame))}</label>
-        <p class="shot-time">Uses the last rendered frame from Chunk ${sourceIndex + 1}.</p>
+        <p class="shot-time">${outpaintUsesMaskedModel()
+          ? `Continues from the finished frames this chunk shares with Chunk ${sourceIndex + 1}.`
+          : `Uses the last rendered frame from Chunk ${sourceIndex + 1}.`}</p>
       </div>
     </div>
   `;
@@ -423,7 +437,9 @@ function outpaintChunkPrompt(row) {
       <textarea id="chunkPrompt_${idx}" placeholder="Optional direction for this chunk">${esc(row.prompt_suffix || '')}</textarea>
       <label>Negative suffix</label>
       <textarea id="chunkNegative_${idx}" placeholder="Optional things to avoid in this chunk">${esc(row.negative_suffix || '')}</textarea>
-      <p class="shot-time">Use these to nudge LTX away from odd extra objects, warped geometry, hands, or missing details.</p>
+      <p class="shot-time">${outpaintUsesMaskedModel()
+        ? `Describe this chunk in the prompt suffix. ${outpaintModelName()} ignores negative text without classifier-free guidance; it is kept for LTX.`
+        : 'Use these to nudge LTX away from odd extra objects, warped geometry, hands, or missing details.'}</p>
     </div>
   `;
 }
@@ -642,8 +658,8 @@ function hydratePendingGuidePreviews() {
 
 function drawOutpaint(st, s, expected, sp) {
   const offsetKeys = new Set(['offset_x', 'offset_y']);
-  // The window length only applies to Wan VACE; the LTX models render each chunk in one pass.
-  const hiddenKeys = new Set(s.outpaint_model === 'wanvace' ? [] : ['wan_window_frames']);
+  // The H3 licence and PDD switches only apply to MiniMax H3.
+  const hiddenKeys = new Set(s.outpaint_model === 'h3' ? [] : ['h3_license_confirmed', 'h3_pdd']);
   const mainFields = st.fields.filter(f => !f[0].startsWith('edge_') && !offsetKeys.has(f[0]) && !hiddenKeys.has(f[0]));
   const offsetFields = st.fields.filter(f => offsetKeys.has(f[0]));
   const cropFields = st.fields.filter(f => f[0].startsWith('edge_'));
@@ -668,7 +684,7 @@ function drawOutpaint(st, s, expected, sp) {
         <div class="outpaint-mask-summary">
           <div>
             <h3>Custom Outpaint Mask</h3>
-            <p class="shot-empty">Paint extra areas for LTX to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically; saved painted areas appear in coral on the preview.</p>
+            <p class="shot-empty">Paint extra areas for ${outpaintModelName()} to replace on every frame, such as rounded film corners or sprocket holes. The hatched expansion remains selected automatically; saved painted areas appear in coral on the preview.</p>
           </div>
           <div class="actions">
             <button id="outpaintMaskEditButton" type="button" onclick="openOutpaintMaskEditor()">${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? 'Edit' : 'Create'} Mask</button>
@@ -700,7 +716,7 @@ function drawOutpaint(st, s, expected, sp) {
     </div>
     <section class="card chunk-section">
       <h2>Outpaint Chunks</h2>
-      <p class="shot-empty">Chunks are the fixed video segments sent to LTX. They are separate from shot detection and can be regenerated individually.</p>
+      <p class="shot-empty">Chunks are the fixed video segments sent to ${outpaintModelName()}${outpaintUsesMaskedModel() ? ', each rendered in one pass' : ''}. They are separate from shot detection and can be regenerated individually.</p>
       ${outpaintChunkCards()}
     </section>
   `;

@@ -175,7 +175,7 @@ function ensureOutpaintMaskModal() {
         <strong>Custom Outpaint Mask</strong>
         <button type="button" onclick="closeOutpaintMaskEditor()">Close</button>
       </div>
-      <p class="shot-empty">Paint over source pixels that LTX should regenerate on every frame. The existing hatched border is already outpainted and does not need painting.</p>
+      <p class="shot-empty">Paint over source pixels that <span id="outpaintMaskModelName">${outpaintModelName()}</span> should regenerate on every frame. The existing hatched border is already outpainted and does not need painting.</p>
       <div class="outpaint-mask-layout">
         <div class="outpaint-mask-canvas-wrap">
           <canvas id="outpaintMaskImageCanvas"></canvas>
@@ -219,6 +219,8 @@ async function openOutpaintMaskEditor() {
   const preview = document.getElementById('aspectPreviewImg');
   if (!preview || !preview.src) return alert('Choose source material before editing the outpaint mask.');
   ensureOutpaintMaskModal();
+  // The modal is built once; keep its model name in step with the current selection.
+  document.getElementById('outpaintMaskModelName').textContent = outpaintModelName();
   const modal = document.getElementById('outpaintMaskModal');
   const imageCanvas = document.getElementById('outpaintMaskImageCanvas');
   const paintCanvas = document.getElementById('outpaintMaskPaintCanvas');

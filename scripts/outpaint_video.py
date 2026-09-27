@@ -35,6 +35,11 @@ from common import (
 )
 from dependency_manager import (
     DEFAULT_OUTPAINT_LORA,
+    H3_DIFFUSION_GGUF,
+    H3_LICENSE_REQUIRED,
+    H3_PDD_ACC,
+    H3_TEXT_ENCODER_GGUF,
+    H3_VIDEO_VAE,
     LTX25_AUDIO_VAE,
     LTX25_GGUF_MODEL,
     LTX25_LATENT_UPSCALER,
@@ -46,6 +51,7 @@ from dependency_manager import (
     WAN_VACE_GGUF_MODEL,
     WAN_VAE,
     HuggingFaceAccessError,
+    ensure_h3_outpaint_models,
     ensure_ltx25_outpaint_models,
     ensure_outpaint_models,
     ensure_wan_vace_outpaint_models,
@@ -61,6 +67,9 @@ from ltx_outpaint_workflow_adapter import (
 )
 from qwen_seed_guides import DEFAULT_SEED_PROMPT, detect_shot_start_frames, seed_guides
 import artifact_ids as aid
+import chunk_plan
+from chunk_plan import ltx_valid_frame_count, valid_final_chunk_start
+import minimax_h3_outpaint as h3
 import wan_vace_outpaint as wan
 
 
@@ -135,6 +144,16 @@ def uses_wan_vace(args: Any | None) -> bool:
     return getattr(args, "outpaint_backend", "ltx") == "wan-vace"
 
 
+def uses_h3(args: Any | None) -> bool:
+    return getattr(args, "outpaint_backend", "ltx") == "h3"
+
+
+def uses_masked_pass(args: Any | None) -> bool:
+    """Wan VACE and MiniMax H3 both take a source video plus a regenerate mask, so they share
+    ARP's masked-pass chunk renderer: masks, previous-chunk context, guides and shot cuts."""
+    return uses_wan_vace(args) or uses_h3(args)
+
+
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 
@@ -196,6 +215,8 @@ def crop_slug(args: Any) -> str:
 def outpaint_artifact_tag(args: Any | None, base: str) -> str:
     if uses_wan_vace(args):
         return f"{base}wan"
+    if uses_h3(args):
+        return f"{base}h3"
     return f"{base}25" if getattr(args, "ltx_version", "2.3") == "2.5" else base
 
 
@@ -211,6 +232,12 @@ def default_raw_output(source: Path, aspect: str, target_height: int | None, arg
     return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, outpaint_artifact_tag(args, "rawcomfy"), "mkv")
 
 
+def render_size(args: Any | None, work_w: int, work_h: int) -> tuple[int, int]:
+    """Canvas the chosen model renders on. Artifact names keep the working size, so the chunk
+    plan, guides and output names stay shared across models; H3 renders smaller."""
+    return aid.h3_render_size(work_w, work_h) if uses_h3(args) else (work_w, work_h)
+
+
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     # Prepare at model-safe dimensions so the canvas fed to LTX exactly matches the latent node
     # dimensions.  LTXVPreprocess crops (not scales) to fit the latent, so any mismatch would
@@ -218,7 +245,9 @@ def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any
     # dimensions (e.g. 704) to delivery resolution (e.g. 720) when producing the final master.
     work_w, work_h = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mkv")
+    # A smaller H3 canvas gets its own file: the working-size one also feeds the GUI's guide editor.
+    tag = outpaint_artifact_tag(args, "prepared") if render_size(args, work_w, work_h) != (work_w, work_h) else "prepared"
+    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, tag, "mkv")
 
 
 def run_command(command: list[str], dry_run: bool) -> None:
@@ -2138,10 +2167,34 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
             "latent_upscaler": "",
             "outpaint_lora": WAN_DISTILL_LORA,
             "text_encoder_device": "default",
-            "outpaint_pipeline": "wan21_vace14b_windowed_v1",
+            "outpaint_pipeline": "wan21_vace14b_chunked_v2",
             "ltx_runtime_adapter": "",
             "ltx_workflow_adapter": "",
             "wan_vace": wan_settings(args).signature(),
+            "wan_shot_detection": wan_shot_detection_settings(args),
+        })
+    if uses_h3(args):
+        signature.update({
+            "workflow": "",
+            "workflow_fingerprint": None,
+            "load_video_node_id": "",
+            "save_node_id": "",
+            "extra_save_node_id": [],
+            "output_node_id": h3.H3_OUTPUT_NODE_ID,
+            "model_backend": "gguf",
+            "ltx_version": "",
+            "generation_fps": "source",
+            "gguf_model": H3_DIFFUSION_GGUF,
+            "video_vae": H3_VIDEO_VAE,
+            "text_encoder": H3_TEXT_ENCODER_GGUF,
+            "audio_vae": "",
+            "latent_upscaler": "",
+            "outpaint_lora": H3_PDD_ACC if getattr(args, "h3_pdd", False) else "",
+            "text_encoder_device": "default",
+            "outpaint_pipeline": "minimax_h3_fun_inpaint_v1",
+            "ltx_runtime_adapter": "",
+            "ltx_workflow_adapter": "",
+            "minimax_h3": h3_settings(args).signature(),
             "wan_shot_detection": wan_shot_detection_settings(args),
         })
     return signature
@@ -2202,28 +2255,10 @@ def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> l
     return ranges
 
 
-def ltx_valid_frame_count(seconds: float, fps: float) -> int:
-    """Return the closest positive LTX temporal length (8n + 1)."""
-    requested = max(1, int(round(float(seconds) * float(fps))))
-    lower = max(1, ((requested - 1) // 8) * 8 + 1)
-    upper = lower + 8
-    return lower if requested - lower <= upper - requested else upper
-
-
 def ltx_padded_frame_count(frame_count: int) -> int:
     """Round a real frame count upward to the next valid LTX length (8n + 1)."""
     requested = max(1, int(frame_count))
     return ((requested - 1 + 7) // 8) * 8 + 1
-
-
-def valid_final_chunk_start(total_frames: int, start: int, ranges: list[tuple[int, int, int]]) -> int:
-    """Grow the final overlap just enough to make its temporal length 8n + 1."""
-    length = total_frames - start
-    grow = (1 - length) % 8
-    adjusted = max(0, start - grow)
-    if ranges and adjusted <= ranges[-1][1]:
-        return start
-    return adjusted
 
 
 def combine_prompt(prompt: str, suffix: str) -> str:
@@ -2353,35 +2388,31 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         handle.write(text)
 
 
-def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
-    if default_seconds <= 0 or total_frames <= 0:
-        return [(0, 0, total_frames)]
-    ranges: list[tuple[int, int, int]] = []
-    start = 0
-    index = 0
-    while start < total_frames:
-        seconds = default_seconds
-        custom = existing.get(index, {}).get("custom_seconds", "")
-        if custom:
-            try:
-                seconds = float(custom)
-            except ValueError:
-                seconds = default_seconds
-        chunk_frames = ltx_valid_frame_count(seconds, fps)
-        end = min(total_frames, start + chunk_frames)
-        if end == total_frames:
-            start = valid_final_chunk_start(total_frames, start, ranges)
-        ranges.append((index, start, end))
-        if end >= total_frames:
-            break
-        overlap = max(0, min(int(overlap_frames), chunk_frames - 1))
-        start += max(1, chunk_frames - overlap)
-        index += 1
-    return ranges
+def chunk_ranges_from_manifest(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]], max_frames: int = 0) -> list[tuple[int, int, int]]:
+    return chunk_plan.chunk_ranges(total_frames, fps, default_seconds, overlap_frames, existing, max_frames)
+
+
+def masked_pass_settings(args) -> "wan.WanSettings | h3.H3Settings":
+    return h3_settings(args) if uses_h3(args) else wan_settings(args)
+
+
+def max_chunk_frames(args, width: int, height: int) -> int:
+    """Longest chunk the chosen model renders in one pass (0 = no limit)."""
+    return masked_pass_settings(args).pass_frames(width, height) if uses_masked_pass(args) else 0
+
+
+def chunk_overlap_frames(args) -> int:
+    """Wan and H3 continue each chunk from the previous chunk's overlap frames, so they must
+    hold a full pass's worth of context however low the Overlap setting is."""
+    overlap = int(args.overlap_frames)
+    return max(overlap, int(masked_pass_settings(args).context_frames)) if uses_masked_pass(args) else overlap
 
 
 def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: float, chunk_dir: Path, default_seed: int, default_offset_x: int = 0, default_offset_y: int = 0) -> dict[int, dict[str, str]]:
-    existing = read_chunk_manifest(path)
+    stored = read_chunk_manifest(path)
+    existing = chunk_plan.remap_chunk_rows(stored, ranges)
+    if existing is not stored:
+        print("Chunk layout changed; guide frames were moved to the chunks that now contain them.", flush=True)
     rows: list[dict[str, str]] = []
     for chunk_index, start_frame, end_frame in ranges:
         row = dict(existing.get(chunk_index, {}))
@@ -2413,21 +2444,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
     return {int(row["chunk_index"]): row for row in rows}
 
 
-def _guide_frames_from_row(row: dict[str, str]) -> list[dict]:
-    raw = (row.get("guide_frames", "") or "").strip()
-    if raw:
-        try:
-            frames = json.loads(raw)
-            if isinstance(frames, list):
-                return [frame for frame in frames if isinstance(frame, dict)]
-        except (json.JSONDecodeError, ValueError):
-            pass
-    frames: list[dict] = []
-    if row.get("guide_image"):
-        frames.append({"frame_idx": 0, "image": row["guide_image"], "strength": row.get("guide_strength", "0.7")})
-    if row.get("guide_end_image"):
-        frames.append({"frame_idx": -1, "image": row["guide_end_image"], "strength": row.get("guide_end_strength", "1.0")})
-    return frames
+_guide_frames_from_row = chunk_plan.guide_frames_from_row
 
 
 def select_chunk_guides(guide_frames_list: "list[dict]", chunk_index: int, chunk_frames: int) -> "tuple[Path | None, float | None, list[dict]]":
@@ -2741,11 +2758,18 @@ def wan_settings(args: Any) -> "wan.WanSettings":
         scheduler=str(getattr(args, "wan_scheduler", "simple")),
         lora_strength=float(getattr(args, "wan_lora_strength", 1.0)),
         control_strength=float(getattr(args, "wan_control_strength", 1.0)),
-        window_frames=int(getattr(args, "wan_window_frames", wan.WAN_WINDOW_FRAMES)),
+
         context_frames=int(getattr(args, "wan_context_frames", wan.WAN_CONTEXT_FRAMES)),
         sampling=str(getattr(args, "wan_sampling", "sequential")),
         context_overlap=int(getattr(args, "wan_context_overlap", 30)),
         max_pass_frames=int(getattr(args, "wan_max_pass_frames", wan.WAN_MAX_PASS_FRAMES)),
+    )
+
+
+def h3_settings(args: Any) -> "h3.H3Settings":
+    return h3.H3Settings(
+        steps=int(getattr(args, "h3_steps", 20)),
+        pdd=bool(getattr(args, "h3_pdd", False)),
     )
 
 
@@ -2794,7 +2818,7 @@ def wan_shot_cuts(prepared: Path, settings: dict[str, float]) -> list[int]:
             return [int(cut) for cut in cached.get("cuts", [])]
     except (OSError, ValueError, TypeError):
         pass
-    print("Wan VACE: detecting shot changes so no window spans a cut...", flush=True)
+    print("Detecting shot changes so no masked pass spans a cut...", flush=True)
     cuts = [frame for frame in detect_shot_start_frames(prepared, **settings) if frame > 0]
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({"signature": signature, "cuts": cuts}, indent=2) + "\n", encoding="utf-8")
@@ -2815,7 +2839,7 @@ def wan_previous_chunk_frames(ffmpeg: str, previous_raw: Path, first_frame: int,
     return frames
 
 
-def render_wan_vace_chunk(
+def render_masked_pass_chunk(
     args,
     comfy_dir: Path,
     comfy_output_root: Path,
@@ -2831,18 +2855,18 @@ def render_wan_vace_chunk(
     previous_context: "tuple[Path, int, int] | None",
     cuts: "list[int]" = (),
 ) -> None:
-    """Outpaint one chunk with Wan VACE, continuing the previous chunk when it is supplied.
+    """Outpaint one chunk with Wan VACE or MiniMax H3, continuing the previous chunk when it is supplied.
 
     previous_context is (previous raw chunk, index of this chunk's frame 0 in it, number of
-    shared overlap frames). Those frames are finished, so they seed VACE's first window
-    exactly instead of the single-frame start guide the LTX graphs use.
+    shared overlap frames). Those frames are finished, so they seed the first pass exactly
+    instead of the single-frame start guide the LTX graphs use.
     """
     ffmpeg = find_ffmpeg()
     info = probe_video(chunk_prepared)
     width, height = int(info["width"]), int(info["height"])
     fps = float(info.get("fps") or 24.0)
     total_frames = int(info.get("frames") or 0)
-    settings = wan_settings(args)
+    settings = masked_pass_settings(args)
 
     known_prefix: list = []
     if previous_context is not None:
@@ -2857,28 +2881,30 @@ def render_wan_vace_chunk(
         if index < 0:
             index += total_frames
         if not 0 <= index < total_frames:
-            print(f"Warning: Wan VACE guide frame_idx={guide.get('frame_idx')} is outside the chunk; skipping it.", flush=True)
+            print(f"Warning: {settings.label} guide frame_idx={guide.get('frame_idx')} is outside the chunk; skipping it.", flush=True)
             continue
         if index in guides:
-            print(f"Warning: Wan VACE guide at frame {index} duplicates another guide; skipping the duplicate.", flush=True)
+            print(f"Warning: {settings.label} guide at frame {index} duplicates another guide; skipping the duplicate.", flush=True)
             continue
         guides[index] = (wan.load_guide_rgb(Path(guide["image"]), width, height), float(guide.get("strength", 1.0)))
 
-    input_subfolder = "arp_outpaint_wan"
+    input_subfolder = "arp_outpaint_h3" if uses_h3(args) else "arp_outpaint_wan"
+    output_node_id = h3.H3_OUTPUT_NODE_ID if uses_h3(args) else wan.WAN_OUTPUT_NODE_ID
     work_dir = comfy_dir / "input" / input_subfolder
 
-    def render_window(control: Path, mask: Path, length: int, window_index: int) -> Path:
-        prompt = wan.build_wan_vace_prompt(
-            f"{input_subfolder}/{control.name}",
-            f"{input_subfolder}/{mask.name}",
-            width, height, length, fps, prompt_text, negative_text,
-            seed + window_index, settings, f"{output_prefix}_w{window_index:02d}",
-        )
+    def render_pass(control: Path, mask: Path, length: int, pass_index: int, context_frames: int) -> Path:
+        control_name, mask_name = f"{input_subfolder}/{control.name}", f"{input_subfolder}/{mask.name}"
+        pass_seed, pass_prefix = seed + pass_index, f"{output_prefix}_p{pass_index:02d}"
+        if uses_h3(args):
+            # Guidance 1 runs no negative branch, so H3 takes the positive prompt only.
+            prompt = h3.build_h3_prompt(control_name, mask_name, width, height, length, fps, prompt_text, pass_seed, settings, pass_prefix, context_frames)
+        else:
+            prompt = wan.build_wan_vace_prompt(control_name, mask_name, width, height, length, fps, prompt_text, negative_text, pass_seed, settings, pass_prefix)
         prompt_id = queue_prompt(args.comfy_url, prompt)
         print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
         history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
         # LoadVideo reports its own input files in the history too; read only the save node.
-        saved = {"outputs": {wan.WAN_OUTPUT_NODE_ID: history.get("outputs", {}).get(wan.WAN_OUTPUT_NODE_ID, {})}}
+        saved = {"outputs": {output_node_id: history.get("outputs", {}).get(output_node_id, {})}}
         return newest_output(extract_output_files(saved, comfy_output_root))
 
     wan.render_chunk(
@@ -2892,7 +2918,7 @@ def render_wan_vace_chunk(
         masks=wan_chunk_masks(args, chunk_prepared, width, height),
         known_prefix=known_prefix,
         guides=guides,
-        render_window=render_window,
+        render_pass=render_pass,
         work_dir=work_dir,
         settings=settings,
         intermediate_profile=args.intermediate_profile,
@@ -2904,7 +2930,7 @@ def render_wan_vace_chunk(
 def build_parser() -> argparse.ArgumentParser:
     config = load_local_config()
     parser = argparse.ArgumentParser(description="Run the LTX IC-LoRA outpainting stage end to end.")
-    parser.add_argument("--outpaint-backend", choices=["ltx", "wan-vace"], default="ltx", help="Outpainting model family. wan-vace uses Wan 2.1 VACE 14B instead of an LTX IC-LoRA.")
+    parser.add_argument("--outpaint-backend", choices=["ltx", "wan-vace", "h3"], default="ltx", help="Outpainting model family. wan-vace uses Wan 2.1 VACE 14B and h3 uses MiniMax H3 with its Fun ControlNet inpaint patch instead of an LTX IC-LoRA.")
     parser.add_argument("--ltx-version", choices=["2.3", "2.5"], default="2.3", help="LTX outpainting generation backend.")
     parser.add_argument(
         "--generation-fps",
@@ -2987,11 +3013,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wan-scheduler", default="simple")
     parser.add_argument("--wan-lora-strength", type=float, default=1.0)
     parser.add_argument("--wan-control-strength", type=float, default=1.0)
-    parser.add_argument("--wan-window-frames", type=int, default=wan.WAN_WINDOW_FRAMES, help="Frames per Wan VACE pass (4n+1; Wan is trained on 81).")
-    parser.add_argument("--wan-context-frames", type=int, default=wan.WAN_CONTEXT_FRAMES, help="Finished frames that open each subsequent Wan VACE window.")
-    parser.add_argument("--wan-sampling", choices=["sequential", "context"], default="sequential", help="sequential renders one Wan window per ComfyUI pass; context samples each shot (up to --wan-max-pass-frames) in one pass with overlapping context windows, giving every frame look-ahead across the shot.")
+    parser.add_argument("--wan-context-frames", type=int, default=wan.WAN_CONTEXT_FRAMES, help="Finished frames each Wan VACE pass opens with; Wan chunks overlap by at least this many.")
+    parser.add_argument("--wan-sampling", choices=["sequential", "context"], default="sequential", help="sequential renders each Wan chunk in one ComfyUI pass (chunks capped at 161 frames at 720p). context (experimental) lets chunks run to --wan-max-pass-frames and samples them with overlapping ComfyUI context windows; the GUI plans sequential chunks, so use it from the command line only.")
     parser.add_argument("--wan-context-overlap", type=int, default=30, help="Overlap between context windows in context sampling.")
     parser.add_argument("--wan-max-pass-frames", type=int, default=wan.WAN_MAX_PASS_FRAMES, help="Longest span sampled in one context-sampling pass (bounded by RAM).")
+    # MiniMax H3. The licence confirmation gates every download and run (see dependency_manager).
+    parser.add_argument("--h3-license-confirmed", action="store_true", help="Confirm you are licensed to use MiniMax H3 (outside the EU, UK, South Korea and USA, or licensed by MiniMax).")
+    parser.add_argument("--h3-pdd", action="store_true", help="Use Alibaba PAI's PDD 8-step distillation (needs the ComfyUI-MiniMax-H3-PDD-Acc nodes) instead of 20 full H3 steps.")
+    parser.add_argument("--h3-steps", type=int, default=20, help="Sampling steps without PDD.")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -3000,9 +3029,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if uses_wan_vace(args):
-        # Wan takes the official explicit-mask input: never Oumoumad's lifted-black canvas,
-        # and none of the LTX 2.5 cadence/model switches.
+    if uses_h3(args) and not args.h3_license_confirmed:
+        raise SystemExit(H3_LICENSE_REQUIRED)
+    if uses_masked_pass(args):
+        # Wan and H3 take the official explicit-mask input: never Oumoumad's lifted-black
+        # canvas, and none of the LTX 2.5 cadence/model switches.
         args.outpaint_lora = DEFAULT_OUTPAINT_LORA
         args.ltx_version = "2.3"
     configure_ltx25_model_args(args)
@@ -3024,11 +3055,15 @@ def main() -> int:
     if args.model_backend == "gguf" and not (comfy_dir / "custom_nodes" / "ComfyUI-GGUF").exists():
         raise FileNotFoundError(f"ComfyUI-GGUF is required for lightweight outpainting. Re-run install_windows.bat, then restart ComfyUI: {comfy_dir / 'custom_nodes' / 'ComfyUI-GGUF'}")
 
-    if uses_wan_vace(args):
-        wan_text = wan.wan_prompt(args.prompt)
-        if wan_text != args.prompt:
-            print(f"Wan VACE: removed the LTX trigger word from the prompt: {json.dumps(wan_text)}", flush=True)
-        args.prompt = wan_text
+    if uses_masked_pass(args):
+        label = masked_pass_settings(args).label
+        stripped = wan.wan_prompt(args.prompt)
+        if stripped != args.prompt:
+            print(f"{label}: removed the LTX trigger word from the prompt: {json.dumps(stripped)}", flush=True)
+        if uses_h3(args) and not stripped:
+            stripped = h3.H3_DEFAULT_PROMPT
+            print(f"{label}: the prompt is empty, so it describes a plain scene continuation: {json.dumps(stripped)}", flush=True)
+        args.prompt = stripped
     source_monochrome = not args.allow_color_outpaint and video_is_monochrome(source)
     if source_monochrome:
         args.prompt = combine_prompt(args.prompt, MONOCHROME_PROMPT_SUFFIX)
@@ -3039,11 +3074,14 @@ def main() -> int:
     raw_output = resolve_path(args.raw_output) if args.raw_output else default_raw_output(source, args.target_aspect, args.target_height, args)
     delivery_width, delivery_height = target_size(source, args.target_aspect, args.target_height)
     work_width, work_height = model_safe_size(source, args.target_aspect, args.target_height)
+    render_width, render_height = render_size(args, work_width, work_height)
     prepared = prepared_for(source, args.target_aspect, args.target_height, args)
 
     if not args.dry_run:
         if uses_wan_vace(args):
             ensure_wan_vace_outpaint_models(comfy_dir)
+        elif uses_h3(args):
+            ensure_h3_outpaint_models(comfy_dir, args.h3_license_confirmed, args.h3_pdd)
         elif args.ltx_version == "2.5":
             ensure_ltx25_outpaint_models(comfy_dir)
         else:
@@ -3056,6 +3094,10 @@ def main() -> int:
         wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
         if uses_wan_vace(args):
             required_nodes = dict(wan.WAN_VACE_REQUIRED_NODES)
+        elif uses_h3(args):
+            required_nodes = dict(h3.H3_REQUIRED_NODES)
+            if args.h3_pdd:
+                required_nodes["MiniMaxH3PDDAccApply"] = "ComfyUI-MiniMax-H3-PDD-Acc"
         elif args.ltx25_two_stage:
             required_nodes = dict(LTX25_OUTPAINT_REQUIRED_NODES)
         else:
@@ -3066,7 +3108,7 @@ def main() -> int:
             if args.ltx_version == "2.5":
                 required_nodes["CLIPLoaderGGUF"] = "ComfyUI-GGUF"
         ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
-        if not args.ltx25_two_stage and not uses_wan_vace(args):
+        if not args.ltx25_two_stage and not uses_masked_pass(args):
             compatibility = ensure_arp_ltx_compatible(args.comfy_url)
             args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
             print(f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}", flush=True)
@@ -3093,8 +3135,8 @@ def main() -> int:
         prepare_command.extend(["--legacy-black-mask", "--black-lift", str(LEGACY_BLACK_LIFT), "--gamma", str(LEGACY_GAMMA)])
     if args.outpaint_all_black_regions:
         prepare_command.append("--outpaint-all-black-regions")
-    prepare_command += ["--target-height", str(work_height)]
-    prepare_command += ["--target-width", str(work_width)]
+    prepare_command += ["--target-height", str(render_height)]
+    prepare_command += ["--target-width", str(render_width)]
     prepare_command += ["--delivery-width", str(delivery_width)]
     prepare_command += ["--delivery-height", str(delivery_height)]
     prepare_command += ["--intermediate-profile", args.intermediate_profile]
@@ -3102,7 +3144,13 @@ def main() -> int:
         prepare_command.append("--force")
     if args.dry_run:
         prepare_command.append("--dry-run")
-    if (work_width, work_height) != (delivery_width, delivery_height):
+    if (render_width, render_height) != (work_width, work_height):
+        print(
+            f"{masked_pass_settings(args).label} working canvas: {render_width}x{render_height}, fitted inside the "
+            f"model's trained canvas. Recomposition will upscale back to delivery {delivery_width}x{delivery_height}.",
+            flush=True,
+        )
+    elif (work_width, work_height) != (delivery_width, delivery_height):
         print(
             f"LTX working canvas: {work_width}x{work_height} (rounded to multiples of {MODEL_SIZE_MULTIPLE} "
             f"from delivery {delivery_width}x{delivery_height}). Recomposition will upscale back to delivery.",
@@ -3111,17 +3159,18 @@ def main() -> int:
     mode = "all black regions" if args.outpaint_all_black_regions else "protected source blacks"
     conditioning = (
         "Wan VACE explicit mask" if uses_wan_vace(args)
+        else "MiniMax H3 Fun ControlNet inpaint mask" if uses_h3(args)
         else "oumoumad legacy black mask" if uses_legacy_black_outpaint(args.outpaint_lora)
         else "official explicit mask"
     )
-    print(f"Preparing expanded outpaint canvas: {work_width}x{work_height}, aspect {args.target_aspect}, mode={mode}, conditioning={conditioning}", flush=True)
+    print(f"Preparing expanded outpaint canvas: {render_width}x{render_height}, aspect {args.target_aspect}, mode={mode}, conditioning={conditioning}", flush=True)
     run_command(prepare_command, False)
 
     generation_prepared = prepared
     if args.ltx_version == "2.5" and not args.dry_run:
         generation_prepared = prepare_ltx25_frame_rate(find_ffmpeg(), prepared, args.generation_fps, args.force, args.intermediate_profile)
 
-    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{work_width}x{work_height}"
+    output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{render_width}x{render_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
@@ -3140,7 +3189,9 @@ def main() -> int:
             )
         prepared_info = probe_video(generation_prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
-        ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, args.overlap_frames, chunk_existing)
+        chunk_cap = max_chunk_frames(args, render_width, render_height)
+        chunk_overlap = chunk_overlap_frames(args)
+        ranges = chunk_ranges_from_manifest(int(prepared_info["frames"]), float(prepared_info["fps"]), args.chunk_seconds, chunk_overlap, chunk_existing, chunk_cap)
         chunk_overrides = sync_chunk_manifest(
             chunk_manifest,
             ranges,
@@ -3158,8 +3209,9 @@ def main() -> int:
             print(f"Reuse raw Comfy render: {raw_output}", flush=True)
         else:
             print(f"ComfyUI is ready at {args.comfy_url}.", flush=True)
-            print(f"Splitting prepared canvas into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {args.overlap_frames} overlap frame(s)", flush=True)
-            if len(ranges) > 1 and args.overlap_frames < RECOMMENDED_OVERLAP_FRAMES:
+            cap_note = f", at most {chunk_cap} frames each for {masked_pass_settings(args).label}" if chunk_cap else ""
+            print(f"Splitting prepared canvas into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks{cap_note}, {chunk_overlap} overlap frame(s)", flush=True)
+            if len(ranges) > 1 and chunk_overlap < RECOMMENDED_OVERLAP_FRAMES:
                 print(
                     f"Warning: overlap is {args.overlap_frames} frame(s). LTX can return short chunks; "
                     f"{RECOMMENDED_OVERLAP_FRAMES}+ overlap frames is recommended to avoid held-frame seams.",
@@ -3169,7 +3221,7 @@ def main() -> int:
             raw_chunks: list[Path] = []
             effective_ranges: list[tuple[int, int, int]] = []
             chunk_offsets: dict[int, tuple[int, int]] = {}
-            shot_cuts = wan_shot_cuts(generation_prepared, wan_shot_detection_settings(args)) if uses_wan_vace(args) else []
+            shot_cuts = wan_shot_cuts(generation_prepared, wan_shot_detection_settings(args)) if uses_masked_pass(args) else []
             for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
                 chunk_row = chunk_overrides.get(chunk_index, {})
                 chunk_offset_x = int(float(chunk_row.get("offset_x", "0") or 0))
@@ -3268,17 +3320,17 @@ def main() -> int:
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
                 superseded = chunk_raw
-                if uses_wan_vace(args):
+                if uses_masked_pass(args):
                     previous_context = None
                     if auto_guide and previous_raw is not None and effective_ranges:
                         previous_index, previous_start, previous_end = effective_ranges[-1]
                         shared = previous_end - start_frame
                         if chunk_offsets.get(previous_index) != (chunk_offset_x, chunk_offset_y):
-                            print(f"Chunk {chunk_index + 1}: offset differs from chunk {previous_index + 1}; starting Wan VACE without its overlap frames.", flush=True)
+                            print(f"Chunk {chunk_index + 1}: offset differs from chunk {previous_index + 1}; starting {masked_pass_settings(args).label} without its overlap frames.", flush=True)
                         elif shared > 0:
                             previous_context = (previous_raw, start_frame - previous_start, shared)
                     chunk_raw = chunk_raw.with_suffix(".mkv")
-                    render_wan_vace_chunk(
+                    render_masked_pass_chunk(
                         args, comfy_dir, comfy_output_root, chunk_prepared, chunk_raw, chunk_prefix,
                         prompt_text, negative_text, chunk_seed,
                         None if auto_guide else guide_image, args.guide_strength, extra_guides, previous_context,
@@ -3342,15 +3394,15 @@ def main() -> int:
     ]
     if uses_legacy_black_outpaint(args.outpaint_lora):
         finalize_command.extend(["--restore-tone", "--black-lift", str(LEGACY_BLACK_LIFT), "--gamma", str(LEGACY_GAMMA)])
-    source_rect = prepared_source_rectangle(prepared, work_width, work_height)
+    source_rect = prepared_source_rectangle(prepared, render_width, render_height)
     if source_rect and not args.outpaint_all_black_regions:
         left, top, right, bottom = source_rect
         left += int(args.offset_x)
         top += int(args.offset_y)
-        left = max(0, min(work_width - 1, left))
-        top = max(0, min(work_height - 1, top))
-        right = max(left + 1, min(work_width, right + int(args.offset_x)))
-        bottom = max(top + 1, min(work_height, bottom + int(args.offset_y)))
+        left = max(0, min(render_width - 1, left))
+        top = max(0, min(render_height - 1, top))
+        right = max(left + 1, min(render_width, right + int(args.offset_x)))
+        bottom = max(top + 1, min(render_height, bottom + int(args.offset_y)))
         finalize_command.extend([
             "--source-x", str(left), "--source-y", str(top),
             "--source-width", str(right - left), "--source-height", str(bottom - top),

@@ -116,6 +116,7 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
         "ComfyUI-SeedVR2_VideoUpscaler": "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler -> ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler",
         "ComfyUI-Reference-Based-Video-Colorization": "https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization -> ComfyUI/custom_nodes/reference-video-colorization",
         "ComfyUI-MMAudio": "https://github.com/kijai/ComfyUI-MMAudio -> ComfyUI/custom_nodes/ComfyUI-MMAudio",
+        "ComfyUI-MiniMax-H3-PDD-Acc": "https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc -> ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-PDD-Acc",
     }
     hints = "; ".join(install_hints.get(package, package) for package in sorted(set(required[node_type] for node_type in missing)))
     stale_running_hints = [

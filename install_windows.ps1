@@ -1215,6 +1215,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     Install-CustomNodePackage 'ComfyUI-FlashVSR_Ultra_Fast' 'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git' (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-SeedVR2_VideoUpscaler' 'https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git' (Join-Path $CustomNodes 'ComfyUI-SeedVR2_VideoUpscaler') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-MMAudio' 'https://github.com/kijai/ComfyUI-MMAudio.git' (Join-Path $CustomNodes 'ComfyUI-MMAudio') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-MiniMax-H3-PDD-Acc' 'https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc.git' (Join-Path $CustomNodes 'ComfyUI-MiniMax-H3-PDD-Acc') -UpdateExisting
     if (-not $SkipDeepExemplar) {
         Install-CustomNodePackage 'reference-video-colorization' 'https://github.com/jonstreeter/ComfyUI-Reference-Based-Video-Colorization.git' (Join-Path $CustomNodes 'reference-video-colorization') -UpdateExisting -PreferBundled
     }

@@ -1,15 +1,16 @@
 """Wan 2.1 VACE outpainting backend.
 
 VACE is conditioned on a *control video* plus a per-frame *control mask*: masked pixels are
-generated, unmasked pixels are kept. ARP's LTX backends render a whole chunk (often 20s) in one
-pass because LTX compresses 32x spatially and 8x temporally. Wan only compresses 8x/4x and is
-trained on 81-frame clips, so a long chunk would be both far too large and far outside its
-training length. Each ARP chunk is therefore rendered as a sequence of overlapping VACE
-windows. Every window after the first starts with frames that are already finished, fed
-with mask 0 so VACE continues their motion and content instead of starting afresh. The same
-mechanism carries the previous chunk's overlap frames into the next chunk.
+generated, unmasked pixels are kept. Like the LTX backends, Wan renders each ARP chunk in one
+pass, but Wan only compresses 8x/4x (LTX: 32x/8x), so its chunks are capped far shorter: 161
+frames at 720p instead of LTX's 20s. Every chunk after the first opens with finished frames
+from the previous chunk, fed with mask 0 so VACE continues their motion and content instead
+of starting afresh.
 
-This module is deliberately free of ComfyUI I/O: rendering a window is delegated to a callback,
+A chunk that crosses a shot cut is split into one pass per shot, because VACE continues
+whatever its context contains and would paint the previous shot into the new one.
+
+This module is deliberately free of ComfyUI I/O: rendering a pass is delegated to a callback,
 so the planning, masking and compositing logic can be tested without a GPU.
 """
 
@@ -27,14 +28,16 @@ from common import replace_with_retry
 from dependency_manager import WAN_DISTILL_LORA, WAN_TEXT_ENCODER, WAN_VACE_GGUF_MODEL, WAN_VAE
 from intermediate_video import audio_codec_args, codec_args, comfy_video_combine_inputs, container_args
 
-# Wan is trained on 81 frames, but at 720p one 161-frame window (6.7s of look-ahead at 24 fps)
-# fits in 24 GB (21.6 GB peak) and kept invented surroundings steadier than 81-frame windows
+# Wan is trained on 81 frames, but at 720p one 161-frame chunk (6.7s of look-ahead at 24 fps)
+# fits in 24 GB (21.6 GB peak) and kept invented surroundings steadier than 81-frame chunks
 # in side-by-side tests, for about 1.6x the render time.
-WAN_WINDOW_FRAMES = 161
-WAN_NATIVE_WINDOW_FRAMES = 81
-# Windows are capped by the largest one measured to fit in 24 GB, so higher resolutions get
-# shorter windows instead of running out of VRAM. Wan's native 81 frames is the floor.
-WAN_MAX_WINDOW_PIXELS = 161 * 1280 * 704
+WAN_MAX_CHUNK_FRAMES = 161
+WAN_NATIVE_FRAMES = 81
+# Chunks are capped by the largest pass measured to fit in 24 GB, so higher resolutions get
+# shorter chunks instead of running out of VRAM. Wan's native 81 frames is the floor.
+WAN_MAX_CHUNK_PIXELS = 161 * 1280 * 704
+# Finished frames each pass opens with. A chunk's overlap frames count towards this; frames
+# just before the chunk make up the rest, so joins keep this much context at any overlap.
 WAN_CONTEXT_FRAMES = 13
 # Context-window passes hold the whole span in system RAM as float frames (control, mask and
 # VACE's inactive/reactive copies). Measured on a 481-frame 1280x704 pass (20s at 24 fps):
@@ -77,30 +80,38 @@ class WanSettings:
     scheduler: str = "simple"
     lora_strength: float = 1.0
     control_strength: float = 1.0
-    window_frames: int = WAN_WINDOW_FRAMES
+    # Frames Wan attends to at once: a whole chunk, or with context sampling each of
+    # ComfyUI's context windows.
+    chunk_frames: int = WAN_MAX_CHUNK_FRAMES
     context_frames: int = WAN_CONTEXT_FRAMES
-    # "sequential": each window is its own ComfyUI pass, continuing from the previous one.
-    # "context": a whole shot is one pass; ComfyUI's Wan context windows sample overlapping
-    # windows and blend them at every step, so each frame sees the entire shot (look-ahead)
-    # while VRAM stays at one window's worth.
+    # "sequential": each chunk is one ComfyUI pass, continuing from the previous chunk.
+    # "context" (experimental, CLI only): chunks may run to max_pass_frames; ComfyUI's Wan
+    # context windows sample overlapping chunk_frames windows and blend them at every step,
+    # so each frame sees the whole chunk while VRAM stays at one window's worth.
     sampling: str = "sequential"
     context_overlap: int = 30
     max_pass_frames: int = WAN_MAX_PASS_FRAMES
+    label = "Wan VACE"
 
-    def window_frames_for(self, width: int, height: int) -> int:
-        """Attention window at this canvas size (4n + 1 frames), within the VRAM budget."""
-        by_pixels = WAN_MAX_WINDOW_PIXELS // max(1, int(width) * int(height))
-        floor = min(int(self.window_frames), WAN_NATIVE_WINDOW_FRAMES)
-        frames = max(floor, min(int(self.window_frames), by_pixels))
+    def chunk_frames_for(self, width: int, height: int) -> int:
+        """Frames attended to at once at this canvas size (4n + 1), within the VRAM budget."""
+        by_pixels = WAN_MAX_CHUNK_PIXELS // max(1, int(width) * int(height))
+        floor = min(int(self.chunk_frames), WAN_NATIVE_FRAMES)
+        frames = max(floor, min(int(self.chunk_frames), by_pixels))
         return ((frames - 1) // 4) * 4 + 1
 
+    def valid_length(self, frame_count: int) -> int:
+        return wan_valid_length(frame_count)
+
     def pass_frames(self, width: int, height: int) -> int:
-        """Longest span sampled in one ComfyUI pass at this canvas size (4n + 1 frames)."""
-        window = self.window_frames_for(width, height)
+        """Longest span sampled in one ComfyUI pass at this canvas size (4n + 1 frames).
+
+        This caps the chunk length: sequential sampling renders a chunk in one pass."""
+        frames = self.chunk_frames_for(width, height)
         if self.sampling != "context":
-            return window
+            return frames
         by_pixels = WAN_MAX_PASS_PIXELS // max(1, int(width) * int(height))
-        frames = max(window, min(int(self.max_pass_frames), by_pixels))
+        frames = max(frames, min(int(self.max_pass_frames), by_pixels))
         return ((frames - 1) // 4) * 4 + 1
 
     def signature(self) -> dict[str, Any]:
@@ -122,7 +133,7 @@ class WanSettings:
             "scheduler": self.scheduler,
             "lora_strength": self.lora_strength,
             "control_strength": self.control_strength,
-            "window_frames": self.window_frames,
+            "chunk_frames": self.chunk_frames,
             "context_frames": self.context_frames,
         }
 
@@ -140,27 +151,28 @@ def wan_valid_length(frame_count: int) -> int:
     return ((requested - 1 + 3) // 4) * 4 + 1
 
 
-def plan_windows(
+def plan_passes(
     total_frames: int,
     known_prefix: int,
-    window_frames: int,
+    pass_frames: int,
     context_frames: int,
     cuts: "list[int] | tuple[int, ...]" = (),
 ) -> list[tuple[int, int]]:
-    """Return (start, end) windows that generate every frame from known_prefix onward.
+    """Return (start, end) passes that generate every frame from known_prefix onward.
 
-    Each window begins with up to context_frames already-finished frames of the same shot.
-    Windows never span a cut and never take context from before one: VACE continues whatever
-    its context and window contain, so a window crossing a cut paints the previous shot into
-    the new shot's bars. A shot uses the fewest windows that fit, sized evenly: filling each
-    window greedily would leave a final window that samples a full window's frames to add
-    only a handful of new ones.
+    Each pass begins with up to context_frames already-finished frames of the same shot.
+    Passes never span a cut and never take context from before one: VACE continues whatever
+    its context contains, so a pass crossing a cut paints the previous shot into the new
+    shot's bars. Chunks are planned no longer than one pass, so normally this is one pass per
+    shot in the chunk. Should a shot still outgrow a pass, it uses the fewest passes that fit,
+    sized evenly: filling each greedily would leave a final pass that samples a full pass's
+    frames to add only a handful of new ones.
     """
-    window = max(5, int(window_frames))
+    window = max(5, int(pass_frames))
     context = max(0, min(int(context_frames), window // 2))
     written = max(0, min(int(known_prefix), total_frames))
     shot_starts = sorted({0, *(int(cut) for cut in cuts if 0 < int(cut) < total_frames)})
-    windows: list[tuple[int, int]] = []
+    passes: list[tuple[int, int]] = []
     while written < total_frames:
         shot_start = max(cut for cut in shot_starts if cut <= written)
         shot_end = min([cut for cut in shot_starts if cut > written] + [total_frames])
@@ -171,9 +183,9 @@ def plan_windows(
         count = 1 if remaining <= first_capacity else 1 + math.ceil((remaining - first_capacity) / (window - context))
         length = math.ceil((remaining + leading_context + (count - 1) * context) / count)
         end = min(shot_end, start + min(window, length))
-        windows.append((start, end))
+        passes.append((start, end))
         written = end
-    return windows
+    return passes
 
 
 def seam_alpha(exact_mask: "np.ndarray", feather_px: float) -> "np.ndarray":
@@ -269,7 +281,7 @@ class FrameReader:
             yield frame
 
     def close(self) -> None:
-        # Callers often stop early (e.g. skipping a window's padding frames). Stop ffmpeg
+        # Callers often stop early (e.g. skipping a pass's padding frames). Stop ffmpeg
         # before closing its pipe, or it reports a spurious "Broken pipe" error.
         if self.process.poll() is None:
             self.process.kill()
@@ -389,7 +401,7 @@ def build_wan_vace_prompt(
             },
         },
     }
-    window = settings.window_frames_for(width, height)
+    window = settings.chunk_frames_for(width, height)
     if settings.sampling == "context" and length > window:
         prompt["22"] = {
             "class_type": "WanContextWindowsManual",
@@ -413,8 +425,8 @@ def build_wan_vace_prompt(
 
 WAN_OUTPUT_NODE_ID = "21"
 
-# (control file, mask file, length, window index) -> rendered window video
-RenderWindow = Callable[[Path, Path, int, int], Path]
+# (control file, mask file, length, pass index, leading finished context frames) -> rendered pass video
+RenderPass = Callable[[Path, Path, int, int, int], Path]
 
 
 def render_chunk(
@@ -429,18 +441,23 @@ def render_chunk(
     masks: "StaticMasks | BlackRegionMasks",
     known_prefix: list["np.ndarray"],
     guides: dict[int, tuple["np.ndarray", float]],
-    render_window: RenderWindow,
+    render_pass: RenderPass,
     work_dir: Path,
-    settings: WanSettings,
+    settings: "WanSettings | Any",
     intermediate_profile: str = "high",
     has_audio: bool = False,
     cuts: "list[int] | tuple[int, ...]" = (),
     log: Callable[[str], None] = lambda message: print(message, flush=True),
 ) -> None:
-    """Render one ARP chunk as consecutive VACE windows and encode it to ``output``.
+    """Render one ARP chunk with a masked-pass model (Wan VACE or MiniMax H3) to ``output``.
 
-    known_prefix holds finished frames for the start of the chunk (the previous chunk's
-    overlap); they are written verbatim and serve as the first window's context. guides maps
+    settings supplies the model's pass limits: pass_frames(), chunk_frames_for(),
+    context_frames, sampling, context_overlap and valid_length(); render_pass runs the model.
+
+    The chunk is one pass unless it crosses a shot cut (one pass per shot) or, with context
+    sampling off, somehow outgrows a pass. known_prefix holds finished frames for the start
+    of the chunk (the previous chunk's overlap); they are written verbatim and serve as the
+    first pass's context. guides maps
     a chunk frame index to (full-canvas RGB, strength): the guide fills that frame's generated
     region, and strength sets how firmly VACE keeps it (1 = kept as given).
     """
@@ -448,13 +465,11 @@ def render_chunk(
 
     prefix = known_prefix[:total_frames]
     pass_frames = settings.pass_frames(width, height)
-    windows = plan_windows(total_frames, len(prefix), pass_frames, settings.context_frames, cuts)
+    passes = plan_passes(total_frames, len(prefix), pass_frames, settings.context_frames, cuts)
     inner_cuts = sorted(int(cut) for cut in cuts if 0 < int(cut) < total_frames)
-    window = settings.window_frames_for(width, height)
-    if window < settings.window_frames:
-        log(f"Wan VACE: {width}x{height} limits windows to {window} frames (requested {settings.window_frames}) to stay within 24 GB of VRAM.")
+    window = settings.chunk_frames_for(width, height)
     log(
-        f"Wan VACE ({settings.sampling}): {total_frames} frame(s) as {len(windows)} pass(es) of up to "
+        f"{settings.label} ({settings.sampling}): {total_frames} frame(s) as {len(passes)} pass(es) of up to "
         f"{pass_frames} frames, {settings.context_frames} context frame(s) each"
         + (f", sampled in {window}-frame context windows overlapping by {settings.context_overlap}"
            if settings.sampling == "context" else "")
@@ -463,7 +478,7 @@ def render_chunk(
     )
     for index in sorted(guides):
         if index < len(prefix):
-            log(f"Wan VACE: guide at chunk frame {index} falls inside the previous chunk's overlap and is ignored.")
+            log(f"{settings.label}: guide at chunk frame {index} falls inside the previous chunk's overlap and is ignored.")
 
     grey = np.full((height, width, 3), WAN_UNKNOWN_GREY, dtype=np.uint8)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -480,7 +495,7 @@ def render_chunk(
         *codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile),
     ]
     writer = FrameWriter(ffmpeg, partial, width, height, fps, output_args, extra_inputs)
-    # Finished frames still needed as context: plan_windows never takes more than context_frames.
+    # Finished frames still needed as context: plan_passes never takes more than context_frames.
     finished: deque[tuple[int, "np.ndarray"]] = deque(maxlen=max(settings.context_frames, 1))
     try:
         for index, frame in enumerate(prefix):
@@ -489,13 +504,13 @@ def render_chunk(
         written = len(prefix)
         with FrameReader(ffmpeg, chunk_video, width, height, start_frame=written) as source:
             last_source: "np.ndarray | None" = None
-            for window_index, (start, end) in enumerate(windows):
-                length = wan_valid_length(end - start)
+            for pass_index, (start, end) in enumerate(passes):
+                length = settings.valid_length(end - start)
                 known = {index: frame for index, frame in finished if start <= index < written}
                 new_sources: list["np.ndarray"] = []
                 new_masks: list[tuple["np.ndarray", "np.ndarray"]] = []
-                control_path = work_dir / f"{output.stem}_w{window_index:02d}_control.mkv"
-                mask_path = work_dir / f"{output.stem}_w{window_index:02d}_mask.mkv"
+                control_path = work_dir / f"{output.stem}_p{pass_index:02d}_control.mkv"
+                mask_path = work_dir / f"{output.stem}_p{pass_index:02d}_mask.mkv"
                 control_writer = FrameWriter(ffmpeg, control_path, width, height, fps, lossless_control_args())
                 mask_writer = FrameWriter(ffmpeg, mask_path, width, height, fps, lossless_control_args())
                 try:
@@ -518,7 +533,7 @@ def render_chunk(
                                 guide, strength = guides[index]
                                 control = np.where(generation[..., None], guide, frame)
                                 mask_value *= 1.0 - max(0.0, min(1.0, float(strength)))
-                                log(f"Wan VACE: guide at chunk frame {index}, strength {float(strength):g}")
+                                log(f"{settings.label}: guide at chunk frame {index}, strength {float(strength):g}")
                             mask_rgb = np.repeat(np.round(mask_value * 255).astype(np.uint8)[..., None], 3, axis=2)
                         # Padding past `end` repeats the last control frame and mask.
                         control_writer.write(control)
@@ -527,15 +542,15 @@ def render_chunk(
                     control_writer.close()
                     mask_writer.close()
                 log(
-                    f"Wan VACE window {window_index + 1}/{len(windows)}: chunk frames {start}-{end - 1} "
+                    f"{settings.label} pass {pass_index + 1}/{len(passes)}: chunk frames {start}-{end - 1} "
                     f"({written - start} context, {end - written} new, {length} sampled)"
                 )
-                rendered = render_window(control_path, mask_path, length, window_index)
+                rendered = render_pass(control_path, mask_path, length, pass_index, written - start)
                 with FrameReader(ffmpeg, rendered, width, height, start_frame=written - start) as generated_frames:
                     for offset, (frame, (_generation, alpha)) in enumerate(zip(new_sources, new_masks)):
                         generated = generated_frames.read()
                         if generated is None:
-                            raise RuntimeError(f"Wan VACE window {window_index + 1} returned too few frames: {rendered}")
+                            raise RuntimeError(f"{settings.label} pass {pass_index + 1} returned too few frames: {rendered}")
                         weight = alpha[..., None]
                         blended = (generated.astype(np.float32) * weight + frame.astype(np.float32) * (1.0 - weight))
                         composite = np.clip(np.round(blended), 0, 255).astype(np.uint8)
@@ -552,4 +567,4 @@ def render_chunk(
         partial.unlink(missing_ok=True)
         raise
     writer.close()
-    replace_with_retry(partial, output, f"Wan VACE chunk {output.name}")
+    replace_with_retry(partial, output, f"{settings.label} chunk {output.name}")

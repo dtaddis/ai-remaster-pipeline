@@ -104,6 +104,35 @@ WAN_VACE_OUTPAINT_MODELS = [
     HfModel("Kijai/WanVideo_comfy", f"Lightx2v/{WAN_DISTILL_LORA}", f"models/loras/{WAN_DISTILL_LORA}"),
 ]
 
+# MiniMax H3 outpainting (FL2VA transformer + Fun ControlNet-Union inpaint patch). The pruned
+# Q5_K_M transformer (~14 GB) suits 24 GB cards; the 32B Qwen3-VL text encoder runs once per pass
+# and is offloaded before sampling. These community GGUFs carry the metadata ComfyUI-GGUF needs
+# (Unsloth's H3 GGUFs have none and only load in stable-diffusion.cpp). Open weights under the MiniMax H3
+# Community License, which excludes the EU, UK, South Korea and USA: ARP only downloads them
+# after the user confirms they are licensed (--h3-license-confirmed).
+H3_LICENSE_URL = "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE"
+H3_LICENSE_APPLICATION_URL = "https://platform.minimax.io/h3-license"
+H3_DIFFUSION_GGUF = "MiniMax-H3-FL2VA-Pruned-Q5_K_M.gguf"
+H3_TEXT_ENCODER_GGUF = "qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf"
+H3_VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
+H3_FUN_CONTROLNET = "minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors"
+# Alibaba PAI's official 8-step PDD acceleration for FL2VA: a trunk LoRA plus per-step output
+# heads, loaded by the ComfyUI-MiniMax-H3-PDD-Acc pack (a plain LoRA loader drops the heads).
+H3_PDD_ACC = "MiniMax-H3-FL2VA-Acc-8Step.safetensors"
+H3_OUTPAINT_MODELS = [
+    HfModel("Abiray/MiniMax-H3-Pruned-GGUF", H3_DIFFUSION_GGUF, f"models/diffusion_models/{H3_DIFFUSION_GGUF}"),
+    HfModel("realrebelai/MiniMax-H3_GGUFs", H3_TEXT_ENCODER_GGUF, f"models/text_encoders/{H3_TEXT_ENCODER_GGUF}"),
+    HfModel("Comfy-Org/MiniMax-H3", f"vae/{H3_VIDEO_VAE}", f"models/vae/{H3_VIDEO_VAE}"),
+    HfModel("Comfy-Org/MiniMax-H3", f"model_patches/{H3_FUN_CONTROLNET}", f"models/model_patches/{H3_FUN_CONTROLNET}"),
+]
+H3_PDD_FILE = HfModel("alibaba-pai/MiniMax-H3-Acc-LoRAs", H3_PDD_ACC, f"models/pdd_acc/{H3_PDD_ACC}")
+H3_LICENSE_REQUIRED = (
+    "MiniMax H3 needs a licence before ARP downloads or runs it. Its Community License "
+    f"({H3_LICENSE_URL}) does not cover the EU, UK, South Korea or USA; users there can apply "
+    f"at {H3_LICENSE_APPLICATION_URL}. Once you are licensed, tick 'I am licensed to use "
+    "MiniMax H3' on the Outpainting tab (or pass --h3-license-confirmed)."
+)
+
 OUTPAINT_LORA_FILES = [
     HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors", "models/loras/ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"),
     HfModel("oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint", "ltx-2.3-22b-ic-lora-outpaint.safetensors", "models/loras/ltx-2.3-22b-ic-lora-outpaint.safetensors"),
@@ -446,6 +475,12 @@ def ensure_ltx25_outpaint_models(comfy_dir: Path) -> None:
 
 def ensure_wan_vace_outpaint_models(comfy_dir: Path) -> None:
     ensure_hf_models(comfy_dir, WAN_VACE_OUTPAINT_MODELS)
+
+
+def ensure_h3_outpaint_models(comfy_dir: Path, license_confirmed: bool, pdd: bool = False) -> None:
+    if not license_confirmed:
+        raise RuntimeError(H3_LICENSE_REQUIRED)
+    ensure_hf_models(comfy_dir, [*H3_OUTPAINT_MODELS, *([H3_PDD_FILE] if pdd else [])])
 
 
 def ensure_ltx25_upscale_models(comfy_dir: Path) -> None:

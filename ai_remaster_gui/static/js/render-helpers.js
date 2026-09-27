@@ -94,9 +94,7 @@ const FIELD_DESCRIPTIONS = {
   'outpaint.offset_x':
     'Shift the source horizontally for the whole video before outpainting. Positive values move it right; negative values move it left. Chunks inherit this unless overridden.',
   'outpaint.outpaint_model':
-    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). It renders each chunk as overlapping windows (see Wan window length), each continuing from the previous window\'s finished frames, so chunk length does not change what the model sees, but a chunk takes longer. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting.',
-  'outpaint.wan_window_frames':
-    'How many frames Wan VACE sees at once. Each window continues from the previous window\'s finished frames, so a longer window lets every frame "look ahead" further and kept invented surroundings steadier in tests, at about 1.6x the render time of 81 frames at 720p. 161 frames fits in 24 GB at 720p; larger canvases automatically use shorter windows to stay within VRAM.',
+    'Oumoumad is the default: on long, full-resolution chunks the official LoRA (with either 2.3 or 2.5) tends to paint static, repeating patterns at the edges. The three LTX choices use the same full-resolution ARP outpainting pass. Official uses Lightricks\' explicit in/outpainting mask; Oumoumad uses its earlier pure-black guide. The LTX 2.5 option uses the newer Q4_K_M transformer, Gemma 4 text encoder, and 2.5 VAE with Lightricks\' official in/outpainting LoRA. Wan 2.1 VACE is a different model family (14B Q4_K_M with the lightx2v few-step LoRA, about 19 GB downloaded on first use). Wan compresses video far less than LTX, so its chunks are capped at 161 frames (6.7s at 24 fps; shorter above 720p to stay within 24 GB of VRAM) and overlap by at least 13 frames, each chunk continuing from the previous chunk\'s finished frames. Switching back to an LTX model restores the full Chunk seconds. Describe the scene in its prompt; the negative prompt has no effect at its CFG-free setting. MiniMax H3 uses its Fun ControlNet inpainting on the same masks, one pass per chunk, as long as fits in 24 GB (about 3.75 s at 1536x640), on a canvas of at most 1344x768 pixels; its open weights need a licence in the EU, UK, South Korea and USA (about 38 GB downloaded once licensed, plus 1.4 GB for the optional PDD 8-step distillation).',
   'outpaint.generation_fps':
     'LTX 2.5 is tuned around 24 fps. 24 fps fast keeps only original frames and retimes them, 24 fps motion-interpolates without changing duration, and Source keeps the original cadence.',
   'outpaint.offset_y':
@@ -208,49 +206,69 @@ const FIELD_DESCRIPTIONS = {
     'Warm-up frames repeated before each chunk and trimmed afterwards. Raise to 16-24 if chunk starts look unstable or faces flip identity mid-scene.',
 };
 
+// Outpainting help names the selected model: {model} reads "Wan" or "LTX", and entries whose
+// advice differs between the two are functions (see outpaintHelpText).
+// Wan VACE and MiniMax H3 both render a chunk as masked passes: exact-frame guides, one pass per chunk.
+function outpaintUsesMaskedModel() {
+  return ['wanvace', 'h3'].includes(settings('outpaint').outpaint_model);
+}
+
+function outpaintModelName() {
+  return { wanvace: 'Wan', h3: 'H3' }[settings('outpaint').outpaint_model] || 'LTX';
+}
+
+function outpaintHelpText(text) {
+  if (typeof text === 'function') return text();
+  return String(text || '').replace(/\{model\}/g, outpaintModelName());
+}
+
 const OUTPAINT_FIELD_TOOLTIPS = {
   target_aspect:
-    'Shape of the expanded canvas. The cropped source is fitted inside it and LTX generates the new pillarbox or letterbox regions.',
+    'Shape of the expanded canvas. The cropped source is fitted inside it and {model} generates the new pillarbox or letterbox regions.',
   target_height:
-    'Requested delivery height. Source keeps the source height; numbered choices set a preset height; Custom reveals a numeric field. LTX may render at a nearby model-safe multiple of 32 before Recomposition scales to the requested size.',
+    'Requested delivery height. Source keeps the source height; numbered choices set a preset height; Custom reveals a numeric field. {model} may render at a nearby model-safe multiple of 32 before Recomposition scales to the requested size.',
   offset_x:
     'Shift the fitted source horizontally before outpainting. Positive values move it right and create more room on the left; negative values move it left. Chunks inherit this unless overridden.',
   offset_y:
     'Shift the fitted source vertically before outpainting. Positive values move it down and create more room above; negative values move it up. Chunks inherit this unless overridden.',
   chunk_seconds:
-    'Approximate duration sent to LTX in each job. Longer chunks improve continuity and create fewer joins but use more VRAM; 0 sends the whole clip at once.',
+    'Approximate duration sent to the model in each job. Longer chunks improve continuity and create fewer joins but use more VRAM; 0 sends the whole clip at once. Wan VACE caps chunks at 161 frames (6.7s at 24 fps, fewer above 720p) and uses the full value again when you switch back to LTX. Changing the chunk layout keeps guide frames on the same picture.',
   overlap_frames:
-    'Frames repeated between neighbouring LTX chunks to give each join temporal context. They are trimmed during stitching, so they do not lengthen the finished video.',
+    'Frames repeated between neighbouring chunks to give each join temporal context. They are trimmed during stitching, so they do not lengthen the finished video. Wan VACE always overlaps by at least 13 frames, the finished frames each chunk continues from.',
   generation_mask_overlap:
-    'Extend the generation mask this many pixels beneath the protected source edge. A small overlap helps the mask survive LTX spatial compression; too much can make edge objects get regenerated, changed, or omitted. Default: 8.',
+    'Extend the generation mask this many pixels beneath the protected source edge. A small overlap helps the mask survive {model}\'s spatial compression; too much can make edge objects get regenerated, changed, or omitted. Default: 8.',
   mask_blend_dilation:
     'How far the Laplacian seam blend reaches into the protected source when the generated plate is assembled. Higher values soften a hard join but can create halos or ghosting. Default: 2.',
   seed_qwen_guides:
-    'Generate a Qwen-outpainted guide frame at every detected shot change before LTX renders. Use this when LTX returns the original black bars. It is slower, but helps stubborn shots begin from an already-filled frame.',
+    'Generate a Qwen-outpainted guide frame at every detected shot change before {model} renders. Use this when {model} returns the original black bars. It is slower, but helps stubborn shots begin from an already-filled frame.',
   outpaint_all_black_regions:
     'Treat every near-black region as an outpaint target instead of protecting black pixels inside the source. Useful for mixed-size footage or changing bars, but it can also replace genuine shadows, silhouettes, or black objects.',
   black_mask_threshold:
     'Maximum pixel brightness treated as black when Outpaint all black regions is enabled. Raise it only when encoded bars are dark grey rather than true black; higher values risk selecting real picture detail.',
-  prompt:
-    'Instruction used for every LTX outpaint chunk. Keep the word "outpaint" in it so the IC-LoRA activates; add scene, period, lighting, or style guidance when the generated sides need direction.',
-  negative_prompt:
-    'Details and failure modes LTX should avoid in every chunk. Chunk-specific negative text is appended to this global list.',
+  prompt: () => (outpaintUsesMaskedModel()
+    ? `Instruction used for every ${outpaintModelName()} chunk. Describe the scene, period, lighting, or style the generated sides should show. ARP removes the word "outpaint" before sending it, because ${outpaintModelName()} reads it as a request to paint.` +
+      (settings('outpaint').outpaint_model === 'h3' ? ' If nothing else is left, ARP asks H3 for a plain continuation of the scene.' : '')
+    : 'Instruction used for every LTX outpaint chunk. Keep the word "outpaint" in it so the IC-LoRA activates; add scene, period, lighting, or style guidance when the generated sides need direction.'),
+  negative_prompt: () => (outpaintUsesMaskedModel()
+    ? `${outpaintModelName()} runs without classifier-free guidance, so negative text has no effect. It is kept for when you switch back to an LTX model.`
+    : 'Details and failure modes LTX should avoid in every chunk. Chunk-specific negative text is appended to this global list.'),
   edge_left:
-    'Signed left-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+    'Signed left-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for {model} to generate. The selected target aspect remains unchanged.',
   edge_right:
-    'Signed right-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+    'Signed right-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for {model} to generate. The selected target aspect remains unchanged.',
   edge_top:
-    'Signed top-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+    'Signed top-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for {model} to generate. The selected target aspect remains unchanged.',
   edge_bottom:
-    'Signed bottom-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for LTX to generate. The selected target aspect remains unchanged.',
+    'Signed bottom-edge adjustment. Negative values trim source pixels; positive values reserve extra canvas for {model} to generate. The selected target aspect remains unchanged.',
 };
 
 function fieldDescription(stageKey, key) {
-  return FIELD_DESCRIPTIONS[`${stageKey}.${key}`] || FIELD_DESCRIPTIONS[key] || '';
+  const text = FIELD_DESCRIPTIONS[`${stageKey}.${key}`] || FIELD_DESCRIPTIONS[key] || '';
+  return stageKey === 'outpaint' ? outpaintHelpText(text) : text;
 }
 
 function fieldTooltip(stageKey, key) {
-  return stageKey === 'outpaint' ? (OUTPAINT_FIELD_TOOLTIPS[key] || '') : '';
+  return stageKey === 'outpaint' ? outpaintHelpText(OUTPAINT_FIELD_TOOLTIPS[key]) : '';
 }
 
 function tooltipTitle(tooltip) {
@@ -322,7 +340,7 @@ function outpaintHeightFieldHtml(label, kind, value, tooltip = '') {
         value="${esc(customHeight)}"
         onchange="syncCustomOutpaintHeight(this.value)"
       >
-      <small class="field-help">LTX renders at the nearest model-safe multiple of 32, then Recomposition restores this requested delivery height.</small>
+      <small class="field-help">${outpaintModelName()} renders at the nearest model-safe multiple of 32, then Recomposition restores this requested delivery height.</small>
     </div>
   `;
 }
@@ -373,8 +391,7 @@ function selectOptionLabel(key, option) {
   if (key === 'outpaint_model' && option === 'ltx25') return '2.5 - Official LoRA';
   if (key === 'outpaint_model' && option === 'oumoumad') return '2.3 - Oumoumad LoRA';
   if (key === 'outpaint_model' && option === 'wanvace') return 'Wan 2.1 VACE (14B)';
-  if (key === 'wan_window_frames' && option === '161') return '161 frames (steadier, ~6.7s look-ahead)';
-  if (key === 'wan_window_frames' && option === '81') return '81 frames (faster)';
+  if (key === 'outpaint_model' && option === 'h3') return 'MiniMax H3 (licence required)';
   if (key === 'generation_fps' && option === '24') return '24 fps (recommended)';
   if (key === 'generation_fps' && option === '24-fast') return '24 fps fast (original frames only)';
   if (key === 'generation_fps' && option === 'source') return 'Source frame rate';
@@ -462,17 +479,21 @@ function rangeFieldHtml(key, label, kind, value, tooltip = '') {
 }
 
 const CHECKBOX_DESCRIPTIONS = {
+  h3_license_confirmed:
+    'MiniMax H3\'s open-weight licence does not cover the EU, UK, South Korea or USA. Tick this only if you are outside those regions or MiniMax has granted you a licence (platform.minimax.io/h3-license). ARP will not download or run H3 until it is ticked.',
+  h3_pdd:
+    'Use Alibaba PAI\'s official PDD 8-step distillation (Wan2GP\'s "PDD 8-Step") instead of 20 full steps: about 2.5x faster, with guidance built in. Distillation can loosen how closely the model keeps the original picture, so compare against a full-step render. Adds a 1.4 GB download.',
   seed_qwen_guides:
-    'Use this if LTX does not outpaint the source material (it hands back the black bars). ' +
+    'Use this if {model} does not outpaint the source material (it hands back the black bars). ' +
     'Before each chunk renders, a guide frame is generated at every detected shot change with ' +
-    'Qwen Image Edit ("Replace the black bars.") and fed to LTX as the anchor for that shot, so ' +
+    'Qwen Image Edit ("Replace the black bars.") and fed to {model} as the anchor for that shot, so ' +
     'it extends from a filled frame instead of copying the bars. Slower, but reliable on stubborn clips.',
   outpaint_all_black_regions:
     "Don't expand the canvas, just paint over all pure black areas. Use this when the region to be extended changes, e.g. you have mixed-size footage in your clip.",
 };
 
 function checkboxFieldHtml(key, label, value, help = '', tooltip = '') {
-  const description = tooltip || CHECKBOX_DESCRIPTIONS[key];
+  const description = tooltip || outpaintHelpText(CHECKBOX_DESCRIPTIONS[key]);
   if (description) {
     return `
       <label class="checkbox-feature" title="${esc(description)}">
@@ -650,15 +671,18 @@ function aspectPreviewSlider(range) {
 
 function outpaintOverlapWarning(s) {
   const warnings = [];
-  if (!String(s.prompt || '').toLowerCase().includes('outpaint')) {
+  // Wan and H3 drop the trigger word and continue across a long overlap, so these are LTX-only.
+  const wan = ['wanvace', 'h3'].includes(s.outpaint_model);
+  if (!wan && !String(s.prompt || '').toLowerCase().includes('outpaint')) {
     warnings.push('The global Outpainting prompt does not contain "outpaint". The LTX IC-LoRA usually needs that word to activate.');
   }
   const overlap = Number(s.overlap_frames ?? 8);
   const chunkSeconds = Number(s.chunk_seconds ?? 20);
-  if (Number.isFinite(overlap) && overlap < 8) {
+  if (!wan && Number.isFinite(overlap) && overlap < 8) {
     warnings.push('Overlap below 8 frames can cause held-frame seams if LTX returns short chunks. 8 or 9 frames is recommended.');
   }
-  if (Number.isFinite(chunkSeconds) && chunkSeconds > 0 && chunkSeconds < 10) {
+  // Wan chunks are capped at 161 frames anyway, so short chunks are expected there.
+  if (!wan && Number.isFinite(chunkSeconds) && chunkSeconds > 0 && chunkSeconds < 10) {
     warnings.push('Short chunks create many separate LTX jobs and can make outpainting dramatically slower. Use around 20 seconds unless a shot needs special handling.');
   }
   if (!warnings.length) return '';

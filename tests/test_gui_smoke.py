@@ -2867,22 +2867,89 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("outpaintwan", expected)
         args = outpaint_video.build_parser().parse_args(command[3:])
         self.assertEqual(outpaint_video.outpaint_artifact_tag(args, "outpaint"), "outpaintwan")
-        self.assertEqual(command[command.index("--wan-window-frames") + 1], "161")
-        app.APP.settings["outpaint"]["wan_window_frames"] = "81"
-        command = app.APP.command_for("outpaint")
-        self.assertEqual(command[command.index("--wan-window-frames") + 1], "81")
+        # The GUI plans exactly the chunks the script renders: capped at one Wan pass and
+        # overlapping by a pass's context, whatever Chunk seconds and Overlap say.
+        values = app.APP.settings["outpaint"] | {"overlap_frames": "8"}
+        with mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1280, 704)):
+            gui_limits = server.outpaint_chunk_limits("input/example.mp4", values, 8)
+        args.overlap_frames = 8
+        self.assertEqual(gui_limits, (outpaint_video.max_chunk_frames(args, 1280, 704), outpaint_video.chunk_overlap_frames(args)))
+        self.assertEqual(gui_limits, (161, 13))
+        # A wider canvas gets shorter chunks from Wan's VRAM budget, in both places.
+        with mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1856, 800)):
+            wide_limits = server.outpaint_chunk_limits("input/example.mp4", values, 8)
+        self.assertEqual(wide_limits[0], outpaint_video.max_chunk_frames(args, *outpaint_video.render_size(args, 1856, 800)))
+        self.assertEqual(wide_limits[0], 97)
 
-    def test_new_projects_default_to_oumoumad_with_161_frame_wan_windows(self) -> None:
+    def test_outpaint_command_selects_minimax_h3_and_gates_it_on_a_licence(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": "", "cleanup": "false", "stabilize": "false", "expand_outpaint": "true"})
+        app.APP.settings["outpaint"].update({"outpaint_model": "h3", "h3_license_confirmed": "false", "h3_pdd": "true"})
+
+        command = app.APP.command_for("outpaint")
+        self.assertEqual(command[command.index("--outpaint-backend") + 1], "h3")
+        self.assertNotIn("--h3-license-confirmed", command)
+        self.assertIn("--h3-pdd", command)
+        self.assertIn("outpainth3", Path(app.APP.expected_outputs("outpaint")[0]).name)
+        # H3's open weights exclude the UK, EU, South Korea and USA: nothing runs until the user confirms a licence.
+        ok, message = app.APP.run_stage("outpaint")
+        self.assertFalse(ok)
+        self.assertIn("licence", message)
+
+        app.APP.settings["outpaint"]["h3_license_confirmed"] = "true"
+        command = app.APP.command_for("outpaint")
+        self.assertIn("--h3-license-confirmed", command)
+        args = outpaint_video.build_parser().parse_args(command[3:])
+        self.assertTrue(outpaint_video.uses_h3(args))
+        self.assertEqual(outpaint_video.outpaint_artifact_tag(args, "outpaint"), "outpainth3")
+        # The GUI plans the same chunks as the script: H3's one-pass cap on H3's canvas.
+        values = app.APP.settings["outpaint"] | {"overlap_frames": "8"}
+        with mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1856, 800)):
+            gui_limits = server.outpaint_chunk_limits("input/example.mp4", values, 8)
+        args.overlap_frames = 8
+        self.assertEqual(gui_limits, (outpaint_video.max_chunk_frames(args, *outpaint_video.render_size(args, 1856, 800)), outpaint_video.chunk_overlap_frames(args)))
+        self.assertEqual(gui_limits, (90, 22))
+
+    def test_new_projects_default_to_oumoumad_and_ltx_chunks_are_uncapped(self) -> None:
         defaults = runtime_settings.base_settings()["outpaint"]
 
         self.assertEqual(defaults["outpaint_model"], "oumoumad")
-        self.assertEqual(defaults["wan_window_frames"], "161")
-        # The Wan-only setting is hidden for the LTX models and never sent to them.
-        outpaint_js = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-outpaint.js").read_text(encoding="utf-8")
-        self.assertIn("s.outpaint_model === 'wanvace' ? [] : ['wan_window_frames']", outpaint_js)
-        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
-        app.APP.settings["outpaint"]["outpaint_model"] = "oumoumad"
-        self.assertNotIn("--wan-window-frames", app.APP.command_for("outpaint"))
+        self.assertNotIn("wan_window_frames", defaults)
+        self.assertEqual(server.outpaint_chunk_limits("input/example.mp4", defaults, 8), (0, 8))
+        args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4"])
+        self.assertEqual((outpaint_video.max_chunk_frames(args, 1280, 704), outpaint_video.chunk_overlap_frames(args)), (0, args.overlap_frames))
+
+    def test_switching_outpaint_model_rechunks_and_keeps_guides_on_their_frame(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            source.write_bytes(b"video")
+            manifest = folder / "chunks.csv"
+            guide = {"frame_idx": 300, "image": "intermediate/outpaint_anchors/demo/g.png", "strength": 1.0}
+            app.write_outpaint_chunk_rows(manifest, [
+                {"chunk_index": "0", "start_frame": "0", "end_frame": "481", "seed": "42", "prompt_suffix": "a sunny street", "guide_frames": json.dumps([guide])},
+                {"chunk_index": "1", "start_frame": "473", "end_frame": "720", "seed": "43"},
+            ])
+            settings = {
+                "global": {"source": app.rel(source), "section_start": "0", "section_end": ""},
+                "outpaint": {"target_aspect": "16:9", "target_height": "720", "chunk_seconds": "20", "overlap_frames": "8", "outpaint_model": "wanvace"},
+            }
+            with (
+                mock.patch.object(server, "ensure_source_section_clip"),
+                mock.patch.object(server, "resolve_video_source", return_value=source),
+                mock.patch.object(server, "video_metrics", return_value={"fps": 24.0, "frames": 720}),
+                mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1280, 704)),
+                mock.patch.object(server, "outpaint_chunk_manifest_for", return_value=app.rel(manifest)),
+                mock.patch.object(server, "outpaint_chunk_dir_for", return_value=folder),
+            ):
+                rows = app.outpaint_chunks_state(settings)["rows"]
+                stored = app.read_outpaint_chunk_rows(manifest)
+
+        self.assertEqual([(int(r["start_frame"]), int(r["end_frame"])) for r in rows[:2]], [(0, 161), (148, 309)])
+        self.assertTrue(all(r["max_chunk_frames"] == 161 for r in rows))
+        # Frame 300 is now frame 152 of the second chunk, and the stretch keeps its prompt.
+        self.assertEqual(json.loads(stored[1]["guide_frames"])[0]["frame_idx"], 152)
+        self.assertEqual(stored[0]["guide_frames"], "")
+        self.assertEqual(stored[1]["prompt_suffix"], "a sunny street")
 
     def test_outpaint_command_uses_whole_video_offsets(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

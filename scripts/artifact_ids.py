@@ -102,6 +102,34 @@ def work_size(source_height: int, aspect: str, target_height_text: str) -> tuple
     return model_safe(width), model_safe(height)
 
 
+# MiniMax H3 is trained on a 768-pixel short edge with at most 768x1344 pixels (ComfyUI's
+# adapt_canvas). H3 renders on the working canvas fitted inside that, and Recomposition scales it
+# back up to delivery like any other working canvas.
+H3_SHORT_EDGE = 768
+H3_MAX_PIXELS = 768 * 1344
+H3_SIZE_MULTIPLE = 32
+
+
+def h3_render_size(work_w: int, work_h: int) -> tuple[int, int]:
+    """Canvas MiniMax H3 renders on for this working size (unchanged when it already fits)."""
+    scale = min(1.0, H3_SHORT_EDGE / min(work_w, work_h), (H3_MAX_PIXELS / (work_w * work_h)) ** 0.5)
+    if scale >= 1:
+        return int(work_w), int(work_h)
+    multiple = H3_SIZE_MULTIPLE
+    aspect = work_w / work_h
+
+    def rounded(value: float) -> set[int]:
+        low = max(multiple, int(value) // multiple * multiple)
+        return {low, low + multiple}
+
+    # Of the nearby multiples that stay within H3's canvas, keep the shape closest to the original.
+    fits = [
+        (w, h) for w in rounded(work_w * scale) for h in rounded(work_h * scale)
+        if w * h <= H3_MAX_PIXELS and min(w, h) <= H3_SHORT_EDGE
+    ]
+    return min(fits, key=lambda size: (abs(size[0] / size[1] - aspect), -size[0] * size[1]))
+
+
 # ── identity + naming ─────────────────────────────────────────────────────────
 
 

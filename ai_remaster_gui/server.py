@@ -219,6 +219,10 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
 import reference_luminance as reference_luma  # noqa: E402
+import chunk_plan  # noqa: E402
+import minimax_h3_outpaint as h3  # noqa: E402
+import wan_vace_outpaint as wan  # noqa: E402
+from dependency_manager import H3_LICENSE_REQUIRED  # noqa: E402
 from model_paths import resolve_comfy_model_path  # noqa: E402
 
 from . import state  # shared singleton registry; sibling modules read state.APP
@@ -1522,11 +1526,13 @@ class PipelineApp:
             cloud_values = dict(self.settings.get("cloud", {}))
             if stage_key == "outpaint":
                 source_text = self.outpaint_source_for()
-                _work_w, work_h = outpaint_work_size_for_source(
+                work_w, work_h = outpaint_work_size_for_source(
                     source_text,
                     values.get("target_aspect", "16:9"),
                     values.get("target_height", "720"),
                 )
+                if values.get("outpaint_model") == "h3":
+                    work_w, work_h = aid.h3_render_size(work_w, work_h)
                 if work_h >= 1056:
                     cloud_values["runpod_gpu_types"] = high_memory_gpu_types(
                         cloud_values.get("runpod_outpaint_highres_gpu_types", "")
@@ -1611,7 +1617,12 @@ class PipelineApp:
         add(["--outpaint-lora", outpaint_lora])
         if values.get("outpaint_model") == "wanvace":
             add(["--outpaint-backend", "wan-vace"])
-            add(["--wan-window-frames", "81" if values.get("wan_window_frames") == "81" else "161"])
+        if values.get("outpaint_model") == "h3":
+            add(["--outpaint-backend", "h3"])
+            if is_true(values, "h3_license_confirmed"):
+                add(["--h3-license-confirmed"])
+            if is_true(values, "h3_pdd"):
+                add(["--h3-pdd"])
         if values.get("outpaint_model") == "ltx25":
             add(["--ltx-version", "2.5"])
             add(["--generation-fps", values.get("generation_fps", "24-fast")])
@@ -1636,8 +1647,8 @@ class PipelineApp:
             add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
             add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
             add(["--seed-min-shot-seconds", shot_values.get("min_shot_seconds", "1.0") or "1.0"])
-        elif values.get("outpaint_model") == "wanvace":
-            # Wan never lets a window span a cut; find cuts with the Shot Detection settings.
+        elif values.get("outpaint_model") in {"wanvace", "h3"}:
+            # Masked passes never span a cut; find cuts with the Shot Detection settings.
             shot_values = self.settings.get("shots", {})
             add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
             add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
@@ -1850,11 +1861,18 @@ class PipelineApp:
             stabilized_output = self.stabilization_output()
             if not stabilized_output or not resolve(stabilized_output).exists():
                 return False, "Run Stabilization first so this phase has its upstream video."
-        # Only the official LTX LoRA is gated; Oumoumad and Wan VACE download without approval.
+        # MiniMax H3's licence excludes some territories, so it only runs once the user confirms a licence.
+        if (
+            stage_key == "outpaint"
+            and self.settings.get("outpaint", {}).get("outpaint_model") == "h3"
+            and not is_true(self.settings.get("outpaint", {}), "h3_license_confirmed")
+        ):
+            return False, H3_LICENSE_REQUIRED
+        # Only the official LTX LoRA is gated; Oumoumad, Wan VACE and H3 download without approval.
         if (
             stage_key == "outpaint"
             and self.settings.get("outpaint", {}).get("compute", "local") != "runpod"
-            and self.settings.get("outpaint", {}).get("outpaint_model") != "wanvace"
+            and self.settings.get("outpaint", {}).get("outpaint_model") not in {"wanvace", "h3"}
         ):
             selected_lora = OUMOUMAD_OUTPAINT_LORA if self.settings.get("outpaint", {}).get("outpaint_model") == "oumoumad" else DEFAULT_OUTPAINT_LORA
             ok, message = outpaint_browser_handoff(selected_lora)
@@ -2838,7 +2856,7 @@ def adopt_saved_artifact(saved_text: str, current_text: str, replace_existing: b
 
 def outpaint_model_tag_suffix(values: dict[str, str]) -> str:
     """Render caches are model-specific; must match outpaint_video.outpaint_artifact_tag."""
-    return {"ltx25": "25", "wanvace": "wan"}.get(values.get("outpaint_model", ""), "")
+    return {"ltx25": "25", "wanvace": "wan", "h3": "h3"}.get(values.get("outpaint_model", ""), "")
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
@@ -3138,13 +3156,18 @@ def outpaint_chunks_state(settings: dict) -> dict:
     migrate_legacy_outpaint_chunk_manifest(source_text, values, manifest)
     values["manifest"] = rel(manifest)
     existing = read_outpaint_chunk_rows(manifest)
-    ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)
+    max_frames, overlap_frames = outpaint_chunk_limits(source_text, values, overlap_frames)
+    ranges = chunk_plan.chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing, max_frames)
+    stored = existing
+    existing = chunk_plan.remap_chunk_rows(stored, ranges)
+    if existing is not stored:
+        APP.log.append("Outpaint chunk layout changed; guide frames were moved to the chunks that now contain them.")
     global_prompt = values.get("prompt") or OUTPAINT_PROMPT
     global_negative = values.get("negative_prompt", "")
     default_offset_x = outpaint_offset_value(values.get("offset_x", "0"))
     default_offset_y = outpaint_offset_value(values.get("offset_y", "0"))
     rows = []
-    manifest_needs_write = len(ranges) != len(existing)
+    manifest_needs_write = len(ranges) != len(stored)
     for index, start_frame, end_frame in ranges:
         row = dict(existing.get(index, {}))
         apply_outpaint_chunk_offsets(row, default_offset_x, default_offset_y)
@@ -3171,7 +3194,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         row.setdefault("guide_end_strength", "1.0")
         row.setdefault("guide_frames", "")
         row.setdefault("auto_start_guide", "true")
-        if row != existing.get(index):
+        if row != stored.get(index):
             manifest_needs_write = True
         rows.append(row)
     # State polling is read-only once the chunk structure is current. Rewriting an
@@ -3202,7 +3225,8 @@ def outpaint_chunks_state(settings: dict) -> dict:
             "fps": fps,
             "total_frames": total_frames,
             "length_frames": length_frames,
-            "max_length_frames": max(1, total_frames - int(row["start_frame"])),
+            "max_length_frames": max(1, min(max_frames or total_frames, total_frames - int(row["start_frame"]))),
+            "max_chunk_frames": max_frames,
             "start_label": format_timecode(float(row["start_seconds"])),
             "end_label": format_timecode(float(row["end_seconds"])),
             "raw_exists": bool(raw_preview),
@@ -3283,27 +3307,20 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
     return aspect_preview_at(source_text, aspect, start_seconds + offset, offset_x, offset_y)
 
 
-def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
-    ranges = []
-    start = 0
-    index = 0
-    while start < total_frames:
-        seconds = default_seconds
-        custom = existing.get(index, {}).get("custom_seconds", "")
-        if custom:
-            try:
-                seconds = float(custom)
-            except ValueError:
-                seconds = default_seconds
-        chunk_frames = total_frames if seconds <= 0 else max(1, int(round(seconds * fps)))
-        end = min(total_frames, start + chunk_frames)
-        ranges.append((index, start, end))
-        if end >= total_frames:
-            break
-        overlap = max(0, min(overlap_frames, chunk_frames - 1))
-        start += max(1, chunk_frames - overlap)
-        index += 1
-    return ranges
+def outpaint_chunk_limits(source_text: str, values: dict[str, str], overlap_frames: int) -> tuple[int, int]:
+    """(max frames per chunk, overlap) for the chosen model, matching outpaint_video.py.
+
+    Wan VACE and MiniMax H3 render a chunk in one pass, so their chunks are capped by what one
+    pass holds at their canvas size, and overlap by at least the finished frames each pass opens with.
+    """
+    model = values.get("outpaint_model")
+    if model not in {"wanvace", "h3"}:
+        return 0, overlap_frames
+    width, height = outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))
+    if model == "h3":
+        settings = h3.H3Settings()
+        return settings.pass_frames(*aid.h3_render_size(width, height)), max(overlap_frames, settings.context_frames)
+    return wan.WanSettings().pass_frames(width, height), max(overlap_frames, wan.WAN_CONTEXT_FRAMES)
 
 
 def _truthy_payload_value(value) -> bool:

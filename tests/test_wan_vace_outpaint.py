@@ -27,7 +27,7 @@ class WanWindowPlanTests(unittest.TestCase):
         self.assertEqual(written, total)
 
     def test_windows_cover_every_frame_with_even_lengths(self) -> None:
-        windows = wan.plan_windows(481, 0, 81, 13)
+        windows = wan.plan_passes(481, 0, 81, 13)
 
         self.assert_plan_covers(windows, 481, 0, 81, 13)
         # Same window count as greedy filling, but no near-empty tail window.
@@ -37,34 +37,34 @@ class WanWindowPlanTests(unittest.TestCase):
 
     def test_short_tail_is_spread_instead_of_resampling_a_full_window(self) -> None:
         # Greedy planning sampled 81 + 81 + 81 frames here to add only 12 in the last window.
-        self.assertEqual(wan.plan_windows(161, 0, 81, 13), [(0, 63), (50, 112), (99, 161)])
-        self.assertEqual(wan.plan_windows(161, 0, 161, 13), [(0, 161)])
+        self.assertEqual(wan.plan_passes(161, 0, 81, 13), [(0, 63), (50, 112), (99, 161)])
+        self.assertEqual(wan.plan_passes(161, 0, 161, 13), [(0, 161)])
 
     def test_known_prefix_is_context_not_regenerated(self) -> None:
-        windows = wan.plan_windows(200, 8, 81, 13)
+        windows = wan.plan_passes(200, 8, 81, 13)
 
         self.assertEqual(windows[0][0], 0)
         self.assert_plan_covers(windows, 200, 8, 81, 13)
-        self.assertEqual(wan.plan_windows(200, 40, 81, 13)[0][0], 27)
-        self.assertEqual(wan.plan_windows(8, 8, 81, 13), [])
+        self.assertEqual(wan.plan_passes(200, 40, 81, 13)[0][0], 27)
+        self.assertEqual(wan.plan_passes(8, 8, 81, 13), [])
 
     def test_windows_never_span_or_take_context_across_a_cut(self) -> None:
-        windows = wan.plan_windows(200, 0, 81, 13, cuts=[50, 120])
+        windows = wan.plan_passes(200, 0, 81, 13, cuts=[50, 120])
 
         self.assertEqual(windows, [(0, 50), (50, 120), (120, 200)])
         # A cut inside the previous chunk's overlap: context starts at the cut.
-        self.assertEqual(wan.plan_windows(100, 8, 81, 13, cuts=[5])[0][0], 5)
+        self.assertEqual(wan.plan_passes(100, 8, 81, 13, cuts=[5])[0][0], 5)
         # A cut right after the overlap: that shot starts without the overlap as context.
-        windows = wan.plan_windows(100, 8, 81, 13, cuts=[8])
+        windows = wan.plan_passes(100, 8, 81, 13, cuts=[8])
         self.assertEqual(windows[0][0], 8)
         self.assert_plan_covers(windows, 100, 8, 81, 13, cuts=[8])
 
-    def test_default_windows_are_161_frames_within_the_measured_vram_budget(self) -> None:
-        self.assertEqual(wan.WanSettings().window_frames_for(1280, 704), 161)
-        self.assertEqual(wan.WanSettings().window_frames_for(864, 480), 161)
+    def test_default_chunks_are_161_frames_within_the_measured_vram_budget(self) -> None:
+        self.assertEqual(wan.WanSettings().chunk_frames_for(1280, 704), 161)
+        self.assertEqual(wan.WanSettings().chunk_frames_for(864, 480), 161)
         # 1080p exceeds what was measured to fit in 24 GB: fall back to Wan's native 81.
-        self.assertEqual(wan.WanSettings().window_frames_for(1920, 1088), 81)
-        self.assertEqual(wan.WanSettings(window_frames=81).window_frames_for(1280, 704), 81)
+        self.assertEqual(wan.WanSettings().chunk_frames_for(1920, 1088), 81)
+        self.assertEqual(wan.WanSettings(chunk_frames=81).chunk_frames_for(1280, 704), 81)
 
     def test_ltx_trigger_word_is_removed_from_wan_prompts(self) -> None:
         self.assertEqual(wan.wan_prompt("outpaint"), "")
@@ -127,7 +127,7 @@ class WanPromptTests(unittest.TestCase):
 
 
     def test_context_sampling_patches_the_model_only_for_passes_longer_than_a_window(self) -> None:
-        settings = wan.WanSettings(sampling="context", window_frames=81, context_overlap=30)
+        settings = wan.WanSettings(sampling="context", chunk_frames=81, context_overlap=30)
         args = ("c.mkv", "m.mkv", 1280, 704)
         tail = (24.0, "", "", 1, settings, "x")
 
@@ -143,7 +143,7 @@ class WanPromptTests(unittest.TestCase):
         self.assertEqual(settings.pass_frames(1920, 1088), 205)
         self.assertEqual(wan.WanSettings().pass_frames(1920, 1088), 81)
         # One pass per shot, never across a cut.
-        self.assertEqual(wan.plan_windows(481, 0, settings.pass_frames(1280, 704), 13, cuts=[208]), [(0, 208), (208, 481)])
+        self.assertEqual(wan.plan_passes(481, 0, settings.pass_frames(1280, 704), 13, cuts=[208]), [(0, 208), (208, 481)])
 
 
 def write_video(ffmpeg: str, path: Path, frames: list[np.ndarray], fps: float = 24.0) -> None:
@@ -186,7 +186,7 @@ class WanRenderChunkTests(unittest.TestCase):
         guide = np.full((height, width, 3), 77, dtype=np.uint8)
         seen: list[tuple[list[np.ndarray], list[np.ndarray]]] = []
 
-        def render_window(control: Path, mask: Path, length: int, window_index: int) -> Path:
+        def render_window(control: Path, mask: Path, length: int, window_index: int, context_frames: int) -> Path:
             controls = read_video(self.ffmpeg, control, width, height)
             mask_frames = read_video(self.ffmpeg, mask, width, height)
             self.assertEqual(len(controls), length)
@@ -200,8 +200,8 @@ class WanRenderChunkTests(unittest.TestCase):
         wan.render_chunk(
             ffmpeg=self.ffmpeg, chunk_video=chunk, output=output, width=width, height=height, fps=24.0,
             total_frames=20, masks=masks, known_prefix=prefix, guides={10: (guide, 1.0)},
-            render_window=render_window, work_dir=self.root / "work",
-            settings=wan.WanSettings(window_frames=9, context_frames=3), intermediate_profile="lossless",
+            render_pass=render_window, work_dir=self.root / "work",
+            settings=wan.WanSettings(chunk_frames=9, context_frames=3), intermediate_profile="lossless",
         )
 
         result = read_video(self.ffmpeg, output, width, height)
@@ -223,8 +223,8 @@ class WanRenderChunkTests(unittest.TestCase):
         np.testing.assert_array_equal(second_controls[0], result[6])
         self.assertFalse(second_masks[0].any())
         # The guide fills its frame's bar and a strength-1 guide is kept as given.
-        guide_window = next(i for i, (start, end) in enumerate(wan.plan_windows(20, 2, 9, 3)) if start <= 10 < end)
-        start = wan.plan_windows(20, 2, 9, 3)[guide_window][0]
+        guide_window = next(i for i, (start, end) in enumerate(wan.plan_passes(20, 2, 9, 3)) if start <= 10 < end)
+        start = wan.plan_passes(20, 2, 9, 3)[guide_window][0]
         controls, mask_frames = seen[guide_window]
         self.assertTrue((controls[10 - start][:, :8] == 77).all())
         self.assertFalse(mask_frames[10 - start].any())
@@ -262,7 +262,7 @@ class WanBackendWiringTests(unittest.TestCase):
 
         self.assertNotIn("wan_vace", ltx)
         self.assertEqual(ltx["outpaint_pipeline"], "crop_first_pillarbox_letterbox_video_only_v1")
-        self.assertEqual(wan_sig["outpaint_pipeline"], "wan21_vace14b_windowed_v1")
+        self.assertEqual(wan_sig["outpaint_pipeline"], "wan21_vace14b_chunked_v2")
         self.assertEqual(wan_sig["wan_vace"]["steps"], 8)
         self.assertEqual(wan_sig["gguf_model"], outpaint_video.WAN_VACE_GGUF_MODEL)
         self.assertIsNone(wan_sig["workflow_fingerprint"])
