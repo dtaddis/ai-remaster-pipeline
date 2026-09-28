@@ -6,9 +6,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import file_fingerprint, resolve_path, root_relative, resumable_output, write_signature
+from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, safe_stem, write_signature
 from outpaint_geometry import crop_box, native_source_layout, source_placement
 from reference_luminance import ffmpeg_curve, identity_curve, reference_luminance_plan
+
+CUSTOM_MASK_FEATHER_VERSION = 1
 
 
 def find_ffmpeg(explicit: str | None):
@@ -41,6 +43,10 @@ def signature(args):
     # Leave the flag out while it is off so composites made before it existed stay reusable.
     if not values.get('native_source_resolution'):
         values.pop('native_source_resolution', None)
+    # Custom-mask composites made before the mask was feathered have a hard cut-out edge;
+    # only those need re-rendering, so the marker is keyed to having a mask at all.
+    if values.get('custom_mask'):
+        values['custom_mask_feather'] = CUSTOM_MASK_FEATHER_VERSION
     values['tool'] = 'final_composite.py'
     values['version'] = 13
     return values
@@ -282,6 +288,70 @@ def append_source_alpha_mask(filters: list[str], args, feather: int, *, horizont
     return source_label, 'srcalphamask'
 
 
+def canvas_feather(args, canvas: tuple[int, int], base_size: tuple[int, int]) -> int:
+    """Return the feather width in composite-canvas pixels.
+
+    --feather-pixels is measured on the outpaint canvas; a native-resolution
+    composite grows that canvas, so the ramp grows with it.
+    """
+    feather = max(1, int(args.feather_pixels))
+    if canvas[0] == base_size[0]:
+        return feather
+    return max(1, int(round(feather * canvas[0] / base_size[0])))
+
+
+def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather: int) -> Path:
+    """Turn the binary custom mask into a feathered keep-alpha for the source overlay.
+
+    Masked pixels stay fully transparent and the source fades back in over
+    `feather` pixels outside them: the same linear ramp the letterbox edges get,
+    and on the same side of the seam, so masked damage never bleeds through.
+    The mask is a still, so the ramp is built once here rather than per frame
+    in the filter graph.
+    """
+    width, height = canvas
+    target = ROOT / '.cache' / 'recomp_masks' / f'{safe_stem(mask_path.name)}_keep_{width}x{height}_f{feather}.png'
+    sig = {
+        'tool': 'final_composite.py/custom_keep_mask',
+        'version': CUSTOM_MASK_FEATHER_VERSION,
+        'custom_mask': root_relative(mask_path),
+        'custom_mask_fingerprint': file_fingerprint(mask_path),
+        'canvas': [width, height],
+        'feather': feather,
+    }
+    if resumable_output(target, sig, width=width, height=height):
+        return target
+
+    import cv2
+    import numpy as np
+
+    custom = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if custom is None:
+        raise RuntimeError(f'Could not read custom mask: {mask_path}')
+    # Read it the way outpainting did, so the ramp starts where generation did.
+    if custom.ndim == 3 and custom.shape[2] == 4:
+        custom = custom[:, :, 3]
+    elif custom.ndim == 3:
+        custom = cv2.cvtColor(custom, cv2.COLOR_BGR2GRAY)
+    if custom.shape[:2] != (height, width):
+        custom = cv2.resize(custom, (width, height), interpolation=cv2.INTER_NEAREST)
+    unmasked = np.where(custom >= 16, 0, 255).astype(np.uint8)
+    if unmasked.all():
+        keep = unmasked
+    else:
+        # Distance from each unmasked pixel to the nearest masked one; masked pixels are 0.
+        distance = cv2.distanceTransform(unmasked, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        keep = np.clip(distance * (255.0 / feather), 0, 255).round().astype(np.uint8)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix('.partial.png')
+    if not cv2.imwrite(str(partial), keep):
+        raise RuntimeError(f'Could not write the feathered custom mask: {partial}')
+    replace_with_retry(partial, target)
+    write_signature(target, sig)
+    print(f'Feathered custom mask {feather}px outward: {target}', flush=True)
+    return target
+
+
 def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
@@ -303,7 +373,7 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 # Grow (or shrink) the outpainted canvas around the source instead of
                 # resampling the source onto it, so the original pixels survive 1:1.
                 canvas, placement = native_source_layout(source_size[0], source_size[1], base_size[0], base_size[1], crops)
-                feather = max(1, int(round(feather * canvas[0] / base_size[0])))
+                feather = canvas_feather(args, canvas, base_size)
                 base_size = canvas
                 scale_base = f",scale={canvas[0]}:{canvas[1]}:flags=lanczos"
                 left, _right, top, _bottom, _w, _h = crop_box(source_size[0], source_size[1], *crops)
@@ -328,10 +398,11 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 source_label='src',
             )
             if custom_mask_input is not None:
-                # Fold the custom mask into the alpha before it is merged, so the
-                # source never has to be split and re-alphaextracted per frame.
+                # The custom-mask input is already the feathered keep-alpha (see
+                # feathered_custom_keep_mask). Fold it into the alpha before it is
+                # merged, so the source never has to be split and re-alphaextracted.
                 filters.extend([
-                    f'[{custom_mask_input}:v]scale={base_size[0]}:{base_size[1]}:flags=neighbor,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray,negate[customkeep]',
+                    f'[{custom_mask_input}:v]scale={base_size[0]}:{base_size[1]}:flags=bilinear,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray[customkeep]',
                     f'[{alpha_label}][customkeep]blend=all_mode=multiply[srcalphacustom]',
                 ])
                 alpha_label = 'srcalphacustom'
@@ -433,8 +504,11 @@ def run(args):
             print(f'Reference luminance matching: {matched}/{len(luminance_plan)} shot span(s), strength {args.reference_luminance_strength:g}%')
         else:
             print('Reference luminance matching requested without a manifest; using original source luminance.')
+    custom_keep = None
+    if outpainted and args.custom_mask:
+        custom_keep = feathered_custom_keep_mask(resolve_path(args.custom_mask), expected_size, canvas_feather(args, expected_size, base_size))
     cmd = [ffmpeg, '-y']
-    inputs, audio_input = input_args(outpainted, source, colorized, resolve_path(args.custom_mask) if args.custom_mask else None)
+    inputs, audio_input = input_args(outpainted, source, colorized, custom_keep)
     cmd += inputs
     cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
@@ -489,7 +563,7 @@ def build_parser():
     parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')
     parser.add_argument('--source-black-threshold', type=int, default=24, help='Maximum RGB channel value considered source black when --source-black-transparent is enabled.')
     parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')
-    parser.add_argument('--custom-mask', help='Additive full-canvas mask whose selected pixels remain transparent in the source overlay.')
+    parser.add_argument('--custom-mask', help='Additive full-canvas mask whose selected pixels remain transparent in the source overlay; the source fades back in over --feather-pixels outside them.')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)

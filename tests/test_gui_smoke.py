@@ -2348,7 +2348,9 @@ class GuiSmokeTests(unittest.TestCase):
             args, False, 24.0, True, (1440, 1080), (1920, 1080), [],
         )
 
-        self.assertIn("[2:v]scale=1920:1080:flags=neighbor", graph)
+        # The mask input is the pre-feathered keep-alpha, so it is used as-is: not negated.
+        self.assertIn("[2:v]scale=1920:1080:flags=bilinear", graph)
+        self.assertNotIn("negate", graph)
         # The custom mask multiplies into the source alpha before it is merged, so the
         # masked-out regions stay transparent and the generated pixels below show through.
         self.assertIn("[srcalphamask][customkeep]blend=all_mode=multiply[srcalphacustom]", graph)
@@ -2356,6 +2358,37 @@ class GuiSmokeTests(unittest.TestCase):
         # The alpha is built as its own stream; the source is never split and
         # re-alphaextracted per frame just to reach it.
         self.assertNotIn("alphaextract", graph)
+
+    def test_recomposition_custom_mask_feathers_outward_into_the_source(self) -> None:
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mask_path = root / "mask.png"
+            mask = np.zeros((90, 160), dtype=np.uint8)
+            mask[:, 60:70] = 255  # a vertical strip, like a sprocket-hole column
+            cv2.imwrite(str(mask_path), mask)
+            with mock.patch.object(final_composite, "ROOT", root):
+                keep_path = final_composite.feathered_custom_keep_mask(mask_path, (320, 180), 20)
+                keep = cv2.imread(str(keep_path), cv2.IMREAD_GRAYSCALE)
+
+                # Masked pixels stay fully transparent, so the generated fill shows whole.
+                self.assertTrue(np.all(keep[:, 120:140] == 0))
+                # The source fades back in linearly over the feather, outside the mask only.
+                self.assertTrue(0 < keep[90, 145] < keep[90, 150] < 255)
+                self.assertTrue(0 < keep[90, 115] < 255)
+                self.assertTrue(np.all(keep[:, :100] == 255))
+                self.assertTrue(np.all(keep[:, 160:] == 255))
+                self.assertEqual(final_composite.feathered_custom_keep_mask(mask_path, (320, 180), 20), keep_path)
+
+    def test_recomposition_custom_mask_invalidates_only_masked_composites(self) -> None:
+        base = ["--outpainted", "o.mp4", "--source", "s.mp4", "--output", "out.mp4"]
+        with mock.patch.object(final_composite, "file_fingerprint", return_value={}):
+            plain = final_composite.signature(final_composite.build_parser().parse_args(base))
+            masked = final_composite.signature(final_composite.build_parser().parse_args(base + ["--custom-mask", "m.png"]))
+        self.assertNotIn("custom_mask_feather", plain)
+        self.assertIn("custom_mask_feather", masked)
 
     def test_recomposition_progress_tracks_the_ffmpeg_frame_counter(self) -> None:
         from ai_remaster_gui.process_utils import recomp_progress
