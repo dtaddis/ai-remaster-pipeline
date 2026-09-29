@@ -34,7 +34,7 @@ SOURCE_ITEMS = (
 )
 PATH_FLAGS = {
     "--source", "--input", "--output", "--manifest", "--outpainted", "--colorized",
-    "--custom-mask",
+    "--custom-mask", "--frame-masks",
     "--source-video", "--output-manifest", "--workflow", "--qwen-workflow",
     "--qwen-masked-workflow", "--chunk-manifest", "--comfy-dir", "--comfy-output-root",
     "--cmnet2-dir",

@@ -2349,7 +2349,7 @@ class GuiSmokeTests(unittest.TestCase):
         )
 
         # The mask input is the pre-feathered keep-alpha, so it is used as-is: not negated.
-        self.assertIn("[2:v]scale=1920:1080:flags=bilinear", graph)
+        self.assertIn("[2:v]setpts=N/(24.00000000*TB),scale=1920:1080:flags=bilinear", graph)
         self.assertNotIn("negate", graph)
         # The custom mask multiplies into the source alpha before it is merged, so the
         # masked-out regions stay transparent and the generated pixels below show through.
@@ -2838,6 +2838,61 @@ class GuiSmokeTests(unittest.TestCase):
                 command = app.APP.command_for("outpaint")
 
         self.assertEqual(command[command.index("--custom-mask") + 1], app.rel(custom))
+
+    def test_outpaint_and_recomp_commands_pass_saved_frame_masks(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["recomp"].update({"outpainted_video": "intermediate/outpainted/example_outpaint.mp4", "source": "input/example.mp4"})
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as folder_text:
+            archive = Path(folder_text) / "frames.zip"
+            with mock.patch.object(server, "frame_outpaint_masks_for", return_value=archive):
+                self.assertNotIn("--frame-masks", app.APP.command_for("outpaint"))
+                archive.write_bytes(b"zip")
+                outpaint = app.APP.command_for("outpaint")
+                recomp = app.APP.command_for("recomp")
+
+        self.assertEqual(outpaint[outpaint.index("--frame-masks") + 1], app.rel(archive))
+        self.assertEqual(recomp[recomp.index("--frame-masks") + 1], app.rel(archive))
+
+    def test_frame_mask_is_saved_at_working_size_and_an_empty_frame_is_removed(self) -> None:
+        import base64
+        import io
+
+        from PIL import Image
+
+        import frame_masks
+
+        def data_url(image) -> str:
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        painted = Image.new("RGBA", (32, 16), (0, 0, 0, 0))
+        painted.paste((224, 92, 73, 158), (8, 4, 16, 12))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as folder_text:
+            folder = Path(folder_text)
+            source = folder / "source.mp4"
+            source.write_bytes(b"video")
+            archive = folder / "frames.zip"
+            with (
+                mock.patch.object(app.APP, "outpaint_source_for", return_value=app.rel(source)),
+                mock.patch.object(server, "frame_outpaint_masks_for", return_value=archive),
+                mock.patch.object(server, "outpaint_work_size_for_source", return_value=(64, 32)),
+            ):
+                server.save_frame_outpaint_mask(7, data_url(painted))
+                stored = Image.open(io.BytesIO(frame_masks.read_frame(archive, 7)))
+                self.assertEqual((stored.mode, stored.size), ("L", (64, 32)))
+                self.assertEqual(stored.getbbox(), (16, 8, 32, 24))
+                self.assertTrue(server.frame_outpaint_mask_image(7)["image"].startswith("data:image/png;base64,"))
+                self.assertEqual(server.frame_outpaint_mask_image(8)["image"], "")
+
+                server.save_frame_outpaint_mask(7, data_url(Image.new("RGBA", (32, 16), (0, 0, 0, 0))))
+                self.assertFalse(archive.exists())
+
+    def test_project_bundles_frame_mask_zips_only_from_the_mask_folder(self) -> None:
+        self.assertTrue(project_io.bundle_name_allowed("manifests/outpaint_masks/clip_framemasks_ab12.zip"))
+        self.assertFalse(project_io.bundle_name_allowed("scripts/anything.zip"))
+        self.assertFalse(project_io.bundle_name_allowed("manifests/outpaint_masks/clip.exe"))
+        self.assertTrue(project_io.bundle_name_allowed("manifests/outpaint_masks/clip_custommask_ab12.png"))
 
     def test_1080p_runpod_outpaint_filters_24gb_gpu_choices(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "0", "section_end": ""})

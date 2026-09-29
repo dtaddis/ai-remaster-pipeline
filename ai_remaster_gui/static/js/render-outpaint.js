@@ -691,6 +691,7 @@ function drawOutpaint(st, s, expected, sp) {
             <button id="outpaintMaskClearButton" type="button" class="warn" onclick="clearOutpaintMask()" ${state.custom_outpaint_mask && state.custom_outpaint_mask.exists ? '' : 'disabled'}>Clear Mask</button>
           </div>
         </div>
+        ${frameMaskSummaryHtml()}
         <div class="outpaint-composition-controls">
           <section class="composition-control-group">
             <div class="crop-head">
@@ -724,6 +725,7 @@ function drawOutpaint(st, s, expected, sp) {
   bindStageFields('outpaint');
   showCommand('outpaint');
   syncOutpaintMaskPreview();
+  syncFramePatchPreview(state.aspect_preview_frame || 0);
   hydratePendingOutpaintPreviews();
   hydratePendingGuidePreviews();
 }

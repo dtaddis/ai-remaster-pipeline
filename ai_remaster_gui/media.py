@@ -220,24 +220,37 @@ def aspect_preview(source_text: str, aspect: str) -> str:
     return aspect_preview_cached(signature[0], signature[1], signature[2], aspect, current_crop_values(), 10.0)
 
 def aspect_preview_for_settings(settings: dict) -> str:
+    return aspect_preview_frame_for_settings(settings)[0]
+
+def aspect_preview_frame_for_settings(settings: dict, relative_seconds: float | None = None) -> tuple[str, int]:
+    """Target Preview image and the frame number it shows.
+
+    The time is snapped to a whole frame and decoded from half a frame early, so the picture
+    is exactly that frame. Frame masks are drawn over it, and a time-based seek can land a
+    frame either side at low frame rates such as 8mm's 16-18fps.
+    """
     source_text = preview_pipeline_source_text(settings)
     if not source_text:
-        return ""
+        return "", 0
     signature = source_signature(source_text)
     if signature is None:
-        return ""
-    seconds = 0.0 if source_section_is_active(settings) else 10.0
+        return "", 0
+    if relative_seconds is None:
+        relative_seconds = 0.0 if source_section_is_active(settings) else 10.0
+    metrics = video_metrics(Path(signature[0]))
+    fps = float(metrics.get("fps") or 24.0)
+    frame = max(0, int(round(max(0.0, relative_seconds) * fps)))
+    if metrics.get("frames"):
+        frame = min(frame, int(metrics["frames"]) - 1)
+    seek = max(0.0, (frame - 0.5) / fps) if frame else 0.0
     outpaint = settings.get("outpaint", {})
-    return aspect_preview_cached(
-        signature[0],
-        signature[1],
-        signature[2],
-        outpaint.get("target_aspect", "16:9"),
-        crop_values_for_settings(settings),
-        seconds,
+    path = aspect_preview_cached(
+        signature[0], signature[1], signature[2], outpaint.get("target_aspect", "16:9"),
+        crop_values_for_settings(settings), round(seek, 3),
         int(float(outpaint.get("offset_x", "0") or 0)),
         int(float(outpaint.get("offset_y", "0") or 0)),
     )
+    return path, frame
 
 def aspect_preview_at(source_text: str, aspect: str, seconds: float, offset_x: int = 0, offset_y: int = 0) -> str:
     signature = source_signature(source_text)
@@ -246,20 +259,7 @@ def aspect_preview_at(source_text: str, aspect: str, seconds: float, offset_x: i
     return aspect_preview_cached(signature[0], signature[1], signature[2], aspect, current_crop_values(), round(max(0.0, seconds), 3), offset_x, offset_y)
 
 def aspect_preview_at_for_settings(settings: dict, seconds: float) -> str:
-    source_text = preview_pipeline_source_text(settings)
-    if not source_text:
-        return ""
-    relative_seconds = section_relative_seconds(settings, seconds)
-    outpaint = settings.get("outpaint", {})
-    signature = source_signature(source_text)
-    if signature is None:
-        return ""
-    return aspect_preview_cached(
-        signature[0], signature[1], signature[2], outpaint.get("target_aspect", "16:9"),
-        crop_values_for_settings(settings), round(max(0.0, relative_seconds), 3),
-        int(float(outpaint.get("offset_x", "0") or 0)),
-        int(float(outpaint.get("offset_y", "0") or 0)),
-    )
+    return aspect_preview_frame_for_settings(settings, section_relative_seconds(settings, seconds))[0]
 
 def auto_crop_for_settings(settings: dict, seconds: float) -> dict[str, str | int]:
     source_text = preview_pipeline_source_text(settings)
@@ -412,12 +412,16 @@ def patterned_canvas(width: int, height: int):
         draw.line((offset, 0, offset - height, height), fill=accent, width=max(2, spacing // 10))
     return canvas
 
-def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int, crops: tuple[int, int, int, int] = (0, 0, 0, 0), offset_x: int = 0, offset_y: int = 0) -> str:
-    ffmpeg = local_tool("ffmpeg")
-    dims = video_dimensions(source)
-    if not ffmpeg or not dims:
-        return ""
-    source_w, source_h = dims
+def aspect_canvas_filter(source_w: int, source_h: int, aspect: str, crops: tuple[int, int, int, int] = (0, 0, 0, 0), offset_x: int = 0, offset_y: int = 0, fps: float | None = None) -> str:
+    """ffmpeg filter placing the trimmed source on the hatched outpaint canvas, at preview size.
+
+    The mask editors paint over this framing, and the server scales what they paint to the
+    outpaint working canvas, so every preview of the canvas must come from here.
+
+    Pass `fps` for more than one frame. The hatched background is a generated stream, and
+    overlay times its output by it: left at the generator's default 25fps it resampled a
+    17fps clip, so frame N of the output was not frame N of the source.
+    """
     ratio = parse_aspect(aspect)
     left, _right, top, _bottom, crop_width, crop_height = crop_box(source_w, source_h, *crops)
     envelope_width, envelope_height = source_envelope_size(source_w, source_h, crops)
@@ -437,13 +441,23 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
     placed_h = max(2, even_int(placement.height * scale))
     scaled_offset_x = int(round(offset_x * scale))
     scaled_offset_y = int(round(offset_y * scale))
-    target.parent.mkdir(parents=True, exist_ok=True)
-    filter_text = (
-        f"crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale={placed_w}:{placed_h}[src];"
-        f"color=c=0x15272b:s={out_w}x{out_h}[bg];"
+    # Both streams on one frame-numbered clock, so overlay pairs them one to one.
+    retime = f"setpts=N/({fps:.8f}*TB)," if fps else ""
+    rate = f":r={fps:.8f}" if fps else ""
+    return (
+        f"{retime}crop=w={crop_width}:h={crop_height}:x={left}:y={top},scale={placed_w}:{placed_h}[src];"
+        f"color=c=0x15272b:s={out_w}x{out_h}{rate}[bg];"
         f"[bg]geq=r='34+34*mod(floor((X+Y)/18)\\,2)':g='62+48*mod(floor((X+Y)/18)\\,2)':b='67+40*mod(floor((X+Y)/18)\\,2)'[pat];"
         f"[pat][src]overlay={placed_x + scaled_offset_x}:{placed_y + scaled_offset_y}"
     )
+
+def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int, crops: tuple[int, int, int, int] = (0, 0, 0, 0), offset_x: int = 0, offset_y: int = 0) -> str:
+    ffmpeg = local_tool("ffmpeg")
+    dims = video_dimensions(source)
+    if not ffmpeg or not dims:
+        return ""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    filter_text = aspect_canvas_filter(dims[0], dims[1], aspect, crops, offset_x, offset_y)
     command = [ffmpeg, "-y", "-ss", "10", "-i", str(source), "-frames:v", "1", "-vf", filter_text, "-q:v", "3", str(target)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -452,6 +466,51 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
     if result.returncode != 0:
         state.APP.log.append(f"Could not generate aspect preview: {(result.stderr or result.stdout).strip()}")
     return rel(target) if result.returncode == 0 and target.exists() and target.stat().st_mtime_ns >= mtime_ns else ""
+
+FRAME_CANVAS_BLOCK = 24
+# Version 1 resampled the clip to 25fps, so its cached frames are the wrong ones.
+FRAME_CANVAS_VERSION = 2
+
+
+def outpaint_frame_canvas_previews(source: Path, first: int, count: int, aspect: str, crops: tuple[int, int, int, int], offset_x: int = 0, offset_y: int = 0) -> list[str]:
+    """Aspect-preview framing for a run of consecutive frames, for the frame-mask editor.
+
+    Stepping through a clip one ffmpeg seek at a time is slow, so frames are extracted in
+    blocks with one decode and cached per source version and geometry.
+    """
+    ffmpeg = local_tool("ffmpeg")
+    metrics = video_metrics(source)
+    if not ffmpeg or not metrics:
+        return []
+    total = int(metrics.get("frames") or 0)
+    first = max(0, min(int(first), max(0, total - 1)))
+    count = max(1, min(int(count), total - first)) if total else max(1, int(count))
+    stat = source.stat()
+    identity = json.dumps([str(source.resolve()), stat.st_size, stat.st_mtime_ns, aspect, list(crops), offset_x, offset_y, ASPECT_PREVIEW_STYLE_VERSION, FRAME_CANVAS_VERSION])
+    directory = ASPECT_PREVIEW_DIR / "frame_canvas" / hashlib.sha256(identity.encode()).hexdigest()[:20]
+    targets = [directory / f"f{frame:06d}.jpg" for frame in range(first, first + count)]
+    if not all(target.exists() for target in targets):
+        directory.mkdir(parents=True, exist_ok=True)
+        width, height = int(metrics.get("width") or 0), int(metrics.get("height") or 0)
+        if width <= 0 or height <= 0:
+            dims = video_dimensions(source)
+            if not dims:
+                return []
+            width, height = dims
+        fps = float(metrics.get("fps") or 24.0)
+        # Half a frame early: accurate seek then decodes forward and starts on exactly `first`.
+        seek = max(0.0, (first - 0.5) / fps) if first else 0.0
+        filter_text = aspect_canvas_filter(width, height, aspect, crops, offset_x, offset_y, fps) + ":shortest=1"
+        command = [
+            ffmpeg, "-y", "-v", "error", "-ss", f"{seek:.6f}", "-i", str(source),
+            "-frames:v", str(count), "-vf", filter_text, "-fps_mode", "passthrough",
+            "-q:v", "3", "-start_number", str(first),
+            str(directory / "f%06d.jpg"),
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            state.APP.log.append(f"Could not extract frame-mask editor frames: {(result.stderr or result.stdout).strip()}")
+    return [rel(target) for target in targets if target.exists()]
 
 def video_dimensions(source: Path) -> tuple[int, int] | None:
     resolution = ffprobe_info(source).get("resolution", "")

@@ -19,13 +19,22 @@ PROJECT_JSON_NAME = "project.json"
 # Extensions allowed inside a project bundle. .json is included so outpaint guide sidecars
 # (resume signatures, edit metadata) travel with the guides and aren't treated as stale on load.
 BUNDLE_EXTS = IMAGE_EXTS | {".csv", ".txt", ".json"}
+# Per-frame outpaint masks are one zip of PNGs. Zips are accepted from this folder only, so a
+# project file cannot use the extension to drop arbitrary archives elsewhere in the install.
+FRAME_MASK_BUNDLE_DIR = "manifests/outpaint_masks/"
+
+
+def bundle_name_allowed(name: str) -> bool:
+    name = name.replace("\\", "/")
+    suffix = Path(name).suffix.lower()
+    return suffix in BUNDLE_EXTS or (suffix == ".zip" and name.startswith(FRAME_MASK_BUNDLE_DIR))
 
 
 def bind_context(context: dict) -> None:
     """Bind GUI helpers used to identify the active outpaint chunk manifest."""
     globals().update({key: context[key] for key in (
         "outpaint_chunk_manifest_for", "pipeline_source_text",
-        "outpaint_source_for_settings", "custom_outpaint_mask_for",
+        "outpaint_source_for_settings", "custom_outpaint_mask_for", "frame_outpaint_masks_for",
     ) if key in context})
 
 
@@ -144,13 +153,15 @@ def project_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
             seen.add(asset)
             assets.append(asset)
     outpaint_source = globals().get("outpaint_source_for_settings")
-    custom_mask_for = globals().get("custom_outpaint_mask_for")
-    if outpaint_source and custom_mask_for:
+    for mask_for_name in ("custom_outpaint_mask_for", "frame_outpaint_masks_for"):
+        mask_for = globals().get(mask_for_name)
+        if not (outpaint_source and mask_for):
+            continue
         try:
-            custom_mask = custom_mask_for(outpaint_source(settings), settings.get("outpaint", {}))
-            if custom_mask not in seen and project_asset_is_bundleable(custom_mask):
-                seen.add(custom_mask)
-                assets.append(custom_mask)
+            mask = mask_for(outpaint_source(settings), settings.get("outpaint", {}))
+            if mask not in seen and project_asset_is_bundleable(mask):
+                seen.add(mask)
+                assets.append(mask)
         except Exception:
             pass
     return assets
@@ -233,13 +244,11 @@ def outpaint_guide_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path
 def project_asset_is_bundleable(path: Path) -> bool:
     if not path.exists() or not path.is_file():
         return False
-    if path.suffix.lower() not in BUNDLE_EXTS:
-        return False
     try:
-        path.resolve().relative_to(ROOT.resolve())
+        relative = path.resolve().relative_to(ROOT.resolve())
     except ValueError:
         return False
-    return True
+    return bundle_name_allowed(relative.as_posix())
 
 def asset_already_on_disk(info: zipfile.ZipInfo, target: Path) -> bool:
     """True when the target file already holds the archived bytes. Restoring it anyway would
@@ -257,7 +266,7 @@ def extract_project_assets(archive: zipfile.ZipFile) -> None:
         name = info.filename.replace("\\", "/")
         if name == PROJECT_JSON_NAME or name.startswith("/") or ".." in Path(name).parts:
             continue
-        if Path(name).suffix.lower() not in BUNDLE_EXTS:
+        if not bundle_name_allowed(name):
             continue
         target = ROOT / name
         try:

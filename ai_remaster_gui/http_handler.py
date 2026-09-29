@@ -15,6 +15,8 @@ from .file_dialogs import browse_path, browse_source_paths
 from .manifests import manifest_source_video, update_manifest_row
 from .media import (
     aspect_preview_at_for_settings,
+    aspect_preview_frame_for_settings,
+    section_relative_seconds,
     auto_crop_for_settings,
     existing_browser_playback,
     export_media_file,
@@ -75,6 +77,10 @@ install_outpaint_end_guide = None
 clear_outpaint_end_guide = None
 save_custom_outpaint_mask = None
 clear_custom_outpaint_mask = None
+frame_outpaint_mask_editor = None
+frame_outpaint_mask_image = None
+save_frame_outpaint_mask = None
+clear_frame_outpaint_masks = None
 
 _SERVER_OUTPAINT_OPS = (
     "ensure_outpaint_prepared_canvas",
@@ -87,6 +93,10 @@ _SERVER_OUTPAINT_OPS = (
     "clear_outpaint_end_guide",
     "save_custom_outpaint_mask",
     "clear_custom_outpaint_mask",
+    "frame_outpaint_mask_editor",
+    "frame_outpaint_mask_image",
+    "save_frame_outpaint_mask",
+    "clear_frame_outpaint_masks",
 )
 
 
@@ -246,8 +256,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/aspect-preview":
             query = parse_qs(parsed.query)
             try:
-                path = aspect_preview_at_for_settings(state.APP.settings, float(query.get("time", ["0"])[0]))
-                self.send_json({"ok": True, "path": path})
+                seconds = section_relative_seconds(state.APP.settings, float(query.get("time", ["0"])[0]))
+                path, frame = aspect_preview_frame_for_settings(state.APP.settings, seconds)
+                self.send_json({"ok": True, "path": path, "frame": frame})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-auto-crop":
@@ -260,6 +271,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-custom-mask":
             self.send_json({"ok": True, **state.APP.state("outpaint").get("custom_outpaint_mask", {})})
+        elif parsed.path == "/api/outpaint-frame-mask-frames":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json({"ok": True, **frame_outpaint_mask_editor(int(query.get("first", ["0"])[0]), int(query.get("count", ["24"])[0]))})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/outpaint-frame-mask":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json({"ok": True, **frame_outpaint_mask_image(int(query.get("frame", ["0"])[0]))})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/outpaint-chunk-preview":
             query = parse_qs(parsed.query)
             try:
@@ -478,6 +501,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_result("Custom outpaint mask save", lambda: {**save_custom_outpaint_mask(str(data.get("image", ""))), "state": state.APP.state("outpaint")})
         elif parsed.path == "/api/outpaint-custom-mask-clear":
             self._send_result("Custom outpaint mask clear", lambda: {**clear_custom_outpaint_mask(), "state": state.APP.state("outpaint")})
+        elif parsed.path == "/api/outpaint-frame-mask-save":
+            self._send_result("Frame mask save", lambda: {"frame_outpaint_masks": save_frame_outpaint_mask(int(data.get("frame", -1)), str(data.get("image", "") or ""))})
+        elif parsed.path == "/api/outpaint-frame-mask-clear":
+            self._send_result("Frame masks clear", lambda: {"frame_outpaint_masks": clear_frame_outpaint_masks(), "state": state.APP.state("outpaint")})
         elif parsed.path == "/api/outpaint-chunk-regenerate":
             self._send_action("Outpaint chunk regeneration", lambda: (
                 update_outpaint_chunk(int(data.get("index", 0)), str(data.get("seed", "")), str(data.get("prompt_suffix", "")), str(data.get("custom_seconds", "")), str(data.get("negative_suffix", "")), str(data.get("guide_strength", "")), str(data.get("guide_end_strength", "")), data.get("custom_length", None), str(data.get("offset_x", "0")), str(data.get("offset_y", "0")), data.get("auto_start_guide", True), data.get("offset_override", None)),

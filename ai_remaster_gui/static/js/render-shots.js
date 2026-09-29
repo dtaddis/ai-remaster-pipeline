@@ -778,5 +778,6 @@ function updateAspectPreview(time) {
     const r = await api('/api/aspect-preview?time=' + encodeURIComponent(time));
     const img = document.getElementById('aspectPreviewImg');
     if (r.ok && r.path && img) img.src = media(r.path) + '&t=' + Date.now();
+    if (r.ok) syncFramePatchPreview(r.frame || 0);
   }, 160);
 }

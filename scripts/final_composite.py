@@ -6,6 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import frame_masks
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, safe_stem, write_signature
 from outpaint_geometry import crop_box, native_source_layout, source_placement
 from reference_luminance import ffmpeg_curve, identity_curve, reference_luminance_plan
@@ -47,6 +48,13 @@ def signature(args):
     # only those need re-rendering, so the marker is keyed to having a mask at all.
     if values.get('custom_mask'):
         values['custom_mask_feather'] = CUSTOM_MASK_FEATHER_VERSION
+    # Likewise frame masks: absent unless given, so composites without them stay reusable.
+    if values.get('frame_masks'):
+        path = resolve_path(values['frame_masks'])
+        values['frame_masks'] = root_relative(path)
+        values['frame_masks_digest'] = frame_masks.digest(path)
+    else:
+        values.pop('frame_masks', None)
     values['tool'] = 'final_composite.py'
     values['version'] = 13
     return values
@@ -300,14 +308,37 @@ def canvas_feather(args, canvas: tuple[int, int], base_size: tuple[int, int]) ->
     return max(1, int(round(feather * canvas[0] / base_size[0])))
 
 
-def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather: int) -> Path:
-    """Turn the binary custom mask into a feathered keep-alpha for the source overlay.
+def read_binary_mask(mask_path: Path, width: int, height: int):
+    """Read a custom mask the way outpainting did, so the ramp starts where generation did."""
+    try:
+        png = Path(mask_path).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f'Could not read custom mask: {mask_path}') from exc
+    return frame_masks.decode_mask(png, width, height)
 
-    Masked pixels stay fully transparent and the source fades back in over
-    `feather` pixels outside them: the same linear ramp the letterbox edges get,
-    and on the same side of the seam, so masked damage never bleeds through.
-    The mask is a still, so the ramp is built once here rather than per frame
-    in the filter graph.
+
+def keep_alpha(mask, feather: int):
+    """Source keep-alpha for a 0/255 mask: 0 on masked pixels, a linear ramp outside them.
+
+    The ramp is the one the letterbox edges get, and on the same side of the seam, so the
+    generated fill shows whole and masked damage never bleeds back through.
+    """
+    import cv2
+    import numpy as np
+
+    unmasked = np.where(mask >= 128, 0, 255).astype(np.uint8)
+    if unmasked.all():
+        return unmasked
+    # Distance from each unmasked pixel to the nearest masked one; masked pixels are 0.
+    distance = cv2.distanceTransform(unmasked, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.clip(distance * (255.0 / feather), 0, 255).round().astype(np.uint8)
+
+
+def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather: int) -> Path:
+    """Turn the binary custom mask into a feathered keep-alpha still for the source overlay.
+
+    The mask is a still, so the ramp is built once here rather than per frame in the
+    filter graph.
     """
     width, height = canvas
     target = ROOT / '.cache' / 'recomp_masks' / f'{safe_stem(mask_path.name)}_keep_{width}x{height}_f{feather}.png'
@@ -323,25 +354,8 @@ def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather
         return target
 
     import cv2
-    import numpy as np
 
-    custom = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-    if custom is None:
-        raise RuntimeError(f'Could not read custom mask: {mask_path}')
-    # Read it the way outpainting did, so the ramp starts where generation did.
-    if custom.ndim == 3 and custom.shape[2] == 4:
-        custom = custom[:, :, 3]
-    elif custom.ndim == 3:
-        custom = cv2.cvtColor(custom, cv2.COLOR_BGR2GRAY)
-    if custom.shape[:2] != (height, width):
-        custom = cv2.resize(custom, (width, height), interpolation=cv2.INTER_NEAREST)
-    unmasked = np.where(custom >= 16, 0, 255).astype(np.uint8)
-    if unmasked.all():
-        keep = unmasked
-    else:
-        # Distance from each unmasked pixel to the nearest masked one; masked pixels are 0.
-        distance = cv2.distanceTransform(unmasked, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        keep = np.clip(distance * (255.0 / feather), 0, 255).round().astype(np.uint8)
+    keep = keep_alpha(read_binary_mask(mask_path, width, height), feather)
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix('.partial.png')
     if not cv2.imwrite(str(partial), keep):
@@ -352,6 +366,61 @@ def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather
     return target
 
 
+def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: tuple[int, int], feather: int, fps: float, ffmpeg: str) -> Path:
+    """Feathered keep-alpha per source frame, for composites with frame masks.
+
+    Each frame is the keep-alpha of the global custom mask OR'd with that frame's patches.
+    The video stops one frame after the last patched frame, on a frame carrying only the
+    global mask: the filter graph's frame sync repeats a secondary input's last frame, so
+    every later frame keeps the global mask without the video running the clip's length.
+    """
+    import numpy as np
+
+    width, height = canvas
+    target = ROOT / '.cache' / 'recomp_masks' / f'{safe_stem(archive.name)}_keep_{width}x{height}_f{feather}.mkv'
+    sig = {
+        'tool': 'final_composite.py/frame_keep_video',
+        'version': CUSTOM_MASK_FEATHER_VERSION,
+        'frame_masks': root_relative(archive),
+        'frame_masks_digest': frame_masks.digest(archive),
+        'custom_mask': root_relative(custom_mask) if custom_mask else '',
+        'custom_mask_fingerprint': file_fingerprint(custom_mask) if custom_mask else None,
+        'canvas': [width, height],
+        'feather': feather,
+        'fps': round(float(fps), 6),
+    }
+    if resumable_output(target, sig, width=width, height=height):
+        return target
+
+    base = read_binary_mask(custom_mask, width, height) if custom_mask else np.zeros((height, width), dtype=np.uint8)
+    base_keep = keep_alpha(base, feather).tobytes()
+    stored = frame_masks.read_frames(archive)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(f'{target.stem}.partial{target.suffix}')
+    command = [
+        ffmpeg, '-y', '-v', 'error',
+        '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', f'{width}x{height}', '-r', f'{fps:.8f}', '-i', '-',
+        '-c:v', 'ffv1', '-pix_fmt', 'gray', str(partial),
+    ]
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    try:
+        for frame in range(max(stored) + 2):
+            png = stored.get(frame)
+            if png is None:
+                process.stdin.write(base_keep)
+            else:
+                mask = np.maximum(base, frame_masks.decode_mask(png, width, height))
+                process.stdin.write(keep_alpha(mask, feather).tobytes())
+    finally:
+        process.stdin.close()
+    if process.wait() != 0:
+        raise RuntimeError(f'Could not write the per-frame keep mask: {partial}')
+    replace_with_retry(partial, target)
+    write_signature(target, sig)
+    print(f'Feathered {len(stored)} frame mask(s) {feather}px outward: {target}', flush=True)
+    return target
+
+
 def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
@@ -359,7 +428,8 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     fps_text = f"{fps:.8f}"
     crop = source_crop_filter(args)
     color_input = 2 if has_outpainted else 1
-    custom_mask_input = (3 if has_color else 2) if has_outpainted and getattr(args, 'custom_mask', None) else None
+    has_keep_mask = getattr(args, 'custom_mask', None) or getattr(args, 'frame_masks', None)
+    custom_mask_input = (3 if has_color else 2) if has_outpainted and has_keep_mask else None
     # Optionally scale the outpainted video to the delivery output dimensions.
     # This corrects for LTX's model-safe quantisation (e.g. 704p → 720p) so the
     # final composite is at the user's intended resolution.
@@ -398,11 +468,12 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 source_label='src',
             )
             if custom_mask_input is not None:
-                # The custom-mask input is already the feathered keep-alpha (see
-                # feathered_custom_keep_mask). Fold it into the alpha before it is
-                # merged, so the source never has to be split and re-alphaextracted.
+                # The custom-mask input is already the feathered keep-alpha: a still, or
+                # with frame masks a per-frame video (see feathered_custom_keep_mask and
+                # feathered_frame_keep_video). Fold it into the alpha before it is merged,
+                # so the source never has to be split and re-alphaextracted.
                 filters.extend([
-                    f'[{custom_mask_input}:v]scale={base_size[0]}:{base_size[1]}:flags=bilinear,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray[customkeep]',
+                    f'[{custom_mask_input}:v]setpts=N/({fps_text}*TB),scale={base_size[0]}:{base_size[1]}:flags=bilinear,crop=w={placement.width}:h={placement.height}:x={placement.x}:y={placement.y},format=gray[customkeep]',
                     f'[{alpha_label}][customkeep]blend=all_mode=multiply[srcalphacustom]',
                 ])
                 alpha_label = 'srcalphacustom'
@@ -505,8 +576,16 @@ def run(args):
         else:
             print('Reference luminance matching requested without a manifest; using original source luminance.')
     custom_keep = None
-    if outpainted and args.custom_mask:
+    frame_archive = resolve_path(args.frame_masks) if args.frame_masks else None
+    if outpainted and frame_archive and frame_masks.frame_indices(frame_archive):
+        custom_keep = feathered_frame_keep_video(
+            frame_archive, resolve_path(args.custom_mask) if args.custom_mask else None,
+            expected_size, canvas_feather(args, expected_size, base_size), fps, ffmpeg,
+        )
+    elif outpainted and args.custom_mask:
         custom_keep = feathered_custom_keep_mask(resolve_path(args.custom_mask), expected_size, canvas_feather(args, expected_size, base_size))
+    # build_filter wires a keep-mask input only when one of these is set; keep that in step.
+    args.frame_masks = str(frame_archive) if custom_keep and custom_keep.suffix == '.mkv' else None
     cmd = [ffmpeg, '-y']
     inputs, audio_input = input_args(outpainted, source, colorized, custom_keep)
     cmd += inputs
@@ -564,6 +643,7 @@ def build_parser():
     parser.add_argument('--source-black-threshold', type=int, default=24, help='Maximum RGB channel value considered source black when --source-black-transparent is enabled.')
     parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')
     parser.add_argument('--custom-mask', help='Additive full-canvas mask whose selected pixels remain transparent in the source overlay; the source fades back in over --feather-pixels outside them.')
+    parser.add_argument('--frame-masks', help='Zip of per-frame patch masks (see frame_masks.py). Each patch stays transparent in the source overlay on its own frame, feathered like --custom-mask.')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)

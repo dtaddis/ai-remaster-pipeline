@@ -166,9 +166,11 @@ from .media import (
     aspect_preview_at_for_settings,
     aspect_preview_cached,
     aspect_preview_for_settings,
+    aspect_preview_frame_for_settings,
     aspect_preview_identity,
     auto_crop_for_settings,
     browser_playback_for,
+    crop_values_for_settings,
     current_crop_values,
     detect_letterbox_crop,
     draw_source_frame_border,
@@ -205,6 +207,7 @@ from .media import (
     video_dimensions,
     video_metrics,
     media_clip_path,
+    outpaint_frame_canvas_previews,
 )
 
 MODEL_SIZE_MULTIPLE = 32
@@ -218,6 +221,7 @@ OUTPAINT_LORA_DESTINATION = f"models/loras/{DEFAULT_OUTPAINT_LORA}"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
+import frame_masks  # noqa: E402
 import reference_luminance as reference_luma  # noqa: E402
 import chunk_plan  # noqa: E402
 import minimax_h3_outpaint as h3  # noqa: E402
@@ -921,7 +925,7 @@ class PipelineApp:
             source_text = settings_snapshot.get("global", {}).get("source", "")
             source_media = self.source_media_state(source_text)
             section = source_section_state(settings_snapshot)
-            aspect_preview = aspect_preview_for_settings(settings_snapshot) if view == "outpaint" else source_media["aspect_preview"]
+            aspect_preview, aspect_preview_frame = aspect_preview_frame_for_settings(settings_snapshot) if view == "outpaint" else (source_media["aspect_preview"], 0)
             outpaint_chunks = outpaint_chunks_state(settings_snapshot) if view == "outpaint" else {"manifest": "", "rows": []}
             cache = cache_state() if view == "cache" else {}
             payload = {
@@ -952,7 +956,9 @@ class PipelineApp:
                 "source_monochrome": source_media["monochrome"],
                 "source_analysis": source_media["analysis"],
                 "aspect_preview": aspect_preview,
+                "aspect_preview_frame": aspect_preview_frame,
                 "custom_outpaint_mask": custom_outpaint_mask_state(settings_snapshot) if view == "outpaint" else {},
+                "frame_outpaint_masks": frame_outpaint_masks_state(settings_snapshot) if view == "outpaint" else {},
                 "outpaint_chunks": outpaint_chunks,
                 "shot_views": {"manifest": "", "rows": []},
                 "audio_stems": self.audio_stems_state() if view == "audio" else [],
@@ -1659,6 +1665,9 @@ class PipelineApp:
         custom_mask = custom_outpaint_mask_for(source_text, values)
         if custom_mask.is_file():
             add(["--custom-mask", rel(custom_mask)])
+        frame_mask_archive = frame_outpaint_masks_for(source_text, values)
+        if frame_mask_archive.is_file():
+            add(["--frame-masks", rel(frame_mask_archive)])
         crop, _black = _outpaint_crop_black(values)
         for flag, amount in zip(("--crop-left", "--crop-right", "--crop-top", "--crop-bottom"), crop):
             add([flag, str(amount)])
@@ -1777,6 +1786,9 @@ class PipelineApp:
         custom_mask = custom_outpaint_mask_for(self.outpaint_source_for(), outpaint_values)
         if outpainted and custom_mask.is_file():
             add(["--custom-mask", rel(custom_mask)])
+        frame_mask_archive = frame_outpaint_masks_for(self.outpaint_source_for(), outpaint_values)
+        if outpainted and frame_mask_archive.is_file():
+            add(["--frame-masks", rel(frame_mask_archive)])
         if outpainted and is_true(outpaint_values, "outpaint_all_black_regions"):
             add(["--source-black-transparent"])
             add(["--source-black-threshold", outpaint_values.get("black_mask_threshold", "12")])
@@ -2632,14 +2644,18 @@ def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
 
 def custom_outpaint_mask_for(source_text: str, values: dict[str, str]) -> Path:
     """Return the project-owned additive mask for the current outpaint geometry."""
+    return _outpaint_mask_path(source_text, values, "custommask", "png")
+
+
+def _outpaint_mask_path(source_text: str, values: dict[str, str], tag: str, ext: str) -> Path:
     if not source_text:
-        return ROOT / "manifests" / "outpaint_masks" / "unset_custom_mask.png"
+        return ROOT / "manifests" / "outpaint_masks" / f"unset_{tag}.{ext}"
     source = resolve_video_source(source_text)
     aspect = values.get("target_aspect", "16:9")
     work_w, work_h = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
     return ROOT / "manifests" / "outpaint_masks" / aid.outpaint_name(
-        source.name, aspect, work_w, work_h, crop, black, "custommask", "png"
+        source.name, aspect, work_w, work_h, crop, black, tag, ext
     )
 
 
@@ -2704,6 +2720,116 @@ def clear_custom_outpaint_mask() -> dict[str, str | int | bool]:
         target.unlink(missing_ok=True)
         APP.log.append(f"Cleared custom outpaint mask: {rel(target)}")
     return custom_outpaint_mask_state(APP.settings)
+
+
+def frame_outpaint_masks_for(source_text: str, values: dict[str, str]) -> Path:
+    """Return the project-owned per-frame patch masks (a zip) for the current outpaint geometry.
+
+    Keyed exactly like the global custom mask, so new geometry starts fresh patches too.
+    """
+    return _outpaint_mask_path(source_text, values, "framemasks", "zip")
+
+
+def frame_outpaint_masks_state(settings: dict) -> dict:
+    source_text = outpaint_source_for_settings(settings)
+    values = settings.get("outpaint", {})
+    supported = values.get("outpaint_model") == "oumoumad"
+    if not source_text:
+        return {"path": "", "exists": False, "frames": [], "supported": supported}
+    path = frame_outpaint_masks_for(source_text, values)
+    frames = frame_masks.frame_indices(path)
+    return {
+        "path": rel(path),
+        "exists": bool(frames),
+        "frames": frames,
+        "supported": supported,
+        "mtime": path.stat().st_mtime_ns if path.is_file() else 0,
+    }
+
+
+def _frame_mask_editor_source() -> tuple[str, Path]:
+    source_text = APP.outpaint_source_for()
+    if not source_text:
+        raise RuntimeError("Choose source material before editing frame masks.")
+    source = resolve_video_source(source_text)
+    if not source.is_file():
+        # Cleanup or stabilization changes the pixels (and with stabilization, where they sit),
+        # so patches must be painted on the exact video Outpainting will consume.
+        raise RuntimeError("The video Outpainting uses has not been made yet. Run Cleanup and/or Stabilization first, then paint frame masks.")
+    return source_text, source
+
+
+def frame_outpaint_mask_editor(first: int, count: int) -> dict:
+    """Framed canvas frames for the editor, plus the clip's frame count and rate."""
+    _source_text, source = _frame_mask_editor_source()
+    values = APP.settings.get("outpaint", {})
+    metrics = video_metrics(source)
+    previews = outpaint_frame_canvas_previews(
+        source, first, count, values.get("target_aspect", "16:9"), crop_values_for_settings(APP.settings),
+        int(float(values.get("offset_x", "0") or 0)), int(float(values.get("offset_y", "0") or 0)),
+    )
+    first = max(0, min(int(first), max(0, int(metrics.get("frames") or 1) - 1)))
+    return {
+        "first": first,
+        "previews": previews,
+        "frame_count": int(metrics.get("frames") or 0),
+        "fps": float(metrics.get("fps") or 24.0),
+    }
+
+
+def frame_outpaint_mask_image(frame: int) -> dict:
+    """One frame's stored patch as a PNG data URL, or an empty string when it has none."""
+    source_text, _source = _frame_mask_editor_source()
+    png = frame_masks.read_frame(frame_outpaint_masks_for(source_text, APP.settings.get("outpaint", {})), int(frame))
+    return {"frame": int(frame), "image": ("data:image/png;base64," + base64.b64encode(png).decode("ascii")) if png else ""}
+
+
+def save_frame_outpaint_mask(frame: int, image_data: str) -> dict:
+    """Store one frame's patch at the working canvas size; an empty painting removes it."""
+    source_text, _source = _frame_mask_editor_source()
+    frame = int(frame)
+    if frame < 0:
+        raise ValueError("Frame numbers start at 0.")
+    values = APP.settings.get("outpaint", {})
+    target = frame_outpaint_masks_for(source_text, values)
+    png: bytes | None = None
+    if image_data:
+        if not image_data.startswith("data:image/png;base64,"):
+            raise ValueError("Frame mask must be a PNG image.")
+        try:
+            payload = base64.b64decode(image_data.split(",", 1)[1], validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Frame mask is not valid base64 PNG data.") from exc
+        if len(payload) > 32 * 1024 * 1024:
+            raise ValueError("Frame mask is too large.")
+
+        from PIL import Image
+
+        width, height = outpaint_work_size_for_source(
+            source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720")
+        )
+        with Image.open(io.BytesIO(payload)) as uploaded:
+            # Same rules as the global mask: the painted overlay's alpha is the mask, and
+            # nearest-neighbour scaling keeps it binary and aligned to LTX pixels.
+            mask = uploaded.convert("RGBA").getchannel("A").point(lambda value: 255 if value >= 16 else 0)
+            if mask.size != (width, height):
+                mask = mask.resize((width, height), Image.Resampling.NEAREST)
+            if mask.getbbox():
+                buffer = io.BytesIO()
+                mask.save(buffer, format="PNG", optimize=True)
+                png = buffer.getvalue()
+    frame_masks.write_frames(target, {frame: png})
+    APP.log.append(f"{'Saved' if png else 'Cleared'} frame mask {frame}: {rel(target)}")
+    return frame_outpaint_masks_state(APP.settings)
+
+
+def clear_frame_outpaint_masks() -> dict:
+    source_text = APP.outpaint_source_for()
+    if source_text:
+        target = frame_outpaint_masks_for(source_text, APP.settings.get("outpaint", {}))
+        target.unlink(missing_ok=True)
+        APP.log.append(f"Cleared all frame masks: {rel(target)}")
+    return frame_outpaint_masks_state(APP.settings)
 
 
 def cleanup_output_for(source_text: str, values: dict[str, str]) -> str:
