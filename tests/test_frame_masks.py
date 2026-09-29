@@ -127,7 +127,7 @@ class OutpaintFrameMaskTests(unittest.TestCase):
             "--source", "input/example.mp4", "--comfy-dir", str(ROOT),
             "--outpaint-lora", outpaint_video.OUMOUMAD_OUTPAINT_LORA, "--dry-run",
         ])
-        args.chunk_frame_mask_video = ROOT / "chunk_framemask.mkv"
+        args.chunk_frame_mask_videos = {"sentinel": (ROOT / "chunk_framemask.mkv", None)}
         with (
             mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=["arp_outpaint/prepared.mp4", "arp_outpaint_frame_mask/mask.mkv"]),
             mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
@@ -145,6 +145,153 @@ class OutpaintFrameMaskTests(unittest.TestCase):
         self.assertEqual(prompt["9125"]["inputs"]["mask"], ["9121", 0])
         self.assertEqual(prompt["9123"]["inputs"]["mask"], ["9125", 0])
         self.assertEqual(prompt["5114"]["inputs"]["image"], ["9123", 0])
+
+
+def write_video(ffmpeg: str, path: Path, frames, pix_fmt: str, codec: list[str]) -> None:
+    import numpy as np
+
+    height, width = frames[0].shape[:2]
+    process = subprocess.Popen(
+        [ffmpeg, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{width}x{height}", "-r", "24", "-i", "-", *codec, str(path)],
+        stdin=subprocess.PIPE,
+    )
+    for frame in frames:
+        process.stdin.write(np.ascontiguousarray(frame).tobytes())
+    process.stdin.close()
+    assert process.wait() == 0
+
+
+class UnfilledPatchTests(unittest.TestCase):
+    """Oumoumad sometimes hands a patch hole back as flat sentinel black."""
+
+    def setUp(self) -> None:
+        import numpy as np
+
+        self.ffmpeg = outpaint_video.find_ffmpeg()
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.width, self.height = 128, 64
+        hole = np.zeros((self.height, self.width), np.uint8)
+        hole[20:40, 40:70] = 255
+        self.base = np.zeros_like(hole)
+        # Nine frames: frame 0 alone, then one 8-frame latent group carrying the hole.
+        self.mask = self.root / "mask.mkv"
+        write_video(self.ffmpeg, self.mask, [np.zeros_like(hole)] + [hole] * 8, "gray", ["-c:v", "ffv1"])
+        self.hole = hole > 0
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def render(self, name: str, fill: int, dark_background: bool = False) -> Path:
+        import numpy as np
+
+        frame = np.full((self.height, self.width, 3), 30 if dark_background else 150, np.uint8)
+        frame[self.hole] = fill
+        path = self.root / name
+        write_video(self.ffmpeg, path, [frame] * 9, "rgb24", ["-c:v", "ffv1"])
+        return path
+
+    def test_black_blob_on_a_bright_scene_is_unfilled_but_a_dark_fill_on_a_dark_scene_is_not(self) -> None:
+        blob = self.render("blob.mkv", 4)
+        self.assertEqual(outpaint_video.unfilled_patch_frames(blob, self.mask, self.base, self.width, self.height), list(range(1, 9)))
+        painted = self.render("painted.mkv", 140)
+        self.assertEqual(outpaint_video.unfilled_patch_frames(painted, self.mask, self.base, self.width, self.height), [])
+        shadow = self.render("shadow.mkv", 18, dark_background=True)
+        self.assertEqual(outpaint_video.unfilled_patch_frames(shadow, self.mask, self.base, self.width, self.height), [])
+
+    def test_retry_splices_only_the_failed_holes(self) -> None:
+        first = self.render("first.mkv", 4)
+        retry_output = self.render("retry.mkv", 140)
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--intermediate-profile", "lossless",
+            "--outpaint-lora", outpaint_video.OUMOUMAD_OUTPAINT_LORA,
+        ])
+        seeds = []
+
+        def render(seed: int) -> Path:
+            seeds.append(seed)
+            return retry_output
+
+        args.frame_patch_retries = 2
+        result = outpaint_video.retry_unfilled_patches(args, first, (self.mask, self.base), 0, 100, self.width, self.height, render)
+        frames = decode_gray_video(self.ffmpeg, result, self.width, self.height)
+
+        self.assertEqual(seeds, [100 + 7919])  # one retry was enough
+        self.assertGreater(int(frames[4][30, 55]), 100, "hole now painted")
+        self.assertEqual(outpaint_video.unfilled_patch_frames(result, self.mask, self.base, self.width, self.height), [])
+
+    def test_recomposition_skips_patches_the_report_says_are_unfilled(self) -> None:
+        archive = self.root / "frames.zip"
+        frame_masks.write_frames(archive, {3: b"a", 4: b"b"})
+        outpainted = self.root / "out.mkv"
+        report = final_composite.frame_patch_report(outpainted)
+        report.write_text(json.dumps({"frame_masks_digest": frame_masks.digest(archive), "unfilled_frames": [4]}), encoding="utf-8")
+        self.assertEqual(final_composite.unfilled_patch_frames(outpainted, archive), {4})
+        # Once the patches are edited, the report no longer describes them: skip nothing.
+        frame_masks.write_frames(archive, {4: b"edited"})
+        self.assertEqual(final_composite.unfilled_patch_frames(outpainted, archive), set())
+
+
+class OfficialFrameMaskTests(unittest.TestCase):
+    """The official 2.3 / 2.5 graph takes explicit masks, so patches go in per frame there too."""
+
+    def patched_prompt(self, extra_args: list[str], videos: dict, copies: list[str]) -> dict:
+        workflow = json.loads((ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args(["--source", "input/example.mp4", "--comfy-dir", str(ROOT), "--dry-run", *extra_args])
+        args.chunk_frame_mask_videos = videos
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=copies),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint/reference.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 864, "height": 480, "frames": 25, "fps": 24.0}),
+        ):
+            return outpaint_video.patch_workflow(args, workflow, ROOT / "prepared.mp4", ROOT, "arp_outpaint/test", args.prompt, args.negative_prompt, 42)
+
+    def test_exact_and_generation_masks_are_loaded_per_frame(self) -> None:
+        prompt = self.patched_prompt(
+            [], {"exact": (ROOT / "exact.mkv", None), "generation": (ROOT / "generation.mkv", None)},
+            ["arp_outpaint/prepared.mp4", "arp_outpaint_frame_mask/exact.mkv", "arp_outpaint_frame_mask/generation.mkv"],
+        )
+        self.assertEqual(prompt["9100"]["class_type"], "LoadVideo")
+        self.assertEqual(prompt["9100"]["inputs"]["file"], "arp_outpaint_frame_mask/exact.mkv")
+        self.assertEqual(prompt["9103"]["inputs"]["file"], "arp_outpaint_frame_mask/generation.mkv")
+        # The final blend reveals by the exact mask; LTX paints by the generation mask.
+        # Both arrive binarised, so no trace of the picture stays inside a hole.
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9106", 0])
+        self.assertEqual(prompt["5358"]["inputs"]["mask"], ["9108", 0])
+        self.assertEqual(prompt["9106"]["class_type"], "ThresholdMask")
+        self.assertEqual(prompt["9106"]["inputs"]["mask"], ["9101", 0])
+        self.assertEqual(prompt["9101"]["inputs"]["image"], ["9105", 0])
+        self.assertEqual(prompt["9105"]["inputs"]["video"], ["9100", 0])
+        self.assertEqual(prompt["9108"]["inputs"]["mask"], ["9104", 0])
+
+    def test_black_region_mode_adds_the_per_frame_custom_mask(self) -> None:
+        prompt = self.patched_prompt(
+            ["--outpaint-all-black-regions", "--generation-mask-overlap", "0"], {"sentinel": (ROOT / "sentinel.mkv", None)},
+            ["arp_outpaint/prepared.mp4", "arp_outpaint_frame_mask/sentinel.mkv"],
+        )
+        self.assertEqual(prompt["9120"]["class_type"], "LoadVideo")
+        self.assertEqual(prompt["9122"]["inputs"]["destination"], ["9102", 0])
+        self.assertEqual(prompt["9122"]["inputs"]["source"], ["9125", 0])
+        self.assertEqual(prompt["5266"]["inputs"]["mask"], ["9122", 0])
+
+    def test_green_sentinel_left_in_a_hole_counts_as_unfilled(self) -> None:
+        import numpy as np
+
+        ffmpeg = outpaint_video.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hole = np.zeros((64, 128), np.uint8)
+            hole[20:40, 40:70] = 255
+            mask = root / "mask.mkv"
+            write_video(ffmpeg, mask, [hole] * 9, "gray", ["-c:v", "ffv1"])
+            base = np.zeros_like(hole)
+            for name, fill, expected in (("green.mkv", (102, 255, 0), 9), ("grass.mkv", (70, 110, 50), 0)):
+                frame = np.full((64, 128, 3), 120, np.uint8)
+                frame[hole > 0] = fill
+                video = root / name
+                write_video(ffmpeg, video, [frame] * 9, "rgb24", ["-c:v", "ffv1"])
+                failed = outpaint_video.unfilled_patch_frames(video, mask, base, 128, 64, "green")
+                self.assertEqual(len(failed), expected, name)
 
 
 class RecompFrameMaskTests(unittest.TestCase):

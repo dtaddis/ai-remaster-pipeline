@@ -239,6 +239,8 @@ const OUTPAINT_FIELD_TOOLTIPS = {
     'Extend the generation mask this many pixels beneath the protected source edge. A small overlap helps the mask survive {model}\'s spatial compression; too much can make edge objects get regenerated, changed, or omitted. Default: 8.',
   mask_blend_dilation:
     'How far the Laplacian seam blend reaches into the protected source when the generated plate is assembled. Higher values soften a hard join but can create halos or ghosting. Default: 2.',
+  frame_patch_retries:
+    'When {model} leaves a frame patch unfilled, re-render the chunk with a new seed and take only those patches from the new render. Each retry renders the whole chunk again, so it can add a long wait. At 0, unfilled patches are listed in the log and Recomposition leaves the original picture on those frames. Default: 0.',
   seed_qwen_guides:
     'Generate a Qwen-outpainted guide frame at every detected shot change before {model} renders. Use this when {model} returns the original black bars. It is slower, but helps stubborn shots begin from an already-filled frame.',
   outpaint_all_black_regions:

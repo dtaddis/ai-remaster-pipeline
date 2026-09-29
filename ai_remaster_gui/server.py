@@ -1611,6 +1611,7 @@ class PipelineApp:
         add(["--intermediate-profile", canonical_intermediate_profile(self.settings.get("cloud", {}).get("intermediate_format"))])
         add(["--generation-mask-overlap", values.get("generation_mask_overlap", "8")])
         add(["--mask-blend-dilation", values.get("mask_blend_dilation", "2")])
+        add(["--frame-patch-retries", values.get("frame_patch_retries", "0")])
         add(["--black-mask-threshold", values.get("black_mask_threshold", "12")])
         add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
         if values.get("negative_prompt"):
@@ -2733,7 +2734,7 @@ def frame_outpaint_masks_for(source_text: str, values: dict[str, str]) -> Path:
 def frame_outpaint_masks_state(settings: dict) -> dict:
     source_text = outpaint_source_for_settings(settings)
     values = settings.get("outpaint", {})
-    supported = values.get("outpaint_model") == "oumoumad"
+    supported = values.get("outpaint_model", "oumoumad") in ("oumoumad", "official", "ltx25")
     if not source_text:
         return {"path": "", "exists": False, "frames": [], "supported": supported}
     path = frame_outpaint_masks_for(source_text, values)

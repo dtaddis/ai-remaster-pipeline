@@ -53,6 +53,9 @@ def signature(args):
         path = resolve_path(values['frame_masks'])
         values['frame_masks'] = root_relative(path)
         values['frame_masks_digest'] = frame_masks.digest(path)
+        report = frame_patch_report(args.outpainted) if args.outpainted else None
+        if report and report.is_file():
+            values['frame_patch_report_fingerprint'] = file_fingerprint(report)
     else:
         values.pop('frame_masks', None)
     values['tool'] = 'final_composite.py'
@@ -366,7 +369,29 @@ def feathered_custom_keep_mask(mask_path: Path, canvas: tuple[int, int], feather
     return target
 
 
-def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: tuple[int, int], feather: int, fps: float, ffmpeg: str) -> Path:
+def frame_patch_report(outpainted: str | Path) -> Path:
+    """Outpainting's list of frames whose patch LTX left unfilled (see outpaint_video.py)."""
+    path = resolve_path(outpainted)
+    return path.with_name(f"{path.name}.framepatches.json")
+
+
+def unfilled_patch_frames(outpainted: Path, archive: Path) -> set[int]:
+    """Frames to leave unpatched: Outpainting found LTX left their hole as flat black.
+
+    Only trusted while it describes the same frame masks; after an edit it is stale until
+    Outpainting runs again, so nothing is skipped.
+    """
+    report = frame_patch_report(outpainted)
+    try:
+        data = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if data.get("frame_masks_digest") != frame_masks.digest(archive):
+        return set()
+    return {int(frame) for frame in data.get("unfilled_frames") or []}
+
+
+def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: tuple[int, int], feather: int, fps: float, ffmpeg: str, skip: set[int] | None = None) -> Path:
     """Feathered keep-alpha per source frame, for composites with frame masks.
 
     Each frame is the keep-alpha of the global custom mask OR'd with that frame's patches.
@@ -383,6 +408,7 @@ def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: 
         'version': CUSTOM_MASK_FEATHER_VERSION,
         'frame_masks': root_relative(archive),
         'frame_masks_digest': frame_masks.digest(archive),
+        'skipped_frames': sorted(skip or ()),
         'custom_mask': root_relative(custom_mask) if custom_mask else '',
         'custom_mask_fingerprint': file_fingerprint(custom_mask) if custom_mask else None,
         'canvas': [width, height],
@@ -394,7 +420,9 @@ def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: 
 
     base = read_binary_mask(custom_mask, width, height) if custom_mask else np.zeros((height, width), dtype=np.uint8)
     base_keep = keep_alpha(base, feather).tobytes()
-    stored = frame_masks.read_frames(archive)
+    stored = {frame: png for frame, png in frame_masks.read_frames(archive).items() if frame not in (skip or ())}
+    if not stored:
+        stored = {0: None}
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(f'{target.stem}.partial{target.suffix}')
     command = [
@@ -578,9 +606,12 @@ def run(args):
     custom_keep = None
     frame_archive = resolve_path(args.frame_masks) if args.frame_masks else None
     if outpainted and frame_archive and frame_masks.frame_indices(frame_archive):
+        skip = unfilled_patch_frames(outpainted, frame_archive)
+        if skip:
+            print(f'Warning: leaving {len(skip)} frame patch(es) out, because Outpainting could not fill them: frames {sorted(skip)}', flush=True)
         custom_keep = feathered_frame_keep_video(
             frame_archive, resolve_path(args.custom_mask) if args.custom_mask else None,
-            expected_size, canvas_feather(args, expected_size, base_size), fps, ffmpeg,
+            expected_size, canvas_feather(args, expected_size, base_size), fps, ffmpeg, skip,
         )
     elif outpainted and args.custom_mask:
         custom_keep = feathered_custom_keep_mask(resolve_path(args.custom_mask), expected_size, canvas_feather(args, expected_size, base_size))

@@ -94,6 +94,8 @@ LTX_SPATIAL_MASK_CELL = 32
 LTX_TEMPORAL_COMPRESSION = 8      # the VAE packs frame 0 alone, then 8 frames per latent
 # How frame patches reach LTX; renders made with an earlier mode must not be reused.
 FRAME_MASK_MODE = "latent_group_union"
+# Share of a patch hole left as flat sentinel black before it counts as unfilled.
+UNFILLED_PATCH_FRACTION = 0.3
 
 # ARP-owned ComfyUI link IDs.  The imported LTX templates never allocate above 15000,
 # so every edge ARP injects lives above 19000.  patch_link() rewrites whichever edge
@@ -914,7 +916,7 @@ def generation_mask_image(exact_mask: Path, args, prepared: Path, width: int, he
     if custom is not None:
         # Latent safety only: the overlap that widens a band exists to give the sampler
         # context, but a custom region needs just enough growth to occupy a whole cell.
-        radius = min(overlap_limit, LTX_SPATIAL_MASK_CELL)
+        radius = custom_region_growth(args)
         if radius:
             kernel = np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8)
             custom = cv2.dilate(custom, kernel)
@@ -966,24 +968,35 @@ def chunk_frame_mask_digest(args, start_frame: int, end_frame: int, generation_f
 def chunk_frame_mask_video(
     args, chunk_prepared: Path, start_frame: int, end_frame: int,
     generation_fps: float, source_fps: float, width: int, height: int,
+    base=None, grow: int = 0, kind: str = "framemask",
 ) -> Path | None:
-    """Build the chunk's per-frame generation mask, or None when no frame in it is patched.
+    """Build one of the chunk's per-frame masks, or None when no frame in it is patched.
 
-    Each frame is the global custom mask OR'd with that frame's patches, so this replaces
-    the broadcast still for the chunk. It is lossless (FFV1) and one frame per generated
-    frame, so the masks land on exactly the frames they were painted on.
+    Each frame is the chunk's static mask (`base`; by default the global custom mask) OR'd
+    with that frame's patches, grown by `grow` pixels, so this replaces the broadcast still
+    for the chunk. It is lossless (FFV1) and one frame per generated frame, so the masks
+    land on exactly the frames they were painted on.
     """
+    import hashlib
+
+    import numpy as np
+
     digest = chunk_frame_mask_digest(args, start_frame, end_frame, generation_fps, source_fps)
     if digest is None:
         return None
+    if base is None:
+        base = custom_mask_array(args, width, height)
+    if base is None:
+        base = np.zeros((height, width), dtype=np.uint8)
     covered = chunk_source_frames(start_frame, end_frame, generation_fps, source_fps)
-    target = chunk_prepared.with_name(f"{chunk_prepared.stem}_framemask.mkv")
+    target = chunk_prepared.with_name(f"{chunk_prepared.stem}_{kind}.mkv")
     sig = {
-        "version": 2,
+        "version": 3,
         "tool": "outpaint_video.py/chunk_frame_mask",
+        "kind": kind,
         "frame_masks_digest": digest,
-        "custom_mask": root_relative(Path(args.custom_mask)) if getattr(args, "custom_mask", None) else "",
-        "custom_mask_fingerprint": file_fingerprint(Path(args.custom_mask)) if getattr(args, "custom_mask", None) and Path(args.custom_mask).is_file() else None,
+        "base_digest": hashlib.sha1(np.ascontiguousarray(base).tobytes()).hexdigest(),
+        "grow": int(grow),
         "start_frame": start_frame,
         "end_frame": end_frame,
         "generation_fps": round(float(generation_fps), 6),
@@ -993,14 +1006,14 @@ def chunk_frame_mask_video(
     if not getattr(args, "force", False) and resumable_output(target, sig, width=width, height=height):
         return target
 
-    import numpy as np
+    import cv2
 
     needed = sorted({frame for frames in covered for frame in frames})
     stored = frame_masks.read_frames(Path(args.frame_masks), needed)
     decoded = {frame: frame_masks.decode_mask(png, width, height) for frame, png in stored.items()}
-    base = custom_mask_array(args, width, height)
-    if base is None:
-        base = np.zeros((height, width), dtype=np.uint8)
+    if grow > 0:
+        kernel = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
+        decoded = {frame: cv2.dilate(mask, kernel) for frame, mask in decoded.items()}
     # LTX's VAE packs frame 0 alone and then every 8 frames into one latent frame, and the
     # IC-LoRA guide goes through it too. Holes that differ within a group are merged in the
     # latent, so LTX paints them a few frames off and leaves the rest of each patch showing.
@@ -1033,11 +1046,234 @@ def chunk_frame_mask_video(
     patched = sum(1 for frames in covered if any(frame in decoded for frame in frames))
     masked = sum(1 for index in range(len(covered)) if ltx_latent_group(index) in group_masks)
     print(
-        f"Per-frame outpaint mask: {patched} generated frame(s) carry patches; {masked}/{len(covered)} "
+        f"Per-frame outpaint {kind}: {patched} generated frame(s) carry patches; {masked}/{len(covered)} "
         f"inpaint them, as whole {LTX_TEMPORAL_COMPRESSION}-frame latent groups: {target}",
         flush=True,
     )
     return target
+
+
+def custom_region_growth(args) -> int:
+    """Pixels a user-painted region grows by in the generation mask (see generation_mask_image)."""
+    return min(max(0, int(getattr(args, "generation_mask_overlap", 8))), LTX_SPATIAL_MASK_CELL)
+
+
+def patch_fill_sentinel(args) -> str:
+    """What an unpainted patch hole looks like: Oumoumad's black, or the official inpaint green."""
+    return "black" if uses_legacy_black_outpaint(getattr(args, "outpaint_lora", "")) else "green"
+
+
+def chunk_patch_masks(
+    args, chunk_prepared: Path, start_frame: int, end_frame: int,
+    generation_fps: float, source_fps: float, width: int, height: int,
+) -> dict[str, tuple[Path, Any]]:
+    """The per-frame mask videos this chunk's graph needs, as {role: (video, static base)}.
+
+    - "sentinel": global custom mask + patches. Oumoumad blacks it out of the guide; the
+      official all-black-regions graph adds it to the per-frame black-pixel mask.
+    - "exact" and "generation": the official graph's two masks. The exact one (bands +
+      custom mask + patches) decides what the final blend reveals; the generation one is
+      grown so narrow regions survive LTX's 32px latent cells, patches included.
+
+    The first of "sentinel"/"exact" is also what unfilled-patch detection measures.
+    """
+    import cv2
+    import numpy as np
+
+    if chunk_frame_mask_digest(args, start_frame, end_frame, generation_fps, source_fps) is None:
+        return {}
+    build = lambda **kind: chunk_frame_mask_video(  # noqa: E731
+        args, chunk_prepared, start_frame, end_frame, generation_fps, source_fps, width, height, **kind,
+    )
+    if uses_legacy_black_outpaint(args.outpaint_lora) or getattr(args, "outpaint_all_black_regions", False):
+        base = custom_mask_array(args, width, height)
+        if base is None:
+            base = np.zeros((height, width), dtype=np.uint8)
+        return {"sentinel": (build(base=base), base)}
+    exact_path = official_mask_image(chunk_prepared, args, width, height)
+    generation_path = generation_mask_image(exact_path, args, chunk_prepared, width, height)
+    exact = cv2.imread(str(exact_path), cv2.IMREAD_GRAYSCALE)
+    generation = cv2.imread(str(generation_path), cv2.IMREAD_GRAYSCALE)
+    return {
+        "exact": (build(base=exact, kind="exactmask"), exact),
+        "generation": (build(base=generation, grow=custom_region_growth(args), kind="generationmask"), generation),
+    }
+
+
+def patch_check_masks(masks: dict[str, tuple[Path, Any]]) -> tuple[Path, Any] | None:
+    return masks.get("sentinel") or masks.get("exact")
+
+
+def _decoded_frames(path: Path, width: int, height: int, pix_fmt: str = "gray"):
+    """Yield a video's frames one at a time, exactly as stored (no frame-rate resampling)."""
+    import numpy as np
+
+    channels = 3 if pix_fmt == "rgb24" else 1
+    shape = (height, width, channels) if channels > 1 else (height, width)
+    size = width * height * channels
+    process = subprocess.Popen(
+        [find_ffmpeg(), "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
+         "-vf", f"scale={width}:{height}", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"],
+        stdout=subprocess.PIPE,
+    )
+    try:
+        while True:
+            data = process.stdout.read(size)
+            if len(data) < size:
+                break
+            yield np.frombuffer(data, dtype=np.uint8).reshape(shape)
+    finally:
+        process.stdout.close()
+        process.wait()
+
+
+def unfilled_patch_frames(raw: Path, mask_video: Path, base, width: int, height: int, sentinel: str = "black") -> list[int]:
+    """Chunk frames whose frame patch came back as the model's sentinel, unpainted.
+
+    Oumoumad paints most holes, but now and then passes one straight through as a flat
+    near-black blob. A hole counts as unfilled when a good share of it is far darker than
+    the ring around it: legitimately dark fills (a shadow, a dark post) match their ring.
+    The official graph marks holes with #66ff00 instead, which nothing in a film scan
+    resembles, so there a share of that green is enough.
+    """
+    import cv2
+    import numpy as np
+
+    ring_kernel = np.ones((41, 41), np.uint8)
+    keep = base <= 127
+    failed = []
+    pix_fmt = "rgb24" if sentinel == "green" else "gray"
+    for index, (frame, mask) in enumerate(zip(_decoded_frames(raw, width, height, pix_fmt), _decoded_frames(mask_video, width, height))):
+        hole = (mask > 127) & keep
+        if hole.sum() < 64:
+            continue
+        if sentinel == "green":
+            pixels = frame[hole].astype(np.int16)
+            red, green, blue = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+            unfilled = (green >= 170) & (green - np.maximum(red, blue) >= 70)
+            if float(np.mean(unfilled)) >= UNFILLED_PATCH_FRACTION:
+                failed.append(index)
+            continue
+        ring = (cv2.dilate(hole.astype(np.uint8), ring_kernel) > 0) & ~hole & keep
+        if not ring.any():
+            continue
+        threshold = min(20.0, 0.5 * float(np.percentile(frame[ring], 10)))
+        if float(np.mean(frame[hole] < threshold)) >= UNFILLED_PATCH_FRACTION:
+            failed.append(index)
+    return failed
+
+
+def splice_patch_retry(first: Path, retry: Path, mask_video: Path, base, groups: set[int], target: Path, width: int, height: int, profile: str) -> None:
+    """Take the retry's pixels inside the holes of `groups`, and the first render everywhere else.
+
+    Both renders reproduce the same source outside the holes, so a few pixels of feather
+    hide the seam. The first render's audio is kept.
+    """
+    import cv2
+    import numpy as np
+
+    fps = float(probe_video(first).get("fps") or 24.0)
+    partial = target.with_name(f"{target.stem}.partial{target.suffix}")
+    command = [
+        find_ffmpeg(), "-y", "-v", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{fps:.8f}", "-i", "-",
+        "-i", str(first), "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+        *intermediate_codec_args(profile, fast=True), *container_args(str(partial), profile), str(partial),
+    ]
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    keep = base <= 127
+    try:
+        for index, (a, b, mask) in enumerate(zip(
+            _decoded_frames(first, width, height, "rgb24"),
+            _decoded_frames(retry, width, height, "rgb24"),
+            _decoded_frames(mask_video, width, height),
+        )):
+            if ltx_latent_group(index) in groups:
+                hole = ((mask > 127) & keep).astype(np.uint8) * 255
+                weight = cv2.GaussianBlur(cv2.dilate(hole, np.ones((9, 9), np.uint8)), (0, 0), 2.0).astype(np.float32)[..., None] / 255.0
+                a = (a * (1.0 - weight) + b * weight).round().astype(np.uint8)
+            process.stdin.write(np.ascontiguousarray(a).tobytes())
+    finally:
+        process.stdin.close()
+    if process.wait() != 0:
+        raise RuntimeError(f"Could not splice the frame-patch retry into {target}")
+    replace_with_retry(partial, target, "Frame-patch retry splice")
+
+
+def frame_ranges_text(frames: list[int]) -> str:
+    """Compact "3-7, 12, 20-22" form of a sorted frame list, for log lines."""
+    spans: list[list[int]] = []
+    for frame in frames:
+        if spans and frame == spans[-1][1] + 1:
+            spans[-1][1] = frame
+        else:
+            spans.append([frame, frame])
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)
+
+
+def retry_unfilled_patches(args, chunk_raw: Path, check: tuple[Path, Any], chunk_index: int, chunk_seed: int, width: int, height: int, render) -> Path:
+    """Re-render with new seeds while frame patches come back unfilled, splicing in only their holes.
+
+    Which holes the model leaves unpainted looks seed-dependent, so a fresh seed usually
+    paints them. Everything outside the failed groups' holes stays as first rendered.
+    `check` is the chunk's (mask video, static base) from patch_check_masks.
+    """
+    mask_video, base = check
+    retries = max(0, int(getattr(args, "frame_patch_retries", 0)))
+    for attempt in range(1, retries + 1):
+        failed = unfilled_patch_frames(chunk_raw, mask_video, base, width, height, patch_fill_sentinel(args))
+        if not failed:
+            return chunk_raw
+        groups = {ltx_latent_group(index) for index in failed}
+        seed = chunk_seed + 7919 * attempt
+        print(
+            f"Chunk {chunk_index + 1}: frame patches came back unfilled on chunk frames {frame_ranges_text(failed)}; "
+            f"re-rendering those with seed {seed} (retry {attempt}/{retries}).",
+            flush=True,
+        )
+        produced = render(seed)
+        target = chunk_raw.with_suffix(".mkv")
+        splice_patch_retry(chunk_raw, produced, mask_video, base, groups, target, width, height, args.intermediate_profile)
+        if target != chunk_raw:
+            chunk_raw.unlink(missing_ok=True)
+            chunk_raw = target
+    return chunk_raw
+
+
+def frame_patch_report_path(output: Path) -> Path:
+    """Sidecar beside the outpainted video listing frames whose patch LTX left unfilled."""
+    return output.with_name(f"{output.name}.framepatches.json")
+
+
+def write_frame_patch_report(args, output: Path, checks: list[tuple[Path, tuple[Path, Any], list[range]]], width: int, height: int) -> None:
+    """Record source frames whose patch is still unfilled, so Recomposition can skip them.
+
+    Revealing an unfilled patch would put a black blob in the picture; skipping it leaves
+    the original defect on that frame, which is the lesser evil. The report is keyed to
+    the frame masks it was measured with, so edited patches are never skipped by mistake.
+    """
+    report = frame_patch_report_path(output)
+    if not getattr(args, "frame_masks", None):
+        report.unlink(missing_ok=True)
+        return
+    unfilled: set[int] = set()
+    for raw, (mask_video, base), covered in checks:
+        for index in unfilled_patch_frames(raw, mask_video, base, width, height, patch_fill_sentinel(args)):
+            unfilled.update(covered[index])
+    patched = set(frame_masks.frame_indices(Path(args.frame_masks)))
+    frames = sorted(unfilled & patched)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps({
+        "frame_masks": root_relative(Path(args.frame_masks)),
+        "frame_masks_digest": frame_masks.digest(Path(args.frame_masks)),
+        "unfilled_frames": frames,
+    }, indent=2) + "\n", encoding="utf-8")
+    if frames:
+        print(
+            f"Warning: {len(frames)} frame patch(es) are still unfilled after retries, on frames {frame_ranges_text(frames)}. "
+            "Recomposition will leave the original picture on those frames. Re-run Outpainting with a different seed to try again.",
+            flush=True,
+        )
 
 
 def patch_video_only_sampling(workflow: dict[str, Any]) -> None:
@@ -1111,7 +1347,7 @@ def patch_legacy_black_graph(
     custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
     # A chunk with frame masks carries its own mask video: the global mask OR'd with each
     # frame's patches, one mask per generated frame. It replaces the broadcast still.
-    frame_mask_video = getattr(args, "chunk_frame_mask_video", None)
+    frame_mask_video = (getattr(args, "chunk_frame_mask_videos", None) or {}).get("sentinel", (None, None))[0]
     if custom_mask_text or frame_mask_video:
         load_link = CUSTOM_MASK_LINK_BASE
         source_link = CUSTOM_MASK_LINK_BASE + 1
@@ -1246,6 +1482,59 @@ def patch_legacy_black_graph(
     set_input_link(workflow, "3159", "image", GUIDE_IMAGE_LINK)
 
 
+def add_mask_video_nodes(
+    workflow: dict[str, Any], video: Path, comfy_dir: Path,
+    ids: tuple[int, int, int, int], links: tuple[int, int, int], output_links: list[int], title: str,
+) -> int:
+    """Load a per-frame mask video as a binary MASK batch; returns the node that outputs it.
+
+    LoadVideo -> GetVideoComponents -> ImageToMask -> ThresholdMask. The threshold matters:
+    ComfyUI decodes the lossless mask's white as 0.996, and both LTX mask consumers blend by
+    the mask value, so without it a trace of the picture survives inside every hole.
+    `ids` are (load, components, channel, threshold) nodes; `links` are the (video, image,
+    channel) edges between them.
+    """
+    load_id, components_id, channel_id, threshold_id = ids
+    video_link, image_link, channel_link = links
+    add_or_replace_node(workflow, {
+        "id": load_id, "type": "LoadVideo", "title": title, "mode": 0, "inputs": [],
+        "outputs": [{"name": "VIDEO", "type": "VIDEO", "links": [video_link]}],
+        "widgets_values": [copy_to_comfy_input(Path(video), comfy_dir, "arp_outpaint_frame_mask"), "image"],
+    })
+    add_or_replace_node(workflow, {
+        "id": components_id, "type": "GetVideoComponents", "title": f"{title} frames", "mode": 0,
+        "inputs": [{"name": "video", "type": "VIDEO", "link": video_link}],
+        "outputs": [
+            {"name": "images", "type": "IMAGE", "links": [image_link]},
+            {"name": "audio", "type": "AUDIO", "links": []},
+            {"name": "fps", "type": "FLOAT", "links": []},
+        ],
+        "widgets_values": [],
+    })
+    add_or_replace_node(workflow, {
+        "id": channel_id, "type": "ImageToMask", "title": f"{title} channel", "mode": 0,
+        "inputs": [
+            {"name": "image", "type": "IMAGE", "link": image_link},
+            {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+        ],
+        "outputs": [{"name": "MASK", "type": "MASK", "links": [channel_link]}],
+        "widgets_values": ["red"],
+    })
+    add_or_replace_node(workflow, {
+        "id": threshold_id, "type": "ThresholdMask", "title": f"{title} binarised", "mode": 0,
+        "inputs": [
+            {"name": "mask", "type": "MASK", "link": channel_link},
+            {"name": "value", "type": "FLOAT", "widget": {"name": "value"}},
+        ],
+        "outputs": [{"name": "MASK", "type": "MASK", "links": list(output_links)}],
+        "widgets_values": [0.5],
+    })
+    patch_link(workflow, video_link, load_id, 0, components_id, 0, "VIDEO")
+    patch_link(workflow, image_link, components_id, 0, channel_id, 0, "IMAGE")
+    patch_link(workflow, channel_link, channel_id, 0, threshold_id, 0, "MASK")
+    return threshold_id
+
+
 def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, comfy_dir: Path, width: int, height: int) -> None:
     """Use the official v0.9 mask conditioning in one full-resolution generation pass.
 
@@ -1265,6 +1554,8 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
 
     source_link = 14364
     mask_link = 14369
+    # Per-frame mask videos for a chunk with frame patches (see chunk_patch_masks).
+    frame_videos = getattr(args, "chunk_frame_mask_videos", None) or {}
     # The prepared frames already have exact model-safe geometry. Feed them directly into
     # the mask compositor: no resize node and no interpolation of source pixels.
     patch_link(workflow, source_link, 5168, 0, 5358, 0, "IMAGE")
@@ -1313,35 +1604,46 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         patch_link(workflow, invert_link, 9101, 0, 9102, 0, "MASK")
         mask_source_id = 9102
         custom_mask_text = str(getattr(args, "custom_mask", "") or "").strip()
-        if custom_mask_text:
-            custom_mask_name = copy_to_comfy_input(Path(custom_mask_text), comfy_dir, "arp_outpaint_custom_mask")
+        # With frame patches, the custom mask arrives per frame (global mask + patches).
+        sentinel_video = frame_videos.get("sentinel", (None, None))[0]
+        if custom_mask_text or sentinel_video:
             load_link = CUSTOM_MASK_LINK_BASE
             dynamic_link = CUSTOM_MASK_LINK_BASE + 1
             custom_channel_link = CUSTOM_MASK_LINK_BASE + 2
-            add_or_replace_node(workflow, {
-                "id": 9120,
-                "type": "LoadImage",
-                "title": "ARP custom outpaint mask",
-                "mode": 0,
-                "inputs": [],
-                "outputs": [
-                    {"name": "IMAGE", "type": "IMAGE", "links": [load_link]},
-                    {"name": "MASK", "type": "MASK", "links": []},
-                ],
-                "widgets_values": [custom_mask_name, "image"],
-            })
-            add_or_replace_node(workflow, {
-                "id": 9121,
-                "type": "ImageToMask",
-                "title": "ARP custom mask channel",
-                "mode": 0,
-                "inputs": [
-                    {"name": "image", "type": "IMAGE", "link": load_link},
-                    {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
-                ],
-                "outputs": [{"name": "MASK", "type": "MASK", "links": [custom_channel_link]}],
-                "widgets_values": ["red"],
-            })
+            if sentinel_video:
+                custom_source_id = add_mask_video_nodes(
+                    workflow, sentinel_video, comfy_dir, (9120, 9124, 9121, 9125),
+                    (CUSTOM_MASK_LINK_BASE + 5, load_link, CUSTOM_MASK_LINK_BASE + 6), [custom_channel_link],
+                    "ARP per-frame custom outpaint mask",
+                )
+            else:
+                custom_mask_name = copy_to_comfy_input(Path(custom_mask_text), comfy_dir, "arp_outpaint_custom_mask")
+                add_or_replace_node(workflow, {
+                    "id": 9120,
+                    "type": "LoadImage",
+                    "title": "ARP custom outpaint mask",
+                    "mode": 0,
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": [load_link]},
+                        {"name": "MASK", "type": "MASK", "links": []},
+                    ],
+                    "widgets_values": [custom_mask_name, "image"],
+                })
+                add_or_replace_node(workflow, {
+                    "id": 9121,
+                    "type": "ImageToMask",
+                    "title": "ARP custom mask channel",
+                    "mode": 0,
+                    "inputs": [
+                        {"name": "image", "type": "IMAGE", "link": load_link},
+                        {"name": "channel", "type": "COMBO", "widget": {"name": "channel"}},
+                    ],
+                    "outputs": [{"name": "MASK", "type": "MASK", "links": [custom_channel_link]}],
+                    "widgets_values": ["red"],
+                })
+                patch_link(workflow, load_link, 9120, 0, 9121, 0, "IMAGE")
+                custom_source_id = 9121
             add_or_replace_node(workflow, {
                 "id": 9122,
                 "type": "MaskComposite",
@@ -1357,9 +1659,8 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
                 "outputs": [{"name": "MASK", "type": "MASK", "links": []}],
                 "widgets_values": [0, 0, "add"],
             })
-            patch_link(workflow, load_link, 9120, 0, 9121, 0, "IMAGE")
             patch_link(workflow, dynamic_link, 9102, 0, 9122, 0, "MASK")
-            patch_link(workflow, custom_channel_link, 9121, 0, 9122, 1, "MASK")
+            patch_link(workflow, custom_channel_link, custom_source_id, 0, 9122, 1, "MASK")
             # 9102 now feeds the compositor instead of the exact-mask consumer below.
             node_by_id(workflow, "9102")["outputs"][0]["links"] = [dynamic_link]
             mask_source_id = 9122
@@ -1403,6 +1704,19 @@ def patch_official_masked_graph(workflow: dict[str, Any], args, prepared: Path, 
         for index in range(dilation_index):
             output_link = mask_link if index == dilation_index - 1 else DILATION_LINK_BASE + index + 1
             node_by_id(workflow, str(9103 + index))["outputs"][0]["links"] = [output_link]
+    elif frame_videos.get("exact") and frame_videos.get("generation"):
+        # A chunk with frame patches: both masks change from frame to frame. The exact mask
+        # decides what the final blend reveals; the generation mask is what LTX paints.
+        mask_source_id = add_mask_video_nodes(
+            workflow, frame_videos["exact"][0], comfy_dir, (9100, 9105, 9101, 9106),
+            (MASK_LINK_BASE + 4, MASK_LINK_BASE, MASK_LINK_BASE + 5), [14377],
+            "ARP per-frame outpaint mask",
+        )
+        generation_source_id = add_mask_video_nodes(
+            workflow, frame_videos["generation"][0], comfy_dir, (9103, 9107, 9104, 9108),
+            (MASK_LINK_BASE + 6, MASK_LINK_BASE + 3, MASK_LINK_BASE + 7), [mask_link],
+            "ARP per-frame latent-safe generation mask",
+        )
     else:
         mask = official_mask_image(prepared, args, width, height)
         generation_mask = generation_mask_image(mask, args, prepared, width, height)
@@ -3147,7 +3461,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=1.0, help=argparse.SUPPRESS)
     parser.add_argument("--outpaint-all-black-regions", action="store_true", help="Leave source blacks untouched so black regions inside the source can be outpainted.")
     parser.add_argument("--custom-mask", help="Optional additive PNG mask. White or opaque pixels are outpainted on every frame.")
-    parser.add_argument("--frame-masks", help="Optional zip of per-frame patch masks (see frame_masks.py), added to the custom mask on the frames they were painted on. Oumoumad only.")
+    parser.add_argument("--frame-patch-retries", type=int, default=0, help="Re-render a chunk with a new seed up to this many times when frame patches come back unfilled, splicing in only those holes.")
+    parser.add_argument("--frame-masks", help="Optional zip of per-frame patch masks (see frame_masks.py), added to the custom mask on the frames they were painted on. LTX models only.")
     parser.add_argument("--intermediate-profile", choices=["low", "medium", "high", "lossless"], default="high")
     parser.add_argument("--allow-color-outpaint", action="store_true", help="Allow colour generation even when the source is detected as monochrome.")
     # Qwen guide seeding: when LTX won't outpaint, auto-generate filled guide frames at every
@@ -3211,10 +3526,11 @@ def main() -> int:
     # An archive with no frames left in it is the same as none, and keeps signatures unchanged.
     frame_mask_archive = resolve_path(args.frame_masks) if args.frame_masks else None
     args.frame_masks = str(frame_mask_archive) if frame_mask_archive and frame_masks.frame_indices(frame_mask_archive) else None
-    if args.frame_masks and (uses_masked_pass(args) or args.ltx25_two_stage or not uses_legacy_black_outpaint(args.outpaint_lora)):
+    if args.frame_masks and (uses_masked_pass(args) or args.ltx25_two_stage):
         raise SystemExit(
-            "Frame masks are only supported with the Oumoumad outpaint LoRA. Switch the outpaint model "
-            "to Oumoumad, or clear the frame masks, and run Outpainting again."
+            "Frame masks work with the LTX outpaint models (2.3 Oumoumad, 2.3 Official, 2.5), not with "
+            "Wan VACE, MiniMax H3 or a legacy two-stage 2.5 workflow. Switch the outpaint model, or clear "
+            "the frame masks, and run Outpainting again."
         )
     if not (comfy_dir / "main.py").exists():
         raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
@@ -3393,6 +3709,8 @@ def main() -> int:
             base_guide_strength = getattr(args, "guide_strength", 0.7)
             raw_chunks: list[Path] = []
             effective_ranges: list[tuple[int, int, int]] = []
+            # (raw chunk, its frame-mask video, source frames per chunk frame) for the patch report.
+            patch_checks: list[tuple[Path, tuple[Path, Any], list[range]]] = []
             chunk_offsets: dict[int, tuple[int, int]] = {}
             shot_cuts = wan_shot_cuts(generation_prepared, wan_shot_detection_settings(args)) if uses_masked_pass(args) else []
             for range_index, (chunk_index, start_frame, end_frame) in enumerate(ranges):
@@ -3478,6 +3796,11 @@ def main() -> int:
                     continue
                 if not args.force and resumable_output(chunk_raw, chunk_sig, video_like=chunk_prepared):
                     print(f"Reuse raw Comfy chunk: {chunk_raw}", flush=True)
+                    check = patch_check_masks(chunk_patch_masks(
+                        args, chunk_prepared, start_frame, end_frame, generation_fps, source_fps, render_width, render_height,
+                    )) if chunk_mask_digest else None
+                    if check:
+                        patch_checks.append((chunk_raw, check, chunk_source_frames(start_frame, end_frame, generation_fps, source_fps)))
                     raw_chunks.append(chunk_raw)
                     effective_ranges.append((chunk_index, start_frame, end_frame))
                     continue
@@ -3514,21 +3837,32 @@ def main() -> int:
                         [cut - start_frame for cut in shot_cuts if start_frame < cut < end_frame],
                     )
                 else:
-                    args.chunk_frame_mask_video = chunk_frame_mask_video(
+                    # Read by patch_legacy_black_graph / patch_official_masked_graph.
+                    args.chunk_frame_mask_videos = chunk_patch_masks(
                         args, chunk_prepared, start_frame, end_frame, generation_fps, source_fps, render_width, render_height,
-                    ) if chunk_mask_digest else None
-                    workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
-                    prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, auto_guide)
-                    prompt = save_chunk_for_profile(prompt, args.output_node_id, args.intermediate_profile)
-                    prompt_id = queue_prompt(args.comfy_url, prompt)
-                    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-                    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
-                    produced = newest_output(extract_output_files(history, comfy_output_root))
+                    ) if chunk_mask_digest else {}
+                    check = patch_check_masks(args.chunk_frame_mask_videos)
+
+                    def render_ltx(seed: int) -> Path:
+                        workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
+                        prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, seed, guide_image, extra_guides, auto_guide)
+                        prompt = save_chunk_for_profile(prompt, args.output_node_id, args.intermediate_profile)
+                        prompt_id = queue_prompt(args.comfy_url, prompt)
+                        print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
+                        history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+                        return newest_output(extract_output_files(history, comfy_output_root))
+
+                    produced = render_ltx(chunk_seed)
                     chunk_raw = chunk_raw.with_suffix(produced.suffix.lower())
                     chunk_raw.parent.mkdir(parents=True, exist_ok=True)
                     chunk_tmp = chunk_raw.with_suffix(chunk_raw.suffix + ".partial")
                     shutil.copy2(produced, chunk_tmp)
                     replace_with_retry(chunk_tmp, chunk_raw, f"Outpaint chunk {chunk_index + 1}")
+                    if check:
+                        chunk_raw = retry_unfilled_patches(
+                            args, chunk_raw, check, chunk_index, chunk_seed, render_width, render_height, render_ltx,
+                        )
+                        patch_checks.append((chunk_raw, check, chunk_source_frames(start_frame, end_frame, generation_fps, source_fps)))
                 write_signature(chunk_raw, chunk_sig)
                 if superseded != chunk_raw:
                     # Lookups fall back between .mkv and .mp4, so a stale sibling must not survive.
@@ -3555,6 +3889,7 @@ def main() -> int:
             if restitched:
                 write_signature(raw_output, raw_sig)
                 print(f"Wrote raw Comfy render: {raw_output}", flush=True)
+                write_frame_patch_report(args, output, patch_checks, render_width, render_height)
             elif args.only_chunk is not None:
                 return 0
 

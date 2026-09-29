@@ -33,7 +33,7 @@ function frameMaskSummaryText() {
   const info = frameMaskState();
   const count = (info.frames || []).length;
   const patched = count ? `${count} frame${count === 1 ? '' : 's'} patched.` : 'No frames patched yet.';
-  const model = info.supported ? '' : ' Frame masks are used by the Oumoumad outpaint model only.';
+  const model = info.supported ? '' : ' Frame masks are used by the LTX outpaint models only (not Wan VACE or H3).';
   return `${patched}${model}`;
 }
 
