@@ -7,16 +7,21 @@ import re
 import shutil
 import subprocess
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt_with_progress, wait_for_comfy
 from common import ROOT, copy_to_comfy_input, ffprobe_for, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
 from dependency_manager import (
+    LTX25_CQ_ENHANCER_LORA,
+    LTX25_DEV_GGUF_MODEL,
+    LTX25_DISTILLED_LORA,
     LTX25_GGUF_MODEL,
     LTX25_PIXEL_UPSCALER_LORA,
     LTX25_TEXT_ENCODER,
     LTX25_VIDEO_VAE,
+    ensure_ltx25_cq_enhancer_models,
     ensure_ltx25_upscale_models,
 )
 
@@ -41,7 +46,12 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
 )
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, migrate_profile_name
 
-UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25"}
+UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
+# The CQ Enhancer restores at its working size; one of these then takes it to delivery size.
+CQ_FINISH_METHODS = ("flashvsr", "seedvr2", "ltx25", "lanczos")
+# The CQ LoRA was trained on 30 fps clips; its author warns other rates cause artefacts.
+CQ_FPS = 30.0
+CQ_DISTILLED_LORA_STRENGTH = 0.5
 DEFAULT_SEEDVR2_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 CURRENT_INTERMEDIATE_PROFILE = "high"
 
@@ -79,6 +89,26 @@ def encode_upscale_delivery(ffmpeg: str, ai_upscale: Path, output: Path) -> None
 def upscale_method(args: argparse.Namespace) -> str:
     method = str(getattr(args, "method", "flashvsr")).lower()
     return method if method in UPSCALE_METHODS else "flashvsr"
+
+
+def cq_finish_method(args: argparse.Namespace) -> str:
+    finish = str(getattr(args, "cq_finish", "flashvsr")).lower()
+    return finish if finish in CQ_FINISH_METHODS else "flashvsr"
+
+
+def finish_args(args: argparse.Namespace) -> argparse.Namespace:
+    """The arguments the finishing upscaler of a CQ-enhanced render runs with."""
+    return argparse.Namespace(**{**vars(args), "method": cq_finish_method(args)})
+
+
+def delivery_dimensions(args: argparse.Namespace, output_width: int, output_height: int) -> tuple[int, int]:
+    """The LTX Pixel Spatial LoRA delivers the nearest model-safe size, not the exact request."""
+    method = upscale_method(args)
+    if method == "ltx25cq":
+        method = cq_finish_method(args)
+    if method == "ltx25":
+        return ltx25_generation_dimensions(output_width, output_height)
+    return output_width, output_height
 
 
 def default_output(source: Path, width: int, height: int, method: str = "flashvsr") -> Path:
@@ -165,8 +195,61 @@ ADVANCED_DEFAULTS = {
 }
 
 
+def cq_signature(args: argparse.Namespace, source: Path, width: int, height: int) -> dict[str, Any]:
+    """Identity of the CQ enhance pass alone, shared by its chunks and its stitched render."""
+    return {
+        "version": 1,
+        "tool": "upscale_video.py",
+        "method": "ltx25_cq_enhancer",
+        "source": root_relative(source),
+        "source_fingerprint": file_fingerprint(source),
+        "enhance_width": width,
+        "enhance_height": height,
+        "comfy_dir": root_relative(resolve_path(args.comfy_dir)),
+        "comfy_url": args.comfy_url,
+        "base": args.cq_base,
+        "model": cq_base_model(args),
+        "text_encoder": args.ltx25_text_encoder,
+        "video_vae": args.ltx25_video_vae,
+        "lora": args.cq_lora,
+        "lora_strength": args.cq_lora_strength,
+        "guide_strength": args.cq_guide_strength,
+        "frame_rate_mode": args.cq_frame_rate,
+        "prompt": args.cq_prompt,
+        "seed": args.cq_seed,
+        "chunk_seconds": args.cq_chunk_seconds,
+        "overlap_frames": args.overlap_frames,
+        "fps": args.fps,
+        "intermediate_profile": getattr(args, "intermediate_profile", "high"),
+    }
+
+
 def signature(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> dict[str, Any]:
     method = upscale_method(args)
+    if method == "ltx25cq":
+        finish = cq_finish_method(args)
+        if finish == "lanczos":
+            finish_settings: dict[str, Any] = {"method": "lanczos"}
+        else:
+            finish_settings = signature(finish_args(args), source, output_width, output_height)
+        # The finishing pass reads the enhanced render, not the source, so only its settings count here.
+        for key in ("tool", "source", "source_fingerprint", "target_width", "target_height"):
+            finish_settings.pop(key, None)
+        enhance = cq_output_signature(args, source)
+        for key in ("tool", "source", "source_fingerprint"):
+            enhance.pop(key, None)
+        return {
+            "version": 1,
+            "tool": "upscale_video.py",
+            "method": "ltx25_cq_enhancer_then_upscale",
+            "source": root_relative(source),
+            "source_fingerprint": file_fingerprint(source),
+            "target_width": output_width,
+            "target_height": output_height,
+            "enhance": enhance,
+            "finish": finish,
+            "finish_settings": finish_settings,
+        }
     if method == "ltx25":
         return {
             "version": 1,
@@ -317,6 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ltx25-seed", type=int, default=42)
     parser.add_argument("--ltx25-prompt", default=DEFAULT_LTX25_PROMPT)
     parser.add_argument("--ltx25-negative-prompt", default=DEFAULT_LTX25_NEGATIVE_PROMPT)
+    parser.add_argument("--cq-finish", choices=CQ_FINISH_METHODS, default="flashvsr", help="Upscaler that takes the CQ-enhanced render to the delivery size, using its own settings.")
+    parser.add_argument("--cq-base", choices=["distilled", "dev"], default="distilled", help="distilled reuses the local distilled transformer; dev is the LoRA author's recipe (dev transformer + distilled LoRA at 0.5, about 25 GB of extra downloads).")
+    parser.add_argument("--cq-lora", default=LTX25_CQ_ENHANCER_LORA)
+    parser.add_argument("--cq-lora-strength", type=float, default=1.0)
+    parser.add_argument("--cq-guide-strength", type=float, default=1.0, help="How strongly the source video conditions the CQ render; the author's workflow uses 1.")
+    parser.add_argument("--cq-short-edge", type=int, default=720, help="Short edge the CQ Enhancer works at; the author's workflow uses 720.")
+    parser.add_argument("--cq-frame-rate", choices=["resample", "retime"], default="resample", help="resample converts to 30 fps by repeating frames, as the author's workflow does; retime plays the original frames at 30 fps. Either way every source frame comes back once.")
+    parser.add_argument("--cq-chunk-seconds", type=float, default=5.0, help="Source seconds per CQ render; the author's workflow uses 153 frames at 30 fps.")
+    parser.add_argument("--cq-colour", choices=["model", "source"], default="model", help="model keeps the CQ render's colour (it can colourise black-and-white film); source keeps the source's colour and takes only brightness detail from the CQ render.")
+    parser.add_argument("--cq-seed", type=int, default=42)
+    parser.add_argument("--cq-prompt", default="", help="The CQ LoRA needs no prompt. It samples without CFG, so there is no negative prompt.")
     parser.add_argument("--chunk-seconds", type=float, default=6.0, help="Upscale in chunks of roughly this many seconds. Use 0 to send the whole clip.")
     parser.add_argument("--overlap-frames", type=int, default=8, help="Frames repeated before each chunk, then trimmed before stitching.")
     parser.add_argument("--blend-strength", type=float, default=100.0, help="AI upscale contribution in the final delivery. 0 is a conventional Lanczos resize; 100 is the full AI upscale.")
@@ -789,7 +883,48 @@ def ltx25_prompt(
     prefix: str,
 ) -> dict[str, Any]:
     """Build a video-only LTX 2.5 Pixel Spatial Upscaler IC-LoRA prompt."""
-    return {
+    return ltx_ic_lora_prompt(
+        video_name, fps, frames, width, height, prefix,
+        unet=args.ltx25_model,
+        lora=args.ltx25_upscaler_lora,
+        lora_strength=args.ltx25_lora_strength,
+        text_encoder=args.ltx25_text_encoder,
+        vae=args.ltx25_video_vae,
+        prompt=args.ltx25_prompt,
+        negative_prompt=args.ltx25_negative_prompt,
+        guide_strength=args.ltx25_source_fidelity,
+        cfg=args.ltx25_guidance_scale,
+        seed=args.ltx25_seed,
+    )
+
+
+def ltx_ic_lora_prompt(
+    video_name: str,
+    fps: float,
+    frames: int,
+    width: int,
+    height: int,
+    prefix: str,
+    *,
+    unet: str,
+    lora: str,
+    lora_strength: float,
+    text_encoder: str,
+    vae: str,
+    prompt: str,
+    negative_prompt: str,
+    guide_strength: float,
+    cfg: float,
+    seed: int,
+    distilled_lora: str = "",
+    distilled_lora_strength: float = CQ_DISTILLED_LORA_STRENGTH,
+) -> dict[str, Any]:
+    """Build a video-only LTX 2.5 prompt that re-renders the loaded video through an IC-LoRA.
+
+    The LoRA's reference_downscale_factor metadata sets the guide scale, so the same graph
+    serves the 2x Pixel Spatial upscaler and the same-size CQ Enhancer.
+    """
+    graph = {
         "1": {
             "class_type": "VHS_LoadVideo",
             "inputs": {
@@ -803,32 +938,32 @@ def ltx25_prompt(
                 "format": "None",
             },
         },
-        "2": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": args.ltx25_model}},
+        "2": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
         "3": {
             "class_type": "ARPLTXVideoOnlyICLoRALoader",
             "inputs": {
                 "model": ["2", 0],
-                "lora_name": args.ltx25_upscaler_lora,
-                "strength_model": float(args.ltx25_lora_strength),
+                "lora_name": lora,
+                "strength_model": float(lora_strength),
             },
         },
         "4": {
             "class_type": "CLIPLoaderGGUF",
-            "inputs": {"clip_name": args.ltx25_text_encoder, "type": "ltxv"},
+            "inputs": {"clip_name": text_encoder, "type": "ltxv"},
         },
         "5": {
             "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["4", 0], "text": args.ltx25_prompt},
+            "inputs": {"clip": ["4", 0], "text": prompt},
         },
         "6": {
             "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["4", 0], "text": args.ltx25_negative_prompt},
+            "inputs": {"clip": ["4", 0], "text": negative_prompt},
         },
         "7": {
             "class_type": "LTXVConditioning",
             "inputs": {"positive": ["5", 0], "negative": ["6", 0], "frame_rate": fps},
         },
-        "8": {"class_type": "VAELoader", "inputs": {"vae_name": args.ltx25_video_vae}},
+        "8": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
         "9": {
             "class_type": "EmptyLTXVLatentVideo",
             "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1},
@@ -842,7 +977,7 @@ def ltx25_prompt(
                 "latent": ["9", 0],
                 "image": ["1", 0],
                 "frame_idx": 0,
-                "strength": float(args.ltx25_source_fidelity),
+                "strength": float(guide_strength),
                 "latent_downscale_factor": ["3", 1],
                 "crop": "disabled",
                 "use_tiled_encode": True,
@@ -856,10 +991,10 @@ def ltx25_prompt(
                 "model": ["3", 0],
                 "positive": ["10", 0],
                 "negative": ["10", 1],
-                "cfg": float(args.ltx25_guidance_scale),
+                "cfg": float(cfg),
             },
         },
-        "12": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(args.ltx25_seed), "control_after_generate": "fixed"}},
+        "12": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed), "control_after_generate": "fixed"}},
         "13": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
         "14": {"class_type": "ManualSigmas", "inputs": {"sigmas": LTX25_SIGMAS}},
         "15": {
@@ -901,6 +1036,25 @@ def ltx25_prompt(
             },
         },
     }
+    if distilled_lora:
+        graph["19"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["2", 0], "lora_name": distilled_lora, "strength_model": float(distilled_lora_strength)},
+        }
+        graph["3"]["inputs"]["model"] = ["19", 0]
+    return graph
+
+
+LTX_IC_LORA_NODE_TYPES = {
+    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+    "UnetLoaderGGUF": "ComfyUI-GGUF",
+    "CLIPLoaderGGUF": "ComfyUI-GGUF",
+    "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
+    "LTXVConditioning": "ComfyUI-LTXVideo",
+    "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
+    "LTXVCropGuides": "ComfyUI-LTXVideo",
+}
 
 
 def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int) -> Path:
@@ -910,20 +1064,7 @@ def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_widt
         raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
     ensure_ltx25_upscale_models(comfy_dir)
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-    ensure_node_types(
-        args.comfy_url,
-        {
-            "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
-            "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
-            "UnetLoaderGGUF": "ComfyUI-GGUF",
-            "CLIPLoaderGGUF": "ComfyUI-GGUF",
-            "ARPLTXVideoOnlyICLoRALoader": "ComfyUI-ARP",
-            "LTXVConditioning": "ComfyUI-LTXVideo",
-            "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
-            "LTXVCropGuides": "ComfyUI-LTXVideo",
-        },
-        "LTX 2.5 Pixel Spatial upscaling",
-    )
+    ensure_node_types(args.comfy_url, LTX_IC_LORA_NODE_TYPES, "LTX 2.5 Pixel Spatial upscaling")
     source_info = video_info(source)
     video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_ltx25")
     fps = args.fps or float(source_info["fps"])
@@ -941,6 +1082,342 @@ def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_widt
     partial.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(produced, partial)
     return partial
+
+
+def cq_base_model(args: argparse.Namespace) -> str:
+    return LTX25_DEV_GGUF_MODEL if args.cq_base == "dev" else args.ltx25_model
+
+
+def cq_output_size(width: int, height: int, short_edge: int) -> tuple[int, int]:
+    """The CQ render's delivered size: the source aspect with its short edge at the working size."""
+    scale = max(64, int(short_edge)) / max(1, min(width, height))
+    return max(2, int(round(width * scale / 2.0)) * 2), max(2, int(round(height * scale / 2.0)) * 2)
+
+
+def cq_generation_size(width: int, height: int) -> tuple[int, int]:
+    """LTX renders on a 32 px grid, so 720 becomes 704; the render is resized back afterwards."""
+    return max(64, int(round(width / 32.0)) * 32), max(64, int(round(height / 32.0)) * 32)
+
+
+def cq_dimensions(args: argparse.Namespace, source: Path) -> tuple[tuple[int, int], tuple[int, int]]:
+    """(delivered size, LTX render size) of the CQ pass for this source."""
+    info = video_info(source)
+    output = cq_output_size(int(info["width"]), int(info["height"]), args.cq_short_edge)
+    return output, cq_generation_size(*output)
+
+
+def cq_frame_rate_mode(args: argparse.Namespace, fps: float) -> str:
+    # Resampling above 30 fps would drop source frames, so faster footage is always retimed.
+    return "resample" if args.cq_frame_rate == "resample" and fps < CQ_FPS else "retime"
+
+
+def cq_chunk_plan(
+    total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int, mode: str
+) -> list[tuple[int, int, int, int]]:
+    """Source windows as (start, end, trim_start, model_frames), model_frames being the 30 fps 8n+1 render."""
+    ranges = chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames)
+    if len(ranges) <= 1:
+        # chunk_ranges marks "send the whole clip" with a placeholder tuple, not a real window.
+        ranges = [(0, total_frames, 0)]
+    plan: list[tuple[int, int, int, int]] = []
+    for source_start, end, trim_start in ranges:
+        span = end - source_start
+        working = span if mode == "retime" else int(math.ceil(span * CQ_FPS / max(fps, 0.001)))
+        plan.append((source_start, end, trim_start, max(9, int(math.ceil((working - 1) / 8.0)) * 8 + 1)))
+    return plan
+
+
+def prepare_cq_chunk(
+    ffmpeg: str,
+    source: Path,
+    target: Path,
+    start_frame: int,
+    end_frame: int,
+    model_frames: int,
+    fps: float,
+    width: int,
+    height: int,
+    mode: str,
+    force: bool,
+    source_fingerprint: dict[str, Any],
+) -> None:
+    if target.exists() and not force and split_matches_source(target, source_fingerprint):
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    # Retiming declares each source frame 1/30 s long; the fps filter then only snaps those
+    # timestamps onto the exact 30 fps grid, which the millisecond timebase cannot hold.
+    to_working_rate = f"fps={CQ_FPS:g}" if mode == "resample" else f"setpts=N/({CQ_FPS:g}*TB),fps={CQ_FPS:g}"
+    vf = (
+        f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),"
+        f"scale={width}:{height}:flags=lanczos,setsar=1,{to_working_rate},"
+        f"tpad=stop_mode=clone:stop={model_frames},trim=end_frame={model_frames}"
+    )
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{CQ_FPS:g}", "-fps_mode", "cfr",
+            # A retimed last frame keeps its source duration; cfr would pad it with a duplicate.
+            "-frames:v", str(model_frames),
+            *working_codec_args(fast=True), *working_container_args(partial), str(partial),
+        ],
+        check=True,
+    )
+    replace_unless_identical(partial, target, f"CQ prepared chunk {target.name}")
+    write_split_sidecar(target, source, source_fingerprint)
+
+
+def normalize_cq_chunk(
+    ffmpeg: str,
+    source: Path,
+    target: Path,
+    width: int,
+    height: int,
+    trim_start: int,
+    keep_frames: int,
+    fps: float,
+    mode: str,
+) -> None:
+    """Return a 30 fps CQ render to the source rate, one output frame per source frame."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    # Resampling repeated some source frames; the nearest working frame to each source
+    # timestamp is always a render of that source frame, because 30 fps is the faster rate.
+    to_source_rate = f"setpts=N/({CQ_FPS:g}*TB),fps={fps:.8f}" if mode == "resample" else f"setpts=N/({fps:.8f}*TB),fps={fps:.8f}"
+    vf = (
+        f"{to_source_rate},trim=start_frame={trim_start}:end_frame={trim_start + keep_frames},"
+        f"setpts=N/({fps:.8f}*TB),scale={width}:{height}:flags=lanczos,setsar=1"
+    )
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
+            "-frames:v", str(keep_frames), *working_codec_args(), *working_container_args(partial), str(partial),
+        ],
+        check=True,
+    )
+    replace_with_retry(partial, target, f"CQ normalized chunk {target.name}")
+
+
+def cq_run(args: argparse.Namespace, source: Path, partial: Path, width: int, height: int, frames: int) -> Path:
+    comfy_dir = resolve_path(args.comfy_dir)
+    comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
+    if not (comfy_dir / "main.py").exists():
+        raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
+    dev_base = args.cq_base == "dev"
+    ensure_ltx25_cq_enhancer_models(comfy_dir, dev_base=dev_base)
+    wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+    ensure_node_types(args.comfy_url, LTX_IC_LORA_NODE_TYPES, "LTX 2.5 CQ enhancement")
+    video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_cq")
+    prefix = f"arp_upscale/{safe_stem(source.name)}_cq_{width}x{height}"
+    prompt = ltx_ic_lora_prompt(
+        video_name, CQ_FPS, frames, width, height, prefix,
+        unet=cq_base_model(args),
+        distilled_lora=LTX25_DISTILLED_LORA if dev_base else "",
+        lora=args.cq_lora,
+        lora_strength=args.cq_lora_strength,
+        text_encoder=args.ltx25_text_encoder,
+        vae=args.ltx25_video_vae,
+        prompt=args.cq_prompt,
+        negative_prompt="",
+        guide_strength=args.cq_guide_strength,
+        cfg=1.0,
+        seed=args.cq_seed,
+    )
+    print(f"Sending LTX 2.5 CQ enhancer prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
+    history = queue_prompt_with_progress(args.comfy_url, prompt, args.poll_seconds, {"15", "17"})
+    produced = newest_comfy_output(
+        extract_output_files(history, comfy_output_root),
+        {".mp4", ".mov", ".mkv", ".webm"},
+        "LTX 2.5 CQ enhanced video",
+    )
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(produced, partial)
+    return partial
+
+
+def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], source_fingerprint: dict[str, Any]) -> Path:
+    """Restore the source at the CQ working size; the result keeps the source's frame rate and audio."""
+    # Chunks render at the 32 px grid size (width x height); the stitched render is
+    # resized to the aspect-correct output size.
+    (out_width, out_height), (width, height) = cq_dimensions(args, source)
+    target = ROOT / ".cache" / "upscale_cq" / f"{safe_stem(source.name)}_cq_{out_width}x{out_height}.mkv"
+    # Colour and output size are applied after stitching, so changing them reuses the rendered chunks.
+    sig = cq_output_signature(args, source)
+    if not args.force and resumable_output(target, sig, video_like=source, width=out_width, height=out_height):
+        print(f"Reuse CQ-enhanced render: {target}", flush=True)
+        return target
+    ffmpeg = find_ffmpeg(args.ffmpeg)
+    fps = args.fps or float(info["fps"])
+    mode = cq_frame_rate_mode(args, fps)
+    plan = cq_chunk_plan(int(info["frames"]), fps, args.cq_chunk_seconds, args.overlap_frames, mode)
+    chunk_dir = ROOT / ".cache" / "upscale_chunks" / (
+        f"{upscale_chunk_source_key(source)}_ltx25cq_{width}x{height}"
+        f"_{int(args.cq_chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
+    )
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Enhancing with LTX 2.5 CQ in {len(plan)} chunk(s): {info['width']}x{info['height']} -> "
+        f"{out_width}x{out_height} (rendered at {width}x{height}) at {CQ_FPS:g} fps ({mode} from {fps:g} fps)",
+        flush=True,
+    )
+    # Each chunk keeps its overlap lead-in: both neighbours rendered those frames, and
+    # dissolving between the two renders hides the jump between independent generations.
+    chunks: list[tuple[Path, int]] = []
+    digits = max(4, int(math.log10(len(plan))) + 1)
+    for index, (start_frame, end_frame, trim_start, model_frames) in enumerate(plan):
+        name = f"{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}"
+        chunk_input = chunk_dir / f"cq_input_{name}.mkv"
+        chunk_raw = chunk_dir / f"cq_raw_{name}.mp4"
+        chunk_final = chunk_dir / f"cq_render_{name}.mkv"
+        print(
+            f"CQ enhance chunk {index + 1}/{len(plan)}: frames {start_frame}-{end_frame}, "
+            f"crossfade {trim_start}, LTX window {model_frames}",
+            flush=True,
+        )
+        prepare_cq_chunk(
+            ffmpeg, source, chunk_input, start_frame, end_frame, model_frames, fps,
+            width, height, mode, args.force, source_fingerprint,
+        )
+        chunk_sig = cq_signature(args, chunk_input, width, height)
+        if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, width, height):
+            print(f"Reuse CQ enhanced chunk: {chunk_final}", flush=True)
+            chunks.append((chunk_final, trim_start))
+            continue
+        reusable = None if args.force else find_reusable_upscale_chunk(chunk_dir, chunk_final.name, chunk_sig, width, height)
+        if reusable:
+            shutil.copy2(reusable, chunk_final)
+            shutil.copy2(reusable.with_suffix(reusable.suffix + ".sig.json"), chunk_final.with_suffix(chunk_final.suffix + ".sig.json"))
+            print(f"Reuse CQ enhanced chunk from compatible cache: {reusable}", flush=True)
+            chunks.append((chunk_final, trim_start))
+            continue
+        cq_run(args, chunk_input, chunk_raw, width, height, model_frames)
+        normalize_cq_chunk(ffmpeg, chunk_raw, chunk_final, width, height, 0, end_frame - start_frame, fps, mode)
+        write_signature(chunk_final, chunk_sig)
+        print(f"Wrote CQ enhanced chunk: {chunk_final}", flush=True)
+        chunk_raw.unlink(missing_ok=True)
+        chunks.append((chunk_final, trim_start))
+    frames = int(info["frames"])
+    if args.cq_colour == "source":
+        stitched = target.with_suffix(".stitched.mkv")
+        crossfade_chunks(ffmpeg, chunks, fps, frames, source, stitched, out_width, out_height)
+        restore_source_colour(ffmpeg, stitched, source, target, out_width, out_height, fps, frames)
+        stitched.unlink(missing_ok=True)
+    else:
+        crossfade_chunks(ffmpeg, chunks, fps, frames, source, target, out_width, out_height)
+    write_signature(target, sig)
+    return target
+
+
+def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any]:
+    """Identity of the stitched CQ render: the chunk identity plus what is applied after stitching."""
+    (out_width, out_height), (width, height) = cq_dimensions(args, source)
+    return {
+        **cq_signature(args, source, width, height),
+        "colour": args.cq_colour,
+        "output_width": out_width,
+        "output_height": out_height,
+    }
+
+
+def frame_clock(fps: float) -> str:
+    """Filters that put a stream on an exact 1/fps timebase, one tick per frame.
+
+    setpts alone leaves millisecond (MKV) and MP4 timebases slightly apart, and filters
+    that sync two inputs then repeat frames to cover the gaps.
+    """
+    rate = Fraction(fps).limit_denominator(1001)
+    return f"settb={rate.denominator}/{rate.numerator},setpts=N,setsar=1"
+
+
+def crossfade_chunks(
+    ffmpeg: str,
+    chunks: list[tuple[Path, int]],
+    fps: float,
+    frames: int,
+    audio_source: Path,
+    output: Path,
+    width: int = 0,
+    height: int = 0,
+) -> None:
+    """Join chunk renders, dissolving across each chunk's lead-in instead of cutting.
+
+    A chunk's lead-in repeats the previous chunk's last frames, so a dissolve over them
+    keeps every source frame exactly once. A width and height resize the joined video.
+    """
+    if not chunks:
+        raise RuntimeError("No CQ chunks were produced.")
+    rate = Fraction(fps).limit_denominator(1001)
+    seconds_per_frame = rate.denominator / rate.numerator
+    inputs: list[str] = []
+    filters = []
+    for index, (chunk, _lead) in enumerate(chunks):
+        inputs += ["-i", str(chunk)]
+        filters.append(f"[{index}:v]{frame_clock(fps)}[c{index}]")
+    current, length = "c0", video_info(chunks[0][0])["frames"]
+    for index, (chunk, lead) in enumerate(chunks[1:], start=1):
+        chunk_frames = video_info(chunk)["frames"]
+        joined = f"j{index}"
+        if lead > 0:
+            filters.append(
+                f"[{current}][c{index}]xfade=transition=fade:duration={lead * seconds_per_frame:.9f}:"
+                f"offset={(length - lead) * seconds_per_frame:.9f}[{joined}]"
+            )
+            length += chunk_frames - lead
+        else:
+            filters.append(f"[{current}][c{index}]concat=n=2:v=1:a=0[{joined}]")
+            length += chunk_frames
+        current = joined
+    if width and height:
+        filters.append(f"[{current}]scale={width}:{height}:flags=lanczos,setsar=1[sized]")
+        current = "sized"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".video.partial" + output.suffix)
+    print(f"Stitching upscaled chunks: {len(chunks)} chunk(s), crossfading overlaps", flush=True)
+    subprocess.run([
+        ffmpeg, "-y", *inputs, "-filter_complex", ";".join(filters), "-map", f"[{current}]", "-an",
+        "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-frames:v", str(frames),
+        *working_codec_args(), *working_container_args(partial), str(partial),
+    ], check=True)
+    mux_audio(ffmpeg, partial, audio_source, output)
+    partial.unlink(missing_ok=True)
+
+
+def restore_source_colour(
+    ffmpeg: str, enhanced: Path, source: Path, output: Path, width: int, height: int, fps: float, frames: int,
+) -> None:
+    """Keep the CQ render's luma but the source's chroma.
+
+    The LoRA invents colour on black-and-white film and shifts hues on colour film; ARP's
+    colour decisions belong to the Colorize stage, so only brightness detail is taken from CQ.
+    """
+    partial = output.with_suffix(output.suffix + ".colour.partial" + output.suffix)
+    # Both inputs need the same exact frame clock, or the merge repeats early frames and
+    # delays the picture; mergeplanes also refuses inputs whose sample aspect ratios differ.
+    filters = (
+        f"[0:v]{frame_clock(fps)},format=yuv444p10le,extractplanes=y[luma];"
+        f"[1:v]{frame_clock(fps)},scale={width}:{height}:flags=lanczos,setsar=1,"
+        "format=yuv444p10le,extractplanes=u+v[cb][cr];"
+        "[luma][cb][cr]mergeplanes=format=yuv444p10le:map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0,setsar=1[vout]"
+    )
+    print(f"Restoring source colour under the CQ render: {enhanced}", flush=True)
+    subprocess.run([
+        ffmpeg, "-y", "-i", str(enhanced), "-i", str(source), "-filter_complex", filters,
+        # Syncing two inputs repeats the last frame to cover stream durations; keep exactly one per source frame.
+        "-map", "[vout]", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-frames:v", str(frames),
+        *working_codec_args(), *working_container_args(partial), str(partial),
+    ], check=True)
+    mux_audio(ffmpeg, partial, source, output)
+    partial.unlink(missing_ok=True)
+
+
+def lanczos_upscale_run(ffmpeg: str, source: Path, output: Path, width: int, height: int, audio_source: Path) -> None:
+    partial = output.with_suffix(output.suffix + ".video.partial" + output.suffix)
+    print(f"Lanczos-scaling to {width}x{height}: {source}", flush=True)
+    subprocess.run([
+        ffmpeg, "-y", "-i", str(source), "-map", "0:v:0", "-vf", f"scale={width}:{height}:flags=lanczos,setsar=1",
+        "-an", *working_codec_args(), *working_container_args(partial), str(partial),
+    ], check=True)
+    mux_audio(ffmpeg, partial, audio_source, output)
+    partial.unlink(missing_ok=True)
 
 
 def chunk_ranges(total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int) -> list[tuple[int, int, int]]:
@@ -1399,6 +1876,14 @@ def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, ou
     return target
 
 
+BACKEND_LABELS = {
+    "flashvsr": "FlashVSR",
+    "seedvr2": "SeedVR2",
+    "ltx25": "LTX 2.5 Pixel Spatial IC-LoRA",
+    "lanczos": "Lanczos",
+}
+
+
 def run(args: argparse.Namespace) -> int:
     global CURRENT_INTERMEDIATE_PROFILE
     CURRENT_INTERMEDIATE_PROFILE = getattr(args, "intermediate_profile", "high")
@@ -1409,16 +1894,15 @@ def run(args: argparse.Namespace) -> int:
     info = video_info(source)
     output_width, output_height = fit_dimensions(int(info["width"]), int(info["height"]), args.target_width, args.target_height)
     method = upscale_method(args)
-    if method == "seedvr2":
+    # A CQ-enhanced render is finished by one of the other backends, with that backend's settings.
+    backend = cq_finish_method(args) if method == "ltx25cq" else method
+    backend_args = finish_args(args) if method == "ltx25cq" else args
+    if backend == "seedvr2":
         if args.seedvr2_batch_size < 1 or (args.seedvr2_batch_size - 1) % 4 != 0:
             raise ValueError("SeedVR2 batch size must use the 4n+1 sequence: 1, 5, 9, 13, ...")
         if args.seedvr2_vae_tile_overlap >= args.seedvr2_vae_tile_size:
             raise ValueError("SeedVR2 VAE tile overlap must be smaller than the tile size.")
-    delivery_width, delivery_height = (
-        ltx25_generation_dimensions(output_width, output_height)
-        if method == "ltx25"
-        else (output_width, output_height)
-    )
+    delivery_width, delivery_height = delivery_dimensions(args, output_width, output_height)
     output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height, method)
     sig = signature(args, source, output_width, output_height)
     manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
@@ -1436,44 +1920,54 @@ def run(args: argparse.Namespace) -> int:
         print(f"Reuse upscaled video: {output}", flush=True)
         return 0
     if args.dry_run:
-        if method == "flashvsr" and args.flashvsr_pre_downscale:
+        if method == "ltx25cq":
+            (enhance_width, enhance_height), (render_width, render_height) = cq_dimensions(args, source)
+            print(
+                f"Would enhance with LTX 2.5 CQ to {enhance_width}x{enhance_height} "
+                f"(rendered at {render_width}x{render_height}), {CQ_FPS:g} fps",
+                flush=True,
+            )
+        if backend == "flashvsr" and args.flashvsr_pre_downscale:
             processing_width, processing_height = pre_downscale_dimensions(output_width, output_height, args.flashvsr_scale)
             print(f"Would pre-downscale FlashVSR input to {processing_width}x{processing_height}", flush=True)
-        labels = {
-            "flashvsr": "FlashVSR",
-            "seedvr2": "SeedVR2",
-            "ltx25": "LTX 2.5 Pixel Spatial IC-LoRA",
-        }
         print(
             f"Would upscale {source} -> {output} at {delivery_width}x{delivery_height} "
-            f"using {labels[method]} in ComfyUI at {args.comfy_url} ({args.comfy_dir})",
+            f"using {BACKEND_LABELS[backend]} in ComfyUI at {args.comfy_url} ({args.comfy_dir})",
             flush=True,
         )
         return 0
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    processing_source = source
-    processing_info = info
-    processing_fingerprint = sig["source_fingerprint"]
-    if method == "flashvsr" and args.flashvsr_pre_downscale:
-        ffmpeg = find_ffmpeg(args.ffmpeg)
-        processing_source = pre_downscale_source(ffmpeg, args, source, output_width, output_height, info)
-        processing_info = video_info(processing_source)
-        processing_fingerprint = file_fingerprint(processing_source)
     ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mkv"
     ai_output.parent.mkdir(parents=True, exist_ok=True)
     if args.force or not resumable_output(
         ai_output, sig, video_like=source, width=delivery_width, height=delivery_height
     ):
-        if method == "ltx25":
-            chunked_ltx25_run(
-                args, source, ai_output, output_width, output_height, info,
-                sig["source_fingerprint"],
+        processing_source = source
+        processing_info = info
+        processing_fingerprint = sig["source_fingerprint"]
+        if method == "ltx25cq":
+            processing_source = cq_enhance(args, source, info, sig["source_fingerprint"])
+            processing_info = video_info(processing_source)
+            processing_fingerprint = file_fingerprint(processing_source)
+            print(f"Finishing CQ-enhanced video with {BACKEND_LABELS[backend]}: {processing_source}", flush=True)
+        if backend == "flashvsr" and args.flashvsr_pre_downscale:
+            processing_source = pre_downscale_source(
+                find_ffmpeg(args.ffmpeg), backend_args, processing_source, output_width, output_height, processing_info,
             )
+            processing_info = video_info(processing_source)
+            processing_fingerprint = file_fingerprint(processing_source)
+        if backend == "ltx25":
+            chunked_ltx25_run(
+                backend_args, processing_source, ai_output, output_width, output_height, processing_info,
+                processing_fingerprint,
+            )
+        elif backend == "lanczos":
+            lanczos_upscale_run(find_ffmpeg(args.ffmpeg), processing_source, ai_output, output_width, output_height, source)
         else:
             chunked_standard_upscale_run(
-                args, processing_source, ai_output, output_width, output_height,
-                processing_info, processing_fingerprint, method, audio_source=source,
+                backend_args, processing_source, ai_output, output_width, output_height,
+                processing_info, processing_fingerprint, backend, audio_source=source,
             )
         write_signature(ai_output, sig)
     else:

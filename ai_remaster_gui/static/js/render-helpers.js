@@ -128,7 +128,7 @@ const FIELD_DESCRIPTIONS = {
   'recomp.native_source_resolution':
     'Off: the composite comes out at the outpainting resolution, which is the usual way to keep working. On: the outpainted canvas is scaled up (or down) around the original source instead, so the source overlays it pixel for pixel at its native resolution, with any trim or extend taken into account. Only the generated sides are resampled; the source loses nothing but the re-encode. The feather width scales with the canvas.',
   'upscale.method':
-    'FlashVSR is the fast refiner. SeedVR2 is a higher-quality one-step video restoration model with heavier VRAM requirements. LTX 2.5 uses a creative 2x Pixel Spatial Upscaler IC-LoRA; preview identity-critical archival shots before a full run.',
+    'FlashVSR is the fast refiner. SeedVR2 is a higher-quality one-step video restoration model with heavier VRAM requirements. LTX 2.5 uses a creative 2x Pixel Spatial Upscaler IC-LoRA. The CQ Enhancer is a strongly generative restoration pass at 720p, followed by one of the other upscalers; it can redraw faces. Preview identity-critical archival shots before a full run.',
   'upscale.flashvsr_mode':
     'tiny = fastest, but its distilled decoder can smear fine motion such as lips. ' +
     'full = real VAE decoder with the best fidelity for faces and small movements, slowest. ' +
@@ -198,6 +198,28 @@ const FIELD_DESCRIPTIONS = {
     'Describes the intended high-resolution reconstruction. The default deliberately asks LTX to re-photograph the scene with modern optical clarity while the reference video anchors layout and motion.',
   'upscale.ltx25_negative_prompt':
     'Identity, geometry, temporal, and sharpening failures that the LTX 2.5 reconstruction should avoid.',
+  'upscale.auto_target_size':
+    'Set the target to exactly what FlashVSR produces: its input size times the FlashVSR scale, so nothing is resized afterwards. With the CQ Enhancer in front, FlashVSR’s input is CQ’s output (for example 1280x720 for a 16:9 source). The size is filled in once the upscale input exists, e.g. after Recomposition.',
+  'upscale.cq_finish':
+    'The CQ Enhancer restores detail at its working size (720p) without enlarging the picture. This upscaler then takes the restored video to the target size, using its own settings below. Lanczos keeps exactly what CQ produced.',
+  'upscale.cq_base':
+    'Distilled reuses the LTX 2.5 transformer ARP already has. Dev + distilled LoRA at 0.5 is the LoRA author’s own recipe and may look more natural, but downloads about 25 GB on first use.',
+  'upscale.cq_short_edge':
+    'Short edge of the frame the CQ Enhancer works at, snapped to LTX’s 32 px grid. The LoRA was made for 720; larger sizes take much longer and are untested.',
+  'upscale.cq_frame_rate':
+    'The LoRA expects 30 fps. Resample repeats frames to reach 30 fps, as the author’s workflow does. Retime plays the original frames at 30 fps, so motion looks faster to the model (25% faster for 24 fps footage). Either way every source frame comes back once, at the source frame rate.',
+  'upscale.cq_colour':
+    'CQ’s colour usually looks natural, but it can colourise black-and-white film and shift the hues of colour footage. Keep source colour takes only brightness detail from CQ and keeps the source’s colour, leaving colour to the Colorize stage. Switching this reuses the rendered chunks.',
+  'upscale.cq_guide_strength':
+    'How strongly the source video conditions the CQ render. 100 is the author’s setting; lower values give the model more freedom to invent.',
+  'upscale.cq_lora_strength':
+    'Strength of the CQ Enhancer LoRA. The author uses 1.0.',
+  'upscale.cq_chunk_seconds':
+    'Source seconds per CQ render; the author renders about 5 seconds (153 frames at 30 fps). Each chunk is a fresh generation, so neighbouring chunks dissolve into each other across the Overlap frames instead of cutting.',
+  'upscale.cq_seed':
+    'Controls the detail the CQ Enhancer synthesizes. Keep it fixed for reproducible output; change it to try another restoration.',
+  'upscale.cq_prompt':
+    'Optional. The CQ LoRA needs no prompt; leave empty unless you want to steer the restoration.',
   'upscale.blend_strength':
     'How much of the AI reconstruction is used by default. The remainder is a conventional resize of the source, which restores source-derived motion blur and reduces the stop-motion look. Each shot can override this.',
   'upscale.chunk_seconds':
@@ -400,6 +422,17 @@ function selectOptionLabel(key, option) {
   if (key === 'method' && option === 'flashvsr') return 'FlashVSR';
   if (key === 'method' && option === 'seedvr2') return 'SeedVR2';
   if (key === 'method' && option === 'ltx25') return 'LTX 2.5 Pixel Spatial (2x IC-LoRA)';
+  if (key === 'method' && option === 'ltx25cq') return 'LTX 2.5 CQ Enhancer (generative restore)';
+  if (key === 'cq_finish' && option === 'flashvsr') return 'FlashVSR';
+  if (key === 'cq_finish' && option === 'seedvr2') return 'SeedVR2';
+  if (key === 'cq_finish' && option === 'ltx25') return 'LTX 2.5 Pixel Spatial (2x IC-LoRA)';
+  if (key === 'cq_finish' && option === 'lanczos') return 'Lanczos resize (no AI)';
+  if (key === 'cq_base' && option === 'distilled') return 'Distilled (installed, faster)';
+  if (key === 'cq_base' && option === 'dev') return 'Dev + distilled LoRA 0.5 (author recipe, +25 GB)';
+  if (key === 'cq_colour' && option === 'model') return 'Use CQ’s colour';
+  if (key === 'cq_colour' && option === 'source') return 'Keep source colour (CQ luma only)';
+  if (key === 'cq_frame_rate' && option === 'resample') return 'Resample to 30 fps (author recipe)';
+  if (key === 'cq_frame_rate' && option === 'retime') return 'Retime original frames to 30 fps';
   if (key === 'repair_device' && option === 'auto') return 'Auto (prefer GPU)';
   if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';
   if (key === 'repair_device' && option === 'cpu') return 'CPU';

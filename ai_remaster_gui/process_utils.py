@@ -125,6 +125,8 @@ def upscale_chunk_progress(text: str) -> dict[str, int]:
             "Wrote LTX 2.5 upscaled chunk",
             "Reuse LTX 2.5 upscaled chunk",
             "Reuse LTX 2.5 chunk from compatible cache",
+            "Wrote CQ enhanced chunk",
+            "Reuse CQ enhanced chunk",
         ),
     )
     total = 0
@@ -133,7 +135,7 @@ def upscale_chunk_progress(text: str) -> dict[str, int]:
     active_value = 0
     active_total = 0
     for line in text.splitlines():
-        marker = "Upscale chunk "
+        marker = "CQ enhance chunk " if "CQ enhance chunk " in line else "Upscale chunk "
         if marker not in line:
             progress_marker = "ComfyUI upscale pass:"
             if progress_marker in line and "%" in line:

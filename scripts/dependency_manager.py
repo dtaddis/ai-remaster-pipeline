@@ -89,6 +89,22 @@ LTX25_PIXEL_UPSCALE_MODELS = [
         f"models/loras/{LTX25_PIXEL_UPSCALER_LORA}",
     ),
 ]
+# CQdesign's generative restoration IC-LoRA (V2). It enhances at the input size,
+# so ARP runs it as a pre-pass and hands the result to a conventional upscaler.
+# The author's recipe samples the dev transformer with the distilled LoRA at 0.5;
+# the "dev" base reproduces that, the default reuses the local distilled GGUF.
+LTX25_CQ_ENHANCER_LORA = "ltx2.5-CQ-enhancer-lora-V2.safetensors"
+LTX25_DEV_GGUF_MODEL = "ltx-2.5-22b-dev-transformer-Q4_K_M.gguf"
+LTX25_DISTILLED_LORA = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
+LTX25_CQ_ENHANCER_LORA_MODEL = HfModel(
+    "CQdesign/LTX-2.5-CQ-Video-and-Image-Enhancer-LoRAs",
+    LTX25_CQ_ENHANCER_LORA,
+    f"models/loras/{LTX25_CQ_ENHANCER_LORA}",
+)
+LTX25_DEV_BASE_MODELS = [
+    HfModel("vantagewithai/LTX-2.5-GGUF", f"dev/{LTX25_DEV_GGUF_MODEL}", f"models/diffusion_models/{LTX25_DEV_GGUF_MODEL}"),
+    HfModel("Lightricks/LTX-2.5", f"loras/{LTX25_DISTILLED_LORA}", f"models/loras/{LTX25_DISTILLED_LORA}"),
+]
 
 # Wan 2.1 VACE 14B outpainting. Q4_K_M keeps the transformer near 12 GB on a 24 GB card; the
 # lightx2v step-distill LoRA (VACE is built on the T2V 14B base) lets it sample in a few
@@ -485,6 +501,14 @@ def ensure_h3_outpaint_models(comfy_dir: Path, license_confirmed: bool, pdd: boo
 
 def ensure_ltx25_upscale_models(comfy_dir: Path) -> None:
     ensure_hf_models(comfy_dir, LTX25_PIXEL_UPSCALE_MODELS)
+
+
+def ensure_ltx25_cq_enhancer_models(comfy_dir: Path, dev_base: bool = False) -> None:
+    models = [*LTX25_CORE_MODELS, LTX25_CQ_ENHANCER_LORA_MODEL]
+    if dev_base:
+        # The dev transformer replaces the distilled one, which is then not needed.
+        models = [*LTX25_CORE_MODELS[1:], *LTX25_DEV_BASE_MODELS, LTX25_CQ_ENHANCER_LORA_MODEL]
+    ensure_hf_models(comfy_dir, models)
 
 
 def ensure_cleanup_models(comfy_dir: Path) -> None:

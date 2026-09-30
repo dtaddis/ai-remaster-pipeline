@@ -143,6 +143,27 @@ class DependencyManagerPathTests(unittest.TestCase):
         self.assertIn(f"models/latent_upscale_models/{dependency_manager.LTX25_LATENT_UPSCALER}", destinations)
         self.assertIn(f"models/loras/{dependency_manager.DEFAULT_OUTPAINT_LORA}", destinations)
 
+    def test_cq_enhancer_reuses_distilled_models_unless_the_dev_recipe_is_chosen(self) -> None:
+        with mock.patch.object(dependency_manager, "ensure_hf_models") as ensure:
+            dependency_manager.ensure_ltx25_cq_enhancer_models(Path("ComfyUI"))
+            distilled = {model.destination for model in ensure.call_args.args[1]}
+            dependency_manager.ensure_ltx25_cq_enhancer_models(Path("ComfyUI"), dev_base=True)
+            dev = {model.destination for model in ensure.call_args.args[1]}
+
+        cq_lora = f"models/loras/{dependency_manager.LTX25_CQ_ENHANCER_LORA}"
+        distilled_model = f"models/diffusion_models/{dependency_manager.LTX25_GGUF_MODEL}"
+        dev_model = f"models/diffusion_models/{dependency_manager.LTX25_DEV_GGUF_MODEL}"
+        distilled_lora = f"models/loras/{dependency_manager.LTX25_DISTILLED_LORA}"
+        self.assertIn(cq_lora, distilled)
+        self.assertIn(distilled_model, distilled)
+        self.assertNotIn(dev_model, distilled)
+        self.assertNotIn(distilled_lora, distilled)
+        self.assertIn(cq_lora, dev)
+        self.assertIn(dev_model, dev)
+        self.assertIn(distilled_lora, dev)
+        self.assertNotIn(distilled_model, dev)
+        self.assertIn(f"models/vae/{dependency_manager.LTX25_VIDEO_VAE}", dev)
+
     def test_gated_model_403_is_rewritten_as_actionable_access_error(self) -> None:
         class Response:
             status_code = 403

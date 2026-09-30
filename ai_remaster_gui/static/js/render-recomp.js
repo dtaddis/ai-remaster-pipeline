@@ -180,6 +180,17 @@ function drawUpscale() {
   `;
 
   bindStageFields('upscale');
+  if (upscaleAutoTargetSize()) {
+    const targetFields = document.querySelectorAll('[data-field="target_width"], [data-field="target_height"]');
+    if (state.upscale_auto_target) {
+      targetFields.forEach(el => { el.disabled = true; });
+    } else if (targetFields.length) {
+      // The FlashVSR input (e.g. the recomposition) has not been rendered yet.
+      const label = targetFields[0].previousElementSibling;
+      const anchor = label && label.tagName === 'LABEL' ? label : targetFields[0];
+      anchor.insertAdjacentHTML('beforebegin', '<p class="shot-empty">Auto target size is set once the upscale input exists; until then these values are used.</p>');
+    }
+  }
   bindUpscaleComparison();
   bindUpscaleShotComparisons();
   showCommand('upscale');
@@ -188,34 +199,57 @@ function drawUpscale() {
 function upscaleMainFields(st) {
   const method = settings('upscale').method || 'flashvsr';
   const fieldKeys = ['method'];
-  if (method === 'ltx25') {
+  let backend = method;
+  if (method === 'ltx25cq') {
+    // The CQ Enhancer restores at 720p; its finishing upscaler's own settings follow.
+    backend = settings('upscale').cq_finish || 'flashvsr';
     fieldKeys.push(
+      'cq_finish', 'cq_base', 'cq_short_edge', 'cq_frame_rate', 'cq_colour', 'cq_guide_strength',
+      'cq_lora_strength', 'cq_chunk_seconds', 'cq_seed', 'cq_prompt',
+    );
+  }
+  fieldKeys.push(...upscaleBackendFieldKeys(backend));
+  fieldKeys.push('blend_strength');
+  // Auto target size multiplies FlashVSR's input by its scale, so it only applies when FlashVSR delivers.
+  if (backend === 'flashvsr') fieldKeys.push('auto_target_size');
+  fieldKeys.push('target_width', 'target_height', 'chunk_seconds', 'overlap_frames', 'preview_seconds');
+  return fieldKeys
+    .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
+    .join('');
+}
+
+function upscaleAutoTargetSize() {
+  const s = settings('upscale');
+  const backend = s.method === 'ltx25cq' ? (s.cq_finish || 'flashvsr') : (s.method || 'flashvsr');
+  return backend === 'flashvsr' && String(s.auto_target_size) === 'true';
+}
+
+function upscaleBackendFieldKeys(backend) {
+  if (backend === 'lanczos') return [];
+  if (backend === 'ltx25') {
+    return [
       'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_guidance_scale', 'ltx25_seed',
       'ltx25_prompt', 'ltx25_negative_prompt',
-    );
-  } else if (method === 'seedvr2') {
-    fieldKeys.push(
+    ];
+  }
+  if (backend === 'seedvr2') {
+    return [
       'seedvr2_model', 'seedvr2_batch_size', 'seedvr2_color_correction',
       'seedvr2_input_noise_scale', 'seedvr2_latent_noise_scale',
       'seedvr2_tiled_vae', 'seedvr2_vae_tile_size', 'seedvr2_vae_tile_overlap',
       'seedvr2_preserve_vram', 'seedvr2_cache_model',
       'seedvr2_blocks_to_swap', 'seedvr2_offload_io_components', 'seedvr2_seed',
-    );
-  } else {
-    fieldKeys.push(
-      'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
-      'flashvsr_pre_downscale',
-      'flashvsr_tiled_dit', 'flashvsr_tile_size', 'flashvsr_tile_overlap',
-      'flashvsr_vae_tile_multiplier',
-      'flashvsr_local_range', 'flashvsr_sparse_ratio', 'flashvsr_kv_ratio',
-      'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
-      'flashvsr_seed',
-    );
+    ];
   }
-  fieldKeys.push('blend_strength', 'target_width', 'target_height', 'chunk_seconds', 'overlap_frames', 'preview_seconds');
-  return fieldKeys
-    .map(key => fieldHtml(st, st.fields.find(f => f[0] === key)))
-    .join('');
+  return [
+    'flashvsr_model', 'flashvsr_mode', 'flashvsr_scale',
+    'flashvsr_pre_downscale',
+    'flashvsr_tiled_dit', 'flashvsr_tile_size', 'flashvsr_tile_overlap',
+    'flashvsr_vae_tile_multiplier',
+    'flashvsr_local_range', 'flashvsr_sparse_ratio', 'flashvsr_kv_ratio',
+    'flashvsr_color_fix', 'flashvsr_tiled_vae', 'flashvsr_unload_dit',
+    'flashvsr_seed',
+  ];
 }
 
 function upscaleInputSummary(s) {
@@ -262,6 +296,7 @@ function bindUpscaleComparison() {
 }
 
 function upscaleMethodLabel(method) {
+  if (method === 'ltx25cq') return 'LTX 2.5 CQ Enhancer';
   if (method === 'ltx25') return 'LTX 2.5';
   if (method === 'seedvr2') return 'SeedVR2';
   return 'FlashVSR';

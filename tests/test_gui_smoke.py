@@ -5916,6 +5916,54 @@ class GuiSmokeTests(unittest.TestCase):
         flash_values = dict(app.APP.settings["upscale"], method="flashvsr")
         self.assertNotEqual(ltx_output, app.upscale_output_for("input/example.mp4", flash_values))
 
+    def test_upscale_can_select_ltx25_cq_enhancer_with_a_finishing_backend(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+        app.APP.settings["upscale"].update({
+            "method": "ltx25cq",
+            "target_width": "3840",
+            "target_height": "2160",
+            "cq_finish": "seedvr2",
+            "cq_base": "dev",
+            "cq_short_edge": "720",
+            "cq_frame_rate": "retime",
+            "cq_colour": "model",
+            "cq_guide_strength": "90",
+            "cq_lora_strength": "0.8",
+            "cq_chunk_seconds": "4",
+            "cq_seed": "9",
+            "cq_prompt": "",
+        })
+
+        command = app.APP.command_for("upscale")
+
+        self.assertEqual(command[command.index("--method") + 1], "ltx25cq")
+        self.assertEqual(command[command.index("--cq-finish") + 1], "seedvr2")
+        self.assertEqual(command[command.index("--cq-base") + 1], "dev")
+        self.assertEqual(command[command.index("--cq-frame-rate") + 1], "retime")
+        self.assertEqual(command[command.index("--cq-colour") + 1], "model")
+        self.assertEqual(command[command.index("--cq-guide-strength") + 1], "0.9")
+        self.assertEqual(command[command.index("--cq-lora-strength") + 1], "0.8")
+        self.assertEqual(command[command.index("--cq-chunk-seconds") + 1], "4")
+        self.assertEqual(command[command.index("--cq-seed") + 1], "9")
+        # The script's parser must accept everything the GUI sends.
+        upscale_video.build_parser().parse_args(command[3:])
+        values = app.APP.settings["upscale"]
+        cq_seedvr2 = app.upscale_output_for("input/example.mp4", values)
+        self.assertEqual(command[command.index("--output") + 1], cq_seedvr2)
+        self.assertNotEqual(cq_seedvr2, app.upscale_output_for("input/example.mp4", dict(values, cq_finish="flashvsr")))
+        self.assertNotEqual(cq_seedvr2, app.upscale_output_for("input/example.mp4", dict(values, method="seedvr2")))
+        self.assertEqual(app.upscale_backend(values), "seedvr2")
+        self.assertEqual(app.upscale_backend(dict(values, cq_finish="bogus")), "flashvsr")
+
+    def test_non_cq_upscale_commands_leave_out_cq_flags(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+        app.APP.settings["upscale"].update({"method": "flashvsr", "cq_finish": "seedvr2"})
+
+        command = app.APP.command_for("upscale")
+
+        self.assertNotIn("--cq-finish", command)
+        self.assertEqual(app.upscale_identity_model(app.APP.settings["upscale"])[0], "flashvsr")
+
     def test_flashvsr_prompt_uses_video_helper_load_and_combine_nodes(self) -> None:
         args = argparse.Namespace(
             flashvsr_model="FlashVSR-v1.1",
@@ -6222,6 +6270,279 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(sum(item[3] for item in ranges), 294)
         self.assertTrue(all(item[4] % 8 == 1 for item in ranges))
 
+    def test_cq_enhancer_prompt_is_video_only_at_30fps_without_prompt_or_cfg(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq"])
+
+        prompt = upscale_video.ltx_ic_lora_prompt(
+            "example.mp4", upscale_video.CQ_FPS, 153, 1280, 704, "arp_upscale/example",
+            unet=upscale_video.cq_base_model(args), lora=args.cq_lora, lora_strength=args.cq_lora_strength,
+            text_encoder=args.ltx25_text_encoder, vae=args.ltx25_video_vae, prompt=args.cq_prompt,
+            negative_prompt="", guide_strength=args.cq_guide_strength, cfg=1.0, seed=args.cq_seed,
+        )
+
+        self.assertEqual(prompt["2"]["inputs"]["unet_name"], upscale_video.LTX25_GGUF_MODEL)
+        self.assertEqual(prompt["3"]["inputs"]["model"], ["2", 0])
+        self.assertEqual(prompt["3"]["inputs"]["lora_name"], upscale_video.LTX25_CQ_ENHANCER_LORA)
+        self.assertEqual(prompt["5"]["inputs"]["text"], "")
+        self.assertEqual(prompt["7"]["inputs"]["frame_rate"], 30.0)
+        self.assertEqual(prompt["9"]["inputs"], {"width": 1280, "height": 704, "length": 153, "batch_size": 1})
+        self.assertEqual(prompt["10"]["inputs"]["strength"], 1.0)
+        self.assertEqual(prompt["11"]["inputs"]["cfg"], 1.0)
+        self.assertNotIn("19", prompt)
+        class_types = {node["class_type"] for node in prompt.values()}
+        self.assertNotIn("LTXVConcatAVLatent", class_types)
+
+    def test_cq_enhancer_dev_base_stacks_the_distilled_lora_at_half_strength(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq", "--cq-base", "dev"])
+
+        prompt = upscale_video.ltx_ic_lora_prompt(
+            "example.mp4", upscale_video.CQ_FPS, 153, 1280, 704, "arp_upscale/example",
+            unet=upscale_video.cq_base_model(args), distilled_lora=upscale_video.LTX25_DISTILLED_LORA,
+            lora=args.cq_lora, lora_strength=1.0, text_encoder=args.ltx25_text_encoder, vae=args.ltx25_video_vae,
+            prompt="", negative_prompt="", guide_strength=1.0, cfg=1.0, seed=1,
+        )
+
+        self.assertEqual(prompt["2"]["inputs"]["unet_name"], upscale_video.LTX25_DEV_GGUF_MODEL)
+        self.assertEqual(prompt["19"]["class_type"], "LoraLoaderModelOnly")
+        self.assertEqual(prompt["19"]["inputs"]["model"], ["2", 0])
+        self.assertEqual(prompt["19"]["inputs"]["lora_name"], upscale_video.LTX25_DISTILLED_LORA)
+        self.assertEqual(prompt["19"]["inputs"]["strength_model"], 0.5)
+        self.assertEqual(prompt["3"]["inputs"]["model"], ["19", 0])
+
+    def test_cq_chunk_plan_renders_valid_30fps_windows_that_keep_every_frame(self) -> None:
+        plan = upscale_video.cq_chunk_plan(294, 24.0, 5.0, 8, "resample")
+
+        self.assertEqual(plan, [(0, 120, 0, 153), (112, 240, 8, 161), (232, 294, 8, 81)])
+        self.assertEqual(sum(end - start - trim for start, end, trim, _model in plan), 294)
+        self.assertTrue(all(model % 8 == 1 for *_rest, model in plan))
+        # Resampling 24 -> 30 fps needs 5 working frames per 4 source frames.
+        self.assertTrue(all(model >= (end - start) * 30 / 24 for start, end, _trim, model in plan))
+        self.assertEqual(upscale_video.cq_chunk_plan(294, 24.0, 5.0, 8, "retime")[0], (0, 120, 0, 121))
+        self.assertEqual(upscale_video.cq_chunk_plan(50, 24.0, 5.0, 8, "resample"), [(0, 50, 0, 65)])
+        self.assertEqual(upscale_video.cq_chunk_plan(50, 24.0, 0.0, 8, "resample"), [(0, 50, 0, 65)])
+
+    def test_cq_frame_rate_never_resamples_footage_faster_than_30fps(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq"])
+
+        self.assertEqual(upscale_video.cq_frame_rate_mode(args, 24.0), "resample")
+        self.assertEqual(upscale_video.cq_frame_rate_mode(args, 50.0), "retime")
+        args.cq_frame_rate = "retime"
+        self.assertEqual(upscale_video.cq_frame_rate_mode(args, 24.0), "retime")
+
+    def test_cq_frame_rate_round_trip_returns_each_source_frame_once(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def frame_levels(path: Path) -> list[int]:
+            capture = cv2.VideoCapture(str(path))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(int(round(frame.mean())))
+            capture.release()
+            return levels
+
+        frames = 40
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            for fps in (18.0, 24.0):
+                source = folder / f"source_{fps:g}.mkv"
+                # Frame i is flat grey 5*i, so every frame stays identifiable through lossy coding.
+                raw = b"".join(bytes([5 * index]) * (64 * 48 * 3) for index in range(frames))
+                subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                     "-r", f"{fps:g}", "-i", "-", "-c:v", "ffv1", str(source)],
+                    input=raw, check=True,
+                )
+                for mode in ("resample", "retime"):
+                    levels: list[int] = []
+                    for index, (start, end, trim, model) in enumerate(upscale_video.cq_chunk_plan(frames, fps, 1.0, 4, mode)):
+                        prepared = folder / f"prepared_{fps:g}_{mode}_{index}.mkv"
+                        restored = folder / f"restored_{fps:g}_{mode}_{index}.mkv"
+                        upscale_video.prepare_cq_chunk(
+                            ffmpeg, source, prepared, start, end, model, fps, 64, 48, mode, True,
+                            common.file_fingerprint(source),
+                        )
+                        self.assertEqual(len(frame_levels(prepared)), model)
+                        # An identity "render": the prepared 30 fps clip goes straight back.
+                        upscale_video.normalize_cq_chunk(ffmpeg, prepared, restored, 64, 48, trim, end - start - trim, fps, mode)
+                        levels.extend(frame_levels(restored))
+                    expected = [5 * index for index in range(frames)]
+                    self.assertEqual(len(levels), frames, (fps, mode))
+                    self.assertTrue(all(abs(got - want) <= 1 for got, want in zip(levels, expected)), (fps, mode, levels))
+
+    def test_cq_source_colour_keeps_cq_luma_and_source_chroma(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "grey_source.mkv"
+            enhanced = folder / "colour_render.mkv"
+            output = folder / "restored.mkv"
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x808080:s=64x48:r=24:d=1",
+                            "-c:v", "ffv1", str(source)], check=True)
+            # A brighter, strongly coloured "CQ render" at twice the size.
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xE08040:s=128x96:r=24:d=1",
+                            "-c:v", "ffv1", str(enhanced)], check=True)
+
+            upscale_video.restore_source_colour(ffmpeg, enhanced, source, output, 128, 96, 24.0, 24)
+
+            capture = cv2.VideoCapture(str(output))
+            frames = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            capture.release()
+        self.assertEqual(len(frames), 24)
+        self.assertEqual(frames[0].shape[:2], (96, 128))
+        blue, green, red = (float(frames[0][..., channel].mean()) for channel in range(3))
+        self.assertLess(max(blue, green, red) - min(blue, green, red), 4)
+        # Luma comes from the render (0xE08040 is brighter than mid grey), not the source.
+        self.assertGreater(green, 135)
+
+    def test_cq_chunks_dissolve_across_their_overlap_and_keep_every_frame(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def clip(path: Path, levels: list[int]) -> None:
+            raw = b"".join(bytes([level]) * (64 * 48 * 3) for level in levels)
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                            "-r", "24", "-i", "-", "-c:v", "ffv1", str(path)], input=raw, check=True)
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            first, second, output = folder / "first.mkv", folder / "second.mkv", folder / "joined.mkv"
+            # Source frames 0-19, then 16-39 with a 4-frame lead-in rendered 40 levels brighter.
+            clip(first, [5 * index for index in range(20)])
+            clip(second, [5 * index + 40 for index in range(16, 40)])
+
+            upscale_video.crossfade_chunks(ffmpeg, [(first, 0), (second, 4)], 24.0, 40, first, output)
+
+            capture = cv2.VideoCapture(str(output))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(frame.mean())
+            capture.release()
+        self.assertEqual(len(levels), 40)
+        offsets = [level - 5 * index for index, level in enumerate(levels)]
+        self.assertTrue(all(abs(offset) <= 2 for offset in offsets[:16]), offsets)
+        self.assertTrue(all(abs(offset - 40) <= 2 for offset in offsets[20:]), offsets)
+        # The lead-in frames ramp from the first render towards the second (xfade weights 0, 1/4, 1/2, 3/4).
+        self.assertTrue(all(2 < offset < 38 for offset in offsets[17:20]), offsets)
+        self.assertEqual(offsets[16:21], sorted(offsets[16:21]))
+
+    def test_cq_source_colour_keeps_render_frames_aligned_with_an_mp4_source(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        frames = 30
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            enhanced = folder / "render.mkv"
+            output = folder / "restored.mkv"
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x48:r=24",
+                            "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
+            # Frame i of the render is grey 6*i; a timebase slip would repeat or delay levels.
+            raw = b"".join(bytes([6 * index]) * (64 * 48 * 3) for index in range(frames))
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                            "-r", "24", "-i", "-", "-c:v", "ffv1", str(enhanced)], input=raw, check=True)
+
+            upscale_video.restore_source_colour(ffmpeg, enhanced, source, output, 64, 48, 24.0, frames)
+
+            capture = cv2.VideoCapture(str(output))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(int(round(frame.mean())))
+            capture.release()
+        self.assertEqual(len(levels), frames)
+        self.assertTrue(all(abs(got - 6 * index) <= 2 for index, got in enumerate(levels)), levels)
+
+    def test_cq_delivers_the_source_aspect_but_renders_on_the_32px_grid(self) -> None:
+        self.assertEqual(upscale_video.cq_output_size(854, 480, 720), (1280, 720))
+        self.assertEqual(upscale_video.cq_generation_size(1280, 720), (1280, 704))
+        self.assertEqual(upscale_video.cq_output_size(4096, 3112, 720), (948, 720))
+        self.assertEqual(upscale_video.cq_generation_size(948, 720), (960, 704))
+        self.assertEqual(upscale_video.cq_output_size(1920, 800, 720), (1728, 720))
+
+    def test_auto_upscale_target_is_the_flashvsr_input_times_its_scale(self) -> None:
+        values = {"method": "flashvsr", "auto_target_size": "true", "flashvsr_scale": "3", "cq_short_edge": "720", "cq_finish": "flashvsr"}
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            source = Path(tmp_text) / "input.mp4"
+            source.write_bytes(b"video")
+            with mock.patch("ai_remaster_gui.server.video_metrics", return_value={"width": 854, "height": 480}):
+                self.assertEqual(app.auto_upscale_target(values, str(source)), (2562, 1440))
+                # With CQ in front, FlashVSR's input is CQ's 720p output.
+                self.assertEqual(app.auto_upscale_target(dict(values, method="ltx25cq"), str(source)), (3840, 2160))
+                self.assertEqual(app.auto_upscale_target(dict(values, method="ltx25cq", flashvsr_scale="2"), str(source)), (2560, 1440))
+                self.assertIsNone(app.auto_upscale_target(dict(values, auto_target_size="false"), str(source)))
+                self.assertIsNone(app.auto_upscale_target(dict(values, method="seedvr2"), str(source)))
+                self.assertIsNone(app.auto_upscale_target(dict(values, method="ltx25cq", cq_finish="lanczos"), str(source)))
+            self.assertIsNone(app.auto_upscale_target(values, str(Path(tmp_text) / "missing.mp4")))
+
+    def test_auto_upscale_target_fills_the_target_fields_on_upscale_changes(self) -> None:
+        app.APP.settings["upscale"].update({"method": "ltx25cq", "cq_finish": "flashvsr", "flashvsr_scale": "2", "target_width": "3840", "target_height": "2160"})
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            source = Path(tmp_text) / "recomp.mp4"
+            source.write_bytes(b"video")
+            with mock.patch.object(app.APP, "upscale_input_for", return_value=str(source)), \
+                    mock.patch("ai_remaster_gui.server.video_metrics", return_value={"width": 1920, "height": 800}), \
+                    mock.patch.object(app.APP, "save"):
+                app.APP.update_settings("upscale", {"auto_target_size": "true"})
+                filled = (app.APP.settings["upscale"]["target_width"], app.APP.settings["upscale"]["target_height"])
+                app.APP.update_settings("upscale", {"auto_target_size": "false", "target_width": "3840", "target_height": "2160"})
+                manual = (app.APP.settings["upscale"]["target_width"], app.APP.settings["upscale"]["target_height"])
+
+        self.assertEqual(filled, ("3456", "1440"))
+        self.assertEqual(manual, ("3840", "2160"))
+
+    def test_cq_upscale_signature_tracks_its_finishing_backend(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq"])
+        source = app.ROOT / "input" / "example.mp4"
+        with mock.patch.object(upscale_video, "file_fingerprint", return_value={"size": 1}), \
+                mock.patch.object(upscale_video, "video_info", return_value={"width": 854, "height": 480, "fps": 24.0, "frames": 96}):
+            flash = upscale_video.signature(args, source, 3840, 2160)
+            args.cq_finish = "lanczos"
+            lanczos = upscale_video.signature(args, source, 3840, 2160)
+            args.cq_seed = 7
+            reseeded = upscale_video.signature(args, source, 3840, 2160)
+
+        self.assertEqual(flash["finish"], "flashvsr")
+        self.assertEqual(flash["finish_settings"]["method"], "flashvsr_ultra_fast")
+        self.assertNotIn("source_fingerprint", flash["finish_settings"])
+        self.assertEqual(flash["enhance"]["enhance_width"], 1280)
+        self.assertEqual(flash["enhance"]["enhance_height"], 704)
+        self.assertEqual(lanczos["finish_settings"], {"method": "lanczos"})
+        self.assertEqual(flash["enhance"]["colour"], "model")
+        self.assertEqual((flash["enhance"]["output_width"], flash["enhance"]["output_height"]), (1280, 720))
+        self.assertNotEqual(lanczos, reseeded)
+        self.assertEqual(upscale_video.delivery_dimensions(args, 3840, 2160), (3840, 2160))
+        args.cq_finish = "ltx25"
+        self.assertEqual(upscale_video.delivery_dimensions(args, 3840, 2160), (3840, 2176))
+
     def test_upscale_signature_only_records_advanced_knobs_when_changed(self) -> None:
         parser = upscale_video.build_parser()
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
@@ -6462,6 +6783,45 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(progress["label"], "Upscale chunks complete, stitching")
         self.assertLess(progress["percent"], 100)
+
+    def test_cq_upscale_progress_splits_enhance_and_finish_passes(self) -> None:
+        original_log = app.APP.log
+        app.APP.running_stage_key = "upscale"
+        app.APP.running_stage = "Upscaling"
+        app.APP.run_started_at = time.time() - 300
+        enhance_log = [
+            "scripts/upscale_video.py --method ltx25cq",
+            "Enhancing with LTX 2.5 CQ in 2 chunk(s): 854x480 -> 1280x704 at 30 fps (resample from 24 fps)",
+            "CQ enhance chunk 1/2: frames 0-120, trim 0, keep 120, LTX window 153",
+            "Wrote CQ enhanced chunk: cq_final_0000.mkv",
+            "CQ enhance chunk 2/2: frames 112-240, trim 8, keep 120, LTX window 161",
+        ]
+        finish_log = [
+            "Stitching upscaled chunks: 2 chunk(s)",
+            "Muxing original audio into upscaled video",
+            "Finishing CQ-enhanced video with FlashVSR: enhanced.mkv",
+            "Splitting upscaling into 4 chunk(s): 6s chunks, 8 overlap frame(s)",
+            "Upscale chunk 1/4: frames 0-144, trim 0",
+            "Wrote upscaled chunk: chunk_0001.mp4",
+            "Upscale chunk 2/4: frames 136-288, trim 8",
+        ]
+
+        try:
+            app.APP.log = enhance_log
+            enhancing = app.APP.estimate_running_progress()
+            app.APP.log = enhance_log + finish_log
+            finishing = app.APP.estimate_running_progress()
+        finally:
+            app.APP.running_stage_key = ""
+            app.APP.running_stage = ""
+            app.APP.run_started_at = 0.0
+            app.APP.log = original_log
+
+        self.assertTrue(enhancing["label"].startswith("CQ enhance: chunk 2/2"), enhancing["label"])
+        self.assertLess(enhancing["percent"], 50)
+        self.assertTrue(finishing["label"].startswith("Finishing: Upscale chunk 2/4"), finishing["label"])
+        self.assertGreaterEqual(finishing["percent"], 50)
+        self.assertLess(finishing["percent"], 75)
 
     def test_model_download_progress_surfaces_percent(self) -> None:
         original_log = app.APP.log

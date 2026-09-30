@@ -254,7 +254,9 @@ Once recomposition finishes, the Output tab plays the final render.
 
 ### Upscaling and source motion
 
-The Upscaling page offers three backends. **FlashVSR** remains the fast, established refiner. **SeedVR2** is a heavier one-step video restoration model; the practical default is its 3B FP8 model with five-frame batches for temporal consistency, VAE tiling, VRAM preservation, and balanced BlockSwap. SeedVR2 models download automatically on first use. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to either generative path. The LTX gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
+The Upscaling page offers four backends. **FlashVSR** remains the fast, established refiner. **SeedVR2** is a heavier one-step video restoration model; the practical default is its 3B FP8 model with five-frame batches for temporal consistency, VAE tiling, VRAM preservation, and balanced BlockSwap. SeedVR2 models download automatically on first use. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to either generative path. The LTX gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
+
+**LTX 2.5 CQ Enhancer** runs CQdesign's generative restoration LoRA before upscaling. It restores detail at 720p rather than enlarging, so a second backend (FlashVSR, SeedVR2, LTX 2.5 Pixel Spatial or a plain Lanczos resize, chosen with **Then upscale with**) takes the restored video to the target size. The LoRA expects 30 fps; ARP converts each chunk to 30 fps and back, so every source frame comes back once at the source frame rate. By default it reuses the installed distilled transformer; the **Dev** base reproduces the author's recipe (dev transformer plus the distilled LoRA at 0.5) at the cost of about 25 GB of extra downloads. By default the CQ render's own colour is kept, which usually looks natural; it can colourise black-and-white film, though, so **CQ colour** can instead keep the source's colour and take only brightness detail from CQ, leaving colour to the Colorize stage. It is also strongly generative: faces can be redrawn, so preview identity-critical shots and use per-shot AI strength where needed. The restored 720p render is cached, so changing only the finishing backend does not rerun it.
 
 AI video upscalers can make motion look unnaturally crisp when they reconstruct every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full AI render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
 
@@ -275,7 +277,7 @@ ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended st
 - LTX 2.3 distilled GGUF Q4_K_M and eight-step schedule for Dearchive and lightweight outpainting.
 - Configurable 540p/720p/1080p/source Dearchive processing and delivery resolution.
 - Official LTX 2.3 v0.9 in/outpainting IC-LoRA (full-resolution mask-conditioned pass).
-- SeedVR2 and LTX 2.5 Pixel Spatial Upscaler as alternatives to FlashVSR.
+- SeedVR2, LTX 2.5 Pixel Spatial Upscaler and the LTX 2.5 CQ Enhancer restoration LoRA as alternatives to FlashVSR.
 - Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
 - Qwen Image Edit Lightning LoRA.
 - Deep Exemplar reference-guided video colorization.

@@ -19,6 +19,9 @@ Model downloads are handled on demand by the pipeline stage that needs them. `in
 - Text encoder: `elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF/gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf`
 - Video/audio VAEs and latent upscaler: `Lightricks/LTX-2.5`
 - In/Outpainting LoRA: the gated LTX 2.3 model listed above
+- CQ Enhancer LoRA (upscaling): `CQdesign/LTX-2.5-CQ-Video-and-Image-Enhancer-LoRAs/ltx2.5-CQ-enhancer-lora-V2.safetensors` → `models/loras/`
+- CQ Enhancer "dev" base only: `vantagewithai/LTX-2.5-GGUF/dev/ltx-2.5-22b-dev-transformer-Q4_K_M.gguf`
+  and `Lightricks/LTX-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` (about 25 GB together)
 
 The quantized text encoder is also gated. Accept its terms in the browser, then authenticate ARP's
 local downloader with `hf auth login --force` from the activated ARP environment (or set `HF_TOKEN`)

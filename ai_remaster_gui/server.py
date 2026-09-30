@@ -850,6 +850,15 @@ class PipelineApp:
             )
             if start >= 0:
                 upscale_log = upscale_log[start:]
+            # The CQ Enhancer runs a whole chunked pass before its finishing upscaler runs
+            # another; each pass reports on its own half of the bar.
+            cq_phase = ""
+            finish_start = upscale_log.lower().rfind("finishing cq-enhanced video with")
+            if finish_start >= 0:
+                upscale_log = upscale_log[finish_start:]
+                cq_phase = "finish"
+            elif "enhancing with ltx 2.5 cq" in upscale_log.lower():
+                cq_phase = "enhance"
             upscale_lower = upscale_log.lower()
             label = "Upscaling"
             milestones = [
@@ -860,6 +869,7 @@ class PipelineApp:
                 ("sending prompt nodes", 42, "Sending FlashVSR prompt"),
                 ("sending seedvr2 prompt nodes", 42, "Sending SeedVR2 prompt"),
                 ("sending ltx 2.5 upscale prompt nodes", 42, "Sending LTX 2.5 prompt"),
+                ("sending ltx 2.5 cq enhancer prompt nodes", 42, "Sending LTX 2.5 CQ prompt"),
                 ("stitching upscaled chunks", 96, "Stitching upscaled chunks"),
                 ("muxing original audio", 98, "Muxing original audio"),
                 ("wrote upscaled video", 100, "Upscaled video written"),
@@ -886,7 +896,7 @@ class PipelineApp:
                     active_note = f"; live pass {chunk['active_value']}/{chunk['active_total']}"
                 tile_note = active_note
                 try:
-                    method = values.get("method", "flashvsr")
+                    method = upscale_backend(values)
                     if method == "flashvsr" and is_true(values, "flashvsr_tiled_dit", "true"):
                         columns, rows = spatial_tile_grid(
                             int(values.get("target_width", "0") or 0),
@@ -916,6 +926,12 @@ class PipelineApp:
                     label = f"Upscale chunk {chunk['current']}/{chunk['total']} rendering in ComfyUI ({chunk['done']} done{tile_note}){eta}"
                 else:
                     label = f"Upscale chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done{tile_note}){eta}"
+            if cq_phase == "enhance":
+                percent = min(49, percent // 2)
+                label = "CQ enhance: " + label.replace("Upscale chunk", "chunk")
+            elif cq_phase == "finish" and percent < 100:
+                percent = 50 + percent // 2
+                label = "Finishing: " + label
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
     def state(self, view: str = "") -> dict:
@@ -946,6 +962,7 @@ class PipelineApp:
                 "stabilization_comparison": self.stabilization_comparison_state(),
                 "reference_luminance": {"enabled": False, "plan": [], "matched_shots": 0},
                 "upscale_preview": self.upscale_preview_state(),
+                "upscale_auto_target": self.upscale_auto_target_state() if view == "upscale" else "",
                 "output_selection": self.output_selection_state(),
                 "source_previews": source_media["previews"],
                 "source_info": source_media["info"],
@@ -1057,6 +1074,8 @@ class PipelineApp:
             preferred = colorized_output_for_manifest(self.settings.get("colour", {}).get("manifest", ""), str(values.get("colorization_method", "deepexemplar")))
             if preferred:
                 self.settings.setdefault("recomp", {})["colorized_video"] = preferred
+        if stage == "upscale":
+            self.apply_auto_upscale_target()
         if stage == "shots" and "outpainted_video" in values:
             manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
             self.settings.setdefault("references", {}).setdefault("manifest", manifest)
@@ -1447,6 +1466,8 @@ class PipelineApp:
         upscale_input = self.upscale_input_for()
         if upscale_input:
             self.settings.setdefault("upscale", {})["input_video"] = upscale_input
+            # The output name is keyed on the target size, so fill an automatic size first.
+            self.apply_auto_upscale_target(upscale_input)
             upscale_output = upscale_output_for(upscale_input, self.settings.get("upscale", {}))
             if upscale_output:
                 self.settings.setdefault("upscale", {})["output"] = upscale_output
@@ -1908,7 +1929,7 @@ class PipelineApp:
             if not self.upscale_input_for():
                 return False, "Upscaling input is not available yet. Choose source material, or run Recomposition first when earlier phases are enabled."
             if (
-                self.settings.get("upscale", {}).get("method", "flashvsr") == "flashvsr"
+                upscale_backend(self.settings.get("upscale", {})) == "flashvsr"
                 and self.settings.get("upscale", {}).get("compute", "local") != "runpod"
             ):
                 warning = flashvsr_hardware_warning()
@@ -2186,6 +2207,19 @@ class PipelineApp:
             return recomposed
         return self.stabilized_source_for_downstream()
 
+    def apply_auto_upscale_target(self, source_text: str = "") -> None:
+        """Fill Target width/height from the FlashVSR input when Auto target size is on."""
+        values = self.settings.setdefault("upscale", {})
+        target = auto_upscale_target(values, source_text or self.upscale_input_for() or values.get("input_video", ""))
+        if target:
+            values["target_width"], values["target_height"] = str(target[0]), str(target[1])
+
+    def upscale_auto_target_state(self) -> str:
+        """"WxH" when Auto target size resolves, so the page can lock the fields; "" while pending."""
+        values = self.settings.get("upscale", {})
+        target = auto_upscale_target(values, self.upscale_input_for() or values.get("input_video", ""))
+        return f"{target[0]}x{target[1]}" if target else ""
+
     def upscale_command(self, values: dict[str, str], source: str, output: str) -> list[str]:
         config = current_config()
         cmd = [sys.executable, "-u", str(SCRIPTS / "upscale_video.py")]
@@ -2197,9 +2231,7 @@ class PipelineApp:
         add(["--comfy-dir", comfy_dir_for(config)])
         add(["--comfy-url", comfy_url_for(config)])
         add(["--comfy-output-root", comfy_output_root_for(config)])
-        method = values.get("method", "flashvsr")
-        if method not in {"flashvsr", "seedvr2", "ltx25"}:
-            method = "flashvsr"
+        method = upscale_method(values)
         add(["--method", method])
         add(["--flashvsr-model", values.get("flashvsr_model", "FlashVSR-v1.1")])
         add(["--flashvsr-mode", values.get("flashvsr_mode", "tiny")])
@@ -2226,6 +2258,19 @@ class PipelineApp:
         add(["--ltx25-seed", values.get("ltx25_seed", "42")])
         add(["--ltx25-prompt", values.get("ltx25_prompt", "")])
         add(["--ltx25-negative-prompt", values.get("ltx25_negative_prompt", "")])
+        if method == "ltx25cq":
+            add(["--cq-finish", upscale_cq_finish(values)])
+            add(["--cq-base", "dev" if values.get("cq_base") == "dev" else "distilled"])
+            add(["--cq-short-edge", values.get("cq_short_edge") or "720"])
+            add(["--cq-frame-rate", "retime" if values.get("cq_frame_rate") == "retime" else "resample"])
+            add(["--cq-colour", "source" if values.get("cq_colour") == "source" else "model"])
+            add(["--cq-guide-strength", str(float(values.get("cq_guide_strength", "100") or 100) / 100.0)])
+            add(["--cq-lora-strength", values.get("cq_lora_strength") or "1.0"])
+            add(["--cq-chunk-seconds", values.get("cq_chunk_seconds") or "5"])
+            add(["--cq-seed", values.get("cq_seed") or "42"])
+            # Empty arguments are dropped below, which would leave the flag without a value.
+            if values.get("cq_prompt", "").strip():
+                add(["--cq-prompt", values["cq_prompt"]])
         add(["--blend-strength", values.get("blend_strength", "100")])
         shot_manifest = (
             self.settings.get("colour", {}).get("manifest", "")
@@ -2376,7 +2421,8 @@ class PipelineApp:
         source_text = self.upscale_input_for() or values.get("input_video")
         if not source_text:
             return False, "Choose a source and enable Upscale before generating a preview."
-        if values.get("method", "flashvsr") == "flashvsr":
+        self.apply_auto_upscale_target(source_text)
+        if upscale_backend(values) == "flashvsr":
             warning = flashvsr_hardware_warning()
             if warning:
                 return False, warning
@@ -3027,15 +3073,75 @@ def upscale_target_size(values: dict[str, str]) -> tuple[int, int]:
     return max(2, width), max(2, height)
 
 
+UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
+CQ_FINISH_METHODS = {"flashvsr", "seedvr2", "ltx25", "lanczos"}
+
+
+def upscale_cq_finish(values: dict[str, str]) -> str:
+    finish = values.get("cq_finish", "flashvsr")
+    return finish if finish in CQ_FINISH_METHODS else "flashvsr"
+
+
+def upscale_method(values: dict[str, str]) -> str:
+    method = values.get("method", "flashvsr")
+    return method if method in UPSCALE_METHODS else "flashvsr"
+
+
+def upscale_backend(values: dict[str, str]) -> str:
+    """The backend that produces the delivery size: the CQ Enhancer hands off to its finisher."""
+    method = upscale_method(values)
+    return upscale_cq_finish(values) if method == "ltx25cq" else method
+
+
+def auto_upscale_target(values: dict[str, str], source_text: str) -> tuple[int, int] | None:
+    """The FlashVSR input size times its scale, when Auto target size is on and FlashVSR delivers.
+
+    With the CQ Enhancer in front, FlashVSR's input is CQ's output (short edge at the CQ
+    working size), not the source. None while the input does not exist yet.
+    """
+    if not is_true(values, "auto_target_size") or upscale_backend(values) != "flashvsr" or not source_text:
+        return None
+    source = resolve(source_text)
+    if not source.is_file():
+        return None
+    metrics = video_metrics(source)
+    width, height = int(metrics.get("width") or 0), int(metrics.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return None
+    if upscale_method(values) == "ltx25cq":
+        from upscale_video import cq_output_size
+
+        try:
+            short_edge = int(float(values.get("cq_short_edge") or 720))
+        except ValueError:
+            short_edge = 720
+        width, height = cq_output_size(width, height, short_edge)
+    try:
+        scale = max(1, int(float(values.get("flashvsr_scale") or 2)))
+    except ValueError:
+        scale = 2
+    return even_int(width * scale), even_int(height * scale)
+
+
+def upscale_identity_model(values: dict[str, str]) -> tuple[str, bool, str]:
+    """The (model, pre_downscale, scale) an upscale output's name is keyed on.
+
+    A CQ-enhanced upscale is named for its finishing backend too, so switching
+    that backend never reuses the other one's output.
+    """
+    method = upscale_method(values)
+    backend = upscale_backend(values)
+    model = f"ltx25cq-{backend}" if method == "ltx25cq" else method
+    pre_downscale = backend == "flashvsr" and is_true(values, "flashvsr_pre_downscale")
+    return model, pre_downscale, values.get("flashvsr_scale", "2") if backend == "flashvsr" else "2"
+
+
 def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
     if not source_text:
         return ""
     source = resolve(source_text)
     width, height = upscale_target_size(values)
-    method = values.get("method", "flashvsr")
-    if method not in {"flashvsr", "seedvr2", "ltx25"}:
-        method = "flashvsr"
-    ident = aid.upscale_identity(source.stem, width, height, method, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
+    ident = aid.upscale_identity(source.stem, width, height, *upscale_identity_model(values))
     return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
 
 
@@ -3057,10 +3163,8 @@ def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
     source = resolve(source_text)
     width, height = upscale_target_size(values)
     seconds = str(values.get("preview_seconds", "6") or "6")
-    method = values.get("method", "flashvsr")
-    if method not in {"flashvsr", "seedvr2", "ltx25"}:
-        method = "flashvsr"
-    ident = aid.upscale_preview_identity(source.stem, width, height, method, seconds, method == "flashvsr" and is_true(values, "flashvsr_pre_downscale"), values.get("flashvsr_scale", "2") if method == "flashvsr" else "2")
+    model, pre_downscale, scale = upscale_identity_model(values)
+    ident = aid.upscale_preview_identity(source.stem, width, height, model, seconds, pre_downscale, scale)
     return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
 
 
