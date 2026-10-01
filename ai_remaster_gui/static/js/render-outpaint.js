@@ -657,6 +657,7 @@ function hydratePendingGuidePreviews() {
 }
 
 function drawOutpaint(st, s, expected, sp) {
+  if (outpaintSectionWaiting()) return showOutpaintLoadingShell();
   const offsetKeys = new Set(['offset_x', 'offset_y']);
   // The H3 licence and PDD switches only apply to MiniMax H3.
   const hiddenKeys = new Set(s.outpaint_model === 'h3' ? [] : ['h3_license_confirmed', 'h3_pdd']);

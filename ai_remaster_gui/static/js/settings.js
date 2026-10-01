@@ -121,20 +121,20 @@ function openAISettingsHtml(refs) {
     <label>Size</label>
     <select id="openaiImageSize">
       ${[
-        ['max', 'Maximum (source aspect, up to 4K)'],
         ['auto', 'Auto'],
+        ['max', 'Maximum (source aspect, up to 4K; costs much more)'],
         ['3840x2160', '3840x2160 (4K landscape)'],
         ['2160x3840', '2160x3840 (4K portrait)'],
         ['2048x2048', '2048x2048 (2K square)'],
         ['1536x1024', '1536x1024 (landscape)'],
         ['1024x1536', '1024x1536 (portrait)'],
         ['1024x1024', '1024x1024 (square)'],
-      ].map(([value, label]) => `<option value="${value}" ${(refs.openai_image_size || 'max') === value ? 'selected' : ''}>${label}</option>`).join('')}
+      ].map(([value, label]) => `<option value="${value}" ${(refs.openai_image_size || 'auto') === value ? 'selected' : ''}>${label}</option>`).join('')}
     </select>
-    <small class="field-help">Maximum preserves the extracted frame's aspect ratio and requests the largest supported multiple-of-16 dimensions. The returned master is kept at that resolution.</small>
+    <small class="field-help">Auto lets OpenAI pick a size and is the cheapest choice. Maximum preserves the extracted frame's aspect ratio and requests the largest supported multiple-of-16 dimensions; it uses far more credit per image.</small>
     <label>Quality</label>
     <select id="openaiImageQuality">
-      ${['max', 'xhigh', 'high', 'medium', 'low', 'auto'].map(value => `<option value="${value}" ${(refs.openai_image_quality || 'max') === value ? 'selected' : ''}>${value}</option>`).join('')}
+      ${['auto', 'low', 'medium', 'high', 'xhigh', 'max'].map(value => `<option value="${value}" ${(refs.openai_image_quality || 'auto') === value ? 'selected' : ''}>${value}</option>`).join('')}
     </select>
     <div class="actions">
       <button type="button" class="primary" onclick="saveOpenAISettings()">Save OpenAI Settings</button>
@@ -190,8 +190,8 @@ async function saveOpenAISettings() {
     values: {
       openai_api_key: document.getElementById('openaiApiKey')?.value || '',
       openai_image_model: document.getElementById('openaiImageModel')?.value || 'gpt-image-2.5-sunburst',
-      openai_image_size: document.getElementById('openaiImageSize')?.value || 'max',
-      openai_image_quality: document.getElementById('openaiImageQuality')?.value || 'max',
+      openai_image_size: document.getElementById('openaiImageSize')?.value || 'auto',
+      openai_image_quality: document.getElementById('openaiImageQuality')?.value || 'auto',
     },
   });
   state = await api(stateUrl());

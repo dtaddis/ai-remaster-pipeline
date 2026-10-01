@@ -50,7 +50,44 @@ from ai_remaster_gui import project_io
 from ai_remaster_gui import runtime_settings
 from ai_remaster_gui import sam_masks
 from ai_remaster_gui import server
+from ai_remaster_gui import stage_stamps
 from ai_remaster_gui import system_status
+
+
+def fake_section_ffprobe(command, **_kwargs):
+    """ffprobe stand-in for section trims: one audio stream, no readable timing."""
+    return subprocess.CompletedProcess(command, 0, stdout='{"streams":[{"index":1}]}', stderr="")
+
+
+def fake_section_trim(commands: list[list[str]], release: threading.Event | None = None, fail: bool = False):
+    """Popen stand-in for the section trim: reports halfway, then writes the partial clip."""
+
+    class FakeTrim:
+        def __init__(self, command, **_kwargs):
+            commands.append(command)
+            self.command = command
+            self.returncode = None
+
+        @property
+        def stdout(self):
+            yield "out_time_us=N/A\n"
+            yield "out_time_us=6000000\n"
+            if release is not None:
+                release.wait(5)
+            if fail:
+                yield Path(self.command[self.command.index("-i") + 1]).name + ": Invalid data found\n"
+            else:
+                Path(self.command[-1]).write_bytes(b"trimmed")
+            yield "progress=end\n"
+
+        def wait(self):
+            self.returncode = 1 if fail else 0
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    return FakeTrim
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -67,6 +104,10 @@ class GuiSmokeTests(unittest.TestCase):
             patcher = mock.patch.object(target, "SETTINGS_FILE", tmp_settings)
             patcher.start()
             cls.addClassCleanup(patcher.stop)
+        # Stage runs record completion stamps; keep them out of the real .cache.
+        patcher = mock.patch.object(stage_stamps, "STAMP_DIR", tmp_settings.parent / "stage_stamps")
+        patcher.start()
+        cls.addClassCleanup(patcher.stop)
         app.APP.settings = server.load_settings()
         cls._pristine_settings = copy.deepcopy(app.APP.settings)
 
@@ -1147,6 +1188,133 @@ class GuiSmokeTests(unittest.TestCase):
 
         run_stage.assert_called_once_with("outpaint")
         self.assertIn("Whole remaster stopped before Outpainting", app.APP.log[-1])
+
+    def test_run_all_skips_stages_that_are_up_to_date(self) -> None:
+        class DoneProcess:
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+        stages = [stage for stage in app.STAGES if stage.key in {"outpaint", "shots", "references"}]
+        started: list[str] = []
+
+        def fake_run_stage(stage_key: str) -> tuple[bool, str]:
+            started.append(stage_key)
+            app.APP.process = DoneProcess()
+            app.APP.running_stage_key = ""
+            return True, "started"
+
+        with (
+            mock.patch.object(app.APP, "active_stages", return_value=tuple(stages)),
+            mock.patch.object(app.APP, "stage_is_current", side_effect=lambda key: key in {"outpaint", "shots"}),
+            mock.patch.object(app.APP, "hydrate_stage_inputs"),
+            mock.patch.object(app.APP, "run_stage", side_effect=fake_run_stage),
+        ):
+            app.APP._run_all_worker()
+
+        self.assertEqual(started, ["references"])
+        log = "\n".join(app.APP.log)
+        self.assertIn("Outpainting is up to date", log)
+        self.assertIn("Shot Detection is up to date", log)
+
+    def test_stage_is_current_only_while_inputs_and_settings_match_the_last_finished_run(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            video = folder / "outpainted.mp4"
+            video.write_bytes(b"video")
+            manifest = folder / "shots.csv"
+            manifest.write_text("enabled,prompt\ntrue,\n", encoding="utf-8")
+            command = [sys.executable, "-u", str(app.SCRIPTS / "generate_references.py"), "--source-video", str(video), "--output-manifest", str(manifest), "--shot-threshold", "0.075"]
+            values = app.APP.settings.setdefault("shots", {})
+            with (
+                mock.patch.object(app.APP, "expected_outputs", return_value=[str(manifest)]),
+                mock.patch.object(app.APP, "local_command_for", side_effect=lambda _key, run_flags=True: list(command)),
+            ):
+                self.assertFalse(app.APP.stage_is_current("shots"))  # never finished
+
+                launch = app.APP.stage_stamp("shots")
+                app.APP.record_stage_stamp("shots", launch)
+                self.assertTrue(app.APP.stage_is_current("shots"))
+
+                manifest.write_text("enabled,prompt\nfalse,a user edit\n", encoding="utf-8")
+                self.assertTrue(app.APP.stage_is_current("shots"))  # its own output is not an input
+
+                values["force"] = "true"
+                self.assertFalse(app.APP.stage_is_current("shots"))  # Regenerate always runs
+                values["force"] = "false"
+
+                command[-1] = "0.2"
+                self.assertFalse(app.APP.stage_is_current("shots"))  # a setting changed
+                command[-1] = "0.075"
+                self.assertTrue(app.APP.stage_is_current("shots"))
+
+                video.write_bytes(b"re-rendered video")
+                self.assertFalse(app.APP.stage_is_current("shots"))  # the input changed
+
+                # An input edited while the stage ran: the output may predate it, so no stamp.
+                launch = app.APP.stage_stamp("shots")
+                video.write_bytes(b"edited mid-run")
+                app.APP.record_stage_stamp("shots", launch)
+                self.assertFalse(app.APP.stage_is_current("shots"))
+
+                manifest.unlink()
+                app.APP.record_stage_stamp("shots", app.APP.stage_stamp("shots"))
+                self.assertFalse(app.APP.stage_is_current("shots"))  # output missing
+
+    def test_stage_stamp_follows_files_a_manifest_points_at(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            guide = folder / "guide.png"
+            raw = folder / "raw_0000.mkv"
+            for path in (source, guide, raw):
+                path.write_bytes(b"x")
+            chunks = folder / "chunks.csv"
+            guide_frames = json.dumps([{"frame_idx": 0, "strength": 0.7, "image": str(guide)}])
+            with chunks.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(f"# source_video={source}\n")
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(["chunk_index", "guide_frames", "raw_path"])
+                writer.writerow(["0", guide_frames, str(raw)])
+            command = ["python", str(app.SCRIPTS / "outpaint_video.py"), "--chunk-manifest", str(chunks)]
+
+            def stamp() -> str:
+                return stage_stamps.compute_stamp(command, [str(folder / "out.mp4")], " ".join(command))
+
+            before = stamp()
+            raw.write_bytes(b"a regenerated chunk render")
+            self.assertEqual(stamp(), before)  # the stage's own chunk renders are not inputs
+            guide.write_bytes(b"a new guide")
+            after_guide = stamp()
+            self.assertNotEqual(after_guide, before)
+            source.write_bytes(b"a new source")
+            self.assertNotEqual(stamp(), after_guide)
+
+    def test_outpaint_chunk_regeneration_forgets_the_outpaint_stamp(self) -> None:
+        stage_stamps.write_stamp("outpaint", ["intermediate/outpainted/movie.mp4"], "digest")
+        app.APP.settings["global"]["source"] = "input/movie.mp4"
+
+        class RunningProcess:
+            stdout: list[str] = []
+
+            def poll(self):
+                return None
+
+        with (
+            mock.patch.object(app.APP, "ensure_pipeline_source"),
+            mock.patch.object(server, "ensure_comfy_available_for_stage", return_value=(True, "")),
+            mock.patch.object(app.APP, "command_for", return_value=["python", "outpaint_video.py"]),
+            mock.patch.object(server.subprocess, "Popen", return_value=RunningProcess()),
+            mock.patch.object(server, "keep_awake"),
+            mock.patch.object(server.threading, "Thread"),
+        ):
+            ok, _message = app.APP.run_outpaint_chunk(0)
+
+        app.APP.process = None
+        app.APP.running_stage_key = ""
+        self.assertTrue(ok)
+        self.assertEqual(stage_stamps.read_stamp("outpaint", ["intermediate/outpainted/movie.mp4"]), "")
 
     def test_deterministic_outpaint_output_path_uses_selected_source(self) -> None:
         app.APP.settings.setdefault("outpaint", {}).update(
@@ -3764,6 +3932,108 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(read_rows[0]["end_frame"], "7")
         self.assertEqual(read_rows[1]["start_frame"], "7")
 
+    def test_shot_redetection_keeps_edits_on_unchanged_shot_spans(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            manifest = folder / "shots.csv"
+            info = generate_references.VideoInfo(width=16, height=9, fps=24.0, frame_count=30, duration=30 / 24.0)
+            previous = [
+                generate_references.ReferenceRow(0, 0, 10, 4, 4 / 24.0, folder / "old_a.png", folder / "chosen_a.png"),
+                generate_references.ReferenceRow(1, 10, 30, 20, 20 / 24.0, folder / "old_b.png", folder / "old_b_color.png"),
+            ]
+            generate_references.write_manifest(manifest, source, previous, info)
+            _source, fields, rows = app.read_manifest_details(manifest)
+            rows[0].update({"enabled": "false", "prompt": "a red coat", "fade_to_next": "true", "crossfade_seconds": "0.5", "note": "mine"})
+            app.write_manifest_details(manifest, _source, [*fields, "note"], rows)
+
+            # Re-detection keeps shot 0's span and splits the old shot 1 in two.
+            detected = [
+                generate_references.ReferenceRow(0, 0, 10, 5, 5 / 24.0, folder / "new_a.png", folder / "new_a_color.png"),
+                generate_references.ReferenceRow(1, 10, 18, 12, 12 / 24.0, folder / "new_b.png", folder / "new_b_color.png"),
+                generate_references.ReferenceRow(2, 18, 30, 24, 24 / 24.0, folder / "new_c.png", folder / "new_c_color.png"),
+            ]
+            _previous_source, previous_fields, previous_rows = generate_references.read_manifest(manifest)
+            kept = generate_references.carry_over_rows(detected, previous_rows, info.fps)
+            generate_references.write_manifest(manifest, source, detected, info, kept, previous_fields)
+            _source, fields, rows = app.read_manifest_details(manifest)
+
+        self.assertEqual(list(kept), [0])
+        self.assertEqual(detected[0].selected_frame, 4)  # the frame the kept row's reference was made from
+        self.assertEqual(Path(rows[0]["source_reference"]).name, "old_a.png")
+        self.assertEqual(Path(rows[0]["color_reference"]).name, "chosen_a.png")
+        self.assertEqual(
+            {key: rows[0][key] for key in ("enabled", "prompt", "fade_to_next", "crossfade_seconds", "note")},
+            {"enabled": "false", "prompt": "a red coat", "fade_to_next": "true", "crossfade_seconds": "0.5", "note": "mine"},
+        )
+        self.assertIn("note", fields)
+        self.assertEqual([(row["start_frame"], row["end_frame"]) for row in rows], [("0", "10"), ("10", "18"), ("18", "30")])
+        self.assertEqual((rows[1]["enabled"], rows[1]["prompt"]), ("true", ""))
+
+    def test_shot_manifest_rewrite_with_identical_rows_keeps_the_file_untouched(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            manifest = folder / "shots.csv"
+            info = generate_references.VideoInfo(width=16, height=9, fps=24.0, frame_count=20, duration=20 / 24.0)
+            rows = [generate_references.ReferenceRow(0, 0, 20, 3, 3 / 24.0, folder / "a.png", folder / "a_color.png")]
+            generate_references.write_manifest(manifest, source, rows, info)
+            os.utime(manifest, ns=(1_000_000_000, 1_000_000_000))
+
+            generate_references.write_manifest(manifest, source, rows, info)
+
+            self.assertEqual(manifest.stat().st_mtime_ns, 1_000_000_000)
+
+    def test_shot_detection_reuses_a_manifest_for_the_same_video_and_settings(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            video = folder / "outpainted.mp4"
+            video.write_bytes(b"video")
+            frame = folder / "refs" / "cut_0000.png"
+            frame.parent.mkdir()
+            frame.write_bytes(b"png")
+            manifest = folder / "shots.csv"
+            manifest.write_text(
+                f"# source_video={video}\nenabled,start_frame,end_frame,selected_frame,end,source_reference,color_reference,prompt\n"
+                f"true,0,20,3,00:00:01.000,{frame},{folder / 'color.png'},an edit\n",
+                encoding="utf-8",
+            )
+            os.utime(video, ns=(1_000_000_000, 1_000_000_000))
+            argv = ["generate_references.py", "--source-video", str(video), "--output-manifest", str(manifest)]
+
+            frames_read: list[int] = []
+
+            def read_frame(_path, index):
+                frames_read.append(index)
+                return generate_references.np.zeros((9, 16, 3), dtype=generate_references.np.uint8)
+
+            def run(*extra: str, frame_count: int = 20) -> None:
+                info = generate_references.VideoInfo(width=16, height=9, fps=24.0, frame_count=frame_count, duration=frame_count / 24.0)
+                with (
+                    mock.patch.object(sys, "argv", [*argv, *extra]),
+                    mock.patch.object(generate_references, "probe_video", return_value=info),
+                    mock.patch.object(generate_references, "read_frame", side_effect=read_frame),
+                    mock.patch.object(generate_references, "sample_video", side_effect=AssertionError("re-detected")),
+                ):
+                    generate_references.main()
+
+            # Written before manifests were signed, for this video at this length: kept and signed.
+            run()
+            self.assertTrue(common.signature_path(manifest).exists())
+            frames_read.clear()
+            run()  # signed and current: not even the frames are re-read
+            self.assertEqual(frames_read, [])
+            video.write_bytes(b"re-rendered video")
+            run()  # new pixels, same length: every shot and edit kept, the frame refreshed
+            self.assertEqual(frames_read, [3])
+            self.assertIn("an edit", manifest.read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(AssertionError, "re-detected"):
+                run("--shot-threshold", "0.2")  # a detection setting changed
+            video.write_bytes(b"a longer re-render")
+            with self.assertRaisesRegex(AssertionError, "re-detected"):
+                run(frame_count=30)  # the video's length changed
+            self.assertIn("an edit", manifest.read_text(encoding="utf-8"))
+
     def test_shot_rows_prefer_manifest_frames_over_rounded_seconds(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             manifest = Path(tmp_text) / "shots.csv"
@@ -4289,22 +4559,18 @@ class GuiSmokeTests(unittest.TestCase):
                 }
             }
             ffmpeg_commands: list[list[str]] = []
-
-            def fake_run(command, **_kwargs):
-                if command[0] == "ffprobe":
-                    return subprocess.CompletedProcess(command, 0, stdout='{"streams":[{"index":1}]}', stderr="")
-                ffmpeg_commands.append(command)
-                Path(command[-1]).write_bytes(b"trimmed")
-                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            progress: list[int] = []
 
             with (
                 mock.patch.object(media, "ROOT", root),
                 mock.patch.object(media, "local_tool", return_value="ffmpeg"),
-                mock.patch.object(media.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(media.subprocess, "run", side_effect=fake_section_ffprobe),
+                mock.patch.object(media.subprocess, "Popen", side_effect=fake_section_trim(ffmpeg_commands)),
             ):
-                output = media.ensure_source_section_clip(settings)
+                output = media.ensure_source_section_clip(settings, progress=lambda percent, _label: progress.append(percent))
 
             self.assertIn("intermediate/source_sections/example_", output)
+            self.assertEqual(progress, [0, 50, 100])
             self.assertEqual(len(ffmpeg_commands), 1)
             command = ffmpeg_commands[0]
             self.assertIn("-vf", command)
@@ -4313,6 +4579,87 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(command[command.index("-af") + 1], "asetpts=PTS-STARTPTS")
             self.assertEqual(command[command.index("-c:a") + 1], "libopus")
             self.assertNotIn("copy", command)
+
+    def test_source_section_job_trims_in_background_and_reports_progress(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            source = root / "input" / "example.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"source")
+            settings = {"global": {"source": str(source), "section_start": "12", "section_end": "24"}}
+            release = threading.Event()
+            ffmpeg_commands: list[list[str]] = []
+
+            with (
+                mock.patch.object(media, "ROOT", root),
+                mock.patch.object(media, "local_tool", return_value="ffmpeg"),
+                mock.patch.object(media.subprocess, "run", side_effect=fake_section_ffprobe),
+                mock.patch.object(media.subprocess, "Popen", side_effect=fake_section_trim(ffmpeg_commands, release)),
+            ):
+                first = media.source_section_job_state(settings)
+                again = media.source_section_job_state(settings)
+                release.set()
+                deadline = time.monotonic() + 5
+                done = again
+                while done["pending"] and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    done = media.source_section_job_state(settings)
+                output = media.source_section_output_for(settings)
+
+            self.assertTrue(first["pending"])
+            self.assertTrue(again["pending"])
+            self.assertFalse(done["pending"])
+            self.assertEqual(done["error"], "")
+            self.assertEqual(len(ffmpeg_commands), 1, "a second poll must not start a second trim")
+            self.assertTrue(output.exists())
+
+    def test_failed_source_section_job_waits_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            source = root / "input" / "broken.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"source")
+            settings = {"global": {"source": str(source), "section_start": "1", "section_end": "3"}}
+            ffmpeg_commands: list[list[str]] = []
+
+            def wait_for_job() -> dict:
+                deadline = time.monotonic() + 5
+                job = media.source_section_job_state(settings)
+                while job["pending"] and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    job = media.source_section_job_state(settings)
+                return job
+
+            with (
+                mock.patch.object(media, "ROOT", root),
+                mock.patch.object(media, "local_tool", return_value="ffmpeg"),
+                mock.patch.object(media.subprocess, "run", side_effect=fake_section_ffprobe),
+                mock.patch.object(media.subprocess, "Popen", side_effect=fake_section_trim(ffmpeg_commands, fail=True)),
+            ):
+                failed = wait_for_job()
+                polled = media.source_section_job_state(settings)
+                retried = media.source_section_job_state(settings, retry=True)
+                wait_for_job()
+
+            self.assertEqual(failed["error"], "broken.mkv: Invalid data found")
+            self.assertFalse(polled["pending"])
+            self.assertEqual(polled["error"], failed["error"])
+            self.assertTrue(retried["pending"])
+            self.assertEqual(len(ffmpeg_commands), 2)
+
+    def test_outpaint_state_skips_chunks_while_section_trims(self) -> None:
+        pending = {"pending": True, "percent": 40, "label": "Trimming source section", "error": ""}
+        with (
+            mock.patch.object(server, "source_section_job_state", return_value=pending),
+            mock.patch.object(server, "outpaint_chunks_state") as chunks,
+            mock.patch.object(server, "aspect_preview_frame_for_settings") as aspect,
+        ):
+            payload = server.APP.state("outpaint")
+
+        self.assertEqual(payload["source_section_job"], pending)
+        self.assertEqual(payload["outpaint_chunks"]["rows"], [])
+        chunks.assert_not_called()
+        aspect.assert_not_called()
 
     def test_opening_source_resets_trim_to_source_duration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -5011,7 +5358,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertGreater(width * height, 8_000_000)
         self.assertAlmostEqual(width / height, 1200 / 700, delta=0.01)
 
-    def test_openai_reference_defaults_migrate_to_sunburst_maximum(self) -> None:
+    def test_openai_reference_size_and_quality_default_to_auto_and_keep_the_users_choice(self) -> None:
         values = runtime_settings.base_settings()
         values["references"].update(
             {
@@ -5020,12 +5367,34 @@ class GuiSmokeTests(unittest.TestCase):
                 "openai_image_quality": "high",
             }
         )
-
         normalized = runtime_settings.normalize_settings(values, include_newest_source=False)
+        self.assertEqual(normalized["references"]["openai_image_size"], "auto")
+        self.assertEqual(normalized["references"]["openai_image_quality"], "high")
 
-        self.assertEqual(normalized["references"]["openai_image_model"], "gpt-image-2.5-sunburst")
-        self.assertEqual(normalized["references"]["openai_image_size"], "max")
-        self.assertEqual(normalized["references"]["openai_image_quality"], "max")
+        # Settings an earlier build forced up to Maximum go back to Auto once...
+        forced = runtime_settings.base_settings()
+        forced["references"].update({"openai_image_size": "max", "openai_image_quality": "max"})
+        forced["references"].pop("openai_cost_defaults", None)
+        normalized = runtime_settings.normalize_settings(forced, include_newest_source=False)
+        self.assertEqual(normalized["references"]["openai_image_size"], "auto")
+        self.assertEqual(normalized["references"]["openai_image_quality"], "auto")
+
+        # ...but Maximum chosen afterwards is kept.
+        normalized["references"].update({"openai_image_size": "max", "openai_image_quality": "max"})
+        again = runtime_settings.normalize_settings(normalized, include_newest_source=False)
+        self.assertEqual(again["references"]["openai_image_size"], "max")
+        self.assertEqual(again["references"]["openai_image_quality"], "max")
+
+    def test_openai_reference_command_defaults_to_auto(self) -> None:
+        app.APP.settings["references"].update(
+            {"method": "openai", "manifest": "manifests/references/demo.csv", "openai_api_key": "sk-test",
+             "openai_image_size": "", "openai_image_quality": ""}
+        )
+        command = app.APP.command_for("references")
+        self.assertEqual(command[command.index("--size") + 1], "auto")
+        self.assertEqual(command[command.index("--quality") + 1], "auto")
+        args = openai_generate_reference.build_parser().parse_args(["--manifest", "m.csv", "--api-key", "k", "--prompt", "p"])
+        self.assertEqual((args.size, args.quality), ("auto", "auto"))
 
     def test_openai_cloud_colorization_command_uses_shared_key_and_cloud_controls(self) -> None:
         app.APP.settings["references"].update({"openai_api_key": "sk-test"})
@@ -6312,14 +6681,40 @@ class GuiSmokeTests(unittest.TestCase):
     def test_cq_chunk_plan_renders_valid_30fps_windows_that_keep_every_frame(self) -> None:
         plan = upscale_video.cq_chunk_plan(294, 24.0, 5.0, 8, "resample")
 
-        self.assertEqual(plan, [(0, 120, 0, 153), (112, 240, 8, 161), (232, 294, 8, 81)])
+        # 294 frames over a 120-frame limit: three equal pieces, not two full ones and a short tail.
+        self.assertEqual(plan, [(0, 98, 0, 129), (90, 196, 8, 137), (188, 294, 8, 137)])
         self.assertEqual(sum(end - start - trim for start, end, trim, _model in plan), 294)
         self.assertTrue(all(model % 8 == 1 for *_rest, model in plan))
         # Resampling 24 -> 30 fps needs 5 working frames per 4 source frames.
         self.assertTrue(all(model >= (end - start) * 30 / 24 for start, end, _trim, model in plan))
-        self.assertEqual(upscale_video.cq_chunk_plan(294, 24.0, 5.0, 8, "retime")[0], (0, 120, 0, 121))
+        self.assertEqual(upscale_video.cq_chunk_plan(294, 24.0, 5.0, 8, "retime")[0], (0, 98, 0, 105))
         self.assertEqual(upscale_video.cq_chunk_plan(50, 24.0, 5.0, 8, "resample"), [(0, 50, 0, 65)])
         self.assertEqual(upscale_video.cq_chunk_plan(50, 24.0, 0.0, 8, "resample"), [(0, 50, 0, 65)])
+
+    def test_cq_chunk_plan_restarts_at_every_shot_and_splits_long_shots(self) -> None:
+        # Shots: 0-40, 40-60, 60-300 (10 s at 24 fps, over the 8 s limit), plus cuts outside the clip.
+        plan = upscale_video.cq_chunk_plan(300, 24.0, 8.0, 8, "retime", [0, 40, 60, 300, 450])
+
+        self.assertEqual([(start, end, trim) for start, end, trim, _model in plan], [
+            (0, 40, 0), (40, 60, 0), (60, 180, 0), (172, 300, 8),
+        ])
+        self.assertEqual(sum(end - start - trim for start, end, trim, _model in plan), 300)
+        # No chunk's window (lead-in included) spans a cut.
+        self.assertFalse(any(start < cut < end for start, end, _trim, _model in plan for cut in (40, 60)))
+
+    def test_cq_shot_cuts_come_from_the_shot_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            manifest.write_text("start_frame,end_frame\n0,40\n40,60\n60,500\n", encoding="utf-8")
+            args = upscale_video.build_parser().parse_args(
+                ["--input", "input/example.mp4", "--method", "ltx25cq", "--shot-manifest", str(manifest)])
+            with mock.patch.object(upscale_video, "video_info", return_value={"frames": 300, "fps": 24.0}):
+                self.assertEqual(upscale_video.cq_shot_cuts(args, Path("clip.mp4")), [40, 60])
+                # A preview clip shorter than the film only sees the cuts inside it.
+                with mock.patch.object(upscale_video, "video_info", return_value={"frames": 50, "fps": 24.0}):
+                    self.assertEqual(upscale_video.cq_shot_cuts(args, Path("clip.mp4")), [40])
+            args.shot_manifest = ""
+            self.assertEqual(upscale_video.cq_shot_cuts(args, Path("clip.mp4")), [])
 
     def test_cq_frame_rate_never_resamples_footage_faster_than_30fps(self) -> None:
         args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq"])
@@ -6502,6 +6897,32 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertIsNone(app.auto_upscale_target(dict(values, method="seedvr2"), str(source)))
                 self.assertIsNone(app.auto_upscale_target(dict(values, method="ltx25cq", cq_finish="lanczos"), str(source)))
             self.assertIsNone(app.auto_upscale_target(values, str(Path(tmp_text) / "missing.mp4")))
+
+    def test_upscale_preview_state_reports_the_cq_render_of_its_input(self) -> None:
+        values = {"method": "ltx25cq", "cq_finish": "flashvsr", "cq_short_edge": "720"}
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            clip = Path(tmp_text) / "cqpreviewclip.mp4"
+            clip.write_bytes(b"video")
+            render = upscale_video.cq_render_path(clip, 1280, 720)
+            with mock.patch("ai_remaster_gui.server.video_metrics", return_value={"width": 1920, "height": 1080}):
+                self.assertEqual(app.upscale_cq_render_for(app.rel(clip), values), "")
+                render.parent.mkdir(parents=True, exist_ok=True)
+                render.write_bytes(b"cq")
+                try:
+                    self.assertEqual(app.upscale_cq_render_for(app.rel(clip), values), app.rel(render))
+                    self.assertEqual(app.upscale_cq_render_for(app.rel(clip), dict(values, method="flashvsr")), "")
+                    # Mid-preview: CQ has rendered, the finisher has not, so the CQ pass is shown on its own.
+                    app.APP.settings["upscale"].update({
+                        **values, "preview_source": app.rel(clip),
+                        "preview_output": "output/upscaled/previews/cq_unfinished_preview.mp4",
+                    })
+                    with mock.patch.object(app.APP, "upscale_input_for", return_value=""):
+                        preview = app.APP.upscale_preview_state()
+                finally:
+                    render.unlink(missing_ok=True)
+        self.assertEqual(preview["source"], app.rel(clip))
+        self.assertEqual(preview["cq"], app.rel(render))
+        self.assertEqual(preview["exists"], "false")
 
     def test_auto_upscale_target_fills_the_target_fields_on_upscale_changes(self) -> None:
         app.APP.settings["upscale"].update({"method": "ltx25cq", "cq_finish": "flashvsr", "flashvsr_scale": "2", "target_width": "3840", "target_height": "2160"})

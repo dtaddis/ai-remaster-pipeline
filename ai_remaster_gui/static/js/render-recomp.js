@@ -269,13 +269,31 @@ function upscaleInputSummary(s) {
 function upscaleComparisonHtml(s, preview) {
   const before = preview.source || s.input_video || '';
   const after = preview.exists === 'true' ? preview.output : '';
+  const cq = s.method === 'ltx25cq' ? (preview.cq || '') : '';
   if (!before) return '<p class="shot-empty">Choose a source on the Overview page, then enable Upscale.</p>';
+  const inputLabel = (state.output_selection && state.output_selection.kind || '').startsWith('recomposed') ? 'Recomposition' : 'Input';
+  if (cq) {
+    // CQ restores, then its finisher upscales: compare each pass against what it was given.
+    const finish = upscaleMethodLabel(s.cq_finish || 'flashvsr');
+    return `
+      <h3>CQ Enhancer</h3>
+      ${videoComparisonHtml('upscaleCqCompareSlider', before, cq, inputLabel, 'CQ Enhancer')}
+      <h3>${esc(finish)}</h3>
+      ${after
+        ? videoComparisonHtml('upscaleCompareSlider', cq, after, 'CQ Enhancer', finish)
+        : `<p class="shot-empty">${state.running ? `Waiting for ${esc(finish)} to finish.` : `${esc(finish)} has not finished this ${preview.kind === 'output' ? 'output' : 'preview'} yet.`}</p>`}
+    `;
+  }
   if (!after) {
     return `
       <video src="${media(before)}" controls preload="metadata"></video>
       <p class="shot-empty">Generate a preview to compare ${upscaleMethodLabel(s.method)} output against the input.</p>
     `;
   }
+  return videoComparisonHtml('upscaleCompareSlider', before, after, 'Before', 'After');
+}
+
+function videoComparisonHtml(sliderId, before, after, beforeLabel, afterLabel) {
   return `
     <div class="comparison-player">
       <video class="compare-before" src="${media(before)}" controls preload="metadata"></video>
@@ -283,15 +301,16 @@ function upscaleComparisonHtml(s, preview) {
       <div class="compare-after-mask" style="width:50%"></div>
       <div class="compare-handle" style="left:50%"></div>
     </div>
-    <input id="upscaleCompareSlider" class="compare-slider" type="range" min="0" max="100" value="50" aria-label="Before after split">
+    <input id="${sliderId}" class="compare-slider" type="range" min="0" max="100" value="50" aria-label="${esc(beforeLabel)} ${esc(afterLabel)} split">
     <div class="source-info">
-      <div><span>Before</span><strong>${esc(before)}</strong></div>
-      <div><span>After</span><strong>${esc(after)}</strong></div>
+      <div><span>${esc(beforeLabel)}</span><strong>${esc(before)}</strong></div>
+      <div><span>${esc(afterLabel)}</span><strong>${esc(after)}</strong></div>
     </div>
   `;
 }
 
 function bindUpscaleComparison() {
+  bindVideoComparison('upscaleCqCompareSlider');
   bindVideoComparison('upscaleCompareSlider');
 }
 
@@ -437,12 +456,15 @@ function bindCleanupComparison() {
 }
 
 function bindVideoComparison(sliderId) {
-  const before = document.querySelector('.compare-before');
-  const after = document.querySelector('.compare-after');
   const slider = document.getElementById(sliderId);
-  const mask = document.querySelector('.compare-after-mask');
-  const handle = document.querySelector('.compare-handle');
-  if (!before || !after || !slider || !mask || !handle) return;
+  // The slider follows its player; a page can hold several comparisons (CQ, then its finisher).
+  const player = slider && slider.previousElementSibling;
+  if (!player || !player.classList.contains('comparison-player')) return;
+  const before = player.querySelector('.compare-before');
+  const after = player.querySelector('.compare-after');
+  const mask = player.querySelector('.compare-after-mask');
+  const handle = player.querySelector('.compare-handle');
+  if (!before || !after || !mask || !handle) return;
 
   const setSplit = () => {
     after.style.clipPath = `inset(0 ${100 - Number(slider.value)}% 0 0)`;

@@ -280,7 +280,7 @@ STAGES = (
             ("cq_colour", "CQ colour", "select:model|source", "model"),
             ("cq_guide_strength", "CQ source fidelity", "range:0|100|1", "100"),
             ("cq_lora_strength", "CQ LoRA strength", "number", "1.0"),
-            ("cq_chunk_seconds", "CQ chunk seconds", "number", "5"),
+            ("cq_chunk_seconds", "CQ chunk seconds", "number", "8"),
             ("cq_seed", "CQ seed", "number", "42"),
             ("cq_prompt", "CQ prompt (optional)", "text", ""),
             ("blend_strength", "Default AI upscale strength", "range:0|100|1", "100"),

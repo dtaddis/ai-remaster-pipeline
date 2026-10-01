@@ -407,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cq-guide-strength", type=float, default=1.0, help="How strongly the source video conditions the CQ render; the author's workflow uses 1.")
     parser.add_argument("--cq-short-edge", type=int, default=720, help="Short edge the CQ Enhancer works at; the author's workflow uses 720.")
     parser.add_argument("--cq-frame-rate", choices=["resample", "retime"], default="resample", help="resample converts to 30 fps by repeating frames, as the author's workflow does; retime plays the original frames at 30 fps. Either way every source frame comes back once.")
-    parser.add_argument("--cq-chunk-seconds", type=float, default=5.0, help="Source seconds per CQ render; the author's workflow uses 153 frames at 30 fps.")
+    parser.add_argument("--cq-chunk-seconds", type=float, default=8.0, help="Longest source span per CQ render; chunks also split at --shot-manifest cuts, and longer shots split evenly. The author's workflow uses 153 frames at 30 fps (about 5 s).")
     parser.add_argument("--cq-colour", choices=["model", "source"], default="model", help="model keeps the CQ render's colour (it can colourise black-and-white film); source keeps the source's colour and takes only brightness detail from the CQ render.")
     parser.add_argument("--cq-seed", type=int, default=42)
     parser.add_argument("--cq-prompt", default="", help="The CQ LoRA needs no prompt. It samples without CFG, so there is no negative prompt.")
@@ -1106,25 +1106,57 @@ def cq_dimensions(args: argparse.Namespace, source: Path) -> tuple[tuple[int, in
     return output, cq_generation_size(*output)
 
 
+def cq_render_path(source: Path, width: int, height: int) -> Path:
+    """Where the stitched CQ render of ``source`` at its delivered size is cached (the GUI previews it)."""
+    return ROOT / ".cache" / "upscale_cq" / f"{safe_stem(source.name)}_cq_{width}x{height}.mkv"
+
+
 def cq_frame_rate_mode(args: argparse.Namespace, fps: float) -> str:
     # Resampling above 30 fps would drop source frames, so faster footage is always retimed.
     return "resample" if args.cq_frame_rate == "resample" and fps < CQ_FPS else "retime"
 
 
 def cq_chunk_plan(
-    total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int, mode: str
+    total_frames: int, fps: float, chunk_seconds: float, overlap_frames: int, mode: str,
+    shot_cuts: list[int] | tuple[int, ...] = (),
 ) -> list[tuple[int, int, int, int]]:
-    """Source windows as (start, end, trim_start, model_frames), model_frames being the 30 fps 8n+1 render."""
-    ranges = chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames)
-    if len(ranges) <= 1:
-        # chunk_ranges marks "send the whole clip" with a placeholder tuple, not a real window.
-        ranges = [(0, total_frames, 0)]
+    """Source windows as (start, end, trim_start, model_frames), model_frames being the 30 fps 8n+1 render.
+
+    Chunks never span a shot cut, so every frame of a shot is restored by the same generation
+    where possible. Each shot starts a fresh chunk with no lead-in (the source cuts there anyway).
+    A shot longer than chunk_seconds is split into equal pieces, each after the first carrying an
+    overlap lead-in from the same shot to dissolve across.
+    """
+    if total_frames <= 0:
+        return []
+    limit = max(1, int(round(chunk_seconds * fps))) if chunk_seconds > 0 and fps > 0 else total_frames
+    overlap = max(0, min(int(overlap_frames), limit - 1))
+    bounds = [0, *sorted({int(cut) for cut in shot_cuts if 0 < int(cut) < total_frames}), total_frames]
     plan: list[tuple[int, int, int, int]] = []
-    for source_start, end, trim_start in ranges:
-        span = end - source_start
-        working = span if mode == "retime" else int(math.ceil(span * CQ_FPS / max(fps, 0.001)))
-        plan.append((source_start, end, trim_start, max(9, int(math.ceil((working - 1) / 8.0)) * 8 + 1)))
+    for shot_start, shot_end in zip(bounds, bounds[1:]):
+        length = shot_end - shot_start
+        pieces = max(1, math.ceil(length / limit))
+        for piece in range(pieces):
+            start = shot_start + length * piece // pieces
+            end = shot_start + length * (piece + 1) // pieces
+            lead = min(overlap, start - shot_start)
+            span = end - start + lead
+            working = span if mode == "retime" else int(math.ceil(span * CQ_FPS / max(fps, 0.001)))
+            plan.append((start - lead, end, lead, max(9, int(math.ceil((working - 1) / 8.0)) * 8 + 1)))
     return plan
+
+
+def cq_shot_cuts(args: argparse.Namespace, source: Path) -> list[int]:
+    """Frames of ``source`` where a new shot starts, from the shot list; empty without one."""
+    manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
+    if manifest is None or not manifest.is_file():
+        return []
+    info = video_info(source)
+    frames = int(info["frames"])
+    shots = read_upscale_shots(manifest, frames, args.fps or float(info["fps"]), 1.0)
+    # Shots past the end of a shorter input (an upscale preview clip) are clamped onto its last
+    # frame; that is not a real cut, and a one-frame chunk there would be a wasted generation.
+    return sorted({int(shot["start"]) for shot in shots if 0 < int(shot["start"]) < frames - 1})
 
 
 def prepare_cq_chunk(
@@ -1239,7 +1271,7 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
     # Chunks render at the 32 px grid size (width x height); the stitched render is
     # resized to the aspect-correct output size.
     (out_width, out_height), (width, height) = cq_dimensions(args, source)
-    target = ROOT / ".cache" / "upscale_cq" / f"{safe_stem(source.name)}_cq_{out_width}x{out_height}.mkv"
+    target = cq_render_path(source, out_width, out_height)
     # Colour and output size are applied after stitching, so changing them reuses the rendered chunks.
     sig = cq_output_signature(args, source)
     if not args.force and resumable_output(target, sig, video_like=source, width=out_width, height=out_height):
@@ -1248,19 +1280,22 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = args.fps or float(info["fps"])
     mode = cq_frame_rate_mode(args, fps)
-    plan = cq_chunk_plan(int(info["frames"]), fps, args.cq_chunk_seconds, args.overlap_frames, mode)
+    shot_cuts = cq_shot_cuts(args, source)
+    plan = cq_chunk_plan(int(info["frames"]), fps, args.cq_chunk_seconds, args.overlap_frames, mode, shot_cuts)
     chunk_dir = ROOT / ".cache" / "upscale_chunks" / (
         f"{upscale_chunk_source_key(source)}_ltx25cq_{width}x{height}"
         f"_{int(args.cq_chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
     )
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    shots = f" across {len(shot_cuts) + 1} shot(s)" if shot_cuts else ""
     print(
-        f"Enhancing with LTX 2.5 CQ in {len(plan)} chunk(s): {info['width']}x{info['height']} -> "
+        f"Enhancing with LTX 2.5 CQ in {len(plan)} chunk(s){shots}: {info['width']}x{info['height']} -> "
         f"{out_width}x{out_height} (rendered at {width}x{height}) at {CQ_FPS:g} fps ({mode} from {fps:g} fps)",
         flush=True,
     )
-    # Each chunk keeps its overlap lead-in: both neighbours rendered those frames, and
-    # dissolving between the two renders hides the jump between independent generations.
+    # Within a shot, each chunk keeps its overlap lead-in: both neighbours rendered those frames,
+    # and dissolving between the two renders hides the jump between independent generations.
+    # A chunk starting a shot has no lead-in and simply cuts, as the source does.
     chunks: list[tuple[Path, int]] = []
     digits = max(4, int(math.log10(len(plan))) + 1)
     for index, (start_frame, end_frame, trim_start, model_frames) in enumerate(plan):
@@ -1312,6 +1347,7 @@ def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any
     (out_width, out_height), (width, height) = cq_dimensions(args, source)
     return {
         **cq_signature(args, source, width, height),
+        "shot_cuts": cq_shot_cuts(args, source),
         "colour": args.cq_colour,
         "output_width": out_width,
         "output_height": out_height,

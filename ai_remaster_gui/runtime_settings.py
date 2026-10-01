@@ -319,19 +319,20 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     defaults["references"].setdefault("method", "qwen")
     defaults["references"].setdefault("openai_api_key", "")
     defaults["references"].setdefault("openai_image_model", "gpt-image-2.5-sunburst")
-    defaults["references"].setdefault("openai_image_size", "max")
-    defaults["references"].setdefault("openai_image_quality", "max")
-    # Reference images are visual masters for downstream processing. Migrate the
-    # former untouched defaults to the explicit highest-quality, source-aspect route.
+    # Size/quality default to Auto: Maximum (4K, max quality) costs many times more credit per
+    # image, so it is only ever used when the user picks it. An earlier migration forced every
+    # Auto/High choice up to Maximum on each load; undo that once, then respect the choice.
+    if defaults["references"].get("openai_cost_defaults") != "auto":
+        for key in ("openai_image_size", "openai_image_quality"):
+            if defaults["references"].get(key, "").strip() in {"", "max"}:
+                defaults["references"][key] = "auto"
+        defaults["references"]["openai_cost_defaults"] = "auto"
+    for key in ("openai_image_size", "openai_image_quality"):
+        if not defaults["references"].get(key, "").strip():
+            defaults["references"][key] = "auto"
     reference_model = defaults["references"].get("openai_image_model", "").strip()
     if reference_model in {"", "gpt-image-2"}:
-        reference_model = "gpt-image-2.5-sunburst"
-        defaults["references"]["openai_image_model"] = reference_model
-    if reference_model.startswith("gpt-image-2.5-"):
-        if defaults["references"].get("openai_image_size", "").strip() in {"", "auto"}:
-            defaults["references"]["openai_image_size"] = "max"
-        if defaults["references"].get("openai_image_quality", "").strip() in {"", "auto", "high"}:
-            defaults["references"]["openai_image_quality"] = "max"
+        defaults["references"]["openai_image_model"] = "gpt-image-2.5-sunburst"
     defaults["references"].setdefault("openai_send_references", "false")
     old_reference_prompts = {
         "",

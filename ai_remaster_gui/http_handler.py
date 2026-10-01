@@ -170,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/api/state":
             query = parse_qs(parsed.query)
-            self.send_json(state.APP.state(query.get("active", [""])[0]))
+            self.send_json(state.APP.state(query.get("active", [""])[0], query.get("retry_section", [""])[0] == "1"))
         elif parsed.path == "/api/command":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"command": redact_command_arguments(state.APP.command_for(stage)) if stage else []})

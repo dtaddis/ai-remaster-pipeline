@@ -45,6 +45,14 @@ async function refresh(force = false) {
   const currentOutpaintVisualSignature = outpaintVisualSignature();
   const outpaintVisualChanged = active === 'outpaint'
     && currentOutpaintVisualSignature !== lastOutpaintVisualSignature;
+  if (outpaintSectionWaiting()) {
+    showOutpaintLoadingShell();
+    lastRenderSignature = sig;
+    lastOutpaintVisualSignature = currentOutpaintVisualSignature;
+    return;
+  }
+  // The section clip just finished: replace the loading shell with the real page.
+  if (active === 'outpaint' && document.querySelector('#app > .outpaint-loading')) force = true;
   if (!force && active === 'global' && document.getElementById('app')?.children.length) {
     updateOverviewDynamicStatus();
     updateRunLogs();
@@ -406,18 +414,47 @@ async function selectTab(tab) {
   lastOutpaintVisualSignature = outpaintVisualSignature();
 }
 
+// The Outpainting page waits for the trimmed source-section clip, which the server makes in
+// the background the first time a section range is opened.
+function outpaintSectionWaiting() {
+  const job = (state && state.source_section_job) || {};
+  return active === 'outpaint' && Boolean(job.pending || job.error);
+}
+
 function showOutpaintLoadingShell() {
   const app = document.getElementById('app');
   if (!app) return;
+  const job = (active === 'outpaint' && state && state.source_section_job) || {};
+  if (job.error) {
+    app.innerHTML = `
+      <section class="card outpaint-loading">
+        <div>
+          <h2>Could Not Prepare the Source Section</h2>
+          <p class="shot-empty">${esc(job.error)}</p>
+          <div class="actions"><button class="primary" onclick="retrySourceSection()">Try Again</button></div>
+        </div>
+      </section>
+    `;
+    return;
+  }
+  const detail = job.pending
+    ? 'Trimming the selected section of the source. This happens once per section range.'
+    : 'Checking chunk ranges and cached previews...';
   app.innerHTML = `
     <section class="card outpaint-loading">
       <span class="spinner"></span>
       <div>
         <h2>Preparing Outpainting</h2>
-        <p class="shot-empty">Checking chunk ranges and cached previews...</p>
+        <p class="shot-empty">${esc(detail)}</p>
+        ${job.pending ? progressHtml(job.percent, job.label) : ''}
       </div>
     </section>
   `;
+}
+
+async function retrySourceSection() {
+  state = await api(stateUrl() + '&retry_section=1');
+  showOutpaintLoadingShell();
 }
 
 function showShotLoadingShell(tab) {

@@ -215,7 +215,7 @@ const FIELD_DESCRIPTIONS = {
   'upscale.cq_lora_strength':
     'Strength of the CQ Enhancer LoRA. The author uses 1.0.',
   'upscale.cq_chunk_seconds':
-    'Source seconds per CQ render; the author renders about 5 seconds (153 frames at 30 fps). Each chunk is a fresh generation, so neighbouring chunks dissolve into each other across the Overlap frames instead of cutting.',
+    'Longest source span per CQ render (the author renders about 5 seconds, 153 frames at 30 fps). With a shot list, chunks also split at every shot change, so each shot is restored as consistently as possible; a shot longer than this is split into equal pieces. Each chunk is a fresh generation, so pieces of the same shot dissolve into each other across the Overlap frames, while shot changes simply cut.',
   'upscale.cq_seed':
     'Controls the detail the CQ Enhancer synthesizes. Keep it fixed for reproducible output; change it to try another restoration.',
   'upscale.cq_prompt':

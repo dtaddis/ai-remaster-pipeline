@@ -73,7 +73,11 @@ def signature_matches(path: Path, signature: dict[str, Any]) -> bool:
     try:
         # mtime_ns is recorded for diagnostics but ignored when matching: size+sha256 already
         # prove content identity, and project load rewrites identical bytes with fresh mtimes.
-        return _without_mtime(json.loads(sig.read_text(encoding="utf-8-sig"))) == _without_mtime(signature)
+        # Compare the signature as it would be stored: a tuple reads back as a list, so
+        # comparing the raw dict made any tuple-valued signature never match (finalize's
+        # source_rectangle re-encoded the outpainted video on every run).
+        stored = json.loads(sig.read_text(encoding="utf-8-sig"))
+        return _without_mtime(stored) == _without_mtime(json.loads(json.dumps(signature)))
     except Exception:
         return False
 

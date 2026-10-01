@@ -158,6 +158,7 @@ from .outpaint_guides import (
     bind_context as bind_outpaint_guides_context,
 )
 from .cache import cache_state, delete_cache_category, delete_cache_file, human_size
+from . import stage_stamps
 from .runtime_settings import APP_VERSION, canonical_intermediate_profile, default_qwen_workflow, default_settings, load_settings, qwen_masked_workflow_for, qwen_workflow_for
 from .system_status import flashvsr_hardware_warning, system_status
 from .media import (
@@ -196,6 +197,7 @@ from .media import (
     section_relative_seconds,
     source_info,
     source_section_is_active,
+    source_section_job_state,
     source_section_output_for,
     source_section_state,
     source_info_cached,
@@ -934,15 +936,19 @@ class PipelineApp:
                 label = "Finishing: " + label
         return {"key": self.running_stage_key, "stage": self.running_stage, "percent": percent, "label": label}
 
-    def state(self, view: str = "") -> dict:
+    def state(self, view: str = "", retry_section: bool = False) -> dict:
         with self.lock:
             running = self.process is not None and self.process.poll() is None
             settings_snapshot = json.loads(json.dumps(self.settings))
             source_text = settings_snapshot.get("global", {}).get("source", "")
             source_media = self.source_media_state(source_text)
             section = source_section_state(settings_snapshot)
-            aspect_preview, aspect_preview_frame = aspect_preview_frame_for_settings(settings_snapshot) if view == "outpaint" else (source_media["aspect_preview"], 0)
-            outpaint_chunks = outpaint_chunks_state(settings_snapshot) if view == "outpaint" else {"manifest": "", "rows": []}
+            # The Outpainting page reads the trimmed section clip. Trimming a long section takes
+            # minutes, so it runs in the background and the page shows its progress meanwhile.
+            section_job = source_section_job_state(settings_snapshot, retry_section) if view == "outpaint" else {"pending": False}
+            outpaint_ready = view == "outpaint" and not section_job["pending"] and not section_job.get("error")
+            aspect_preview, aspect_preview_frame = aspect_preview_frame_for_settings(settings_snapshot) if outpaint_ready else (source_media["aspect_preview"], 0)
+            outpaint_chunks = outpaint_chunks_state(settings_snapshot) if outpaint_ready else {"manifest": "", "rows": []}
             cache = cache_state() if view == "cache" else {}
             payload = {
                 "root": str(ROOT),
@@ -969,13 +975,14 @@ class PipelineApp:
                 "source_sequence": sequence_state(settings_snapshot),
                 "source_playback": settings_snapshot.get("global", {}).get("source_sequence_preview", "") or source_media.get("playback", "") or source_text,
                 "source_section": section,
+                "source_section_job": section_job,
                 "project_path": str(self.project_path) if self.project_path else "",
                 "source_monochrome": source_media["monochrome"],
                 "source_analysis": source_media["analysis"],
                 "aspect_preview": aspect_preview,
                 "aspect_preview_frame": aspect_preview_frame,
-                "custom_outpaint_mask": custom_outpaint_mask_state(settings_snapshot) if view == "outpaint" else {},
-                "frame_outpaint_masks": frame_outpaint_masks_state(settings_snapshot) if view == "outpaint" else {},
+                "custom_outpaint_mask": custom_outpaint_mask_state(settings_snapshot) if outpaint_ready else {},
+                "frame_outpaint_masks": frame_outpaint_masks_state(settings_snapshot) if outpaint_ready else {},
                 "outpaint_chunks": outpaint_chunks,
                 "shot_views": {"manifest": "", "rows": []},
                 "audio_stems": self.audio_stems_state() if view == "audio" else [],
@@ -1521,6 +1528,37 @@ class PipelineApp:
     def existing_outputs(self, stage_key: str) -> list[str]:
         return [path for path in self.expected_outputs(stage_key) if path and resolve(path).exists()]
 
+    def stage_stamp(self, stage_key: str) -> str:
+        """Digest of what the stage would run with now (see stage_stamps); "" if it has no outputs."""
+        outputs = [path for path in self.expected_outputs(stage_key) if path]
+        cmd = self.local_command_for(stage_key, run_flags=False) if outputs else []
+        if not cmd:
+            return ""
+        return stage_stamps.compute_stamp(cmd, outputs, redact_command_for_log(cmd))
+
+    def stage_is_current(self, stage_key: str) -> bool:
+        """True when every output exists and the stage last finished with exactly today's inputs.
+
+        Run Whole Remaster skips such a stage. Regenerate and Dry run always run."""
+        values = self.settings.get(stage_key, {})
+        if is_true(values, "force") or is_true(values, "dry_run"):
+            return False
+        if stage_key in {"audio", "upscale"}:
+            self.hydrate_stage_inputs(stage_key)  # run_stage does the same before building these
+        outputs = [path for path in self.expected_outputs(stage_key) if path]
+        if not outputs or len(self.existing_outputs(stage_key)) != len(outputs):
+            return False
+        recorded = stage_stamps.read_stamp(stage_key, outputs)
+        return bool(recorded) and recorded == self.stage_stamp(stage_key)
+
+    def record_stage_stamp(self, stage_key: str, launch_stamp: str) -> None:
+        """Remember a finished stage's inputs, unless they changed while it was running."""
+        if not launch_stamp or is_true(self.settings.get(stage_key, {}), "dry_run"):
+            return
+        if self.stage_stamp(stage_key) != launch_stamp:
+            return  # Edited mid-run: the output may predate the edit, so let the next run check.
+        stage_stamps.write_stamp(stage_key, [path for path in self.expected_outputs(stage_key) if path], launch_stamp)
+
     # Per-stage command builders. command_for() dispatches here by stage key; each builder returns
     # the full `python -u <script> …` argv for its stage (or [] to signal "nothing runnable yet").
     # Shared --force/--dry-run handling lives in command_for so it stays in one place.
@@ -1537,18 +1575,28 @@ class PipelineApp:
             "upscale": self._upscale_stage_command,
         }
 
-    def command_for(self, stage_key: str) -> list[str]:
+    def local_command_for(self, stage_key: str, run_flags: bool = True) -> list[str]:
+        """The stage's own script command, before any RunPod wrapping.
+
+        run_flags=False leaves out --force/--dry-run, which change how a run behaves but not
+        what its inputs are."""
         values = self.settings[stage_key]
         config = current_config()
         builder = self._stage_command_builders().get(stage_key)
         cmd = builder(config, values) if builder else [sys.executable, "-u"]
         if not cmd:
             return []
-        if is_true(values, "force"):
+        if run_flags and is_true(values, "force"):
             cmd.append("--force")
-        if is_true(values, "dry_run"):
+        if run_flags and is_true(values, "dry_run"):
             cmd.append("--dry-run")
-        cmd = [part for part in cmd if part != ""]
+        return [part for part in cmd if part != ""]
+
+    def command_for(self, stage_key: str) -> list[str]:
+        values = self.settings[stage_key]
+        cmd = self.local_command_for(stage_key)
+        if not cmd:
+            return []
         if stage_uses_runpod(stage_key, values):
             cloud_values = dict(self.settings.get("cloud", {}))
             if stage_key == "outpaint":
@@ -1729,7 +1777,7 @@ class PipelineApp:
             add(["--manifest", values.get("manifest", ""), "--api-key", values.get("openai_api_key", "")])
             add(["--model", values.get("openai_image_model", "gpt-image-2.5-sunburst") or "gpt-image-2.5-sunburst"])
             add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
-            add(["--size", values.get("openai_image_size", "max"), "--quality", values.get("openai_image_quality", "max")])
+            add(["--size", values.get("openai_image_size") or "auto", "--quality", values.get("openai_image_quality") or "auto"])
             add(["--no-normalize-to-source-size"])
             if is_true(values, "openai_send_references"):
                 add(["--reference-count", "3"])
@@ -1982,6 +2030,11 @@ class PipelineApp:
             ok, message = ensure_comfy_available_for_stage(stage.title)
             if not ok:
                 return False, message
+        try:
+            launch_stamp = self.stage_stamp(stage_key)
+        except Exception as exc:
+            launch_stamp = ""
+            self.log.append(f"Could not record {stage.title} inputs; Run Whole Remaster will run it again: {exc}")
         with self.lock:
             if self.process and self.process.poll() is None:
                 return False, "A command is already running."
@@ -1995,7 +2048,7 @@ class PipelineApp:
             self.log.append("> " + redact_command_for_log(cmd))
             self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(stage.title)
-            threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
+            threading.Thread(target=self._collect_output, args=(stage_key, launch_stamp), daemon=True).start()
         return True, "Started " + stage.title
 
     def run_outpaint_chunk(self, index: int) -> tuple[bool, str]:
@@ -2016,6 +2069,9 @@ class PipelineApp:
             self.run_started_at = time.time()
             cmd = self.command_for("outpaint")
             cmd.extend(["--only-chunk", str(index), "--force"])
+            # The outpainted video is rebuilt from this chunk (and only up to it, if later
+            # chunks are missing), so it no longer matches the last full run's stamp.
+            stage_stamps.clear_stamps("outpaint")
             self.log.append("> " + " ".join(cmd))
             self.process = subprocess.Popen(cmd, **self.child_process_kwargs())
             keep_awake(f"Outpainting chunk {index + 1}")
@@ -2266,7 +2322,7 @@ class PipelineApp:
             add(["--cq-colour", "source" if values.get("cq_colour") == "source" else "model"])
             add(["--cq-guide-strength", str(float(values.get("cq_guide_strength", "100") or 100) / 100.0)])
             add(["--cq-lora-strength", values.get("cq_lora_strength") or "1.0"])
-            add(["--cq-chunk-seconds", values.get("cq_chunk_seconds") or "5"])
+            add(["--cq-chunk-seconds", values.get("cq_chunk_seconds") or "8"])
             add(["--cq-seed", values.get("cq_seed") or "42"])
             # Empty arguments are dropped below, which would leave the flag without a value.
             if values.get("cq_prompt", "").strip():
@@ -2290,18 +2346,27 @@ class PipelineApp:
         return [part for part in cmd if part != ""]
 
     def upscale_preview_state(self) -> dict[str, str]:
+        """The upscale viewer's videos. With the CQ Enhancer, "cq" is its render of the same input,
+        so the viewer can compare input -> CQ and CQ -> finisher separately."""
         values = self.settings.get("upscale", {})
         source = self.upscale_input_for() or values.get("input_video")
         full_output = upscale_output_for(source, values) or values.get("output", "")
         if source and full_output and resolve(full_output).exists():
-            return {"source": source, "output": full_output, "exists": "true", "kind": "output", "title": "Upscale Output"}
+            return {"source": source, "output": full_output, "exists": "true", "kind": "output", "title": "Upscale Output",
+                    "cq": upscale_cq_render_for(source, values)}
         preview_source = values.get("preview_source", "")
         preview_output = values.get("preview_output", "")
-        if preview_source and preview_output and resolve(preview_output).exists():
-            return {"source": preview_source, "output": preview_output, "exists": "true", "kind": "preview", "title": "Upscale Preview"}
+        if preview_source and preview_output:
+            preview_exists = resolve(preview_output).exists()
+            # The CQ pass finishes before the finisher starts, so it can be compared on its own meanwhile.
+            preview_cq = upscale_cq_render_for(preview_source, values)
+            if preview_exists or preview_cq:
+                return {"source": preview_source, "output": preview_output, "exists": "true" if preview_exists else "false",
+                        "kind": "preview", "title": "Upscale Preview", "cq": preview_cq}
         output = upscale_preview_output_for(source, values)
         exists = bool(output and resolve(output).exists())
-        return {"source": source, "output": output, "exists": "true" if exists else "false", "kind": "preview", "title": "Upscale Preview"}
+        return {"source": source, "output": output, "exists": "true" if exists else "false", "kind": "preview", "title": "Upscale Preview",
+                "cq": upscale_cq_render_for(source, values)}
 
     def upscale_shot_comparison_frames(self, index: int, seconds: float) -> dict[str, str]:
         """Return cached input/output stills for one shot's upscale comparison card."""
@@ -2584,6 +2649,17 @@ class PipelineApp:
 
     def _run_all_worker(self) -> None:
         for stage in self.active_stages():
+            try:
+                current = self.stage_is_current(stage.key)
+            except Exception as exc:
+                current = False
+                with self.lock:
+                    self.log.append(f"Could not check whether {stage.title} is up to date, so running it: {exc}")
+            if current:
+                with self.lock:
+                    self.log.append(f"{stage.title} is up to date (same inputs and settings as its last finished run); skipping it.")
+                self.hydrate_stage_inputs(stage.key)
+                continue
             ok, message = self.run_stage(stage.key)
             if not ok:
                 with self.lock:
@@ -2597,9 +2673,9 @@ class PipelineApp:
                 break
 
     def ensure_pipeline_source(self) -> None:
-        ensure_source_section_clip(self.settings)
+        ensure_source_section_clip(self.settings, progress=self.console_progress)
 
-    def _collect_output(self, stage_key: str) -> None:
+    def _collect_output(self, stage_key: str, launch_stamp: str = "") -> None:
         assert self.process and self.process.stdout
         stop_progress, reporter = self._start_console_progress_reporter()
         try:
@@ -2609,6 +2685,12 @@ class PipelineApp:
             code = self.process.wait()
         finally:
             self._stop_console_progress_reporter(stop_progress, reporter)
+        if code == 0 and launch_stamp:
+            try:
+                self.record_stage_stamp(stage_key, launch_stamp)
+            except Exception as exc:
+                with self.lock:
+                    self.log.append(f"Could not record {stage_key} inputs; Run Whole Remaster will run it again: {exc}")
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
             release_keep_awake()
@@ -3109,18 +3191,40 @@ def auto_upscale_target(values: dict[str, str], source_text: str) -> tuple[int, 
     if width <= 0 or height <= 0:
         return None
     if upscale_method(values) == "ltx25cq":
-        from upscale_video import cq_output_size
-
-        try:
-            short_edge = int(float(values.get("cq_short_edge") or 720))
-        except ValueError:
-            short_edge = 720
-        width, height = cq_output_size(width, height, short_edge)
+        width, height = cq_size_for(values, width, height)
     try:
         scale = max(1, int(float(values.get("flashvsr_scale") or 2)))
     except ValueError:
         scale = 2
     return even_int(width * scale), even_int(height * scale)
+
+
+def cq_size_for(values: dict[str, str], width: int, height: int) -> tuple[int, int]:
+    """The CQ Enhancer's delivered size for a source of this size."""
+    from upscale_video import cq_output_size
+
+    try:
+        short_edge = int(float(values.get("cq_short_edge") or 720))
+    except ValueError:
+        short_edge = 720
+    return cq_output_size(width, height, short_edge)
+
+
+def upscale_cq_render_for(source_text: str, values: dict[str, str]) -> str:
+    """The CQ Enhancer's cached render of this upscale input, or "" when CQ is off or it is not rendered."""
+    if upscale_method(values) != "ltx25cq" or not source_text:
+        return ""
+    source = resolve(source_text)
+    if not source.is_file():
+        return ""
+    metrics = video_metrics(source)
+    width, height = int(metrics.get("width") or 0), int(metrics.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return ""
+    from upscale_video import cq_render_path
+
+    render = cq_render_path(source, *cq_size_for(values, width, height))
+    return rel(render) if render.is_file() else ""
 
 
 def upscale_identity_model(values: dict[str, str]) -> tuple[str, bool, str]:

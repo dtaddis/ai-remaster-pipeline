@@ -1933,14 +1933,12 @@ async function showCommand(key) {
 }
 
 async function confirmOverwrite(key) {
-  const force = settings(key).force === 'true';
-  if (!force && key !== 'shots') return true;
+  if (settings(key).force !== 'true') return true;
 
   const result = await api('/api/existing-outputs?stage=' + encodeURIComponent(key));
   if (!result.paths || !result.paths.length) return true;
 
-  const reason = force ? 'Regenerate is enabled' : 'Shot Detection rewrites its manifest';
-  return confirm(reason + ' and these output paths already exist:\n\n' + result.paths.join('\n') + '\n\nOverwrite them?');
+  return confirm('Regenerate is enabled and these output paths already exist:\n\n' + result.paths.join('\n') + '\n\nOverwrite them?');
 }
 
 async function runStage(key) {

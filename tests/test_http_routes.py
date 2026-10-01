@@ -149,7 +149,14 @@ class HelperBehaviourTests(unittest.TestCase):
         handler.do_GET()
 
         self.assertEqual(handler.responses["json"], {"ok": True})
-        state.APP.state.assert_called_once_with("shots")
+        state.APP.state.assert_called_once_with("shots", False)
+
+    def test_state_route_passes_section_retry(self) -> None:
+        state.APP.state = mock.Mock(return_value={"ok": True})
+        handler = _Handler("/api/state?active=outpaint&retry_section=1")
+        handler.do_GET()
+
+        state.APP.state.assert_called_once_with("outpaint", True)
 
     def test_upscale_shot_comparison_returns_cached_frame_pair(self) -> None:
         state.APP.upscale_shot_comparison_frames = mock.Mock(

@@ -1,12 +1,12 @@
 ﻿#!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse, csv
+import argparse, csv, io, json
 from dataclasses import dataclass
 from pathlib import Path
 import cv2
 import numpy as np
-from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, resumable_output, write_signature
+from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, resumable_output, signature_path, write_signature
 
 DEFAULT_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references'
 DEFAULT_COLOR_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
@@ -303,16 +303,91 @@ def build_rows(args,source_path,info,shots):
         if args.limit is not None and len(rows)>=args.limit: break
     return rows
 
-def write_manifest(path,source_path,rows,info):
+MANIFEST_FIELDS=['enabled','start_frame','end_frame','selected_frame','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds']
+# Everything that decides where the cuts fall and which frames are extracted.
+DETECTION_ARGS=('sample_seconds','shot_threshold','dynamic_threshold_scale','peak_margin','anchor_threshold','anchor_min_seconds','anchor_adjacent_floor','dissolve_threshold','dissolve_window_seconds','dissolve_min_gap_seconds','boundary_dedupe_seconds','min_shot_seconds','fade_black_ratio','fade_luma','reuse_existing_references','existing_reuse_threshold','frame_width','frame_height','reference_set','limit')
+
+def read_manifest(path):
+    """(source_video, fieldnames, rows) of an existing shot manifest; empty when there is none."""
+    if not path.is_file(): return '',[],[]
+    with path.open('r',encoding='utf-8-sig',newline='') as h: lines=h.readlines()
+    source=next((line.split('=',1)[1].strip() for line in lines if line.startswith('# source_video=')),'')
+    reader=csv.DictReader(line for line in lines if not line.startswith('#'))
+    rows=list(reader); return source,list(reader.fieldnames or []),rows
+
+def write_manifest(path,source_path,rows,info,kept=None,fields=None):
+    """Write the manifest. kept maps a row index to a previous manifest row (every column) that replaces it."""
+    kept=kept or {}; fieldnames=MANIFEST_FIELDS+[f for f in (fields or []) if f not in MANIFEST_FIELDS]
+    out=[]
+    for i,row in enumerate(rows):
+        fresh={'enabled':'true','start_frame':row.start_frame,'end_frame':row.end_frame,'selected_frame':row.selected_frame,'end':format_time(min(row.end_frame/info.fps,info.duration)),'source_reference':root_relative(row.source_reference) if row.source_reference else '','color_reference':root_relative(row.color_reference),'prompt':'','fade_to_next':'false','crossfade_seconds':''}
+        out.append({**fresh,**{k:v for k,v in kept.get(i,{}).items() if k in fieldnames and v is not None}})
+    buf=io.StringIO(newline=''); buf.write(f'# source_video={root_relative(source_path)}\n')
+    w=csv.DictWriter(buf,fieldnames=fieldnames,lineterminator='\n',extrasaction='ignore'); w.writeheader(); w.writerows(out); text=buf.getvalue()
+    # Unchanged bytes keep the file's mtime, so later phases do not see a changed input.
+    if path.is_file() and path.read_text(encoding='utf-8-sig')==text: return
     path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
-    with tmp.open('w',encoding='utf-8',newline='') as h:
-        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','start_frame','end_frame','selected_frame','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
-        for row in rows: w.writerow(['true',row.start_frame,row.end_frame,row.selected_frame,format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
+    with tmp.open('w',encoding='utf-8',newline='') as h: h.write(text)
     tmp.replace(path)
-def source_signature(source_path,row,out_w=0,out_h=0): return {'version':3,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'grayscale':True,'generator':'generate_references.py'}
-def extract_frames(args,source_path,info,rows):
+
+def carry_over_rows(rows,previous,fps):
+    """Keep a previous manifest row, edits and all, wherever re-detection found the same shot span.
+
+    A re-rendered outpaint (one regenerated chunk, say) changes the video's bytes but rarely its
+    cuts, so prompts, fades, disabled shots and chosen references survive. Returns {index: row}."""
+    by_span={}
+    for old in previous:
+        try: by_span[(int(old.get('start_frame') or ''),int(old.get('end_frame') or ''))]=old
+        except ValueError: pass
+    kept={}
+    for i,row in enumerate(rows):
+        old=by_span.get((row.start_frame,row.end_frame))
+        if old is None: continue
+        try: frame=int(old.get('selected_frame') or row.selected_frame)
+        except ValueError: frame=row.selected_frame
+        src=resolve_path(old['source_reference']) if old.get('source_reference') else None
+        color=resolve_path(old['color_reference']) if old.get('color_reference') else row.color_reference
+        rows[i]=ReferenceRow(row.index,row.start_frame,row.end_frame,frame,frame/fps,src,color); kept[i]=old
+    return kept
+
+def manifest_signature(args,source_path,fingerprint):
+    return {'version':1,'generator':'generate_references.py/manifest','source_video':root_relative(source_path),'source_fingerprint':fingerprint,'reference_root':root_relative(args.reference_root),'color_reference_root':root_relative(args.color_reference_root),**{k:getattr(args,k) for k in DETECTION_ARGS}}
+
+def frames_present(manifest):
+    _source,_fields,rows=read_manifest(manifest)
+    return bool(rows) and all(resolve_path(r['source_reference']).is_file() for r in rows if r.get('source_reference'))
+
+def manifest_reference_rows(rows,fps):
+    """The manifest's own rows as ReferenceRows, or None if any row lacks integer frame spans."""
+    out=[]
+    for index,row in enumerate(rows):
+        try: start=int(row['start_frame']); end=int(row['end_frame']); frame=int(row.get('selected_frame') or start)
+        except (KeyError,TypeError,ValueError): return None
+        src=resolve_path(row['source_reference']) if row.get('source_reference') else None
+        color=resolve_path(row['color_reference']) if row.get('color_reference') else None
+        out.append(ReferenceRow(index,start,end,frame,frame/fps,src,color))
+    return out
+
+def cuts_still_fit(manifest,source_path,info,args):
+    """The existing shots still describe this video: it is the manifest's own video, with the same
+    frame count, and the detection settings are unchanged (or unknown, for a manifest written
+    before manifests were signed). Outpainting repaints only the edges, so a re-render changes
+    the video's bytes, not where its shots fall; re-cutting it would only throw away edits."""
+    source,_fields,rows=read_manifest(manifest)
+    if not rows or not source or resolve_path(source).resolve()!=source_path.resolve(): return False
+    spans=manifest_reference_rows(rows,info.fps)
+    if not spans or max(row.end_frame for row in spans)!=info.frame_count: return False
+    try: stored=json.loads(signature_path(manifest).read_text(encoding='utf-8-sig'))
+    except (OSError,ValueError): return True
+    now=json.loads(json.dumps({k:getattr(args,k) for k in DETECTION_ARGS}))
+    return all(stored.get(k)==v for k,v in now.items())
+
+def source_signature(source_path,row,out_w=0,out_h=0,fingerprint=None): return {'version':3,'source_video':root_relative(source_path),'source_fingerprint':fingerprint or file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'grayscale':True,'generator':'generate_references.py'}
+def extract_frames(args,source_path,info,rows,fingerprint=None):
     out_w=int(args.frame_width or 0); out_h=int(args.frame_height or 0)
     write_w=out_w or info.width; write_h=out_h or info.height
+    fingerprint=fingerprint or file_fingerprint(source_path)
+    rows=[row for row in rows if row.source_reference]
     expected={row.source_reference for row in rows}
     if args.prune_source_frames:
         for folder in {p.parent for p in expected}:
@@ -320,7 +395,7 @@ def extract_frames(args,source_path,info,rows):
                 for png in folder.glob('cut_*.png'):
                     if png not in expected: png.unlink(missing_ok=True); png.with_suffix(png.suffix+'.sig.json').unlink(missing_ok=True); print(f'Removed orphan source frame: {png}')
     for row in rows:
-        sig=source_signature(source_path,row,out_w,out_h)
+        sig=source_signature(source_path,row,out_w,out_h,fingerprint)
         if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
         if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
         frame=read_frame(source_path,row.selected_frame)
@@ -376,10 +451,25 @@ def main():
     args.reference_root=resolve_path(args.reference_root)
     args.color_reference_root=resolve_path(args.color_reference_root)
     manifest=resolve_path(args.output_manifest) if args.output_manifest else default_manifest_path(source_path)
+    fingerprint=file_fingerprint(source_path)
+    sig=manifest_signature(args,source_path,fingerprint)
+    if not args.force and resumable_output(manifest,sig) and frames_present(manifest):
+        # Re-detecting rewrites every row, so an up-to-date manifest (and its edits) is left alone.
+        print(f'Reuse shot manifest (same video and detection settings): {manifest}'); return 0
     info=probe_video(source_path)
+    if not args.force and cuts_still_fit(manifest,source_path,info,args):
+        _source,_fields,rows=read_manifest(manifest)
+        print(f'Keeping all {len(rows)} shots and their edits: the video changed but its length and the detection settings did not. Refreshing the reference frames only.')
+        if args.dry_run: return 0
+        extract_frames(args,source_path,info,manifest_reference_rows(rows,info.fps),fingerprint)
+        write_signature(manifest,sig)
+        print(f'Reuse shot manifest: {manifest}'); return 0
     samples=sample_video(source_path,info,args)
     shots=detect_shots(samples,info,args)
     rows=build_rows(args,source_path,info,shots)
+    _previous_source,previous_fields,previous_rows=read_manifest(manifest) if not args.force else ('',[],[])
+    kept=carry_over_rows(rows,previous_rows,info.fps)
+    if previous_rows: print(f'Kept {len(kept)} of {len(rows)} shot(s), with their edits, from the previous manifest (same frame span).')
     reused=sum(1 for row in rows if row.reused_color_from)
     print(f'Source: {source_path}')
     print(f'Video: {info.width}x{info.height}, {info.fps:.6g} fps, {info.frame_count} frames, {format_time(info.duration)}')
@@ -390,8 +480,9 @@ def main():
     if args.dry_run:
         print(f'Dry run; would write {manifest}')
         return 0
-    extract_frames(args,source_path,info,rows)
-    write_manifest(manifest,source_path,rows,info)
+    extract_frames(args,source_path,info,rows,fingerprint)
+    write_manifest(manifest,source_path,rows,info,kept,previous_fields)
+    write_signature(manifest,sig)
     print(f'Wrote manifest: {manifest}')
     return 0
 

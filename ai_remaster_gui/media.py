@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,6 +21,13 @@ from .project_io import source_analysis_key, source_signature
 
 SOURCE_PREVIEW_COUNT = 3
 ASPECT_PREVIEW_STYLE_VERSION = 6
+
+# Background source-section trims, keyed by output clip path.
+_section_jobs: dict[str, dict] = {}
+_section_jobs_lock = threading.Lock()
+_section_output_locks: dict[str, threading.Lock] = {}
+_section_processes: set[subprocess.Popen] = set()
+_valid_section_clips: set[tuple[str, int, int, float]] = set()
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -963,7 +972,69 @@ def source_section_is_active(settings: dict) -> bool:
     end = section_float(global_settings.get("section_end", ""), 0.0)
     return end > start
 
-def ensure_source_section_clip(settings: dict) -> str:
+def source_section_output_lock(output: Path) -> threading.Lock:
+    """One lock per section clip, so a run waits for a background trim instead of racing it."""
+    with _section_jobs_lock:
+        return _section_output_locks.setdefault(str(output), threading.Lock())
+
+def source_section_job_state(settings: dict, retry: bool = False) -> dict:
+    """Section clip readiness for the page, without blocking on the trim.
+
+    A missing clip is trimmed on a background thread and reported as pending with its
+    progress. A failed trim is not retried until the user asks, so a broken source
+    does not re-run ffmpeg on every poll.
+    """
+    idle = {"pending": False, "percent": 100, "label": "", "error": ""}
+    global_settings = settings.get("global", {})
+    if not global_settings.get("source", "") or not source_section_is_active(settings):
+        return idle
+    output = source_section_output_for(settings)
+    key = str(output)
+    with _section_jobs_lock:
+        job = _section_jobs.get(key)
+        if job and job["running"]:
+            return {"pending": True, "percent": job["percent"], "label": job["label"], "error": ""}
+    ffmpeg = local_tool("ffmpeg")
+    start = section_float(global_settings.get("section_start", "0"), 0.0)
+    end = section_float(global_settings.get("section_end", ""), 0.0)
+    if ffmpeg and source_section_clip_is_valid(output, ffmpeg, max(0.041, end - start)):
+        return idle
+    if job and job["error"] and not retry:
+        return idle | {"error": job["error"]}
+    job = {"running": True, "percent": 0, "label": "Trimming source section", "error": ""}
+    with _section_jobs_lock:
+        if (_section_jobs.get(key) or {}).get("running"):
+            return {"pending": True, "percent": 0, "label": job["label"], "error": ""}
+        _section_jobs[key] = job
+    settings_copy = json.loads(json.dumps(settings))
+
+    def report(percent: int | float, label: str) -> None:
+        job["percent"] = int(percent)
+        job["label"] = label
+
+    def trim() -> None:
+        try:
+            ensure_source_section_clip(settings_copy, progress=report)
+        except Exception as exc:
+            job["error"] = str(exc).strip().splitlines()[-1] if str(exc).strip() else "ffmpeg source section trim failed"
+            log_media_message(f"Could not prepare selected source section: {exc}")
+        finally:
+            job["running"] = False
+
+    threading.Thread(target=trim, name="source-section-trim", daemon=True).start()
+    return {"pending": True, "percent": 0, "label": job["label"], "error": ""}
+
+def stop_source_section_trims() -> None:
+    with _section_jobs_lock:
+        processes = list(_section_processes)
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+
+# A trim left running after ARP quits would hold the source open and leave a .partial behind.
+atexit.register(stop_source_section_trims)
+
+def ensure_source_section_clip(settings: dict, progress: Callable[[int, str], None] | None = None) -> str:
     global_settings = settings.get("global", {})
     source_text = global_settings.get("source", "")
     if not source_text or not source_section_is_active(settings):
@@ -978,20 +1049,41 @@ def ensure_source_section_clip(settings: dict) -> str:
     if not ffmpeg:
         raise RuntimeError("Run install_windows.bat to install local FFmpeg for source section trimming.")
     expected_duration = max(0.041, end - start)
-    if source_section_clip_is_valid(output, ffmpeg, expected_duration):
-        return rel(output)
+    with source_section_output_lock(output):
+        if source_section_clip_is_valid(output, ffmpeg, expected_duration):
+            return rel(output)
+        trim_source_section(settings, source, output, ffmpeg, start, expected_duration, progress)
+    return rel(output)
+
+def trim_source_section(
+    settings: dict,
+    source: Path,
+    output: Path,
+    ffmpeg: str,
+    start: float,
+    duration: float,
+    progress: Callable[[int, str], None] | None,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
     has_audio = source_has_audio_stream(ffmpeg, source)
     command = [
         ffmpeg,
         "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-stats_period",
+        "0.5",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-ss",
         f"{start:.3f}",
         "-i",
         str(source),
         "-t",
-        f"{max(0.041, end - start):.3f}",
+        f"{duration:.3f}",
         "-map",
         "0:v:0",
         "-map",
@@ -1010,16 +1102,53 @@ def ensure_source_section_clip(settings: dict) -> str:
         profile = str(settings.get("cloud", {}).get("intermediate_format", "high") or "high").lower()
         audio_args = ["-af", "asetpts=PTS-STARTPTS", *intermediate_audio_codec_args(profile, bitrate="320k")]
         command[command.index("-sn"):command.index("-sn")] = audio_args
-    result = subprocess.run(command, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "ffmpeg source section trim failed").strip())
+    label = f"Trimming source section ({format_timecode(duration)})"
+    if progress:
+        progress(0, label)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    with _section_jobs_lock:
+        _section_processes.add(process)
+    errors: list[str] = []
+    try:
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            key, _, value = line.partition("=")
+            if key in {"out_time_us", "out_time_ms"}:
+                # Both keys are microseconds (out_time_ms is misnamed); early lines can be N/A.
+                try:
+                    seconds = int(value) / 1_000_000
+                except ValueError:
+                    continue
+                if progress:
+                    progress(min(99, int(seconds * 100 / duration)), label)
+            elif line and "=" not in line:
+                errors.append(line)
+        process.wait()
+    finally:
+        with _section_jobs_lock:
+            _section_processes.discard(process)
+    if process.returncode != 0:
+        raise RuntimeError("\n".join(errors[-20:]).strip() or "ffmpeg source section trim failed")
     partial.replace(output)
+    if progress:
+        progress(100, label)
     log_media_message(f"Prepared source section clip: {rel(output)}")
-    return rel(output)
 
 def source_section_clip_is_valid(output: Path, ffmpeg: str, expected_duration: float) -> bool:
     if not output.exists() or output.stat().st_size <= 0:
         return False
+    stat = output.stat()
+    # Polls ask on every refresh; probe a given file once rather than every 4 seconds.
+    memo_key = (str(output), stat.st_size, stat.st_mtime_ns, round(expected_duration, 3))
+    if memo_key in _valid_section_clips:
+        return True
+    valid = probe_source_section_clip(output, ffmpeg, expected_duration)
+    if valid:
+        _valid_section_clips.add(memo_key)
+    return valid
+
+def probe_source_section_clip(output: Path, ffmpeg: str, expected_duration: float) -> bool:
     try:
         timing = source_section_timing(ffmpeg, output)
     except Exception:
