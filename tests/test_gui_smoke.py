@@ -6843,6 +6843,43 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(all(2 < offset < 38 for offset in offsets[17:20]), offsets)
         self.assertEqual(offsets[16:21], sorted(offsets[16:21]))
 
+    def test_cq_chunks_cut_at_a_shot_change_then_dissolve_within_the_next_shot(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def clip(path: Path, levels: list[int]) -> None:
+            raw = b"".join(bytes([level]) * (64 * 48 * 3) for level in levels)
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                            "-r", "24", "-i", "-", "-c:v", "ffv1", str(path)], input=raw, check=True)
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            shot_one, shot_two_a, shot_two_b = folder / "a.mkv", folder / "b.mkv", folder / "c.mkv"
+            output = folder / "joined.mkv"
+            # Shot one is frames 0-9; shot two (10-39) is split in two with a 4-frame lead-in.
+            # The concat at the cut used to leave a microsecond timebase that xfade refused.
+            clip(shot_one, [5 * index for index in range(10)])
+            clip(shot_two_a, [5 * index for index in range(10, 25)])
+            clip(shot_two_b, [5 * index for index in range(21, 40)])
+
+            upscale_video.crossfade_chunks(
+                ffmpeg, [(shot_one, 0), (shot_two_a, 0), (shot_two_b, 4)], 24.0, 40, shot_one, output,
+            )
+
+            capture = cv2.VideoCapture(str(output))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(frame.mean())
+            capture.release()
+        self.assertEqual(len(levels), 40)
+        self.assertTrue(all(abs(level - 5 * index) <= 2 for index, level in enumerate(levels)), levels)
+
     def test_cq_source_colour_keeps_render_frames_aligned_with_an_mp4_source(self) -> None:
         try:
             ffmpeg = common.find_ffmpeg("")

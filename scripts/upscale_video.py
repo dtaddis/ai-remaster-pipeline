@@ -1399,7 +1399,8 @@ def crossfade_chunks(
             )
             length += chunk_frames - lead
         else:
-            filters.append(f"[{current}][c{index}]concat=n=2:v=1:a=0[{joined}]")
+            # concat outputs a 1/1000000 timebase; a later xfade needs both inputs on the frame clock.
+            filters.append(f"[{current}][c{index}]concat=n=2:v=1:a=0,{frame_clock(fps)}[{joined}]")
             length += chunk_frames
         current = joined
     if width and height:
