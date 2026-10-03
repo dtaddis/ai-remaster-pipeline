@@ -5323,6 +5323,47 @@ class GuiSmokeTests(unittest.TestCase):
 
             self.assertEqual(sig["extra_guides"][0]["image_fingerprint"]["sha256"], common.file_fingerprint(guide)["sha256"])
 
+    def test_outpaint_chunk_reused_when_identical_guides_move_folders(self) -> None:
+        # A chunk rendered with guides outside ARP's folder, then recovered into imported/ (same
+        # bytes, new path), was re-rendered because the signature compared guide paths.
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            prepared = folder / "prepared.mp4"
+            workflow = folder / "workflow.json"
+            outside = folder / "elsewhere" / "chunk_0000_guide_00.png"
+            imported = folder / "imported" / "chunk_0000_guide_00_cf5b91d7.png"
+            start = folder / "elsewhere" / "guide_prev.png"
+            moved_start = folder / "imported" / "guide_prev.png"
+            output = folder / "raw_0000.mp4"
+            for path, data in ((prepared, b"prepared"), (workflow, b"{}"), (outside, b"guide bytes"), (start, b"start")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            imported.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(outside, imported)
+            shutil.copy2(start, moved_start)
+            output.write_bytes(b"rendered")
+            args = argparse.Namespace(
+                target_aspect="16:9", target_height=480, outpaint_all_black_regions=False,
+                prompt="outpaint", negative_prompt="", guide_strength=0.7,
+                load_video_node_id="5060", save_node_id="5076", extra_save_node_id=["5069"],
+                output_node_id="5076", model_backend="gguf", gguf_model="model.gguf",
+                video_vae="vae.safetensors", outpaint_lora="lora.safetensors",
+                chunk_seconds=20.0, overlap_frames=8,
+            )
+
+            def signature(guide: Path, start_guide: Path) -> dict:
+                return outpaint_video.raw_signature(args, workflow, prepared, 42, guide_image=start_guide,
+                                                    extra_guides=[{"frame_idx": 237, "strength": 0.95, "image": guide}])
+
+            common.write_signature(output, signature(outside, start))
+            self.assertTrue(common.resumable_output(output, signature(imported, moved_start)))
+
+            imported.write_bytes(b"edited guide")  # different content still re-renders
+            self.assertFalse(common.resumable_output(output, signature(imported, moved_start)))
+            moved_start.unlink()  # a path with no fingerprint (file gone) is still compared
+            imported.write_bytes(b"guide bytes")
+            self.assertFalse(common.resumable_output(output, signature(imported, moved_start)))
+
     def test_unchanged_auto_guide_pixels_preserve_resume_signature(self) -> None:
         import cv2
         import numpy as np

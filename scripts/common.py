@@ -54,15 +54,33 @@ def signature_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".sig.json")
 
 
-def _without_mtime(value: Any) -> Any:
+def _fingerprint_key(key: str) -> str:
+    """The signature key that fingerprints the file named by `key` ("image" -> "image_fingerprint";
+    outpaint's start guide pairs "guide_image" with "guide_fingerprint")."""
+    return "guide_fingerprint" if key == "guide_image" else f"{key}_fingerprint"
+
+
+def _comparable(value: Any) -> Any:
+    """A signature as it is matched, which is by content rather than by where files live:
+
+    - mtime_ns is dropped: size+sha256 already prove identity, and project load rewrites
+      identical bytes with fresh mtimes.
+    - A file path is dropped when the same dict holds that file's sha256 fingerprint. Guides
+      recovered from outside ARP's folder, plans renamed to the short artifact names, and project
+      folders moved or reopened all change paths without changing a byte; matching on the path
+      re-rendered every affected chunk anyway (a 20-second LTX chunk for an identical guide)."""
     if isinstance(value, dict):
-        return {
-            key: _without_mtime(item)
-            for key, item in value.items()
-            if key not in {"mtime_ns", "color_reference_previous"}
-        }
+        comparable = {}
+        for key, item in value.items():
+            if key in {"mtime_ns", "color_reference_previous"}:
+                continue
+            fingerprint = value.get(_fingerprint_key(key))
+            if isinstance(item, str) and isinstance(fingerprint, dict) and fingerprint.get("sha256"):
+                continue
+            comparable[key] = _comparable(item)
+        return comparable
     if isinstance(value, list):
-        return [_without_mtime(item) for item in value]
+        return [_comparable(item) for item in value]
     return value
 
 
@@ -71,13 +89,11 @@ def signature_matches(path: Path, signature: dict[str, Any]) -> bool:
     if not path.exists() or not sig.exists():
         return False
     try:
-        # mtime_ns is recorded for diagnostics but ignored when matching: size+sha256 already
-        # prove content identity, and project load rewrites identical bytes with fresh mtimes.
-        # Compare the signature as it would be stored: a tuple reads back as a list, so
-        # comparing the raw dict made any tuple-valued signature never match (finalize's
-        # source_rectangle re-encoded the outpainted video on every run).
+        # Match by content (see _comparable). Compare the signature as it would be stored: a
+        # tuple reads back as a list, so comparing the raw dict made any tuple-valued signature
+        # never match (finalize's source_rectangle re-encoded the outpainted video on every run).
         stored = json.loads(sig.read_text(encoding="utf-8-sig"))
-        return _without_mtime(stored) == _without_mtime(json.loads(json.dumps(signature)))
+        return _comparable(stored) == _comparable(json.loads(json.dumps(signature)))
     except Exception:
         return False
 
