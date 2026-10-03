@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from .config import (
 from .file_dialogs import browse_path
 from .manifests import read_outpaint_chunk_rows, write_outpaint_chunk_rows
 from .media import extract_video_frame_at, pipeline_source_text
-from .paths import rel, resolve
+from .paths import is_within, rel, resolve
 from .runtime_settings import qwen_masked_workflow_for
 from .sam_masks import sam2_mask_for_image
 
@@ -87,6 +88,76 @@ def _save_guide_frames(manifest: Path, chunk_index: int, frames: list[dict]) -> 
         raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
     rows[chunk_index]["guide_frames"] = json.dumps(frames)
     write_outpaint_chunk_rows(manifest, [rows[k] for k in sorted(rows)])
+
+CHUNK_IMAGE_FIELDS = ("guide_image", "guide_end_image", "anchor_image")
+
+
+def _import_outside_image(text: str, target_dir: Path) -> str:
+    """Copy an image the plan references from outside ARP's folder into target_dir and return
+    its new path, or the text unchanged. The GUI only serves files under ROOT and projects only
+    bundle them, so a plan edited by hand (or by another tool) to point elsewhere would show
+    broken guides and lose them from saved projects."""
+    if not text:
+        return text
+    source = resolve(text)
+    if is_within(source, ROOT) or not source.is_file():
+        return text
+    data = source.read_bytes()
+    # Content-keyed, so re-importing is a no-op and same-named images from different folders
+    # cannot overwrite each other.
+    target = target_dir / f"{source.stem[:40]}_{hashlib.sha256(data).hexdigest()[:8]}{source.suffix.lower()}"
+    if not target.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        shutil.copystat(source, target)
+        for sidecar in (".sig.json", ".json"):
+            outside = Path(str(source) + sidecar)
+            if outside.is_file():
+                shutil.copy2(outside, Path(str(target) + sidecar))
+    return rel(target)
+
+
+def import_outside_guide_images(manifest: Path) -> int:
+    """Bring every guide/anchor image the chunk plan references from outside ARP's folder into
+    intermediate/outpaint_guides/<plan>/imported/ and point the plan at the copies. Returns how
+    many references changed; the plan is only rewritten when something did."""
+    rows = read_outpaint_chunk_rows(manifest)
+    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem / "imported"
+    changed = 0
+    for row in rows.values():
+        for field in CHUNK_IMAGE_FIELDS:
+            new = _import_outside_image(row.get(field, ""), target_dir)
+            if new != row.get(field, ""):
+                row[field] = new
+                changed += 1
+        raw = (row.get("guide_frames") or "").strip()
+        if not raw:
+            continue
+        try:
+            frames = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(frames, list):
+            continue
+        frames_changed = 0
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            for key in ("image", "image_previous"):
+                old = frame.get(key) or ""
+                new = _import_outside_image(old, target_dir)
+                if new != old:
+                    frame[key] = new
+                    frames_changed += 1
+        if frames_changed:
+            row["guide_frames"] = json.dumps(frames)
+            changed += frames_changed
+    if changed:
+        write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+        if state.APP is not None:
+            state.APP.log.append(f"Copied {changed} guide image(s) from outside ARP's folder into {rel(target_dir)}")
+    return changed
+
 
 def _guide_source_seconds(row: dict, frame_idx: int, fps: float) -> float:
     """Convert a frame_idx (possibly negative) to absolute seconds in the prepared canvas."""

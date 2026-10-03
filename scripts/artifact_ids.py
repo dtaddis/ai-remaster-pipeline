@@ -180,6 +180,29 @@ def outpaint_identity(source_name: str, aspect: str, work_w: int, work_h: int, c
     return identity
 
 
+def legacy_outpaint_identities(identity: dict) -> list[dict]:
+    """Earlier versions of an outpaint identity, newest first, so work saved under an older name
+    (chunk plans and their guide frames) can still be found after a version bump.
+
+    v2 (2026-08-11) used "crop_then_fit_v1"; v1 had no geometry, and from 2026-08-02 added
+    crop_fill=2 when cropping. The crop values kept the same sign throughout (positive trims).
+    """
+    base = {key: value for key, value in identity.items() if key not in ("v", "geometry", "crop_fill")}
+    older = [
+        {**base, "v": 2, "geometry": "crop_then_fit_v1"},
+        {**base, "v": 1},
+    ]
+    if any(base.get("crop") or ()):
+        older.insert(1, {**base, "v": 1, "crop_fill": 2})
+    return older
+
+
+def legacy_outpaint_basenames(source_name: str, aspect: str, work_w: int, work_h: int, crop: Iterable[int], black: bool, tag: str) -> list[str]:
+    """outpaint_basename under each earlier identity version (see legacy_outpaint_identities)."""
+    ident = outpaint_identity(source_name, aspect, work_w, work_h, crop, black)
+    return [artifact_basename(source_word(source_name), tag, older) for older in legacy_outpaint_identities(ident)]
+
+
 def outpaint_basename(source_name: str, aspect: str, work_w: int, work_h: int, crop: Iterable[int], black: bool, tag: str) -> str:
     """Shared stem for every outpaint-family artifact (output/rawcomfy/prepared/chunks). Call from
     both the GUI locator and the producer scripts so their names are byte-identical."""

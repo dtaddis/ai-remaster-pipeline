@@ -6,6 +6,7 @@ import io
 import json
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -145,6 +146,7 @@ from .outpaint_guides import (
     clear_guide_frame_image,
     guide_edit_preview_command,
     guide_frame_generation_command,
+    import_outside_guide_images,
     normalize_guide_preview_to_source,
     remove_guide_frame,
     outpaint_end_guide_generation_command,
@@ -1287,6 +1289,12 @@ class PipelineApp:
         else:
             path = self.project_path
         self.log.append(f"Saving ARP project: {path}")
+        # Record the chunk plan's path so a later rename can carry it (and its guides) over.
+        chunk_manifest = outpaint_chunk_manifest_for(self.outpaint_source_for(), self.settings.get("outpaint", {})) if self.outpaint_enabled() else ""
+        if chunk_manifest and resolve(chunk_manifest).is_file():
+            self.settings.setdefault("outpaint", {})["manifest"] = chunk_manifest
+            # Projects only bundle files inside ARP's folder.
+            import_outside_guide_images(resolve(chunk_manifest))
         write_project_file(path, self.settings)
         self.log.append(f"Saved ARP project: {path}")
         return {"path": str(path)}
@@ -1330,8 +1338,13 @@ class PipelineApp:
         current_outpainted = outpaint_output_for(source, outpaint_values.get("target_aspect", "16:9"), outpaint_values.get("target_height", "720"))
         current_shots = manifest_for_outpainted(current_outpainted)
         method = settings.get("recomp", {}).get("colorization_method", "") or settings.get("colour", {}).get("method", "deepexemplar")
+        saved_chunks = outpaint_values.get("manifest", "")
+        if not (saved_chunks and resolve(saved_chunks).is_file()):
+            # Projects saved without the plan's path: look under the names it had before.
+            older = legacy_outpaint_chunk_manifests(source, outpaint_values)
+            saved_chunks = rel(older[0]) if older else saved_chunks
         pairs = [
-            (outpaint_values.get("manifest", ""), outpaint_chunk_manifest_for(source, outpaint_values)),
+            (saved_chunks, outpaint_chunk_manifest_for(source, outpaint_values)),
             (saved_outpainted, current_outpainted),
             (saved_shots, current_shots),
             *zip(colorized_outputs_for_manifest(saved_shots, method), colorized_outputs_for_manifest(current_shots, method)),
@@ -3340,18 +3353,53 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
     return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
 
 
+def legacy_outpaint_chunk_manifests(source_text: str, values: dict[str, str]) -> list[Path]:
+    """Chunk plans for this source and geometry that were saved under older names.
+
+    The plan's name hashes its identity, so an identity version bump or the 2026-09-15 rename of
+    section clips (``<stem>_<range>.mp4`` became ``<stem>_<range>_<profile>.mkv``) gives the same
+    plan a new name, and its guide frames appear to vanish. Edited plans come first, then the
+    newest.
+    """
+    if not source_text:
+        return []
+    source = resolve_video_source(source_text)
+    aspect = values.get("target_aspect", "16:9")
+    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
+    crop, black = _outpaint_crop_black(values)
+    current = resolve(outpaint_chunk_manifest_for(source_text, values))
+    source_names = [source.name]
+    section = re.fullmatch(r"(.+_\d{10}_\d{10})_(?:low|medium|high|lossless)\.mkv", source.name)
+    if section and source.parent.name == "source_sections":
+        source_names.append(f"{section.group(1)}.mp4")
+    basenames: list[str] = []
+    for name in source_names:
+        basenames.append(aid.outpaint_basename(name, aspect, width, height, crop, black, "chunks"))
+        basenames.extend(aid.legacy_outpaint_basenames(name, aspect, width, height, crop, black, "chunks"))
+    found = [
+        path for path in dict.fromkeys(ROOT / "manifests" / "outpaint_chunks" / f"{base}.csv" for base in basenames)
+        if path != current and path.is_file()
+    ]
+    return sorted(found, key=lambda path: (chunk_manifest_has_user_edits(path), path.stat().st_mtime), reverse=True)
+
+
 def migrate_legacy_outpaint_chunk_manifest(source_text: str, values: dict[str, str], manifest: Path) -> None:
-    """Recover an LTX 2.5-only chunk plan when no shared manifest exists yet."""
+    """Recover a chunk plan saved under an older name when no current-name plan exists yet."""
     if manifest.exists():
         return
     legacy = legacy_ltx25_outpaint_chunk_manifest_for(source_text, values)
-    if not legacy.exists() or legacy == manifest:
+    if legacy.exists() and legacy != manifest:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, manifest)
+        APP.log.append(
+            f"Recovered outpaint chunk settings and guide frames from legacy LTX 2.5 manifest: {rel(legacy)}"
+        )
         return
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(legacy, manifest)
-    APP.log.append(
-        f"Recovered outpaint chunk settings and guide frames from legacy LTX 2.5 manifest: {rel(legacy)}"
-    )
+    older = legacy_outpaint_chunk_manifests(source_text, values)
+    if older:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(older[0], manifest)
+        APP.log.append(f"Recovered outpaint chunk settings and guide frames saved under an older name: {rel(older[0])}")
 
 
 def outpaint_raw_chunk(path: Path) -> Path:
@@ -3489,6 +3537,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
     chunk_dir = outpaint_chunk_dir_for(source_text, values)
     manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
     migrate_legacy_outpaint_chunk_manifest(source_text, values, manifest)
+    import_outside_guide_images(manifest)
     values["manifest"] = rel(manifest)
     existing = read_outpaint_chunk_rows(manifest)
     max_frames, overlap_frames = outpaint_chunk_limits(source_text, values, overlap_frames)

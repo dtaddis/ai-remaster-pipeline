@@ -20,6 +20,7 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import artifact_ids as aid  # noqa: E402
 import comfy_api  # noqa: E402
 import audio_models  # noqa: E402
 import common  # noqa: E402
@@ -46,6 +47,7 @@ from ai_remaster_gui import config
 from ai_remaster_gui import lifecycle
 from ai_remaster_gui import media
 from ai_remaster_gui import outpaint_guides
+from ai_remaster_gui import paths
 from ai_remaster_gui import project_io
 from ai_remaster_gui import runtime_settings
 from ai_remaster_gui import sam_masks
@@ -5187,6 +5189,85 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(new_video.read_bytes(), b"finished outpaint")
             self.assertEqual(server.manifest_source_video(new_shots), server.rel(new_video))
             self.assertEqual(server.read_manifest(new_shots), [{"enabled": "true", "start_frame": "0"}])
+
+    def test_loading_project_without_plan_path_finds_plan_under_older_name(self) -> None:
+        chunk_header = "chunk_index,start_frame,end_frame,seed,guide_frames,auto_start_guide\n"
+        plans = app.ROOT / "manifests" / "outpaint_chunks"
+        source = "intermediate/source_sections/Zzarptest_0000000000_0000001000_high.mkv"
+        values = {"target_aspect": "16:9", "target_height": "720", "edge_left": "-10", "edge_right": "-10"}
+        crop = [10, 10, 0, 0]
+        old_section_name = "Zzarptest_0000000000_0000001000.mp4"
+        edited = plans / f"{aid.legacy_outpaint_basenames(old_section_name, '16:9', 1280, 704, crop, False, 'chunks')[0]}.csv"
+        untouched = plans / f"{aid.legacy_outpaint_basenames(Path(source).name, '16:9', 1280, 704, crop, False, 'chunks')[0]}.csv"
+        current = plans / f"{aid.outpaint_basename(Path(source).name, '16:9', 1280, 704, crop, False, 'chunks')}.csv"
+        created = [edited, untouched, current, Path(str(current) + ".bak")]
+        try:
+            plans.mkdir(parents=True, exist_ok=True)
+            edited.write_text(chunk_header + '0,0,480,42,"[{""frame_idx"": 9, ""image"": ""g.png""}]",true\n', encoding="utf-8")
+            untouched.write_text(chunk_header + "0,0,480,42,,true\n", encoding="utf-8")
+            current.write_text(chunk_header + "0,0,480,42,,true\n", encoding="utf-8")
+            with (
+                mock.patch.object(server, "resolve_video_source", side_effect=lambda text: app.ROOT / text),
+                mock.patch.object(server, "outpaint_work_size_for_source", return_value=(1280, 704)),
+            ):
+                self.assertEqual(server.legacy_outpaint_chunk_manifests(source, values), [edited, untouched])
+
+                settings = copy.deepcopy(app.APP.settings)
+                settings["outpaint"].update(values, manifest="")
+                app.APP.settings = settings
+                with (
+                    mock.patch.object(app.APP, "outpaint_enabled", return_value=True),
+                    mock.patch.object(app.APP, "outpaint_source_for", return_value=source),
+                    mock.patch.object(server, "outpaint_output_for", return_value=""),
+                    mock.patch.object(server, "manifest_for_outpainted", return_value=""),
+                    mock.patch.object(server, "colorized_outputs_for_manifest", return_value=[]),
+                ):
+                    app.APP.adopt_saved_project_artifacts()
+
+            self.assertIn("g.png", current.read_text(encoding="utf-8"))
+            self.assertTrue(Path(str(current) + ".bak").is_file())
+        finally:
+            for path in created:
+                path.unlink(missing_ok=True)
+
+    def test_guide_images_outside_arp_are_copied_in(self) -> None:
+        chunk_header = "chunk_index,start_frame,end_frame,seed,guide_image,guide_frames,auto_start_guide\n"
+        with tempfile.TemporaryDirectory() as outside_text, tempfile.TemporaryDirectory(dir=app.ROOT) as inside_text:
+            outside, inside = Path(outside_text), Path(inside_text)
+            manifest = inside / "Zzarptest_chunks_import.csv"
+            imported_dir = app.ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+            try:
+                (outside / "a").mkdir()
+                (outside / "b").mkdir()
+                # Same name, different content: each must keep its own copy.
+                (outside / "a" / "guide.png").write_bytes(b"first guide")
+                (outside / "b" / "guide.png").write_bytes(b"second guide")
+                (outside / "a" / "guide.png.sig.json").write_text("{}", encoding="utf-8")
+                local = inside / "local.png"
+                local.write_bytes(b"already inside")
+                frames = [
+                    {"frame_idx": 0, "image": str(outside / "a" / "guide.png"), "image_previous": server.rel(local)},
+                    {"frame_idx": 9, "image": str(outside / "missing.png")},
+                ]
+                with manifest.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.writer(handle)
+                    handle.write(chunk_header)
+                    writer.writerow([0, 0, 480, 42, str(outside / "b" / "guide.png"), json.dumps(frames), "true"])
+
+                self.assertEqual(server.import_outside_guide_images(manifest), 2)
+                row = server.read_outpaint_chunk_rows(manifest)[0]
+                guides = json.loads(row["guide_frames"])
+                first, second = server.resolve(guides[0]["image"]), server.resolve(row["guide_image"])
+                self.assertTrue(paths.is_within(first, imported_dir) and paths.is_within(second, imported_dir))
+                self.assertEqual(first.read_bytes(), b"first guide")
+                self.assertEqual(second.read_bytes(), b"second guide")
+                self.assertTrue(Path(str(first) + ".sig.json").is_file())
+                self.assertEqual(guides[0]["image_previous"], server.rel(local))
+                self.assertEqual(guides[1]["image"], str(outside / "missing.png"))
+                # Already imported: nothing changes and the plan is left alone.
+                self.assertEqual(server.import_outside_guide_images(manifest), 0)
+            finally:
+                shutil.rmtree(imported_dir, ignore_errors=True)
 
     def test_adopting_older_work_never_overwrites_edited_current_files(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

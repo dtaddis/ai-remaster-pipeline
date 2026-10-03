@@ -213,10 +213,12 @@ def outpaint_guide_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path
             manifests.append(manifest)
 
     chunk_manifest_for = globals().get("outpaint_chunk_manifest_for")
-    pipeline_source = globals().get("pipeline_source_text")
-    if chunk_manifest_for and pipeline_source:
+    # The plan is named after the video Outpainting consumes (the cleaned or stabilized one when
+    # those stages are on), not the raw section clip.
+    outpaint_source = globals().get("outpaint_source_for_settings")
+    if chunk_manifest_for and outpaint_source:
         try:
-            manifest_text = chunk_manifest_for(pipeline_source(settings), settings.get("outpaint", {}))
+            manifest_text = chunk_manifest_for(outpaint_source(settings), settings.get("outpaint", {}))
             manifest = resolve(manifest_text) if manifest_text else None
             if manifest and project_asset_is_bundleable(manifest) and manifest not in seen_manifests:
                 seen_manifests.add(manifest)

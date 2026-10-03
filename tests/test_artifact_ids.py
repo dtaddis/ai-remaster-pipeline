@@ -53,6 +53,18 @@ class IdentityKeyTests(unittest.TestCase):
         self.assertTrue(name.startswith("Metropolis_outpaint_"))
         self.assertTrue(name.endswith(".mp4"))
 
+    def test_legacy_names_reproduce_a_plan_saved_before_the_v3_bump(self) -> None:
+        # A real chunk plan written on 2026-09-08 (v2 geometry, section clip still named .mp4).
+        names = aid.legacy_outpaint_basenames(
+            "The_Most_Dangerous_Game__1932__High_Quality_0000000000_0000315021.mp4",
+            "16:9", 1280, 704, [10, 10, 6, 6], False, "chunks",
+        )
+        self.assertEqual(names[0], "The_chunks_c41fbc5d")
+        self.assertNotIn(aid.outpaint_basename(
+            "The_Most_Dangerous_Game__1932__High_Quality_0000000000_0000315021.mp4",
+            "16:9", 1280, 704, [10, 10, 6, 6], False, "chunks",
+        ), names)
+
     def test_outputs_use_signed_trim_extend_geometry_identity(self) -> None:
         self.assertEqual(self.base()["geometry"], "trim_extend_then_fit_v2")
         self.assertEqual(self.base(crop=[0, 0, 0, 0])["geometry"], "trim_extend_then_fit_v2")
