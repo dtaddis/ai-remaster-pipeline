@@ -134,6 +134,7 @@ from .lifecycle import (
     stop_started_comfy,
 )
 from .outpaint_guides import (
+    NoEditRegionError,
     _build_guide_frames_view,
     _get_guide_manifest,
     _composite_guide_in_place,
@@ -144,6 +145,7 @@ from .outpaint_guides import (
     add_guide_frame,
     chunk_frame_preview,
     clear_guide_frame_image,
+    guide_edit_engine,
     guide_edit_preview_command,
     guide_frame_generation_command,
     import_outside_guide_images,
@@ -2552,14 +2554,20 @@ class PipelineApp:
         source_text = self.upscale_input_for() or self.settings.get("upscale", {}).get("input_video", "")
         return resolve(source_text), 0.0, preview_seconds, f"upscale_preview_{preview_seconds:.3f}"
 
-    def run_guide_edit_preview(self, chunk_index: int, guide_index: int, instruction: str, mask_data: str = "", sampled_color: str = "") -> tuple[bool, str, str]:
-        ok, message = ensure_comfy_available_for_stage("Guide Frame Editing")
-        if not ok:
-            return False, message, ""
+    def run_guide_edit_preview(self, chunk_index: int, guide_index: int, instruction: str, mask_data: str = "", sampled_color: str = "", engine: str = "") -> tuple[bool, str, str]:
+        engine = guide_edit_engine(engine)
+        if engine != self.settings.get("outpaint", {}).get("guide_edit_method"):
+            self.update_settings("outpaint", {"guide_edit_method": engine})
         try:
-            cmd, output = guide_edit_preview_command(chunk_index, guide_index, instruction, mask_data, sampled_color)
+            cmd, output = guide_edit_preview_command(chunk_index, guide_index, instruction, mask_data, sampled_color, engine)
+        except NoEditRegionError:
+            raise  # The HTTP layer reports its type so the editor shows it as a popup.
         except Exception as exc:
             return False, str(exc), ""
+        if engine == "qwen":
+            ok, message = ensure_comfy_available_for_stage("Guide Frame Editing")
+            if not ok:
+                return False, message, ""
         with self.lock:
             if self.process and self.process.poll() is None:
                 return False, "A command is already running.", output
@@ -2567,7 +2575,8 @@ class PipelineApp:
             self.running_stage_key = "outpaint"
             self.run_started_at = time.time()
             mode = "masked" if mask_data else "unmasked"
-            self.log.append(f"Generating {mode} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}")
+            label = "OpenAI" if engine == "openai" else "Qwen"
+            self.log.append(f"Generating {mode} {label} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}")
             self.log.append("> " + redact_command_for_log(cmd))
             try:
                 self.process = subprocess.Popen(cmd, **self.child_process_kwargs())

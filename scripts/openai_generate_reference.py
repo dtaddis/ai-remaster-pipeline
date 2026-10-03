@@ -30,14 +30,18 @@ def multipart_field(name: str, value: str) -> bytes:
     ).encode("utf-8")
 
 
-def multipart_file(name: str, path: Path) -> bytes:
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+def multipart_bytes(name: str, filename: str, data: bytes, mime: str) -> bytes:
     header = (
         f"--{BOUNDARY}\r\n"
-        f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'
+        f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
         f"Content-Type: {mime}\r\n\r\n"
     ).encode("utf-8")
-    return header + path.read_bytes() + b"\r\n"
+    return header + data + b"\r\n"
+
+
+def multipart_file(name: str, path: Path) -> bytes:
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return multipart_bytes(name, path.name, path.read_bytes(), mime)
 
 
 def build_body(args: argparse.Namespace, source: Path, references: list[Path] | None = None) -> bytes:
@@ -96,11 +100,16 @@ def maximum_source_aspect_size(source_path: Path) -> str:
     return f"{width}x{height}"
 
 
+def supports_custom_size(model: str) -> bool:
+    """GPT Image 2 / 2.5 accept any multiple-of-16 size; older models only the three presets."""
+    model_id = model.strip().lower()
+    return model_id == "gpt-image-2" or model_id.startswith("gpt-image-2.5-")
+
+
 def resolved_output_size(requested: str, source_path: Path, model: str) -> str:
     if requested.strip().lower() != "max":
         return requested
-    model_id = model.strip().lower()
-    if not (model_id.startswith("gpt-image-2.5-") or model_id == "gpt-image-2"):
+    if not supports_custom_size(model):
         raise RuntimeError(
             "Maximum source-aspect output requires GPT Image 2.5 or GPT Image 2; "
             f"the selected model is {model}."
@@ -122,6 +131,50 @@ def normalize_to_source_size(path: Path, source_path: Path, *, quiet: bool = Fal
         image.convert("RGB").resize(target_size, resampling).save(path, format="PNG")
     if not quiet:
         print(f"Normalized OpenAI output to source size: {path} ({target_size[0]}x{target_size[1]})", flush=True)
+
+
+def post_image_edit(body: bytes, token: str, timeout: float, max_retries: int = 5) -> dict:
+    """POST a multipart body to the Images edit endpoint, retrying rate limits, 5xx and dropped connections."""
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/images/edits",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        },
+        method="POST",
+    )
+    max_retries = max(0, int(max_retries))
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            error_text = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            if not retryable or attempt >= max_retries:
+                raise RuntimeError(f"OpenAI API error {exc.code}: {error_text}") from exc
+            retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+            try:
+                delay = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                delay = min(60.0, 2.0 ** attempt)
+            print(f"OpenAI API temporarily unavailable ({exc.code}); retrying in {delay:.0f}s...", flush=True)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt >= max_retries:
+                raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
+            delay = min(60.0, 2.0 ** attempt)
+            print(f"OpenAI connection interrupted; retrying in {delay:.0f}s...", flush=True)
+            time.sleep(delay)
+    raise RuntimeError("OpenAI API request failed without a response.")
+
+
+def first_image_bytes(payload: dict) -> bytes:
+    images = payload.get("data") or []
+    if not images or not images[0].get("b64_json"):
+        raise RuntimeError("OpenAI API response did not contain an image.")
+    return base64.b64decode(images[0]["b64_json"])
 
 
 def generate(args: argparse.Namespace, references: list[Path] | None = None) -> Path:
@@ -151,15 +204,6 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     requested_size = args.size
     args.size = resolved_output_size(requested_size, source, args.model)
     body = build_body(args, source, reference_paths)
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/images/edits",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
-        },
-        method="POST",
-    )
     quiet = bool(getattr(args, "quiet", False))
     if not quiet:
         print(f"OpenAI image edit: {source} -> {output}", flush=True)
@@ -169,41 +213,11 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
             print(f"OpenAI reference images: {len(reference_paths)}", flush=True)
     if args.dry_run:
         return output
-    max_retries = max(0, int(getattr(args, "max_retries", 5)))
-    payload = None
-    for attempt in range(max_retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=args.timeout, context=ssl.create_default_context()) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            error_text = exc.read().decode("utf-8", errors="replace")
-            retryable = exc.code == 429 or 500 <= exc.code < 600
-            if not retryable or attempt >= max_retries:
-                raise RuntimeError(f"OpenAI API error {exc.code}: {error_text}") from exc
-            retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
-            try:
-                delay = max(1.0, float(retry_after))
-            except (TypeError, ValueError):
-                delay = min(60.0, 2.0 ** attempt)
-            print(f"OpenAI API temporarily unavailable ({exc.code}); retrying in {delay:.0f}s...", flush=True)
-            time.sleep(delay)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if attempt >= max_retries:
-                raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
-            delay = min(60.0, 2.0 ** attempt)
-            print(f"OpenAI connection interrupted; retrying in {delay:.0f}s...", flush=True)
-            time.sleep(delay)
-
-    if payload is None:
-        raise RuntimeError("OpenAI API request failed without a response.")
-
-    images = payload.get("data") or []
-    if not images or not images[0].get("b64_json"):
-        raise RuntimeError("OpenAI API response did not contain an image.")
+    payload = post_image_edit(body, token, args.timeout, int(getattr(args, "max_retries", 5)))
+    image_bytes = first_image_bytes(payload)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_suffix(output.suffix + ".partial")
-    temp.write_bytes(base64.b64decode(images[0]["b64_json"]))
+    temp.write_bytes(image_bytes)
     if not args.no_normalize_to_source_size:
         normalize_to_source_size(temp, source, quiet=quiet)
     temp.replace(output)

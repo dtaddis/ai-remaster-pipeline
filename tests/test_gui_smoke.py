@@ -5672,7 +5672,9 @@ class GuiSmokeTests(unittest.TestCase):
             prepared = folder / "prepared.mp4"
             prepared_preview = folder / "prepared_preview.png"
             masked_workflow = folder / "masked.json"
-            Image.new("RGB", (16, 9), (32, 32, 32)).save(guide)
+            barred = Image.new("RGB", (16, 9), (32, 32, 32))
+            barred.paste((0, 0, 0), (0, 0, 3, 9))  # a black bar down the left edge
+            barred.save(guide)
             Image.new("RGB", (16, 9), (0, 0, 0)).save(prepared_preview)
             prepared.write_bytes(b"prepared")
             masked_workflow.write_text("{}", encoding="utf-8")
@@ -5706,11 +5708,188 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("edit_reference_image.py", " ".join(unmasked))
         self.assertIn("edit_reference_image.py", " ".join(masked))
         self.assertEqual(Path(unmasked[unmasked.index("--source-image") + 1]), app.resolve(app.rel(guide)))
-        self.assertEqual(defaulted[defaulted.index("--instruction") + 1], "Replace the black bars.")
+        self.assertEqual(defaulted[defaulted.index("--instruction") + 1], outpaint_guides.GUIDE_EDIT_PROMPT)
         self.assertIn("--mask", unmasked)
         self.assertIn("--mask", masked)
         self.assertIn("outpaint_guides", unmasked_output)
         self.assertIn("outpaint_guides", masked_output)
+
+    def test_guide_edit_preview_command_routes_to_openai_with_the_shared_key(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            guide = folder / "guide.png"
+            Image.new("RGB", (16, 9), (32, 32, 32)).save(guide)
+            rows = [
+                {
+                    "chunk_index": "0",
+                    "start_frame": "0",
+                    "end_frame": "24",
+                    "guide_frames": json.dumps([{"frame_idx": 0, "strength": 0.7, "image": app.rel(guide)}]),
+                }
+            ]
+            app.write_outpaint_chunk_rows(manifest, rows)
+            app.APP.settings["references"].update(
+                {"openai_api_key": "", "openai_image_model": "gpt-image-2.5-sunburst", "openai_image_quality": "high"}
+            )
+            app.APP.settings["outpaint"].pop("guide_edit_method", None)
+            fake_state = {"manifest": app.rel(manifest), "rows": [{"index": 0}]}
+            with mock.patch.object(outpaint_guides, "outpaint_chunks_state", return_value=fake_state):
+                self.assertEqual(outpaint_guides.guide_edit_engine(), "qwen")
+                with self.assertRaisesRegex(RuntimeError, "OpenAI API key"):
+                    app.guide_edit_preview_command(0, 0, "make the coat green", "iVBORw0KGgo=", "", "openai")
+                app.APP.settings["references"]["openai_api_key"] = "sk-test"
+                command, output = app.guide_edit_preview_command(0, 0, "make the coat green", "iVBORw0KGgo=", "", "openai")
+                app.APP.settings["outpaint"]["guide_edit_method"] = "openai"
+                remembered, _output = app.guide_edit_preview_command(0, 0, "make the coat green", "iVBORw0KGgo=")
+                sidecar = json.loads(app.resolve(output + ".json").read_text(encoding="utf-8"))
+            app.APP.settings["outpaint"].pop("guide_edit_method", None)
+
+        self.assertIn("openai_edit_guide_image.py", " ".join(command))
+        self.assertNotIn("edit_reference_image.py", " ".join(command))
+        self.assertEqual(command[command.index("--api-key") + 1], "sk-test")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-image-2.5-sunburst")
+        self.assertEqual(command[command.index("--quality") + 1], "high")
+        self.assertIn("--mask", command)
+        self.assertIn("openai_edit_guide_image.py", " ".join(remembered))
+        self.assertEqual(sidecar["engine"], "openai")
+        self.assertNotIn("sk-test", json.dumps(sidecar))
+
+    def test_guide_edit_without_mask_or_black_bars_is_refused(self) -> None:
+        import numpy as np
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            filled = folder / "filled.png"
+            barred = folder / "barred.png"
+            black = folder / "black.png"
+            picture = np.full((90, 160, 3), 40, np.uint8)
+            picture[0, 0] = (3, 3, 3)  # one dark corner pixel is not a bar
+            Image.fromarray(picture).save(filled)
+            picture[:, :20] = 0
+            Image.fromarray(picture).save(barred)
+            Image.new("RGB", (160, 90)).save(black)
+            self.assertFalse(guide_frame_utils.edge_region_found(filled))
+            self.assertTrue(guide_frame_utils.edge_region_found(barred))
+            self.assertTrue(guide_frame_utils.edge_region_found(black))
+
+            rows = [{"chunk_index": "0", "start_frame": "0", "end_frame": "24",
+                     "guide_frames": json.dumps([{"frame_idx": 0, "strength": 0.7, "image": app.rel(filled)}])}]
+            app.write_outpaint_chunk_rows(manifest, rows)
+            app.APP.settings["references"]["openai_api_key"] = "sk-test"
+            fake_state = {"manifest": app.rel(manifest), "rows": [{"index": 0}]}
+            with mock.patch.object(outpaint_guides, "outpaint_chunks_state", return_value=fake_state):
+                for engine in ("openai", "qwen"):
+                    with self.assertRaisesRegex(outpaint_guides.NoEditRegionError, "No mask has been drawn"):
+                        app.guide_edit_preview_command(0, 0, "", "", "", engine)
+                # A painted mask is always enough.
+                command, _output = app.guide_edit_preview_command(0, 0, "", "iVBORw0KGgo=", "", "openai")
+                self.assertIn("openai_edit_guide_image.py", " ".join(command))
+                # The runner lets this error reach the HTTP layer, before any ComfyUI start.
+                with mock.patch.object(server, "ensure_comfy_available_for_stage") as comfy:
+                    with self.assertRaises(outpaint_guides.NoEditRegionError):
+                        app.APP.run_guide_edit_preview(0, 0, "", "", "", "qwen")
+                    comfy.assert_not_called()
+
+    def test_openai_guide_canvas_keeps_the_source_aspect_within_api_limits(self) -> None:
+        import openai_edit_guide_image as guide_edit
+
+        self.assertEqual(guide_edit.api_canvas_size(1280, 704, "gpt-image-2.5-sunburst"), (1280, 704))
+        for width, height in ((1920, 1080), (864, 480), (4096, 1716), (640, 352), (3000, 600)):
+            canvas_w, canvas_h = guide_edit.api_canvas_size(width, height, "gpt-image-2")
+            self.assertEqual((canvas_w % 16, canvas_h % 16), (0, 0))
+            self.assertLessEqual(max(canvas_w, canvas_h), 3840)
+            self.assertLessEqual(canvas_w * canvas_h, 8_294_400)
+            self.assertGreaterEqual(canvas_w * canvas_h, 655_360)
+            self.assertLessEqual(max(canvas_w / canvas_h, canvas_h / canvas_w), 3.0)
+            x, y, fit_w, fit_h = guide_edit.fit_box(width, height, canvas_w, canvas_h)
+            self.assertAlmostEqual(fit_w / fit_h, width / height, delta=0.02)
+            self.assertLessEqual(x + fit_w, canvas_w)
+            self.assertLessEqual(y + fit_h, canvas_h)
+        # Older models only take the presets: pick the nearest aspect and pad.
+        self.assertEqual(guide_edit.api_canvas_size(1280, 544, "gpt-image-1"), (1536, 1024))
+        self.assertEqual(guide_edit.api_canvas_size(704, 1280, "gpt-image-1.5"), (1024, 1536))
+
+    def test_openai_guide_edit_changes_only_the_masked_area_at_source_size(self) -> None:
+        import io
+        import base64
+        import numpy as np
+        import openai_edit_guide_image as guide_edit
+        from PIL import Image
+
+        sent: dict = {}
+        rng = np.random.default_rng(7)
+        # Mid-grey texture, so a brightness shift has room in both directions.
+        pixels = rng.integers(70, 150, (300, 500, 3), dtype=np.uint8)
+
+        def fake_post(body, token, timeout, max_retries):
+            sent["body"] = body
+            sent["token"] = token
+            # GPT Image repaints everything: the left part of the frame comes back much brighter
+            # (a local shift, as on real footage), and the masked area turns red.
+            match = body.split(b'name="size"\r\n\r\n', 1)[1].split(b"\r\n", 1)[0].decode()
+            canvas_w, canvas_h = (int(part) for part in match.split("x"))
+            result = np.asarray(Image.fromarray(pixels).resize((canvas_w, canvas_h), Image.LANCZOS)).astype(np.float32)
+            result[:, : canvas_w // 3] += 45
+            sx, sy = canvas_w / 500, canvas_h / 300
+            result[int(100 * sy):int(200 * sy), int(80 * sx):int(160 * sx)] = (220, 40, 40)
+            buffer = io.BytesIO()
+            Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), "RGB").save(buffer, format="PNG")
+            return {"data": [{"b64_json": base64.b64encode(buffer.getvalue()).decode()}]}
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "guide.png"
+            mask = folder / "mask.png"
+            output = folder / "edit.png"
+            Image.fromarray(pixels, "RGB").save(source)
+            # The editor sends its mask at display size; white = edit, left part only.
+            mask_pixels = np.zeros((150, 250), np.uint8)
+            mask_pixels[30:120, 20:100] = 255
+            Image.fromarray(mask_pixels, "L").save(mask)
+            args = guide_edit.build_parser().parse_args([
+                "--source-image", str(source), "--mask", str(mask), "--output", str(output),
+                "--instruction", "make the coat red", "--api-key", "sk-test", "--model", "gpt-image-2",
+            ])
+            with mock.patch.object(guide_edit, "post_image_edit", side_effect=fake_post):
+                guide_edit.edit_guide(args)
+            result = np.asarray(Image.open(output).convert("RGB"))
+            raw_exists = output.with_name("edit_raw.png").is_file()
+
+        self.assertEqual(sent["token"], "sk-test")
+        self.assertIn(b'name="mask"', sent["body"])
+        self.assertIn(b"make the coat red", sent["body"])
+        self.assertTrue(raw_exists)
+        self.assertEqual(result.shape, pixels.shape)
+        full_mask = np.asarray(Image.fromarray(mask_pixels).resize((500, 300), Image.NEAREST)) > 0
+        np.testing.assert_array_equal(result[~full_mask], pixels[~full_mask])
+        inner = result[110:190, 90:150].astype(int)
+        self.assertGreater(inner[..., 0].mean() - inner[..., 2].mean(), 40)
+        # The local brightening is undone where the edit meets the untouched frame: the masked
+        # area's unchanged (non-red) margin is as bright as the frame just outside it.
+        margin = result[64:72, 50:150].astype(float).mean()
+        outside = result[50:58, 50:150].astype(float).mean()
+        self.assertLess(abs(margin - outside), 12)
+
+    def test_openai_guide_tone_match_falls_back_inside_wide_masks(self) -> None:
+        import numpy as np
+        import openai_edit_guide_image as guide_edit
+
+        rng = np.random.default_rng(3)
+        source = rng.integers(60, 120, (200, 400, 3), dtype=np.uint8)
+        result = np.clip(source.astype(int) + 30, 0, 255).astype(np.uint8)
+        keep = np.ones((200, 400), bool)
+        keep[:, :300] = False  # a mask far wider than the finest window
+        matched = guide_edit.match_tone(result, source, keep, 6.0)
+        self.assertTrue(np.isfinite(matched).all())
+        self.assertLess(abs(matched[:, :300].astype(float).mean() - source[:, :300].astype(float).mean()), 3)
+        unmatched = np.ones((200, 400), bool)
+        unmatched[:] = False
+        np.testing.assert_array_equal(guide_edit.match_tone(result, source, unmatched, 6.0), result)
 
     def test_outpaint_guide_generation_defaults_to_replace_black_bars(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

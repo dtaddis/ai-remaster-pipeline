@@ -27,7 +27,15 @@ from .sam_masks import sam2_mask_for_image
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
-from guide_frame_utils import guide_output_size_for_prepared, save_edge_mask_for_image  # noqa: E402
+from guide_frame_utils import edge_region_found, guide_output_size_for_prepared, save_edge_mask_for_image  # noqa: E402
+
+# The guide editor's default instruction (both engines). It covers both jobs the editor is used
+# for: filling black bars, which are masked automatically, and repairing a painted area.
+GUIDE_EDIT_PROMPT = "Repair the area under the mask. Fill black regions and fix discontinuities."
+
+
+class NoEditRegionError(RuntimeError):
+    """A guide edit with no painted mask, on a guide with no black bars to mask automatically."""
 
 # These few names live in server.py (a constant plus helpers wired into its outpaint internals);
 # importing server here would be circular (see state.py), so server.py injects them at startup via
@@ -584,7 +592,7 @@ def _guide_edit_prompt(instruction: str, sampled_color: str = "") -> str:
             "luminance to the target value while preserving texture, shadows, edges, composition, and identity; "
             "do not merely darken or tint the existing colour."
         )
-    return " ".join(part for part in parts if part).strip() or DEFAULT_ANCHOR_PROMPT
+    return " ".join(part for part in parts if part).strip() or GUIDE_EDIT_PROMPT
 
 def normalize_guide_preview_to_source(output: Path, source: Path) -> None:
     """Fill-resize a Qwen guide-edit preview to the editor source image size."""
@@ -623,7 +631,34 @@ def _guide_editor_source(chunk_index: int, guide_index: int, frames: list[dict])
         raise FileNotFoundError("Could not prepare a guide image for editing.")
     return preview_rel, prepared, source_seconds
 
-def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: str, mask_data: str = "", sampled_color: str = "") -> tuple[list[str], str]:
+GUIDE_EDIT_ENGINES = ("qwen", "openai")
+
+
+def guide_edit_engine(engine: str = "") -> str:
+    """The guide editor's model: the one asked for, else the remembered choice, else Qwen."""
+    chosen = (engine or state.APP.settings.get("outpaint", {}).get("guide_edit_method", "")).strip().lower()
+    return chosen if chosen in GUIDE_EDIT_ENGINES else "qwen"
+
+
+def _openai_guide_edit_command(source: Path, mask: str, output: Path, prompt: str) -> list[str]:
+    values = state.APP.settings.get("references", {})
+    token = values.get("openai_api_key", "").strip()
+    if not token:
+        raise RuntimeError("Add your OpenAI API key in Settings before editing guides with OpenAI.")
+    return [
+        sys.executable, "-u", str(SCRIPTS / "openai_edit_guide_image.py"),
+        "--source-image", str(source),
+        "--mask", mask,
+        "--output", rel(output),
+        "--instruction", prompt,
+        "--api-key", token,
+        "--model", values.get("openai_image_model", "gpt-image-2.5-sunburst") or "gpt-image-2.5-sunburst",
+        "--quality", values.get("openai_image_quality") or "auto",
+    ]
+
+
+def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: str, mask_data: str = "", sampled_color: str = "", engine: str = "") -> tuple[list[str], str]:
+    engine = guide_edit_engine(engine)
     manifest, rows, _manifest_text = _get_guide_manifest()
     if chunk_index not in rows:
         raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
@@ -632,44 +667,56 @@ def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: 
         raise IndexError(f"Guide frame {guide_index} not found in chunk {chunk_index + 1}")
     source_rel, _prepared, _source_seconds = _guide_editor_source(chunk_index, guide_index, frames)
     source = resolve(source_rel)
+    # Without a painted mask the edge mask decides what changes; on a guide with no black bars it
+    # would cover the whole frame and quietly hand the entire guide to the model.
+    if not mask_data and not edge_region_found(source):
+        raise NoEditRegionError(
+            "There is nothing to edit. No mask has been drawn, and this guide has no black regions "
+            "at its edges to fill automatically. Paint the area to change with the brush, SAM2 or "
+            "magic wand tools, then apply again."
+        )
     output = _next_guide_edit_output(manifest, chunk_index, guide_index)
     mask = _save_guide_edit_mask(manifest, chunk_index, guide_index, mask_data)
     if not mask:
         mask_path = _guide_edit_dir(manifest, chunk_index, guide_index) / f"mask_edge_{time.strftime('%Y%m%d_%H%M%S')}.png"
         mask = rel(save_edge_mask_for_image(source, mask_path))
     prompt = _guide_edit_prompt(instruction, sampled_color)
-    values = state.APP.settings.get("references", {})
-    config = current_config()
-    comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
-    comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
-    comfy_output = comfy_output_root_for(config)
-    workflow = qwen_masked_workflow_for(values, config)
-    if not workflow:
-        raise RuntimeError("Guide editing needs a Qwen masked edit workflow. ARP's bundled masked workflow was not found, and no custom workflow is set.")
-    if not resolve(workflow).is_file():
-        raise FileNotFoundError(f"Masked edit workflow not found: {workflow}")
-    cmd = [
-        sys.executable, "-u", str(SCRIPTS / "edit_reference_image.py"),
-        "--source-image", str(source),
-        "--mask", mask,
-        "--output", rel(output),
-        "--workflow", workflow,
-        "--comfy-url", comfy_url,
-        "--comfy-dir", comfy_dir,
-        "--comfy-output-root", comfy_output,
-        "--model-backend", values.get("model_backend", "gguf"),
-        "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL),
-        "--instruction", prompt,
-        "--no-normalize-to-source-size",
-        "--force",
-    ]
-    if values.get("prompt_node_id"):
-        cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
+    if engine == "openai":
+        cmd = _openai_guide_edit_command(source, mask, output, prompt)
+    else:
+        values = state.APP.settings.get("references", {})
+        config = current_config()
+        comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
+        comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
+        comfy_output = comfy_output_root_for(config)
+        workflow = qwen_masked_workflow_for(values, config)
+        if not workflow:
+            raise RuntimeError("Guide editing needs a Qwen masked edit workflow. ARP's bundled masked workflow was not found, and no custom workflow is set.")
+        if not resolve(workflow).is_file():
+            raise FileNotFoundError(f"Masked edit workflow not found: {workflow}")
+        cmd = [
+            sys.executable, "-u", str(SCRIPTS / "edit_reference_image.py"),
+            "--source-image", str(source),
+            "--mask", mask,
+            "--output", rel(output),
+            "--workflow", workflow,
+            "--comfy-url", comfy_url,
+            "--comfy-dir", comfy_dir,
+            "--comfy-output-root", comfy_output,
+            "--model-backend", values.get("model_backend", "gguf"),
+            "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL),
+            "--instruction", prompt,
+            "--no-normalize-to-source-size",
+            "--force",
+        ]
+        if values.get("prompt_node_id"):
+            cmd.extend(["--prompt-node-id", values["prompt_node_id"]])
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(
             {
                 "chunk_index": chunk_index,
                 "guide_index": guide_index,
+                "engine": engine,
                 "source_image": rel(source),
                 "mask": mask,
                 "instruction": instruction,

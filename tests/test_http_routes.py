@@ -195,6 +195,19 @@ class HelperBehaviourTests(unittest.TestCase):
         handler.do_POST()
         self.assertEqual(handler.responses["json"]["preview"], "preview.png")
 
+    def test_send_action_exception_reports_its_type(self) -> None:
+        # The guide editor pops up NoEditRegionError rather than burying it in the status line.
+        from ai_remaster_gui.outpaint_guides import NoEditRegionError
+
+        def refuse(*_args):
+            raise NoEditRegionError("nothing to edit")
+
+        state.APP.run_guide_edit_preview = refuse
+        handler = _Handler("/api/guide-frame-edit-preview", {"chunk_index": 0, "guide_index": 0})
+        handler.do_POST()
+        payload = handler.responses["json"]
+        self.assertEqual((payload["ok"], payload["error"], payload["error_type"]), (False, "nothing to edit", "NoEditRegionError"))
+
 
 class StateLockTests(unittest.TestCase):
     def test_shot_view_builds_after_app_lock_is_released(self) -> None:

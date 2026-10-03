@@ -365,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(payload)
         except Exception as exc:
             state.APP.log.append(f"{label} failed: {exc}")
-            self.send_json({"ok": False, "error": str(exc)})
+            self.send_json({"ok": False, "error": str(exc), "error_type": type(exc).__name__})
 
     def do_POST(self) -> None:  # noqa: N802
         if not self.request_host_is_local() or not self.request_origin_is_local():
@@ -546,6 +546,7 @@ class Handler(BaseHTTPRequestHandler):
                 str(data.get("instruction", "")),
                 str(data.get("mask", "")),
                 str(data.get("sampled_color", "")),
+                str(data.get("engine", "")),
             ), view="outpaint", extra_key="preview")
         elif parsed.path == "/api/guide-frame-edit-accept":
             self._send_result("Guide frame edit accept", lambda: {**accept_guide_edit(int(data.get("chunk_index", 0)), int(data.get("guide_index", 0)), str(data.get("preview", ""))), "state": state.APP.state("outpaint")})

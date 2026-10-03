@@ -133,6 +133,23 @@ def _save_edge_mask(
     return target
 
 
+def edge_region_found(source: Path) -> bool:
+    """Whether save_edge_mask_for_image would find something to fill: black bars on at least one
+    edge, or a wholly black frame. False for a frame with picture right up to every edge, where the
+    edge mask would cover the whole image."""
+    import numpy as np
+    from PIL import Image as PILImage
+
+    with PILImage.open(source) as img:
+        content = (np.asarray(img.convert("RGB")) > 4).any(axis=2)
+    if not content.any():
+        return True
+    rows = np.flatnonzero(content.any(axis=1))
+    cols = np.flatnonzero(content.any(axis=0))
+    height, width = content.shape
+    return bool(cols[0] > 0 or cols[-1] < width - 1 or rows[0] > 0 or rows[-1] < height - 1)
+
+
 def save_edge_mask_for_image(source: Path, target: Path, overlap_px: int = DEFAULT_EDGE_MASK_OVERLAP_PX) -> Path:
     """Create a mask for exact-black prepared-canvas edges with a small inward overlap."""
     from PIL import Image as PILImage

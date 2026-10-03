@@ -339,6 +339,7 @@ const referenceEditor = {
   row: null,
   guide: null,
   guideSourcePath: '',
+  engine: 'qwen',
   tool: 'brush-add',
   brushSize: 28,
   sampledColor: '',
@@ -379,6 +380,7 @@ function openReferenceEditor(manifest, index) {
   clearReferenceSample();
   document.getElementById('referenceEditPreview').innerHTML = missingImage('No preview yet');
   document.getElementById('referenceEditRecent').innerHTML = referenceRecentHtml(row);
+  setReferenceEditEngine('qwen');
   document.getElementById('referenceEditModal').classList.remove('hidden');
   setReferenceTool(referenceEditor.tool);
   loadReferenceEditorImage(media(row.color_reference) + '&t=' + (row.color_reference_mtime || Date.now()));
@@ -409,10 +411,11 @@ async function openGuideEditor(chunkIndex, guideIndex, fallbackPath = '') {
   referenceEditor.samPoints = [];
   ensureReferenceEditorModal();
   document.getElementById('referenceEditTitle').textContent = `Chunk ${chunkIndex + 1} Guide ${guideIndex + 1} Editor`;
-  document.getElementById('referenceEditInstruction').value = DEFAULT_ANCHOR_PROMPT;
+  document.getElementById('referenceEditInstruction').value = GUIDE_EDIT_PROMPT;
   clearReferenceSample();
   document.getElementById('referenceEditPreview').innerHTML = missingImage('No preview yet');
   document.getElementById('referenceEditRecent').innerHTML = guideRecentHtml(row, guideIndex);
+  setReferenceEditEngine(settings('outpaint').guide_edit_method || 'qwen');
   document.getElementById('referenceEditModal').classList.remove('hidden');
   setReferenceTool(referenceEditor.tool);
   loadReferenceEditorImage(media(srcPath) + '&t=' + (guide.image_mtime || Date.now()));
@@ -495,8 +498,15 @@ function ensureReferenceEditorModal() {
           </div>
           <label>Recent reference images</label>
           <div id="referenceEditRecent" class="recent-reference-strip"></div>
+          <div id="referenceEditEngineRow" class="hidden">
+            <label for="referenceEditEngine">Edit with</label>
+            <select id="referenceEditEngine" onchange="setReferenceEditEngine(this.value)">
+              <option value="qwen">Qwen (local)</option>
+              <option value="openai">OpenAI Cloud Editing</option>
+            </select>
+          </div>
           <div class="actions">
-            <button class="primary" type="button" onclick="submitReferenceEditPreview()">Apply with Qwen</button>
+            <button id="referenceEditApply" class="primary" type="button" onclick="submitReferenceEditPreview()">Apply with Qwen</button>
             <button type="button" onclick="acceptReferenceEditPreview()">Accept</button>
             <button type="button" onclick="revertReferenceEdit()">Revert</button>
           </div>
@@ -1138,13 +1148,34 @@ function referenceMaskDataUrl() {
   return out.toDataURL('image/png');
 }
 
+// Guide frames can be edited with local Qwen (default) or OpenAI's image model; reference
+// stills always use Qwen. The guide choice is remembered in the outpaint settings.
+function setReferenceEditEngine(engine) {
+  const guideMode = referenceEditor.mode === 'guide';
+  referenceEditor.engine = guideMode && engine === 'openai' ? 'openai' : 'qwen';
+  const select = document.getElementById('referenceEditEngine');
+  if (select) select.value = referenceEditor.engine;
+  document.getElementById('referenceEditEngineRow')?.classList.toggle('hidden', !guideMode);
+  const apply = document.getElementById('referenceEditApply');
+  if (apply) apply.textContent = `Apply with ${referenceEditEngineLabel()}`;
+}
+
+function referenceEditEngineLabel() {
+  return referenceEditor.engine === 'openai' ? 'OpenAI' : 'Qwen';
+}
+
 async function submitReferenceEditPreview() {
   const status = document.getElementById('referenceEditStatus');
+  const engineLabel = referenceEditEngineLabel();
   if (referenceEditor.paintStrokes) {
-    status.textContent = 'Save or discard your recolour strokes first. Qwen edits the saved image, not unsaved paint.';
+    status.textContent = `Save or discard your recolour strokes first. ${engineLabel} edits the saved image, not unsaved paint.`;
     return;
   }
-  status.textContent = 'Starting Qwen edit preview...';
+  if (referenceEditor.engine === 'openai' && !((settings('references').openai_api_key || '').trim())) {
+    status.textContent = 'Add your OpenAI API key in Settings before editing guides with OpenAI.';
+    return;
+  }
+  status.textContent = `Starting ${engineLabel} edit preview...`;
   stopReferencePreviewPolling();
   const mask = referenceMaskDataUrl();
   const payload = {
@@ -1157,6 +1188,7 @@ async function submitReferenceEditPreview() {
         ...payload,
         chunk_index: referenceEditor.chunkIndex,
         guide_index: referenceEditor.guideIndex,
+        engine: referenceEditor.engine,
       })
     : await postJson('/api/reference-edit-preview', {
         ...payload,
@@ -1165,6 +1197,8 @@ async function submitReferenceEditPreview() {
       });
   if (!result.ok) {
     status.textContent = result.error || result.message || 'Could not start reference edit';
+    // No painted mask and no black bars to find: say so plainly rather than in the status line.
+    if (result.error_type === 'NoEditRegionError') alert(result.error);
     return;
   }
   referenceEditor.preview = result.preview || '';
@@ -1178,8 +1212,8 @@ async function submitReferenceEditPreview() {
 function startReferencePreviewPolling(path) {
   const preview = document.getElementById('referenceEditPreview');
   const status = document.getElementById('referenceEditStatus');
-  if (preview) preview.innerHTML = '<p class="shot-empty">Qwen preview is rendering...</p>';
-  if (status) status.textContent = 'Qwen preview is rendering...';
+  if (preview) preview.innerHTML = `<p class="shot-empty">${referenceEditEngineLabel()} preview is rendering...</p>`;
+  if (status) status.textContent = `${referenceEditEngineLabel()} preview is rendering...`;
   referenceEditor.previewPollStartedAt = Date.now();
   pollReferencePreview(path);
 }
@@ -1198,29 +1232,29 @@ async function pollReferencePreview(path) {
   if (path !== referenceEditor.preview) return;
   if (result && result.ok && result.exists) {
     if (preview) preview.innerHTML = `<img src="${media(path)}&t=${Date.now()}" alt="">`;
-    if (status) status.textContent = 'Qwen preview ready.';
+    if (status) status.textContent = `${referenceEditEngineLabel()} preview ready.`;
     refresh(true);
     return;
   }
   const elapsed = Date.now() - referenceEditor.previewPollStartedAt;
   if (result && result.ok && !result.running && elapsed > 5000) {
-    if (preview) preview.innerHTML = '<p class="shot-empty">Qwen finished, but ARP could not find the preview image. Check the ARP command-prompt console for details.</p>';
-    if (status) status.textContent = 'Preview image was not found after Qwen finished.';
+    if (preview) preview.innerHTML = `<p class="shot-empty">${referenceEditEngineLabel()} finished, but ARP could not find the preview image. Check the ARP command-prompt console for details.</p>`;
+    if (status) status.textContent = `Preview image was not found after ${referenceEditEngineLabel()} finished.`;
     refresh(true);
     return;
   }
   if (elapsed > 20 * 60 * 1000) {
-    if (preview) preview.innerHTML = '<p class="shot-empty">Still waiting for the preview image. Check ComfyUI and the ARP command-prompt console.</p>';
-    if (status) status.textContent = 'Still waiting for Qwen preview.';
+    if (preview) preview.innerHTML = `<p class="shot-empty">Still waiting for the preview image. Check ${referenceEditor.engine === 'openai' ? 'the OpenAI request' : 'ComfyUI'} and the ARP command-prompt console.</p>`;
+    if (status) status.textContent = `Still waiting for ${referenceEditEngineLabel()} preview.`;
     return;
   }
-  if (status) status.textContent = result && result.running ? `Qwen preview is rendering: ${result.running_stage || 'running'}...` : 'Waiting for Qwen preview image...';
+  if (status) status.textContent = result && result.running ? `${referenceEditEngineLabel()} preview is rendering: ${result.running_stage || 'running'}...` : `Waiting for ${referenceEditEngineLabel()} preview image...`;
   referenceEditor.previewPollTimer = setTimeout(() => pollReferencePreview(path), 1500);
 }
 
 async function acceptReferenceEditPreview() {
   if (!referenceEditor.preview) return alert('Generate a preview first.');
-  if (referenceEditor.paintStrokes && !confirm('Accepting the Qwen preview discards your unsaved recolour strokes. Continue?')) return;
+  if (referenceEditor.paintStrokes && !confirm(`Accepting the ${referenceEditEngineLabel()} preview discards your unsaved recolour strokes. Continue?`)) return;
   referenceEditor.paintStrokes = 0;
   const result = referenceEditor.mode === 'guide'
     ? await postJson('/api/guide-frame-edit-accept', {
@@ -1538,6 +1572,8 @@ async function exportMedia(path) {
 }
 
 const DEFAULT_ANCHOR_PROMPT = 'Replace the black bars.';
+// The guide editor's default: it both fills auto-masked black bars and repairs painted areas.
+const GUIDE_EDIT_PROMPT = 'Repair the area under the mask. Fill black regions and fix discontinuities.';
 
 // ── Guide frame list actions ─────────────────────────────────────────────────
 
