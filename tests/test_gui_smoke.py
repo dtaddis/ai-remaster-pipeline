@@ -1220,6 +1220,45 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("Outpainting is up to date", log)
         self.assertIn("Shot Detection is up to date", log)
 
+    def test_run_all_keep_shots_skips_shot_detection_and_references_that_exist(self) -> None:
+        class DoneProcess:
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+        stages = [stage for stage in app.STAGES if stage.key in {"outpaint", "shots", "references", "colour"}]
+        started: list[str] = []
+
+        def fake_run_stage(stage_key: str) -> tuple[bool, str]:
+            started.append(stage_key)
+            app.APP.process = DoneProcess()
+            app.APP.running_stage_key = ""
+            return True, "started"
+
+        outputs = {"shots": ["shots.csv"], "references": ["a.png", "b.png"]}
+        with (
+            mock.patch.object(app.APP, "active_stages", return_value=tuple(stages)),
+            mock.patch.object(app.APP, "stage_is_current", return_value=False),
+            mock.patch.object(app.APP, "expected_outputs", side_effect=lambda key: outputs.get(key, [])),
+            mock.patch.object(app.APP, "existing_outputs", side_effect=lambda key: outputs.get(key, [])),
+            mock.patch.object(app.APP, "hydrate_stage_inputs"),
+            mock.patch.object(app.APP, "run_stage", side_effect=fake_run_stage),
+        ):
+            app.APP._run_all_worker(keep_shots=True)
+            self.assertEqual(started, ["outpaint", "colour"])
+            self.assertIn("Keeping the existing Shot Detection results", "\n".join(app.APP.log))
+
+            # A missing reference image still runs Reference Generation, which fills in only that one.
+            started.clear()
+            with mock.patch.object(app.APP, "existing_outputs", side_effect=lambda key: outputs.get(key, [])[:1]):
+                app.APP._run_all_worker(keep_shots=True)
+            self.assertEqual(started, ["outpaint", "references", "colour"])
+
+            started.clear()
+            app.APP._run_all_worker()
+            self.assertEqual(started, ["outpaint", "shots", "references", "colour"])
+
     def test_stage_is_current_only_while_inputs_and_settings_match_the_last_finished_run(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)

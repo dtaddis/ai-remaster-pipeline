@@ -377,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             state.APP.update_settings(str(data.get("stage", "")), data.get("values", {}))
             self.send_json({"ok": True})
         elif parsed.path == "/api/run":
-            ok, message = state.APP.run_all() if data.get("all") else state.APP.run_stage(str(data.get("stage", "")))
+            ok, message = state.APP.run_all(keep_shots=bool(data.get("keep_shots"))) if data.get("all") else state.APP.run_stage(str(data.get("stage", "")))
             self.send_json({"ok": ok, "message": message})
         elif parsed.path == "/api/upscale-preview":
             ok, message = state.APP.run_upscale_preview()

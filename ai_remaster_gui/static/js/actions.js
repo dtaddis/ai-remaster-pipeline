@@ -2047,12 +2047,35 @@ function releaseFinalOutputVideos() {
 }
 
 async function runAll() {
+  // An existing shot list may still fit after an outpaint tweak; let the user keep it, and
+  // with it the reference images, so Colorization reuses both on the new outpainted clip.
+  let keepShots = false;
+  if (state.stages.some(st => st.key === 'shots')) {
+    const existing = await api('/api/existing-outputs?stage=shots');
+    if (existing.paths && existing.paths.length) {
+      const choice = await choiceDialog({
+        title: 'Re-detect shots?',
+        message: 'This project already has a shot list. Run Shot Detection again?\n\n'
+          + 'Yes: re-detect shots if the outpainted clip changed, and redo Reference Generation for any shots that change.\n\n'
+          + 'No: keep the current shots and reference images, and go straight on to Colorization with the new outpainted clip.',
+        choices: [
+          { label: 'Yes', value: 'yes', className: 'primary' },
+          { label: 'No', value: 'no' },
+          { label: 'Cancel', value: null },
+        ],
+      });
+      if (!choice) return;
+      keepShots = choice === 'no';
+    }
+  }
+
   for (const st of state.stages) {
     if (st.key === 'output') continue;
+    if (keepShots && (st.key === 'shots' || st.key === 'references')) continue;
     if (!(await confirmOverwrite(st.key))) return;
   }
 
-  const result = await postJson('/api/run', { all: true });
+  const result = await postJson('/api/run', { all: true, keep_shots: keepShots });
   if (!result.ok) alert(result.message);
   setTimeout(() => refresh(true), 500);
 }

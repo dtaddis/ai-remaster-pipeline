@@ -2665,12 +2665,26 @@ class PipelineApp:
             if code == 0:
                 self.hydrate_stage_inputs("outpaint")
 
-    def run_all(self) -> tuple[bool, str]:
-        threading.Thread(target=self._run_all_worker, daemon=True).start()
+    def run_all(self, keep_shots: bool = False) -> tuple[bool, str]:
+        threading.Thread(target=self._run_all_worker, kwargs={"keep_shots": keep_shots}, daemon=True).start()
         return True, "Started whole remaster queue."
 
-    def _run_all_worker(self) -> None:
+    def kept_shot_stage(self, stage_key: str) -> bool:
+        """With keep_shots, Shot Detection and Reference Generation stand as they are, even
+        though a re-run outpaint changed the clip they were made from. Only a missing shot list
+        or missing reference images still run (the reference scripts fill in just those)."""
+        if stage_key not in {"shots", "references"}:
+            return False
+        outputs = [path for path in self.expected_outputs(stage_key) if path]
+        return bool(outputs) and len(self.existing_outputs(stage_key)) == len(outputs)
+
+    def _run_all_worker(self, keep_shots: bool = False) -> None:
         for stage in self.active_stages():
+            if keep_shots and self.kept_shot_stage(stage.key):
+                with self.lock:
+                    self.log.append(f"Keeping the existing {stage.title} results, as asked; skipping it.")
+                self.hydrate_stage_inputs(stage.key)
+                continue
             try:
                 current = self.stage_is_current(stage.key)
             except Exception as exc:
