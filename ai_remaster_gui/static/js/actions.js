@@ -48,8 +48,9 @@ function choiceDialog({ title, message, choices }) {
     modal.querySelector('.image-modal-backdrop').onclick = () => finish(null);
     document.addEventListener('keydown', onKeyDown);
     document.body.appendChild(modal);
-    const cancelChoice = choices.find(choice => choice.value === null);
-    const initial = cancelChoice ? buttons.children[choices.indexOf(cancelChoice)] : buttons.firstElementChild;
+    // Focus the choice marked default (Enter picks it), else Cancel, else the first.
+    const focusChoice = choices.find(choice => choice.default) || choices.find(choice => choice.value === null);
+    const initial = focusChoice ? buttons.children[choices.indexOf(focusChoice)] : buttons.firstElementChild;
     if (initial) initial.focus();
   });
 }
@@ -2054,18 +2055,18 @@ async function runAll() {
     const existing = await api('/api/existing-outputs?stage=shots');
     if (existing.paths && existing.paths.length) {
       const choice = await choiceDialog({
-        title: 'Re-detect shots?',
-        message: 'This project already has a shot list. Run Shot Detection again?\n\n'
-          + 'Yes: re-detect shots if the outpainted clip changed, and redo Reference Generation for any shots that change.\n\n'
-          + 'No: keep the current shots and reference images, and go straight on to Colorization with the new outpainted clip.',
+        title: 'Skip Shot Detection?',
+        message: 'This project already has a shot list.\n\n'
+          + 'Yes: keep the current shot list and reference images untouched, and go straight on to Colorization with the new outpainted clip.\n\n'
+          + 'No: re-detect shots if the outpainted clip changed, and redo Reference Generation for any shots that change.',
         choices: [
-          { label: 'Yes', value: 'yes', className: 'primary' },
-          { label: 'No', value: 'no' },
+          { label: 'Yes', value: 'yes' },
+          { label: 'No', value: 'no', className: 'primary', default: true },
           { label: 'Cancel', value: null },
         ],
       });
       if (!choice) return;
-      keepShots = choice === 'no';
+      keepShots = choice === 'yes';
     }
   }
 
