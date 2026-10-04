@@ -7072,7 +7072,7 @@ class GuiSmokeTests(unittest.TestCase):
                     self.assertEqual(len(levels), frames, (fps, mode))
                     self.assertTrue(all(abs(got - want) <= 1 for got, want in zip(levels, expected)), (fps, mode, levels))
 
-    def test_cq_source_colour_keeps_cq_luma_and_source_chroma(self) -> None:
+    def test_cq_luma_only_shots_keep_source_colour_at_delivery(self) -> None:
         try:
             ffmpeg = common.find_ffmpeg("")
         except Exception:
@@ -7081,16 +7081,20 @@ class GuiSmokeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_text:
             folder = Path(tmp_text)
-            source = folder / "grey_source.mkv"
-            enhanced = folder / "colour_render.mkv"
-            output = folder / "restored.mkv"
-            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x808080:s=64x48:r=24:d=1",
-                            "-c:v", "ffv1", str(source)], check=True)
-            # A brighter, strongly coloured "CQ render" at twice the size.
-            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xE08040:s=128x96:r=24:d=1",
-                            "-c:v", "ffv1", str(enhanced)], check=True)
+            source = folder / "grey_source.mp4"
+            upscaled = folder / "colour_upscale.mkv"
+            output = folder / "delivery.mp4"
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x808080:s=64x48:r=24",
+                            "-frames:v", "48", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
+            # A brighter, strongly coloured "CQ + finisher" upscale at twice the size.
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xE08040:s=128x96:r=24",
+                            "-frames:v", "48", "-c:v", "ffv1", str(upscaled)], check=True)
+            shots = [
+                {"start": 0, "end": 24, "strength": 1.0, "fade": False, "crossfade_seconds": "", "luma_only": True},
+                {"start": 24, "end": 48, "strength": 1.0, "fade": False, "crossfade_seconds": "", "luma_only": False},
+            ]
 
-            upscale_video.restore_source_colour(ffmpeg, enhanced, source, output, 128, 96, 24.0, 24)
+            upscale_video.blend_upscale_delivery(ffmpeg, source, upscaled, output, 128, 96, 24.0, shots, 1.0)
 
             capture = cv2.VideoCapture(str(output))
             frames = []
@@ -7100,12 +7104,29 @@ class GuiSmokeTests(unittest.TestCase):
                     break
                 frames.append(frame)
             capture.release()
-        self.assertEqual(len(frames), 24)
+        self.assertEqual(len(frames), 48)
         self.assertEqual(frames[0].shape[:2], (96, 128))
-        blue, green, red = (float(frames[0][..., channel].mean()) for channel in range(3))
-        self.assertLess(max(blue, green, red) - min(blue, green, red), 4)
-        # Luma comes from the render (0xE08040 is brighter than mid grey), not the source.
+        blue, green, red = (float(frames[12][..., channel].mean()) for channel in range(3))
+        # The luma-only shot keeps the grey source's colour...
+        self.assertLess(max(blue, green, red) - min(blue, green, red), 6)
+        # ...but its brightness comes from the upscale (0xE08040 is brighter than mid grey).
         self.assertGreater(green, 135)
+        blue, green, red = (float(frames[36][..., channel].mean()) for channel in range(3))
+        # The next shot keeps the upscale's own colour.
+        self.assertGreater(red - blue, 100)
+
+    def test_cq_luma_only_is_a_shot_list_column_inheriting_the_cq_colour_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            manifest.write_text("start_frame,end_frame,cq_luma_only\n0,10,\n10,20,true\n20,30,false\n", encoding="utf-8")
+            shots = upscale_video.read_upscale_shots(manifest, 30, 24.0, 1.0)
+            self.assertEqual([shot["luma_only"] for shot in shots], [False, True, False])
+            shots = upscale_video.read_upscale_shots(manifest, 30, 24.0, 1.0, default_luma_only=True)
+            self.assertEqual([shot["luma_only"] for shot in shots], [True, True, False])
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq", "--cq-colour", "source"])
+        self.assertTrue(upscale_video.cq_default_luma_only(args))
+        args.method = "flashvsr"
+        self.assertFalse(upscale_video.cq_default_luma_only(args))
 
     def test_cq_chunks_dissolve_across_their_overlap_and_keep_every_frame(self) -> None:
         try:
@@ -7181,7 +7202,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(len(levels), 40)
         self.assertTrue(all(abs(level - 5 * index) <= 2 for index, level in enumerate(levels)), levels)
 
-    def test_cq_source_colour_keeps_render_frames_aligned_with_an_mp4_source(self) -> None:
+    def test_upscale_delivery_blend_keeps_render_frames_aligned_with_an_mp4_source(self) -> None:
         try:
             ffmpeg = common.find_ffmpeg("")
         except Exception:
@@ -7193,7 +7214,7 @@ class GuiSmokeTests(unittest.TestCase):
             folder = Path(tmp_text)
             source = folder / "source.mp4"
             enhanced = folder / "render.mkv"
-            output = folder / "restored.mkv"
+            output = folder / "delivery.mp4"
             subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x48:r=24",
                             "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
             # Frame i of the render is grey 6*i; a timebase slip would repeat or delay levels.
@@ -7201,7 +7222,8 @@ class GuiSmokeTests(unittest.TestCase):
             subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
                             "-r", "24", "-i", "-", "-c:v", "ffv1", str(enhanced)], input=raw, check=True)
 
-            upscale_video.restore_source_colour(ffmpeg, enhanced, source, output, 64, 48, 24.0, frames)
+            # Luma-only forces the blend path; its luma is all render, so levels track the render.
+            upscale_video.blend_upscale_delivery(ffmpeg, source, enhanced, output, 64, 48, 24.0, [], 1.0, True)
 
             capture = cv2.VideoCapture(str(output))
             levels = []
@@ -7941,6 +7963,39 @@ class GuiSmokeTests(unittest.TestCase):
             ".preview.compact .aspect-preview-frame canvas",
         ):
             self.assertIn(selector, override)
+
+    def test_shot_cq_luma_only_endpoint_writes_the_shot_list_column(self) -> None:
+        server = app.create_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+                manifest = Path(tmp_text) / "shots.csv"
+                manifest.write_text("start_frame,end_frame,upscale_strength\n0,10,80\n10,20,\n", encoding="utf-8")
+
+                def post(value: str) -> dict:
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/shot-cq-luma-only",
+                        data=json.dumps({"manifest": app.rel(manifest), "index": 1, "luma_only": value}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return json.loads(response.read().decode("utf-8"))
+
+                def column() -> list[str]:
+                    with manifest.open(encoding="utf-8", newline="") as handle:
+                        return [row.get("cq_luma_only", "") for row in csv.DictReader(handle)]
+
+                self.assertTrue(post("true")["ok"])
+                self.assertEqual(column(), ["", "true"])
+                post("bogus")  # anything else falls back to inheriting the project setting
+                self.assertEqual(column(), ["", ""])
+                with manifest.open(encoding="utf-8", newline="") as handle:
+                    self.assertEqual(next(csv.DictReader(handle))["upscale_strength"], "80")
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_quit_endpoint_acknowledges_and_stops_server(self) -> None:
         server = app.create_server("127.0.0.1", 0)

@@ -446,6 +446,14 @@ class Handler(BaseHTTPRequestHandler):
                 update_manifest_row(resolve(manifest), index, {"upscale_strength": raw})
                 return {"strength": raw, "state": state.APP.state("upscale")}
             self._send_result("Shot upscale strength update", update_upscale_strength)
+        elif parsed.path == "/api/shot-cq-luma-only":
+            def update_cq_luma_only():
+                # "" inherits the CQ colour default; "true"/"false" is this shot's own choice.
+                raw = str(data.get("luma_only", "")).strip().lower()
+                raw = raw if raw in {"true", "false"} else ""
+                update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"cq_luma_only": raw})
+                return {"luma_only": raw, "state": state.APP.state("upscale")}
+            self._send_result("Shot CQ colour update", update_cq_luma_only)
         elif parsed.path == "/api/reference-regenerate":
             self._send_action("Reference regeneration", lambda: state.APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("provider", "qwen")), int(data.get("reference_index", 0))))
         elif parsed.path == "/api/reference-add":

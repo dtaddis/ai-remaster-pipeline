@@ -372,12 +372,29 @@ function upscaleShotBreakdownHtml(s) {
                 <small>${inherited ? `Using the ${defaultStrength}% default` : 'Custom strength for this shot'}</small>
                 <button type="button" title="Use the default strength" onclick="saveShotUpscaleStrength(${jsArg(manifest)},${row.index},'')" ${inherited ? 'disabled' : ''}>Use Default</button>
               </div>
+              ${upscaleShotCqLumaHtml(s, row, manifest)}
             </div>
           </article>
         `;
       }).join('')}
       </div>
     </section>
+  `;
+}
+
+function upscaleShotCqLumaHtml(s, row, manifest) {
+  if (s.method !== 'ltx25cq') return '';
+  const projectDefault = s.cq_colour === 'source';
+  const own = String(row.cq_luma_only || '').trim().toLowerCase();
+  const checked = own === 'true' || own === 'false' ? own === 'true' : projectDefault;
+  return `
+    <div class="upscale-shot-actions">
+      <label class="checkbox-field" title="Take only brightness detail from the CQ Enhancer and keep this shot's source colour. Applied when the upscale is delivered, so changing it does not re-render.">
+        <input type="checkbox" ${checked ? 'checked' : ''} onchange="saveShotCqLumaOnly(${jsArg(manifest)},${row.index},this.checked)">
+        CQ luma only (keep source colour)
+      </label>
+      <small>${own ? 'Custom for this shot' : 'Project CQ colour setting'}</small>
+    </div>
   `;
 }
 

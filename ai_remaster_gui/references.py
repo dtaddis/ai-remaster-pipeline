@@ -175,6 +175,7 @@ def shot_rows(
                 "fade_to_next": row.get("fade_to_next", "false"),
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "upscale_strength": row.get("upscale_strength", ""),
+                "cq_luma_only": row.get("cq_luma_only", ""),
                 "prompt": row.get("prompt", ""),
                 "reference_items": item_references,
                 "reference_count": len(item_references),

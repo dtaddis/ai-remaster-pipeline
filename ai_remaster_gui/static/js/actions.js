@@ -1438,6 +1438,15 @@ async function saveShotUpscaleStrength(manifest, index, strength) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function saveShotCqLumaOnly(manifest, index, checked) {
+  // Matching the project's CQ colour default stores nothing, so the shot keeps following it.
+  const projectDefault = settings('upscale').cq_colour === 'source';
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-cq-luma-only', { manifest, index, luma_only: checked === projectDefault ? '' : String(checked) });
+  if (!result.ok) return alert(result.error || 'Could not update the shot CQ colour choice');
+  await redrawWithState(result.state, snap, true);
+}
+
 function nudgeShotBoundary(manifest, index, edge, frames) {
   // Nudge from the slider's live value, not the last server response, so several quick
   // clicks accumulate instead of all resolving to the same frame.

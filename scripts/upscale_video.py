@@ -407,8 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cq-guide-strength", type=float, default=1.0, help="How strongly the source video conditions the CQ render; the author's workflow uses 1.")
     parser.add_argument("--cq-short-edge", type=int, default=720, help="Short edge the CQ Enhancer works at; the author's workflow uses 720.")
     parser.add_argument("--cq-frame-rate", choices=["resample", "retime"], default="resample", help="resample converts to 30 fps by repeating frames, as the author's workflow does; retime plays the original frames at 30 fps. Either way every source frame comes back once.")
-    parser.add_argument("--cq-chunk-seconds", type=float, default=8.0, help="Longest source span per CQ render; chunks also split at --shot-manifest cuts, and longer shots split evenly. The author's workflow uses 153 frames at 30 fps (about 5 s).")
-    parser.add_argument("--cq-colour", choices=["model", "source"], default="model", help="model keeps the CQ render's colour (it can colourise black-and-white film); source keeps the source's colour and takes only brightness detail from the CQ render.")
+    parser.add_argument("--cq-chunk-seconds", type=float, default=15.0, help="Longest source span per CQ render; chunks also split at --shot-manifest cuts, and longer shots split evenly. The author's workflow uses 153 frames at 30 fps (about 5 s).")
+    parser.add_argument("--cq-colour", choices=["model", "source"], default="model", help="Default for shots without their own cq_luma_only: model keeps the CQ render's colour (it can colourise black-and-white film); source keeps the source's colour and takes only brightness detail. Applied when delivering, so changing it never re-renders.")
     parser.add_argument("--cq-seed", type=int, default=42)
     parser.add_argument("--cq-prompt", default="", help="The CQ LoRA needs no prompt. It samples without CFG, so there is no negative prompt.")
     parser.add_argument("--chunk-seconds", type=float, default=6.0, help="Upscale in chunks of roughly this many seconds. Use 0 to send the whole clip.")
@@ -448,7 +448,9 @@ def optional_int(value: Any) -> int | None:
         return None
 
 
-def read_upscale_shots(manifest: Path | None, total_frames: int, fps: float, default_strength: float) -> list[dict[str, Any]]:
+def read_upscale_shots(
+    manifest: Path | None, total_frames: int, fps: float, default_strength: float, default_luma_only: bool = False,
+) -> list[dict[str, Any]]:
     if manifest is None or not manifest.is_file():
         return []
     with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -476,6 +478,8 @@ def read_upscale_shots(manifest: Path | None, total_frames: int, fps: float, def
             "start": start_frame,
             "end": end_frame,
             "strength": normalized_blend_strength(row.get("upscale_strength", ""), default_strength),
+            # Blank inherits --cq-colour; only meaningful for a CQ-enhanced upscale.
+            "luma_only": truthy(luma_text) if (luma_text := str(row.get("cq_luma_only") or "").strip()) else default_luma_only,
             "fade": truthy(row.get("fade_to_next")),
             "crossfade_seconds": row.get("crossfade_seconds", ""),
         })
@@ -522,13 +526,25 @@ def blend_upscale_delivery(
     fps: float,
     shots: list[dict[str, Any]],
     default_strength: float,
+    default_luma_only: bool = False,
 ) -> None:
+    """Mix the source and the AI upscale by each shot's strength.
+
+    A luma-only shot keeps the source's colour: its chroma planes take no AI share, so a CQ
+    render's invented or shifted colour never reaches the delivery while its detail does.
+    """
     weight = blend_weight_expression(shots, fps, default_strength)
+    chroma_shots = [dict(shot, strength=0.0 if shot.get("luma_only") else shot["strength"]) for shot in shots]
+    chroma = blend_weight_expression(chroma_shots, fps, 0.0 if default_luma_only else default_strength)
+    luma_mix = f"A*(1-({weight}))+B*({weight})"
+    chroma_mix = f"A*(1-({chroma}))+B*({chroma})"
     partial = output.with_suffix(output.suffix + ".blend.partial" + output.suffix)
+    # Both inputs on the exact frame clock (an MKV render and an MP4 source otherwise drift),
+    # and in YUV so blend's planes 1 and 2 are the chroma.
     filters = (
-        f"[0:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[src];"
-        f"[1:v]setpts=N/({fps:.8f}*TB),fps={fps:.8f},scale={width}:{height}:flags=lanczos,setsar=1[ai];"
-        f"[src][ai]blend=all_expr='A*(1-({weight}))+B*({weight})',"
+        f"[0:v]{frame_clock(fps)},scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p10le[src];"
+        f"[1:v]{frame_clock(fps)},scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p10le[ai];"
+        f"[src][ai]blend=c0_expr='{luma_mix}':c1_expr='{chroma_mix}':c2_expr='{chroma_mix}',"
         "format=yuv420p[vout]"
     )
     command = [
@@ -1146,6 +1162,11 @@ def cq_chunk_plan(
     return plan
 
 
+def cq_default_luma_only(args: argparse.Namespace) -> bool:
+    """True when shots without their own choice keep the source colour under CQ's luma."""
+    return upscale_method(args) == "ltx25cq" and str(getattr(args, "cq_colour", "model")) == "source"
+
+
 def cq_shot_cuts(args: argparse.Namespace, source: Path) -> list[int]:
     """Frames of ``source`` where a new shot starts, from the shot list; empty without one."""
     manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
@@ -1331,13 +1352,8 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
         chunk_raw.unlink(missing_ok=True)
         chunks.append((chunk_final, trim_start))
     frames = int(info["frames"])
-    if args.cq_colour == "source":
-        stitched = target.with_suffix(".stitched.mkv")
-        crossfade_chunks(ffmpeg, chunks, fps, frames, source, stitched, out_width, out_height)
-        restore_source_colour(ffmpeg, stitched, source, target, out_width, out_height, fps, frames)
-        stitched.unlink(missing_ok=True)
-    else:
-        crossfade_chunks(ffmpeg, chunks, fps, frames, source, target, out_width, out_height)
+    # The render keeps CQ's colour; "source colour" (luma only) is applied per shot at delivery.
+    crossfade_chunks(ffmpeg, chunks, fps, frames, source, target, out_width, out_height)
     write_signature(target, sig)
     return target
 
@@ -1348,7 +1364,8 @@ def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any
     return {
         **cq_signature(args, source, width, height),
         "shot_cuts": cq_shot_cuts(args, source),
-        "colour": args.cq_colour,
+        # Always CQ's own colour now: luma-only moved to delivery. Older "model" renders stay reusable.
+        "colour": "model",
         "output_width": out_width,
         "output_height": out_height,
     }
@@ -1415,34 +1432,6 @@ def crossfade_chunks(
         *working_codec_args(), *working_container_args(partial), str(partial),
     ], check=True)
     mux_audio(ffmpeg, partial, audio_source, output)
-    partial.unlink(missing_ok=True)
-
-
-def restore_source_colour(
-    ffmpeg: str, enhanced: Path, source: Path, output: Path, width: int, height: int, fps: float, frames: int,
-) -> None:
-    """Keep the CQ render's luma but the source's chroma.
-
-    The LoRA invents colour on black-and-white film and shifts hues on colour film; ARP's
-    colour decisions belong to the Colorize stage, so only brightness detail is taken from CQ.
-    """
-    partial = output.with_suffix(output.suffix + ".colour.partial" + output.suffix)
-    # Both inputs need the same exact frame clock, or the merge repeats early frames and
-    # delays the picture; mergeplanes also refuses inputs whose sample aspect ratios differ.
-    filters = (
-        f"[0:v]{frame_clock(fps)},format=yuv444p10le,extractplanes=y[luma];"
-        f"[1:v]{frame_clock(fps)},scale={width}:{height}:flags=lanczos,setsar=1,"
-        "format=yuv444p10le,extractplanes=u+v[cb][cr];"
-        "[luma][cb][cr]mergeplanes=format=yuv444p10le:map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0,setsar=1[vout]"
-    )
-    print(f"Restoring source colour under the CQ render: {enhanced}", flush=True)
-    subprocess.run([
-        ffmpeg, "-y", "-i", str(enhanced), "-i", str(source), "-filter_complex", filters,
-        # Syncing two inputs repeats the last frame to cover stream durations; keep exactly one per source frame.
-        "-map", "[vout]", "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", "-frames:v", str(frames),
-        *working_codec_args(), *working_container_args(partial), str(partial),
-    ], check=True)
-    mux_audio(ffmpeg, partial, source, output)
     partial.unlink(missing_ok=True)
 
 
@@ -1950,6 +1939,9 @@ def run(args: argparse.Namespace) -> int:
         "shot_manifest": root_relative(manifest) if manifest else "",
         "shot_manifest_fingerprint": file_fingerprint(manifest) if manifest and manifest.is_file() else None,
     })
+    if method == "ltx25cq":
+        # Colour is chosen at delivery (per shot), so it changes only this file, not the renders.
+        final_sig["cq_luma_only"] = cq_default_luma_only(args)
 
     if not args.force and resumable_output(
         output, final_sig, video_like=source, width=delivery_width, height=delivery_height
@@ -2011,14 +2003,19 @@ def run(args: argparse.Namespace) -> int:
         print(f"Reuse full-strength {method} render: {ai_output}", flush=True)
     ffmpeg = find_ffmpeg(args.ffmpeg)
     default_strength = normalized_blend_strength(args.blend_strength)
-    shots = read_upscale_shots(manifest, int(info["frames"]), float(info["fps"]), default_strength)
+    default_luma_only = cq_default_luma_only(args)
+    shots = read_upscale_shots(manifest, int(info["frames"]), float(info["fps"]), default_strength, default_luma_only)
+    if method != "ltx25cq":
+        for shot in shots:
+            shot["luma_only"] = False
     strengths = [float(shot["strength"]) for shot in shots] or [default_strength]
-    if all(abs(strength - 1.0) < 1e-9 for strength in strengths):
+    luma_only = [bool(shot["luma_only"]) for shot in shots] or [default_luma_only]
+    if all(abs(strength - 1.0) < 1e-9 for strength in strengths) and not any(luma_only):
         encode_upscale_delivery(ffmpeg, ai_output, output)
     else:
         blend_upscale_delivery(
             ffmpeg, source, ai_output, output, delivery_width, delivery_height,
-            float(info["fps"]), shots, default_strength,
+            float(info["fps"]), shots, default_strength, default_luma_only,
         )
     write_signature(output, final_sig)
     print(f"Wrote upscaled video: {output}", flush=True)

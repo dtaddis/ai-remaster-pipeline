@@ -209,13 +209,13 @@ const FIELD_DESCRIPTIONS = {
   'upscale.cq_frame_rate':
     'The LoRA expects 30 fps. Resample repeats frames to reach 30 fps, as the author’s workflow does. Retime plays the original frames at 30 fps, so motion looks faster to the model (25% faster for 24 fps footage). Either way every source frame comes back once, at the source frame rate.',
   'upscale.cq_colour':
-    'CQ’s colour usually looks natural, but it can colourise black-and-white film and shift the hues of colour footage. Keep source colour takes only brightness detail from CQ and keeps the source’s colour, leaving colour to the Colorize stage. Switching this reuses the rendered chunks.',
+    'CQ’s colour usually looks natural, but it can colourise black-and-white film and shift the hues of colour footage. Keep source colour takes only brightness detail from CQ and keeps the source’s colour, leaving colour to the Colorize stage. This is the default for every shot; each shot in Per-shot Upscale can override it. It is applied when the upscale is delivered, so changing it re-encodes the output but never re-renders CQ or the finishing upscaler.',
   'upscale.cq_guide_strength':
     'How strongly the source video conditions the CQ render. 100 is the author’s setting; lower values give the model more freedom to invent.',
   'upscale.cq_lora_strength':
     'Strength of the CQ Enhancer LoRA. The author uses 1.0.',
   'upscale.cq_chunk_seconds':
-    'Longest source span per CQ render (the author renders about 5 seconds, 153 frames at 30 fps). With a shot list, chunks also split at every shot change, so each shot is restored as consistently as possible; a shot longer than this is split into equal pieces. Each chunk is a fresh generation, so pieces of the same shot dissolve into each other across the Overlap frames, while shot changes simply cut.',
+    'Longest span the CQ Enhancer renders in one generation. With a shot list, each shot is rendered whole so all its frames match, and only a shot longer than this is split into equal pieces that dissolve into each other across the Overlap frames; shot changes simply cut. Without a shot list the film is split into equal pieces up to this length. Longer chunks take more VRAM and time (the cost grows faster than the length), and the LoRA author renders about 5 seconds (153 frames at 30 fps).',
   'upscale.cq_seed':
     'Controls the detail the CQ Enhancer synthesizes. Keep it fixed for reproducible output; change it to try another restoration.',
   'upscale.cq_prompt':
