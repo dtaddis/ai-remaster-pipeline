@@ -871,6 +871,16 @@ def install_sparse_guide_attention_patch(model_patcher=None):
             transformer_options=None,
         ):
             options = transformer_options or {}
+            frozen_call = getattr(diffusion_model, "_arp_frozen_call", None)
+            if (
+                frozen_call is not None
+                and context is None
+                and mask is None
+                and not options.get("stg_skip_self_attn", False)
+            ):
+                return _frozen_reference_self_attention(
+                    self, x, pe, k_pe, options, frozen_call, block_index, ltx_model, torch
+                )
             if not isinstance(mask, SparseGuideAttentionMask):
                 return original_forward(
                     x,
@@ -961,6 +971,389 @@ def install_sparse_guide_attention_patch(model_patcher=None):
         "on %d LTX blocks",
         patched_blocks,
     )
+    return model_patcher
+
+
+# ARP name -> ComfyUI registered attention function. "int8" is ComfyUI's bundled
+# comfy_kitchen kernel (SageAttention-style int8 QK); "sage" needs the sageattention wheel.
+ATTENTION_BACKENDS = {"int8": "comfy_kitchen_int8", "sage": "sage"}
+
+
+def install_attention_backend(model_patcher, backend: str) -> str:
+    """Route this model clone's unmasked attention through a faster kernel.
+
+    ComfyUI's ``optimized_attention_override`` lives in the clone's model options,
+    so other models in the same ComfyUI session keep the global attention. Masked
+    calls and calls that ask for full precision keep their original kernel.
+    Returns the backend actually installed ("default" when unavailable).
+    """
+    if not backend or backend == "default":
+        return "default"
+    import comfy.ldm.modules.attention as attention_module
+
+    registry_name = ATTENTION_BACKENDS.get(backend)
+    if registry_name is None:
+        raise ValueError(f"Unknown ARP attention backend: {backend}")
+    fast_attention = attention_module.get_attention_function(registry_name, None)
+    if fast_attention is None:
+        LOGGER.warning(
+            "ARP attention backend %s (%s) is unavailable in this ComfyUI; using its default attention",
+            backend, registry_name,
+        )
+        return "default"
+
+    def override(original, *args, **kwargs):
+        mask = kwargs.get("mask", args[4] if len(args) > 4 else None)
+        if mask is not None or kwargs.get("low_precision_attention", True) is False:
+            return original(*args, **kwargs)
+        return fast_attention(*args, **kwargs)
+
+    override._arp_attention_backend = backend
+    model_patcher.model_options.setdefault("transformer_options", {})[
+        "optimized_attention_override"
+    ] = override
+    LOGGER.info("ARP routed this LTX model's attention through %s", registry_name)
+    return backend
+
+
+DEFAULT_FROZEN_REFERENCE_RAM_MARGIN_GB = 12.0
+FROZEN_REFERENCE_MAX_CACHES = 2  # prompt + negative prompt
+# LTX 2.3 modulates text cross-attention keys/values by one global timestep (the
+# current sigma), so the reference's hidden states drift with sigma even when it
+# attends only to itself. Reuse a recording only while sigma stays this close.
+DEFAULT_FROZEN_REFERENCE_SIGMA_TOLERANCE = 0.1
+
+
+def _frozen_reference_sigma_tolerance() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "ARP_LTX_FROZEN_REFERENCE_SIGMA_TOLERANCE", DEFAULT_FROZEN_REFERENCE_SIGMA_TOLERANCE
+        )))
+    except (TypeError, ValueError):
+        return DEFAULT_FROZEN_REFERENCE_SIGMA_TOLERANCE
+
+
+def _frozen_reference_ram_margin() -> int:
+    try:
+        configured = float(os.environ.get(
+            "ARP_LTX_FROZEN_REFERENCE_RAM_MARGIN_GB", DEFAULT_FROZEN_REFERENCE_RAM_MARGIN_GB
+        ))
+    except (TypeError, ValueError):
+        configured = DEFAULT_FROZEN_REFERENCE_RAM_MARGIN_GB
+    return int(max(0.0, configured) * 1024 ** 3)
+
+
+def _available_ram_bytes() -> int:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return 0
+
+
+def _tensor_fingerprint(torch, value):
+    """Cheap content fingerprint: shape, dtype and three independent weighted sums."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return tuple(_tensor_fingerprint(torch, item) for item in value)
+    if not torch.is_tensor(value):
+        return repr(value)
+    flat = value.detach().flatten().float()
+    weights = torch.arange(flat.numel(), device=flat.device, dtype=torch.float32).mul_(0.6180339).cos_()
+    return (
+        tuple(value.shape),
+        str(value.dtype),
+        float(flat.sum()),
+        float(flat.square().sum()),
+        float((flat * weights).sum()),
+    )
+
+
+class _FrozenReferenceCache:
+    """Per-layer self-attention keys/values of the frozen reference tokens, kept in host RAM.
+
+    bf16 is exact. int8 (per token and head absmax scale) halves the footprint for
+    full-resolution references that would not otherwise fit.
+    """
+
+    def __init__(self, key, layer_count: int, storage: str, sigma: float):
+        self.key = key
+        self.storage = storage
+        self.sigma = sigma
+        self.keys: list = [None] * layer_count
+        self.values: list = [None] * layer_count
+        self.complete = False
+
+    def filled(self) -> bool:
+        return all(item is not None for item in self.keys)
+
+    def _pack(self, torch, tensor, heads: int):
+        if self.storage == "bf16":
+            return tensor.to("cpu", torch.bfloat16)
+        batch, tokens, width = tensor.shape
+        grouped = tensor.view(batch, tokens, heads, width // heads).float()
+        scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-8).div_(127.0)
+        quantized = grouped.div(scale).round_().clamp_(-127, 127).to(torch.int8)
+        return quantized.to("cpu"), scale.to("cpu", torch.float16)
+
+    def _unpack(self, torch, packed, device, dtype):
+        if self.storage == "bf16":
+            return packed.to(device=device, dtype=dtype, non_blocking=True)
+        quantized, scale = packed
+        grouped = quantized.to(device).to(dtype).mul_(scale.to(device=device, dtype=dtype))
+        batch, tokens, heads, dim = grouped.shape
+        return grouped.view(batch, tokens, heads * dim)
+
+    def store(self, torch, layer: int, key, value, heads: int) -> None:
+        self.keys[layer] = self._pack(torch, key, heads)
+        self.values[layer] = self._pack(torch, value, heads)
+
+    def load(self, torch, layer: int, device, dtype):
+        key, value = self.keys[layer], self.values[layer]
+        if key is None or value is None:
+            raise RuntimeError(f"ARP frozen reference cache is missing layer {layer}")
+        return self._unpack(torch, key, device, dtype), self._unpack(torch, value, device, dtype)
+
+
+class _FrozenCall:
+    """What the attention layers of one model call should do with the reference tokens."""
+
+    __slots__ = ("mode", "start", "count", "expected_tokens", "cache")
+
+    def __init__(self, mode: str, start: int, count: int, expected_tokens: int, cache):
+        self.mode = mode
+        self.start = start
+        self.count = count
+        self.expected_tokens = expected_tokens
+        self.cache = cache
+
+
+def _frozen_reference_self_attention(attention, x, pe, k_pe, options, frozen_call, block_index, ltx_model, torch):
+    """Self-attention where clean reference tokens attend only to themselves.
+
+    record: the full sequence runs; reference queries see only reference keys, and
+    their keys/values are cached. replay: the reference tokens are absent from the
+    sequence and the cached keys/values are appended, so the remaining queries see
+    exactly what they saw in the record pass.
+    """
+    import comfy.ldm.modules.attention as attention_module
+
+    if x.shape[1] != frozen_call.expected_tokens:
+        raise RuntimeError(
+            f"ARP frozen reference expected {frozen_call.expected_tokens} tokens in block "
+            f"{block_index}, got {x.shape[1]}. Disable Frozen reference and report this."
+        )
+    q = attention.q_norm(attention.to_q(x))
+    k = attention.k_norm(attention.to_k(x))
+    v = attention.to_v(x)
+    if pe is not None:
+        if k_pe is None and q.shape == k.shape:
+            q, k = ltx_model.apply_rotary_emb_qk(q, k, pe)
+        else:
+            q = ltx_model.apply_rotary_emb(q, pe)
+            k = ltx_model.apply_rotary_emb(k, pe if k_pe is None else k_pe)
+
+    def attend(query, key, value):
+        return attention_module.optimized_attention(
+            query, key, value, attention.heads,
+            attn_precision=attention.attn_precision, transformer_options=options,
+        )
+
+    if frozen_call.mode == "replay":
+        cached_k, cached_v = frozen_call.cache.load(torch, block_index, k.device, k.dtype)
+        out = attend(q, torch.cat([k, cached_k], dim=1), torch.cat([v, cached_v], dim=1))
+        del cached_k, cached_v
+    else:
+        start, end = frozen_call.start, frozen_call.start + frozen_call.count
+        out = torch.empty_like(v)
+        for live_start, live_end in ((0, start), (end, q.shape[1])):
+            if live_end > live_start:
+                out[:, live_start:live_end] = attend(q[:, live_start:live_end].contiguous(), k, v)
+        ref_k, ref_v = k[:, start:end].contiguous(), v[:, start:end].contiguous()
+        out[:, start:end] = attend(q[:, start:end].contiguous(), ref_k, ref_v)
+        if frozen_call.cache is not None:
+            frozen_call.cache.store(torch, block_index, ref_k, ref_v, attention.heads)
+
+    if attention.to_gate_logits is not None:
+        gate_logits = attention.to_gate_logits(x)
+        batch, tokens, _ = out.shape
+        out = out.view(batch, tokens, attention.heads, attention.dim_head)
+        out = (out * (2.0 * torch.sigmoid(gate_logits)).unsqueeze(-1)).view(
+            batch, tokens, attention.heads * attention.dim_head
+        )
+    return attention.to_out(out)
+
+
+def _plan_frozen_reference(torch, diffusion_model, x, keyframe_idxs, denoise_mask, merged_args):
+    """Locate the clean reference frames, or return None to run the model unchanged.
+
+    Frozen frames are trailing guide frames whose tokens are all clean (mask 0, or -1
+    for the holes of a downscaled reference). Soft guides stay live; per-guide attention
+    strengths or spatial masks disable the optimisation for that call.
+    """
+    vx = x[0] if isinstance(x, (list, tuple)) else x
+    if keyframe_idxs is None or keyframe_idxs.shape[2] == 0 or denoise_mask is None:
+        return None
+    if vx.ndim != 5 or denoise_mask.ndim != 5:
+        return None
+    if tuple(getattr(diffusion_model.patchifier, "patch_size", (1, 1, 1))) != (1, 1, 1):
+        return None
+    entries = merged_args.get("guide_attention_entries") or ()
+    if any(float(e.get("strength", 1.0)) != 1.0 or e.get("pixel_mask") is not None for e in entries):
+        return None
+
+    frames, height, width = vx.shape[2:]
+    tokens_per_frame = height * width
+    if keyframe_idxs.shape[2] % tokens_per_frame:
+        return None
+    first_guide = frames - keyframe_idxs.shape[2] // tokens_per_frame
+    mask = denoise_mask[0]
+    if mask.shape[1] != frames:
+        return None
+    guide_mask = mask[:, first_guide:]
+    clean = (guide_mask.amax(dim=(0, 2, 3)) <= 0) & (guide_mask == 0).any(dim=3).any(dim=2).any(dim=0)
+    frozen = [first_guide + index for index, is_clean in enumerate(clean.tolist()) if is_clean]
+    if not frozen or frozen != list(range(frozen[0], frozen[-1] + 1)):
+        return None
+    frame_start, frame_end = frozen[0], frozen[-1] + 1
+    surviving = (mask >= 0).all(dim=0)
+    start = int(surviving[:frame_start].sum())
+    count = int(surviving[frame_start:frame_end].sum())
+    total = int(surviving.sum())
+    if count == 0:
+        return None
+    # Fingerprint only surviving tokens: a downscaled reference's -1 holes are dropped,
+    # but the sampler's inpaint blend leaves step-dependent noise in them.
+    reference = vx[:, :, frame_start:frame_end]
+    reference = torch.where(surviving[frame_start:frame_end], reference, torch.zeros_like(reference))
+    key = (
+        tuple(vx.shape), frame_start, frame_end,
+        _tensor_fingerprint(torch, reference),
+        _tensor_fingerprint(torch, keyframe_idxs),
+        _tensor_fingerprint(torch, merged_args.get("_arp_context")),
+        repr(merged_args.get("_arp_frame_rate")),
+    )
+    return {
+        "frame_start": frame_start, "frame_end": frame_end,
+        "start": start, "count": count, "total": total, "key": key, "batch": int(vx.shape[0]),
+    }
+
+
+def install_frozen_reference(model_patcher):
+    """Compute the clean IC reference once per sampling run instead of every step.
+
+    The reference tokens are made to attend only to each other (a one-way change to
+    LTX's bidirectional attention). Their hidden states then no longer depend on the
+    noisy video, so every layer's reference keys/values are identical at every step:
+    the first step records them, and later steps drop the reference tokens through
+    ComfyUI's own -1 denoise-mask token filter and attend to the cached copies.
+    """
+    import torch
+
+    diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
+    if diffusion_model is None or not getattr(diffusion_model, "_arp_model_scoped_execution", False):
+        raise ARPLTXCompatibilityError(
+            "ARP frozen reference needs ARP's model-scoped LTX execution patch first."
+        )
+    if getattr(diffusion_model, "_arp_frozen_reference", False):
+        return model_patcher
+    original_forward = diffusion_model._forward
+    _require_parameters(
+        original_forward,
+        {"x", "timestep", "context", "attention_mask", "frame_rate", "transformer_options",
+         "keyframe_idxs", "denoise_mask"},
+        "ComfyUI LTX forward",
+    )
+    blocks = diffusion_model.transformer_blocks
+    # Without cross-attention AdaLN nothing in the reference path depends on sigma.
+    sigma_tolerance = (
+        _frozen_reference_sigma_tolerance()
+        if any(getattr(block, "cross_attention_adaln", False) for block in blocks)
+        else float("inf")
+    )
+    reported = {"disabled": False, "replay": False, "no_cache": False}
+
+    def frozen_forward(
+        self, x, timestep, context, attention_mask, frame_rate=25,
+        transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+    ):
+        def run(mask):
+            return original_forward(
+                x, timestep, context, attention_mask, frame_rate, transformer_options,
+                keyframe_idxs, denoise_mask=mask, **kwargs,
+            )
+
+        merged = {**transformer_options, **kwargs, "_arp_context": context, "_arp_frame_rate": frame_rate}
+        plan = _plan_frozen_reference(torch, self, x, keyframe_idxs, denoise_mask, merged)
+        if plan is None:
+            if keyframe_idxs is not None and keyframe_idxs.shape[2] and not reported["disabled"]:
+                reported["disabled"] = True
+                LOGGER.info("ARP frozen reference does not apply to this guide layout; running normally")
+            return run(denoise_mask)
+
+        sigma = float(torch.as_tensor(timestep).detach().float().max())
+        caches = self._arp_frozen_caches
+        cache = caches.get(plan["key"])
+        if cache is not None and cache.complete and abs(sigma - cache.sigma) <= sigma_tolerance:
+            replay_mask = denoise_mask.clone()
+            replay_mask[:, :, plan["frame_start"]:plan["frame_end"]] = -1.0
+            self._arp_frozen_call = _FrozenCall(
+                "replay", plan["start"], plan["count"], plan["total"] - plan["count"], cache
+            )
+            if not reported["replay"]:
+                reported["replay"] = True
+                LOGGER.info(
+                    "ARP frozen reference: reusing cached reference keys/values; sequence %d -> %d tokens",
+                    plan["total"], plan["total"] - plan["count"],
+                )
+            try:
+                return run(replay_mask)
+            finally:
+                self._arp_frozen_call = None
+
+        # A new sigma for this conditioning, or a new one. Each conditioning (the prompt and,
+        # for CFG++ samplers, the negative prompt) has its own reference keys/values; anything
+        # older belongs to a finished run or chunk.
+        caches.pop(plan["key"], None)
+        while len(caches) >= FROZEN_REFERENCE_MAX_CACHES:
+            caches.pop(next(iter(caches)))
+        attention = blocks[0].attn1
+        width = int(attention.heads) * int(attention.dim_head)
+        bf16_bytes = len(blocks) * 2 * plan["count"] * width * 2
+        budget = _available_ram_bytes() - _frozen_reference_ram_margin()
+        storage = "bf16" if bf16_bytes <= budget else "int8" if bf16_bytes // 2 + bf16_bytes // 64 <= budget else None
+        if plan["batch"] != 1:
+            storage = None  # batched cond/uncond: keep the one-way attention, skip the cache
+        cache = _FrozenReferenceCache(plan["key"], len(blocks), storage, sigma) if storage else None
+        if cache is None and plan["batch"] == 1 and not reported["no_cache"]:
+            reported["no_cache"] = True
+            LOGGER.warning(
+                "ARP frozen reference: %.1f GB of reference keys/values does not fit in free RAM; "
+                "using one-way reference attention without the cache (slower)",
+                bf16_bytes / 1024 ** 3,
+            )
+        LOGGER.info(
+            "ARP frozen reference: recording %d reference tokens of %d at sigma %.4f (%s, %.1f GB)",
+            plan["count"], plan["total"], sigma, storage or "not cached",
+            (bf16_bytes if storage == "bf16" else bf16_bytes / 2) / 1024 ** 3,
+        )
+        self._arp_frozen_call = _FrozenCall("record", plan["start"], plan["count"], plan["total"], cache)
+        try:
+            result = run(denoise_mask)
+        finally:
+            self._arp_frozen_call = None
+        if cache is not None and cache.filled():
+            cache.complete = True
+            caches[plan["key"]] = cache
+        return result
+
+    diffusion_model._forward = types.MethodType(frozen_forward, diffusion_model)
+    diffusion_model._arp_frozen_caches = {}
+    diffusion_model._arp_frozen_call = None
+    diffusion_model._arp_frozen_reference = True
+    LOGGER.info("ARP enabled frozen reference attention (one-way IC reference, cached across steps)")
     return model_patcher
 
 

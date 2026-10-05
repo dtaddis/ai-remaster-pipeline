@@ -160,6 +160,20 @@ def uses_masked_pass(args: Any | None) -> bool:
     return uses_wan_vace(args) or uses_h3(args)
 
 
+def uses_ltx_ic_lora(args: Any | None) -> bool:
+    """LTX outpainting through the IC-LoRA reference graph (not Wan, H3 or Clean Up)."""
+    return args is not None and not uses_wan_vace(args) and not uses_h3(args) and not hasattr(args, "cleanup_lora")
+
+
+def reference_downscale_factor(args: Any | None) -> int:
+    """2 when the IC reference video is encoded at half resolution, else 1."""
+    return 2 if uses_ltx_ic_lora(args) and getattr(args, "reference_half_res", False) else 1
+
+
+def uses_frozen_reference(args: Any | None) -> bool:
+    return uses_ltx_ic_lora(args) and bool(getattr(args, "frozen_reference", False))
+
+
 def uses_legacy_black_outpaint(outpaint_lora: str) -> bool:
     return Path(str(outpaint_lora).replace("\\", "/")).name == OUMOUMAD_OUTPAINT_LORA
 
@@ -1878,6 +1892,10 @@ def patch_lightweight_gguf(workflow: dict[str, Any], args) -> None:
     ensure_widget_input(lora_node, "strength_model", "FLOAT")
     set_widget(lora_node, "0", args.outpaint_lora)
     set_widget(lora_node, "1", float(getattr(args, "lora_strength", 1.0)))
+    ensure_widget_input(lora_node, "attention_backend")
+    ensure_widget_input(lora_node, "frozen_reference", "BOOLEAN")
+    set_widget(lora_node, "2", getattr(args, "attention_backend", "default"))
+    set_widget(lora_node, "3", uses_frozen_reference(args))
     text_node = node_by_id(workflow, "5023")
     ensure_widget_input(text_node, "text_encoder")
     ensure_widget_input(text_node, "ckpt_name")
@@ -2310,6 +2328,16 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
                 canvas_height,
             )
         patch_video_only_sampling(workflow)
+        downscale = reference_downscale_factor(args)
+        if downscale > 1:
+            # LTX dilates the smaller reference latent back onto the full token grid.
+            unit = MODEL_SIZE_MULTIPLE * downscale
+            if canvas_width % unit or canvas_height % unit:
+                raise ValueError(
+                    f"Half-resolution reference needs a canvas that is a multiple of {unit}px; "
+                    f"this one is {canvas_width}x{canvas_height}. Turn off Half-res reference or change the target height."
+                )
+            set_widget(node_by_id(workflow, "5114"), "2", downscale)
     if guide_image and guide_image.exists():
         image_name = copy_guide_image_to_comfy_input(
             guide_image, comfy_dir, canvas_width, canvas_height,
@@ -2619,6 +2647,13 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "chunk_manifest": root_relative(chunk_manifest) if chunk_manifest else "",
         "chunk_manifest_fingerprint": file_fingerprint(chunk_manifest) if chunk_manifest and chunk_manifest.exists() else None,
     }
+    # LTX speed options that change the render. Recorded only when on, so renders made
+    # before they existed stay valid. The int8 attention kernel is deliberately absent:
+    # it matches PyTorch attention to ~1e-4 and should not re-render finished chunks.
+    if reference_downscale_factor(args) > 1:
+        signature["reference_downscale_factor"] = reference_downscale_factor(args)
+    if uses_frozen_reference(args):
+        signature["frozen_reference"] = "one_way_cached_v1"
     if uses_wan_vace(args):
         # Wan builds its graph in code: no LTX template, node IDs or LTX weights take part.
         signature.update({
@@ -3435,6 +3470,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-blend-dilation", type=int, choices=range(0, 16), default=2, metavar="0-15", help="Laplacian mask dilation at the generated/source seam. Higher values blend farther into the protected source without enlarging the generated region.")
     parser.add_argument("--black-mask-threshold", type=int, choices=range(0, 65), default=12, metavar="0-64", help="Maximum source level treated as black in dynamic all-black-region masks. Raise only when encoded bars are not truly zero.")
     parser.add_argument("--outpaint-lora", choices=[DEFAULT_OUTPAINT_LORA, OUMOUMAD_OUTPAINT_LORA], default=DEFAULT_OUTPAINT_LORA)
+    parser.add_argument("--attention-backend", choices=["int8", "sage", "default"], default="int8", help="Attention kernel for the LTX outpaint model only. int8 is ComfyUI's bundled int8 kernel (~3.7x faster attention on an RTX 4090); default keeps ComfyUI's global attention.")
+    parser.add_argument("--reference-half-res", action="store_true", help="Encode the LTX IC reference video at half resolution: about 2x faster sampling, but both outpaint LoRAs were trained on a full-resolution reference (Oumoumad ignored a half-resolution one in testing).")
+    parser.add_argument("--frozen-reference", action="store_true", help="Experimental: the LTX IC reference attends only to itself, so its attention keys/values are computed once and reused on later steps. The outpaint LoRAs left the bars black in testing.")
     parser.add_argument("--output")
     parser.add_argument("--raw-output")
     parser.add_argument("--workflow")

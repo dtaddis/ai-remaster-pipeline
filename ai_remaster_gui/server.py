@@ -1719,6 +1719,11 @@ class PipelineApp:
             add(["--generation-fps", values.get("generation_fps", "24-fast")])
         if is_true(values, "outpaint_all_black_regions"):
             add(["--outpaint-all-black-regions"])
+        if values.get("outpaint_model") not in {"wanvace", "h3"}:
+            if is_true(values, "reference_half_res"):
+                add(["--reference-half-res"])
+            if is_true(values, "frozen_reference"):
+                add(["--frozen-reference"])
         if is_true(values, "seed_qwen_guides"):
             ref = self.settings.get("references", {})
             qwen_workflow = qwen_workflow_for(ref, config) or ref.get("workflow", "")

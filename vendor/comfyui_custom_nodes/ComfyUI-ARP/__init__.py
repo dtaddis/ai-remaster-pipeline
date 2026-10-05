@@ -8,7 +8,11 @@ not alter global model behavior.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import logging
+import os
+from pathlib import Path
 
 from aiohttp import web
 import comfy.model_management
@@ -19,6 +23,9 @@ import torch
 from server import PromptServer
 
 from .ltx_video_only_patch import (
+    ATTENTION_BACKENDS,
+    install_attention_backend,
+    install_frozen_reference,
     install_sparse_guide_attention_patch,
     ltx_runtime_capabilities,
     prune_ltxav_audio_transformer_blocks,
@@ -54,7 +61,24 @@ class ARPLTXVideoOnlyICLoRALoader:
                     "FLOAT",
                     {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01},
                 ),
-            }
+            },
+            "optional": {
+                "attention_backend": (
+                    ["default", *ATTENTION_BACKENDS],
+                    {
+                        "default": "default",
+                        "tooltip": "int8 uses ComfyUI's bundled int8 attention kernel for this model only.",
+                    },
+                ),
+                "frozen_reference": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental: the IC reference attends only to itself, so its "
+                        "keys/values are computed once and reused on later steps.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "FLOAT")
@@ -66,7 +90,7 @@ class ARPLTXVideoOnlyICLoRALoader:
         "enables exact guide attention and bounded feed-forward execution."
     )
 
-    def load_lora(self, model, lora_name, strength_model):
+    def load_lora(self, model, lora_name, strength_model, attention_backend="default", frozen_reference=False):
         # Validate and install before mutating the model. Incompatible ComfyUI
         # updates fail here with an actionable error instead of silently using
         # different attention semantics or hanging in an unsupported kernel.
@@ -92,6 +116,9 @@ class ARPLTXVideoOnlyICLoRALoader:
             )
         video_only_model = prune_ltxav_audio_transformer_blocks(model_lora)
         install_sparse_guide_attention_patch(video_only_model)
+        install_attention_backend(video_only_model, attention_backend)
+        if frozen_reference:
+            install_frozen_reference(video_only_model)
         return video_only_model, latent_downscale_factor
 
 
@@ -128,6 +155,11 @@ class ARPLTXEphemeralTextEncode:
     def encode(self, text_encoder, ckpt_name, device, positive, negative):
         clip_path = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        cache_path = _conditioning_cache_path(clip_path, ckpt_path, device, positive, negative)
+        cached = _load_cached_conditioning(cache_path)
+        if cached is not None:
+            LOGGER.info("ARP reused cached LTX prompt encoding (%s)", cache_path.name)
+            return cached
         model_options = {}
         if device == "cpu":
             cpu = torch.device("cpu")
@@ -157,7 +189,64 @@ class ARPLTXEphemeralTextEncode:
             gc.collect()
 
         LOGGER.info("ARP released the LTX text encoder after prompt encoding")
+        _save_cached_conditioning(cache_path, (positive_conditioning, negative_conditioning))
         return positive_conditioning, negative_conditioning
+
+
+# Encoding both prompts loads ~15 GB of Gemma and runs it on the CPU: minutes per
+# outpaint run. The result depends only on the encoder files, device and the two
+# prompt texts, so keep it on disk.
+CONDITIONING_CACHE_LIMIT = 64
+
+
+def _conditioning_cache_dir() -> Path:
+    return Path(folder_paths.get_user_directory()) / "arp_cache" / "ltx_prompt_encodings"
+
+
+def _file_identity(path: str) -> list:
+    stat = os.stat(path)
+    return [os.path.basename(path), stat.st_size, stat.st_mtime_ns]
+
+
+def _conditioning_cache_path(clip_path: str, ckpt_path: str, device: str, positive: str, negative: str) -> Path:
+    identity = json.dumps(
+        {
+            "version": 1,
+            "text_encoder": _file_identity(clip_path),
+            "checkpoint": _file_identity(ckpt_path),
+            "device": device,
+            "positive": positive,
+            "negative": negative,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return _conditioning_cache_dir() / f"{digest}.pt"
+
+
+def _load_cached_conditioning(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        positive, negative = torch.load(path, map_location="cpu", weights_only=True)
+        os.utime(path)  # most recently used survives pruning
+        return positive, negative
+    except Exception as exc:
+        LOGGER.warning("ARP ignored an unreadable cached prompt encoding %s: %s", path, exc)
+        return None
+
+
+def _save_cached_conditioning(path: Path, conditioning) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        torch.save(conditioning, temporary)
+        os.replace(temporary, path)
+        entries = sorted(path.parent.glob("*.pt"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for stale in entries[CONDITIONING_CACHE_LIMIT:]:
+            stale.unlink(missing_ok=True)
+    except Exception as exc:
+        LOGGER.warning("ARP could not cache the prompt encoding: %s", exc)
 
 
 NODE_CLASS_MAPPINGS = {

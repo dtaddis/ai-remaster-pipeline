@@ -111,6 +111,8 @@ STAGES = (
             ("generation_mask_overlap", "Generation mask overlap", "range:0|96|8", "8"),
             ("mask_blend_dilation", "Mask seam blend", "range:0|15|1", "2"),
             ("frame_patch_retries", "Frame patch retries", "range:0|3|1", "0"),
+            ("reference_half_res", "Half-res reference (faster)", "checkbox", "false"),
+            ("frozen_reference", "Frozen reference (experimental, faster)", "checkbox", "false"),
             ("seed_qwen_guides", "Seed with Qwen guide frames", "checkbox", "false"),
             ("outpaint_all_black_regions", "Outpaint all black regions", "checkbox", "false"),
             ("black_mask_threshold", "Black mask threshold", "range:0|32|1", "12"),

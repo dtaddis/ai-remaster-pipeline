@@ -525,6 +525,16 @@ const CHECKBOX_DESCRIPTIONS = {
     'it extends from a filled frame instead of copying the bars. Slower, but reliable on stubborn clips.',
   outpaint_all_black_regions:
     "Don't expand the canvas, just paint over all pure black areas. Use this when the region to be extended changes, e.g. you have mixed-size footage in your clip.",
+  reference_half_res:
+    'LTX sees the source clip as a second video alongside the one it paints, which doubles the work. ' +
+    'This feeds that reference at half resolution: about twice as fast. Both outpaint LoRAs were trained ' +
+    'on a full-resolution reference, and in testing Oumoumad ignored a half-resolution one and invented a ' +
+    'different scene. Only for LoRAs trained on a downscaled reference. Needs a canvas that is a multiple of 64 px.',
+  frozen_reference:
+    'Experimental. The source reference normally attends to the frames being painted at every step. ' +
+    'With this on it attends only to itself, so ARP works it out once and reuses it on later steps ' +
+    '(about 40% faster sampling when the cache fits in RAM). In testing the outpaint LoRAs then left ' +
+    'the bars black: they need that two-way attention. A 20 s 720p chunk also needs ~21 GB of RAM per prompt for the cache.',
 };
 
 function checkboxFieldHtml(key, label, value, help = '', tooltip = '') {

@@ -659,8 +659,10 @@ function hydratePendingGuidePreviews() {
 function drawOutpaint(st, s, expected, sp) {
   if (outpaintSectionWaiting()) return showOutpaintLoadingShell();
   const offsetKeys = new Set(['offset_x', 'offset_y']);
-  // The H3 licence and PDD switches only apply to MiniMax H3.
+  // The H3 licence and PDD switches only apply to MiniMax H3; the reference speed-ups
+  // only to the LTX IC-LoRA models.
   const hiddenKeys = new Set(s.outpaint_model === 'h3' ? [] : ['h3_license_confirmed', 'h3_pdd']);
+  if (outpaintUsesMaskedModel()) ['reference_half_res', 'frozen_reference'].forEach(key => hiddenKeys.add(key));
   const mainFields = st.fields.filter(f => !f[0].startsWith('edge_') && !offsetKeys.has(f[0]) && !hiddenKeys.has(f[0]));
   const offsetFields = st.fields.filter(f => offsetKeys.has(f[0]));
   const cropFields = st.fields.filter(f => f[0].startsWith('edge_'));
