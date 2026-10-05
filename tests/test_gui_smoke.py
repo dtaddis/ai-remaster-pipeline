@@ -2025,6 +2025,44 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("LatentUpscaleModelLoader", classes)
         self.assertEqual(prompt["5227"]["inputs"]["images"], ["5266", 0])
 
+    def test_ltx25_uses_the_cached_gguf_prompt_encoder_when_comfy_has_it(self) -> None:
+        workflow = json.loads((app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json").read_text(encoding="utf-8-sig"))
+        args = outpaint_video.build_parser().parse_args([
+            "--source", "input/example.mp4", "--comfy-dir", str(app.ROOT),
+            "--ltx-version", "2.5", "--dry-run",
+        ])
+        outpaint_video.configure_ltx25_model_args(args)
+        args.cached_gguf_text_encode = True
+
+        with (
+            mock.patch.object(outpaint_video, "copy_to_comfy_input", side_effect=[
+                "arp_outpaint_ltx25/prepared.mp4",
+                "arp_outpaint_mask/mask.png",
+                "arp_outpaint_generation_mask/mask.png",
+            ]),
+            mock.patch.object(outpaint_video, "copy_reference_frame_to_comfy_input", return_value="arp_outpaint_ltx25/frame.png"),
+            mock.patch.object(outpaint_video, "official_mask_image", return_value=app.ROOT / "exact-mask.png"),
+            mock.patch.object(outpaint_video, "generation_mask_image", return_value=app.ROOT / "generation-mask.png"),
+            mock.patch.object(outpaint_video, "probe_video", return_value={"width": 2240, "height": 960, "frames": 294, "fps": 24.0}),
+        ):
+            prompt = outpaint_video.patch_workflow(
+                args, workflow, app.ROOT / "prepared.mp4", app.ROOT, "arp_outpaint_ltx25/test",
+                "preserve the archival street scene", args.negative_prompt, 42,
+            )
+
+        classes = [node["class_type"] for node in prompt.values()]
+        encoder = prompt["9199"]
+        self.assertEqual(encoder["class_type"], "ARPLTXCachedGGUFTextEncode")
+        self.assertEqual(encoder["inputs"]["clip_name"], outpaint_video.LTX25_TEXT_ENCODER)
+        self.assertEqual(encoder["inputs"]["positive"], "preserve the archival street scene")
+        self.assertEqual(encoder["inputs"]["negative"], args.negative_prompt)
+        self.assertNotIn("CLIPLoaderGGUF", classes)
+        self.assertNotIn("CLIPTextEncode", classes)
+        links = [value for node in prompt.values() for value in node["inputs"].values() if isinstance(value, list) and len(value) == 2]
+        self.assertIn(["9199", 0], links)
+        self.assertIn(["9199", 1], links)
+        self.assertTrue(all(str(source) in prompt for source, _slot in links))
+
     def test_outpaint_model_labels_name_model_and_lora(self) -> None:
         helpers = (app.ROOT / "ai_remaster_gui" / "static" / "js" / "render-helpers.js").read_text(encoding="utf-8")
 

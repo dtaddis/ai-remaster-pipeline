@@ -12,7 +12,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from comfy_api import ensure_arp_ltx_compatible, extract_output_files, ensure_node_types, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
+from comfy_api import ensure_arp_ltx_compatible, extract_output_files, ensure_node_types, node_by_id, object_info, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
 from common import (
     QWEN_IMAGE_EDIT_MODEL,
     ROOT,
@@ -2488,11 +2488,32 @@ def patch_ltx25_gguf_text_encoder(prompt: dict[str, Any], args) -> dict[str, Any
     loader_id = str(positive_clip[0])
     if loader_id not in prompt:
         return prompt
-    prompt[loader_id] = {
-        "class_type": "CLIPLoaderGGUF",
-        "inputs": {"clip_name": args.text_encoder, "type": "ltxv"},
-        "_meta": {"title": "LTX 2.5 Gemma 4 text encoder (GGUF)"},
+    if not getattr(args, "cached_gguf_text_encode", False):
+        # A ComfyUI started before ARP's cached GGUF encoder existed: plain loader.
+        prompt[loader_id] = {
+            "class_type": "CLIPLoaderGGUF",
+            "inputs": {"clip_name": args.text_encoder, "type": "ltxv"},
+            "_meta": {"title": "LTX 2.5 Gemma 4 text encoder (GGUF)"},
+        }
+        return prompt
+    positive_id, negative_id = str(args.positive_node_id), str(args.negative_node_id)
+    node_id = "9199"
+    prompt[node_id] = {
+        "class_type": "ARPLTXCachedGGUFTextEncode",
+        "inputs": {
+            "clip_name": args.text_encoder,
+            "type": "ltxv",
+            "positive": positive.get("inputs", {}).get("text", ""),
+            "negative": negative.get("inputs", {}).get("text", ""),
+        },
+        "_meta": {"title": "LTX 2.5 Gemma 4 prompt encoding (cached)"},
     }
+    for node in prompt.values():
+        for input_name, value in list(node.get("inputs", {}).items()):
+            if isinstance(value, list) and len(value) == 2 and str(value[0]) in (positive_id, negative_id):
+                node["inputs"][input_name] = [node_id, 0 if str(value[0]) == positive_id else 1]
+    for stale in (positive_id, negative_id, loader_id):
+        prompt.pop(stale, None)
     return prompt
 
 
@@ -3632,6 +3653,9 @@ def main() -> int:
             compatibility = ensure_arp_ltx_compatible(args.comfy_url)
             args.ltx_runtime_adapter = compatibility.get("adapter", "unknown")
             print(f"ComfyUI-ARP LTX adapter ready: {args.ltx_runtime_adapter}", flush=True)
+            if args.ltx_version == "2.5":
+                # Only a ComfyUI started after this node shipped has it; older ones keep the plain loader.
+                args.cached_gguf_text_encode = "ARPLTXCachedGGUFTextEncode" in object_info(args.comfy_url)
 
     prepare_command = [
         sys.executable,

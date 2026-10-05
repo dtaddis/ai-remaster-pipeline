@@ -19,6 +19,7 @@ import comfy.model_management
 import comfy.sd
 import comfy.utils
 import folder_paths
+import nodes
 import torch
 from server import PromptServer
 
@@ -155,7 +156,14 @@ class ARPLTXEphemeralTextEncode:
     def encode(self, text_encoder, ckpt_name, device, positive, negative):
         clip_path = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        cache_path = _conditioning_cache_path(clip_path, ckpt_path, device, positive, negative)
+        cache_path = _conditioning_cache_path({
+            "version": 1,
+            "text_encoder": _file_identity(clip_path),
+            "checkpoint": _file_identity(ckpt_path),
+            "device": device,
+            "positive": positive,
+            "negative": negative,
+        })
         cached = _load_cached_conditioning(cache_path)
         if cached is not None:
             LOGGER.info("ARP reused cached LTX prompt encoding (%s)", cache_path.name)
@@ -172,28 +180,78 @@ class ARPLTXEphemeralTextEncode:
             clip_type=comfy.sd.CLIPType.LTXV,
             model_options=model_options,
         )
-        try:
-            positive_conditioning = clip.encode_from_tokens_scheduled(
-                clip.tokenize(positive)
-            )
-            negative_conditioning = clip.encode_from_tokens_scheduled(
-                clip.tokenize(negative)
-            )
-        finally:
-            # The conditionings are tensors and do not need the CLIP wrapper. Once
-            # this last strong reference is gone, Comfy's weak loaded-model entry
-            # can be removed and the encoder's CPU tensors reclaimed.
-            del clip
-            gc.collect()
-            comfy.model_management.cleanup_models()
-            gc.collect()
-
-        LOGGER.info("ARP released the LTX text encoder after prompt encoding")
-        _save_cached_conditioning(cache_path, (positive_conditioning, negative_conditioning))
-        return positive_conditioning, negative_conditioning
+        conditioning = _encode_and_release(clip, positive, negative)
+        _save_cached_conditioning(cache_path, conditioning)
+        return conditioning
 
 
-# Encoding both prompts loads ~15 GB of Gemma and runs it on the CPU: minutes per
+class ARPLTXCachedGGUFTextEncode:
+    """LTX 2.5's Gemma 4 GGUF prompt encoding, cached on disk and released after use."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip_name": ("STRING", {"default": ""}),
+                "type": ("STRING", {"default": "ltxv"}),
+                "positive": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "encode"
+    CATEGORY = "ARP/LTX"
+    DESCRIPTION = (
+        "Loads a GGUF text encoder through ComfyUI-GGUF, encodes both prompts, caches "
+        "the result on disk and releases the encoder before video diffusion."
+    )
+
+    def encode(self, clip_name, type, positive, negative):
+        clip_path = folder_paths.get_full_path("clip", clip_name) or folder_paths.get_full_path("clip_gguf", clip_name)
+        if not clip_path:
+            raise FileNotFoundError(f"GGUF text encoder not found: {clip_name}")
+        cache_path = _conditioning_cache_path({
+            "version": 1,
+            "loader": "gguf",
+            "text_encoder": _file_identity(clip_path),
+            "type": type,
+            "positive": positive,
+            "negative": negative,
+        })
+        cached = _load_cached_conditioning(cache_path)
+        if cached is not None:
+            LOGGER.info("ARP reused cached LTX prompt encoding (%s)", cache_path.name)
+            return cached
+        loader = nodes.NODE_CLASS_MAPPINGS.get("CLIPLoaderGGUF")
+        if loader is None:
+            raise RuntimeError("ComfyUI-GGUF's CLIPLoaderGGUF node is not installed.")
+        clip = loader().load_clip(clip_name, type)[0]
+        conditioning = _encode_and_release(clip, positive, negative)
+        _save_cached_conditioning(cache_path, conditioning)
+        return conditioning
+
+
+def _encode_and_release(clip, positive: str, negative: str):
+    try:
+        conditioning = (
+            clip.encode_from_tokens_scheduled(clip.tokenize(positive)),
+            clip.encode_from_tokens_scheduled(clip.tokenize(negative)),
+        )
+    finally:
+        # The conditionings are tensors and do not need the CLIP wrapper. Once
+        # this last strong reference is gone, Comfy's weak loaded-model entry
+        # can be removed and the encoder's tensors reclaimed.
+        del clip
+        gc.collect()
+        comfy.model_management.cleanup_models()
+        gc.collect()
+    LOGGER.info("ARP released the LTX text encoder after prompt encoding")
+    return conditioning
+
+
+# Encoding both prompts loads ~15 GB of Gemma (2.3 runs it on the CPU): minutes per
 # outpaint run. The result depends only on the encoder files, device and the two
 # prompt texts, so keep it on disk.
 CONDITIONING_CACHE_LIMIT = 64
@@ -208,19 +266,9 @@ def _file_identity(path: str) -> list:
     return [os.path.basename(path), stat.st_size, stat.st_mtime_ns]
 
 
-def _conditioning_cache_path(clip_path: str, ckpt_path: str, device: str, positive: str, negative: str) -> Path:
-    identity = json.dumps(
-        {
-            "version": 1,
-            "text_encoder": _file_identity(clip_path),
-            "checkpoint": _file_identity(ckpt_path),
-            "device": device,
-            "positive": positive,
-            "negative": negative,
-        },
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+def _conditioning_cache_path(identity: dict) -> Path:
+    """Cache file for an encoding identified by its encoder files, settings and prompts."""
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:32]
     return _conditioning_cache_dir() / f"{digest}.pt"
 
 
@@ -252,11 +300,13 @@ def _save_cached_conditioning(path: Path, conditioning) -> None:
 NODE_CLASS_MAPPINGS = {
     "ARPLTXVideoOnlyICLoRALoader": ARPLTXVideoOnlyICLoRALoader,
     "ARPLTXEphemeralTextEncode": ARPLTXEphemeralTextEncode,
+    "ARPLTXCachedGGUFTextEncode": ARPLTXCachedGGUFTextEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ARPLTXVideoOnlyICLoRALoader": "ARP LTX Video-Only IC-LoRA Loader",
     "ARPLTXEphemeralTextEncode": "ARP LTX Ephemeral Text Encode",
+    "ARPLTXCachedGGUFTextEncode": "ARP LTX Cached GGUF Text Encode",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
