@@ -51,7 +51,7 @@ function recompLayerSummary(s) {
   `;
 }
 
-function recompLayerItem(label, path, fallback) {
+function recompLayerItem(label, path, fallback, saveTitle = 'Save this layer as...') {
   return `
     <div class="layer-item">
       <span>${esc(label)}</span>
@@ -60,7 +60,7 @@ function recompLayerItem(label, path, fallback) {
         <button
           class="icon-button inline"
           type="button"
-          title="Save this layer as..."
+          title="${esc(saveTitle)}"
           onclick="exportMedia(${jsArg(path)})"
           ${path ? '' : 'disabled'}
         >&#128190;</button>
@@ -174,6 +174,7 @@ function drawUpscale() {
       <section class="card editor-viewer">
         <h2>${esc(preview.title || 'Upscale Preview')}</h2>
         ${upscaleComparisonHtml(s, preview)}
+        ${upscaleSaveRows(s, preview)}
       </section>
     </div>
     ${upscaleShotBreakdownHtml(s)}
@@ -266,6 +267,19 @@ function upscaleInputSummary(s) {
       <span>Input source</span>
       <strong>${esc(source || 'Choose source material on the Overview page')}</strong>
       <p class="shot-empty">${esc(label)} is selected automatically from the active workflow.</p>
+    </div>
+  `;
+}
+
+function upscaleSaveRows(s, preview) {
+  const output = preview.exists === 'true' ? preview.output : '';
+  const cq = s.method === 'ltx25cq' ? (preview.cq || '') : '';
+  if (!output && !cq) return '';
+  const label = preview.kind === 'output' ? 'Upscaled output' : 'Upscale preview';
+  return `
+    <div class="layer-grid">
+      ${output ? recompLayerItem(label, output, '', 'Save this video as...') : ''}
+      ${cq ? recompLayerItem('CQ Enhancer render', cq, '', 'Save this video as...') : ''}
     </div>
   `;
 }
