@@ -275,7 +275,7 @@ STAGES = (
             ("ltx25_seed", "LTX 2.5 seed", "number", "42"),
             ("ltx25_prompt", "LTX 2.5 upscale prompt", "text", LTX25_UPSCALE_PROMPT),
             ("ltx25_negative_prompt", "LTX 2.5 negative prompt", "text", LTX25_UPSCALE_NEGATIVE_PROMPT),
-            ("cq_finish", "Then upscale with", "select:flashvsr|seedvr2|ltx25|lanczos", "flashvsr"),
+            ("cq_finish", "Then upscale with", "select:flashvsr|seedvr2|ltx25|lanczos|none", "flashvsr"),
             ("cq_base", "CQ base model", "select:distilled|dev", "distilled"),
             ("cq_short_edge", "CQ working short edge (px)", "number", "720"),
             ("cq_frame_rate", "CQ frame-rate handling", "select:resample|retime", "resample"),

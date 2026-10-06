@@ -7368,6 +7368,9 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertIsNone(app.auto_upscale_target(dict(values, auto_target_size="false"), str(source)))
                 self.assertIsNone(app.auto_upscale_target(dict(values, method="seedvr2"), str(source)))
                 self.assertIsNone(app.auto_upscale_target(dict(values, method="ltx25cq", cq_finish="lanczos"), str(source)))
+                # With no finisher the CQ render is delivered, so its size is the target even with Auto off.
+                no_finish = dict(values, method="ltx25cq", cq_finish="none", auto_target_size="false")
+                self.assertEqual(app.auto_upscale_target(no_finish, str(source)), (1280, 720))
             self.assertIsNone(app.auto_upscale_target(values, str(Path(tmp_text) / "missing.mp4")))
 
     def test_upscale_preview_state_reports_the_cq_render_of_its_input(self) -> None:
@@ -7435,6 +7438,30 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(upscale_video.delivery_dimensions(args, 3840, 2160), (3840, 2160))
         args.cq_finish = "ltx25"
         self.assertEqual(upscale_video.delivery_dimensions(args, 3840, 2160), (3840, 2176))
+        args.cq_finish = "none"
+        with mock.patch.object(upscale_video, "file_fingerprint", return_value={"size": 1}),                 mock.patch.object(upscale_video, "video_info", return_value={"width": 854, "height": 480, "fps": 24.0, "frames": 96}):
+            self.assertEqual(upscale_video.signature(args, source, 1280, 720)["finish_settings"], {"method": "none"})
+
+    def test_cq_upscale_with_no_finisher_delivers_the_cq_render(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            source = Path(tmp_text) / "source.mp4"
+            source.write_bytes(b"video")
+            output = Path(tmp_text) / "out.mp4"
+            render = Path(tmp_text) / "cq.mkv"
+            args = upscale_video.build_parser().parse_args([
+                "--input", str(source), "--output", str(output), "--method", "ltx25cq", "--cq-finish", "none",
+                "--target-width", "3840", "--target-height", "2160",
+            ])
+            with mock.patch.object(upscale_video, "file_fingerprint", return_value={"size": 1}),                     mock.patch.object(upscale_video, "video_info", return_value={"width": 854, "height": 480, "fps": 24.0, "frames": 96}),                     mock.patch.object(upscale_video, "find_ffmpeg", return_value="ffmpeg"),                     mock.patch.object(upscale_video, "cq_enhance", return_value=render) as enhance,                     mock.patch.object(upscale_video, "lanczos_upscale_run") as lanczos,                     mock.patch.object(upscale_video, "chunked_standard_upscale_run") as standard,                     mock.patch.object(upscale_video, "encode_upscale_delivery") as deliver,                     mock.patch.object(upscale_video, "write_signature") as write_signature:
+                self.assertEqual(upscale_video.run(args), 0)
+
+        enhance.assert_called_once()
+        lanczos.assert_not_called()
+        standard.assert_not_called()
+        deliver.assert_called_once_with("ffmpeg", render, output)
+        final_sig = write_signature.call_args[0][1]
+        # The 3840x2160 target is ignored: CQ's own size is what is delivered.
+        self.assertEqual((final_sig["target_width"], final_sig["target_height"]), (1280, 720))
 
     def test_upscale_signature_only_records_advanced_knobs_when_changed(self) -> None:
         parser = upscale_video.build_parser()

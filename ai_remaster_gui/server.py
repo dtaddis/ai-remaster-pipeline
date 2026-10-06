@@ -2348,7 +2348,7 @@ class PipelineApp:
         return self.stabilized_source_for_downstream()
 
     def apply_auto_upscale_target(self, source_text: str = "") -> None:
-        """Fill Target width/height from the FlashVSR input when Auto target size is on."""
+        """Fill Target width/height from the FlashVSR input when Auto target size is on, or CQ's size with no finisher."""
         values = self.settings.setdefault("upscale", {})
         target = auto_upscale_target(values, source_text or self.upscale_input_for() or values.get("input_video", ""))
         if target:
@@ -3278,7 +3278,7 @@ def upscale_target_size(values: dict[str, str]) -> tuple[int, int]:
 
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
-CQ_FINISH_METHODS = {"flashvsr", "seedvr2", "ltx25", "lanczos"}
+CQ_FINISH_METHODS = {"flashvsr", "seedvr2", "ltx25", "lanczos", "none"}
 
 
 def upscale_cq_finish(values: dict[str, str]) -> str:
@@ -3301,9 +3301,13 @@ def auto_upscale_target(values: dict[str, str], source_text: str) -> tuple[int, 
     """The FlashVSR input size times its scale, when Auto target size is on and FlashVSR delivers.
 
     With the CQ Enhancer in front, FlashVSR's input is CQ's output (short edge at the CQ
-    working size), not the source. None while the input does not exist yet.
+    working size), not the source; with no finishing upscaler, CQ's output is the target.
+    None while the input does not exist yet.
     """
-    if not is_true(values, "auto_target_size") or upscale_backend(values) != "flashvsr" or not source_text:
+    backend = upscale_backend(values)
+    if backend != "none" and (not is_true(values, "auto_target_size") or backend != "flashvsr"):
+        return None
+    if not source_text:
         return None
     source = resolve(source_text)
     if not source.is_file():
@@ -3314,6 +3318,8 @@ def auto_upscale_target(values: dict[str, str], source_text: str) -> tuple[int, 
         return None
     if upscale_method(values) == "ltx25cq":
         width, height = cq_size_for(values, width, height)
+    if backend == "none":
+        return width, height
     try:
         scale = max(1, int(float(values.get("flashvsr_scale") or 2)))
     except ValueError:

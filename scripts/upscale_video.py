@@ -47,8 +47,9 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, migrate_profile_name
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
-# The CQ Enhancer restores at its working size; one of these then takes it to delivery size.
-CQ_FINISH_METHODS = ("flashvsr", "seedvr2", "ltx25", "lanczos")
+# The CQ Enhancer restores at its working size; one of these then takes it to delivery size,
+# or "none" delivers it at that working size.
+CQ_FINISH_METHODS = ("flashvsr", "seedvr2", "ltx25", "lanczos", "none")
 # The CQ LoRA was trained on 30 fps clips; its author warns other rates cause artefacts.
 CQ_FPS = 30.0
 CQ_DISTILLED_LORA_STRENGTH = 0.5
@@ -228,8 +229,8 @@ def signature(args: argparse.Namespace, source: Path, output_width: int, output_
     method = upscale_method(args)
     if method == "ltx25cq":
         finish = cq_finish_method(args)
-        if finish == "lanczos":
-            finish_settings: dict[str, Any] = {"method": "lanczos"}
+        if finish in ("lanczos", "none"):
+            finish_settings: dict[str, Any] = {"method": finish}
         else:
             finish_settings = signature(finish_args(args), source, output_width, output_height)
         # The finishing pass reads the enhanced render, not the source, so only its settings count here.
@@ -1907,6 +1908,7 @@ BACKEND_LABELS = {
     "seedvr2": "SeedVR2",
     "ltx25": "LTX 2.5 Pixel Spatial IC-LoRA",
     "lanczos": "Lanczos",
+    "none": "no finishing upscaler",
 }
 
 
@@ -1922,6 +1924,9 @@ def run(args: argparse.Namespace) -> int:
     method = upscale_method(args)
     # A CQ-enhanced render is finished by one of the other backends, with that backend's settings.
     backend = cq_finish_method(args) if method == "ltx25cq" else method
+    if backend == "none":
+        # Without a finisher the CQ render is the delivery, so the target size does not apply.
+        output_width, output_height = cq_dimensions(args, source)[0]
     backend_args = finish_args(args) if method == "ltx25cq" else args
     if backend == "seedvr2":
         if args.seedvr2_batch_size < 1 or (args.seedvr2_batch_size - 1) % 4 != 0:
@@ -1969,7 +1974,10 @@ def run(args: argparse.Namespace) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     ai_output = ROOT / ".cache" / "upscale_ai" / f"{safe_stem(output.stem)}_{method}.mkv"
     ai_output.parent.mkdir(parents=True, exist_ok=True)
-    if args.force or not resumable_output(
+    if backend == "none":
+        # The cached CQ render is already the full-strength delivery picture.
+        ai_output = cq_enhance(args, source, info, sig["source_fingerprint"])
+    elif args.force or not resumable_output(
         ai_output, sig, video_like=source, width=delivery_width, height=delivery_height
     ):
         processing_source = source

@@ -201,7 +201,7 @@ const FIELD_DESCRIPTIONS = {
   'upscale.auto_target_size':
     'Set the target to exactly what FlashVSR produces: its input size times the FlashVSR scale, so nothing is resized afterwards. With the CQ Enhancer in front, FlashVSR’s input is CQ’s output (for example 1280x720 for a 16:9 source). The size is filled in once the upscale input exists, e.g. after Recomposition.',
   'upscale.cq_finish':
-    'The CQ Enhancer restores detail at its working size (720p) without enlarging the picture. This upscaler then takes the restored video to the target size, using its own settings below. Lanczos keeps exactly what CQ produced.',
+    'The CQ Enhancer restores detail at its working size (720p) without enlarging the picture. This upscaler then takes the restored video to the target size, using its own settings below. Lanczos keeps exactly what CQ produced. None delivers CQ’s render at its working size, ignoring the target size.',
   'upscale.cq_base':
     'Distilled reuses the LTX 2.5 transformer ARP already has. Dev + distilled LoRA at 0.5 is the LoRA author’s own recipe and may look more natural, but downloads about 25 GB on first use.',
   'upscale.cq_short_edge':
@@ -427,6 +427,7 @@ function selectOptionLabel(key, option) {
   if (key === 'cq_finish' && option === 'seedvr2') return 'SeedVR2';
   if (key === 'cq_finish' && option === 'ltx25') return 'LTX 2.5 Pixel Spatial (2x IC-LoRA)';
   if (key === 'cq_finish' && option === 'lanczos') return 'Lanczos resize (no AI)';
+  if (key === 'cq_finish' && option === 'none') return 'None (keep CQ size)';
   if (key === 'cq_base' && option === 'distilled') return 'Distilled (installed, faster)';
   if (key === 'cq_base' && option === 'dev') return 'Dev + distilled LoRA 0.5 (author recipe, +25 GB)';
   if (key === 'cq_colour' && option === 'model') return 'Use CQ’s colour';

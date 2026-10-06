@@ -188,7 +188,10 @@ function drawUpscale() {
       // The FlashVSR input (e.g. the recomposition) has not been rendered yet.
       const label = targetFields[0].previousElementSibling;
       const anchor = label && label.tagName === 'LABEL' ? label : targetFields[0];
-      anchor.insertAdjacentHTML('beforebegin', '<p class="shot-empty">Auto target size is set once the upscale input exists; until then these values are used.</p>');
+      const note = settings('upscale').cq_finish === 'none'
+        ? 'The output is CQ’s working size; these fields show it once the upscale input exists.'
+        : 'Auto target size is set once the upscale input exists; until then these values are used.';
+      anchor.insertAdjacentHTML('beforebegin', `<p class="shot-empty">${note}</p>`);
     }
   }
   bindUpscaleComparison();
@@ -221,11 +224,12 @@ function upscaleMainFields(st) {
 function upscaleAutoTargetSize() {
   const s = settings('upscale');
   const backend = s.method === 'ltx25cq' ? (s.cq_finish || 'flashvsr') : (s.method || 'flashvsr');
-  return backend === 'flashvsr' && String(s.auto_target_size) === 'true';
+  // With no finishing upscaler the CQ render is delivered as-is, so its size is the target.
+  return backend === 'none' || (backend === 'flashvsr' && String(s.auto_target_size) === 'true');
 }
 
 function upscaleBackendFieldKeys(backend) {
-  if (backend === 'lanczos') return [];
+  if (backend === 'lanczos' || backend === 'none') return [];
   if (backend === 'ltx25') {
     return [
       'ltx25_source_fidelity', 'ltx25_lora_strength', 'ltx25_guidance_scale', 'ltx25_seed',
@@ -273,6 +277,10 @@ function upscaleComparisonHtml(s, preview) {
   if (!before) return '<p class="shot-empty">Choose a source on the Overview page, then enable Upscale.</p>';
   const inputLabel = (state.output_selection && state.output_selection.kind || '').startsWith('recomposed') ? 'Recomposition' : 'Input';
   if (cq) {
+    // With no finisher, the delivered output is the CQ render (after any per-shot blend).
+    if (s.cq_finish === 'none') {
+      return videoComparisonHtml('upscaleCqCompareSlider', before, after || cq, inputLabel, 'CQ Enhancer');
+    }
     // CQ restores, then its finisher upscales: compare each pass against what it was given.
     const finish = upscaleMethodLabel(s.cq_finish || 'flashvsr');
     return `
