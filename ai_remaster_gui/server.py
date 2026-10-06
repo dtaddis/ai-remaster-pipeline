@@ -1372,6 +1372,52 @@ class PipelineApp:
                 _source_video, fieldnames, rows = read_manifest_details(resolve(adopted))
                 write_manifest_details(resolve(adopted), current_outpainted, fieldnames, rows)
 
+    def adopt_other_model_shot_list(self, outpainted_text: str) -> str:
+        """Carry the shot list over when the outpaint model changes; return the adopted path.
+
+        The shot list is named after the outpainted clip, and each outpaint model names its clip
+        differently, so switching model used to start Shot Detection and Reference Generation
+        from nothing. The model only repaints the edges, so the shots fall on the same frames:
+        the newest shot list of the same outpaint is copied, with its prompts, edits and
+        reference images, and pointed at this clip. Its reference folders are copied too, so
+        the two models' shot lists never edit or prune each other's images. Shot Detection then
+        keeps every shot as long as the clip's length and the detection settings match.
+        """
+        current_text = manifest_for_outpainted(outpainted_text)
+        current = resolve(current_text) if current_text else None
+        if not current or current.exists():
+            return ""
+        candidates = [
+            (resolve(other), resolve(manifest))
+            for other in other_model_outpaints(outpainted_text)
+            if (manifest := manifest_for_outpainted(other)) and resolve(manifest).is_file()
+        ]
+        if not candidates:
+            return ""
+        other_clip, saved = max(candidates, key=lambda pair: pair[1].stat().st_mtime)
+        old_stem, new_stem = other_clip.stem, resolve(outpainted_text).stem
+        try:
+            for root in ("outpainted_references", "outpainted_references_color"):
+                folder = ROOT / "intermediate" / root / old_stem
+                if folder.is_dir():
+                    shutil.copytree(folder, folder.with_name(new_stem), dirs_exist_ok=True)
+            _source_video, fieldnames, rows = read_manifest_details(saved)
+            def repoint(value):
+                if not isinstance(value, str):
+                    return value
+                return value.replace(f"/{old_stem}/", f"/{new_stem}/").replace(f"\\{old_stem}\\", f"\\{new_stem}\\")
+            rows = [{key: repoint(value) for key, value in row.items()} for row in rows]
+            write_manifest_details(current, outpainted_text, fieldnames, rows)
+            signature = saved.with_name(saved.name + ".sig.json")
+            if signature.is_file():
+                # Keeps the detection settings it was made with, so changing those still re-detects.
+                shutil.copy2(signature, current.with_name(current.name + ".sig.json"))
+        except OSError as exc:
+            self.log.append(f"Could not carry the shot list {rel(saved)} over to {current_text}: {exc}")
+            return ""
+        self.log.append(f"Carried the shot list and its reference images over from the other outpaint model: {rel(saved)} -> {current_text}")
+        return current_text
+
     def clear_derived_stage_inputs(self) -> None:
         for stage_key, keys in {
             "cleanup": ("output",),
@@ -1432,6 +1478,7 @@ class PipelineApp:
                 outpainted_text = rel(outpainted)
                 self.settings.setdefault("shots", {})["outpainted_video"] = outpainted_text
                 self.settings.setdefault("recomp", {})["outpainted_video"] = outpainted_text
+                self.adopt_other_model_shot_list(outpainted_text)
                 manifest = manifest_for_outpainted(outpainted_text)
                 self.settings.setdefault("references", {})["manifest"] = manifest
                 self.settings.setdefault("colour", {})["manifest"] = manifest
@@ -1542,6 +1589,23 @@ class PipelineApp:
 
     def existing_outputs(self, stage_key: str) -> list[str]:
         return [path for path in self.expected_outputs(stage_key) if path and resolve(path).exists()]
+
+    def existing_shot_list(self) -> str:
+        """The shot list Run Whole Remaster would work from, even before Outpainting has rendered
+        the clip it is named after (a new outpaint model carries the other model's list over)."""
+        existing = self.existing_outputs("shots")
+        if existing or not self.outpaint_enabled():
+            return existing[0] if existing else ""
+        source = self.outpaint_source_for()
+        if not source:
+            return ""
+        values = self.settings.get("outpaint", {})
+        clip = outpaint_output_for(source, values.get("target_aspect", "16:9"), values.get("target_height", "720"))
+        for candidate in (clip, *other_model_outpaints(clip)):
+            manifest = manifest_for_outpainted(candidate)
+            if manifest and resolve(manifest).is_file():
+                return manifest
+        return ""
 
     def stage_stamp(self, stage_key: str) -> str:
         """Digest of what the stage would run with now (see stage_stamps); "" if it has no outputs."""
@@ -3150,9 +3214,26 @@ def adopt_saved_artifact(saved_text: str, current_text: str, replace_existing: b
     return rel(current)
 
 
+OUTPAINT_MODEL_TAG_SUFFIXES = {"ltx25": "25", "wanvace": "wan", "h3": "h3"}
+
+
 def outpaint_model_tag_suffix(values: dict[str, str]) -> str:
     """Render caches are model-specific; must match outpaint_video.outpaint_artifact_tag."""
-    return {"ltx25": "25", "wanvace": "wan", "h3": "h3"}.get(values.get("outpaint_model", ""), "")
+    return OUTPAINT_MODEL_TAG_SUFFIXES.get(values.get("outpaint_model", ""), "")
+
+
+def other_model_outpaints(outpainted_text: str) -> list[str]:
+    """The same outpaint as rendered by the other outpaint models: only the name's tag differs."""
+    if not outpainted_text:
+        return []
+    path = resolve(outpainted_text)
+    suffixes = ("", *OUTPAINT_MODEL_TAG_SUFFIXES.values())
+    match = re.fullmatch(rf"(.+)_outpaint(?:{'|'.join(s for s in suffixes if s)})?_([0-9a-f]+)", path.stem)
+    if not match:
+        return []
+    word, key = match.groups()
+    stems = [f"{word}_outpaint{suffix}_{key}" for suffix in suffixes]
+    return [rel(path.with_name(stem + path.suffix)) for stem in stems if stem != path.stem]
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:

@@ -2052,8 +2052,8 @@ async function runAll() {
   // with it the reference images, so Colorization reuses both on the new outpainted clip.
   let keepShots = false;
   if (state.stages.some(st => st.key === 'shots')) {
-    const existing = await api('/api/existing-outputs?stage=shots');
-    if (existing.paths && existing.paths.length) {
+    const existing = await api('/api/existing-shot-list');
+    if (existing.path) {
       const choice = await choiceDialog({
         title: 'Skip Shot Detection?',
         message: 'This project already has a shot list.\n\n'

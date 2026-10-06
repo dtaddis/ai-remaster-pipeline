@@ -22,7 +22,7 @@ EXPECTED_GET_ROUTES = {
     "/site.webmanifest",
     "/api/state",
     "/api/command",
-    "/api/existing-outputs",
+    "/api/existing-outputs", "/api/existing-shot-list",
     "/api/media-status",
     "/api/comfy",
     "/api/logfile",

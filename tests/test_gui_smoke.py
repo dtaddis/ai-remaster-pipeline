@@ -1259,6 +1259,41 @@ class GuiSmokeTests(unittest.TestCase):
             app.APP._run_all_worker()
             self.assertEqual(started, ["outpaint", "shots", "references", "colour"])
 
+    def test_switching_outpaint_model_carries_the_shot_list_and_references_over(self) -> None:
+        old_clip = "intermediate/outpainted/Zzcarry_outpaint_0123abcd.mkv"
+        new_clip = "intermediate/outpainted/Zzcarry_outpaint25_0123abcd.mkv"
+        self.assertIn(old_clip, app.other_model_outpaints(new_clip))
+        old_manifest = app.resolve(app.manifest_for_outpainted(old_clip))
+        new_manifest = app.resolve(app.manifest_for_outpainted(new_clip))
+        self.assertNotEqual(old_manifest, new_manifest)
+        folders = [app.ROOT / "intermediate" / root / stem for root in ("outpainted_references", "outpainted_references_color") for stem in ("Zzcarry_outpaint_0123abcd", "Zzcarry_outpaint25_0123abcd")]
+        try:
+            colour = app.ROOT / "intermediate/outpainted_references_color/Zzcarry_outpaint_0123abcd/cut_0000.png"
+            colour.parent.mkdir(parents=True)
+            colour.write_bytes(b"png")
+            app.write_manifest_details(old_manifest, old_clip, ["enabled", "color_reference", "prompt"], [
+                {"enabled": "true", "color_reference": "intermediate/outpainted_references_color/Zzcarry_outpaint_0123abcd/cut_0000.png", "prompt": "a red car"},
+            ])
+            old_manifest.with_name(old_manifest.name + ".sig.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(app.APP.adopt_other_model_shot_list(new_clip), app.rel(new_manifest))
+
+            source_video, _fields, rows = app.read_manifest_details(new_manifest)
+            self.assertEqual(source_video, new_clip)
+            self.assertEqual(rows[0]["prompt"], "a red car")
+            self.assertEqual(rows[0]["color_reference"], "intermediate/outpainted_references_color/Zzcarry_outpaint25_0123abcd/cut_0000.png")
+            self.assertTrue((app.ROOT / rows[0]["color_reference"]).is_file())
+            self.assertTrue(new_manifest.with_name(new_manifest.name + ".sig.json").is_file())
+            # The other model's list is untouched, and an existing list is never replaced.
+            self.assertEqual(app.read_manifest_details(old_manifest)[0], old_clip)
+            self.assertEqual(app.APP.adopt_other_model_shot_list(new_clip), "")
+        finally:
+            for manifest in (old_manifest, new_manifest):
+                manifest.unlink(missing_ok=True)
+                manifest.with_name(manifest.name + ".sig.json").unlink(missing_ok=True)
+            for folder in folders:
+                shutil.rmtree(folder, ignore_errors=True)
+
     def test_stage_is_current_only_while_inputs_and_settings_match_the_last_finished_run(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)

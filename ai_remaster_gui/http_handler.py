@@ -177,6 +177,8 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/existing-outputs":
             stage = parse_qs(parsed.query).get("stage", [""])[0]
             self.send_json({"paths": state.APP.existing_outputs(stage) if stage else []})
+        elif parsed.path == "/api/existing-shot-list":
+            self.send_json({"path": state.APP.existing_shot_list()})
         elif parsed.path == "/api/media-status":
             query = parse_qs(parsed.query)
             path_text = query.get("path", [""])[0]
