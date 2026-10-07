@@ -60,6 +60,12 @@ def _fingerprint_key(key: str) -> str:
     return "guide_fingerprint" if key == "guide_image" else f"{key}_fingerprint"
 
 
+# Shot-list columns that only the upscale stage reads. Editing them must not make any other
+# stage's cached work look stale: re-colourising would re-encode the colourised film and so
+# send everything downstream, CQ included, back to the start.
+SHOT_LIST_UPSCALE_COLUMNS = frozenset({"upscale_strength", "cq_luma_only", "cq_guide_shots", "cq_anchor_chunk"})
+
+
 def _comparable(value: Any) -> Any:
     """A signature as it is matched, which is by content rather than by where files live:
 
@@ -68,15 +74,19 @@ def _comparable(value: Any) -> Any:
     - A file path is dropped when the same dict holds that file's sha256 fingerprint. Guides
       recovered from outside ARP's folder, plans renamed to the short artifact names, and project
       folders moved or reopened all change paths without changing a byte; matching on the path
-      re-rendered every affected chunk anyway (a 20-second LTX chunk for an identical guide)."""
+      re-rendered every affected chunk anyway (a 20-second LTX chunk for an identical guide).
+    - Upscale-only shot-list columns are dropped from signed shot-list rows ("row"), and the
+      whole-file "manifest_fingerprint" is dropped: the rows it covers are signed one by one."""
     if isinstance(value, dict):
         comparable = {}
         for key, item in value.items():
-            if key in {"mtime_ns", "color_reference_previous"}:
+            if key in {"mtime_ns", "color_reference_previous", "manifest_fingerprint"}:
                 continue
             fingerprint = value.get(_fingerprint_key(key))
             if isinstance(item, str) and isinstance(fingerprint, dict) and fingerprint.get("sha256"):
                 continue
+            if key == "row" and isinstance(item, dict):
+                item = {column: cell for column, cell in item.items() if column not in SHOT_LIST_UPSCALE_COLUMNS}
             comparable[key] = _comparable(item)
         return comparable
     if isinstance(value, list):
@@ -255,16 +265,40 @@ def replace_with_retry(source: Path, target: Path, label: str | None = None, att
 
 
 def replace_unless_identical(partial: Path, target: Path, label: str | None = None) -> None:
-    """Promote partial to target, but keep the existing target when the bytes are identical
-    so resume signatures that fingerprint it stay valid."""
+    """Promote partial to target, but keep the existing target when it is identical so resume
+    signatures that fingerprint it stay valid.
+
+    Videos count as identical when their decoded frames are: Matroska stamps every file with
+    a random segment ID, so re-splitting unchanged frames never gives the same bytes."""
     if target.exists():
         try:
-            if file_fingerprint(partial)["sha256"] == file_fingerprint(target)["sha256"]:
+            if file_fingerprint(partial)["sha256"] == file_fingerprint(target)["sha256"] or same_video_frames(partial, target):
                 partial.unlink()
                 return
         except OSError:
             pass
     replace_with_retry(partial, target, label)
+
+
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".webm", ".avi"}
+
+
+def same_video_frames(first: Path, second: Path) -> bool:
+    """True when two video files decode to the same frames at the same timestamps."""
+    if first.suffix.lower() not in VIDEO_SUFFIXES or second.suffix.lower() not in VIDEO_SUFFIXES:
+        return False
+    try:
+        ffmpeg = find_ffmpeg()
+        digests = []
+        for path in (first, second):
+            result = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", str(path), "-map", "0:v:0", "-f", "framemd5", "-"],
+                capture_output=True, text=True, check=True,
+            )
+            digests.append([line for line in result.stdout.splitlines() if line and not line.startswith("#")])
+        return bool(digests[0]) and digests[0] == digests[1]
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
 
 def split_sidecar_path(target: Path) -> Path:

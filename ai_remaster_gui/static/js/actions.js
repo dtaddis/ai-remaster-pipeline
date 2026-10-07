@@ -1448,6 +1448,26 @@ async function saveShotCqLumaOnly(manifest, index, checked) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function saveShotCqGuides(manifest, index, shots) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-cq-guides', { manifest, index, shots });
+  if (!result.ok) {
+    alert(result.error || 'Could not update the guide shots');
+    return redrawWithState(null, snap, true);
+  }
+  await redrawWithState(result.state, snap, true);
+}
+
+async function saveShotCqAnchor(manifest, index, chunk) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-cq-anchor', { manifest, index, chunk });
+  if (!result.ok) {
+    alert(result.error || 'Could not update the chunk this shot takes its look from');
+    return redrawWithState(null, snap, true);
+  }
+  await redrawWithState(result.state, snap, true);
+}
+
 function nudgeShotBoundary(manifest, index, edge, frames) {
   // Nudge from the slider's live value, not the last server response, so several quick
   // clicks accumulate instead of all resolving to the same frame.

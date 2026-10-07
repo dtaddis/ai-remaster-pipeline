@@ -49,6 +49,7 @@ from ai_remaster_gui import media
 from ai_remaster_gui import outpaint_guides
 from ai_remaster_gui import paths
 from ai_remaster_gui import project_io
+from ai_remaster_gui import references
 from ai_remaster_gui import runtime_settings
 from ai_remaster_gui import sam_masks
 from ai_remaster_gui import server
@@ -6712,6 +6713,7 @@ class GuiSmokeTests(unittest.TestCase):
             "cq_guide_strength": "90",
             "cq_lora_strength": "0.8",
             "cq_chunk_seconds": "4",
+            "cq_continuity": "60",
             "cq_seed": "9",
             "cq_prompt": "",
         })
@@ -6726,6 +6728,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--cq-guide-strength") + 1], "0.9")
         self.assertEqual(command[command.index("--cq-lora-strength") + 1], "0.8")
         self.assertEqual(command[command.index("--cq-chunk-seconds") + 1], "4")
+        self.assertEqual(command[command.index("--cq-continuity") + 1], "0.6")
         self.assertEqual(command[command.index("--cq-seed") + 1], "9")
         # The script's parser must accept everything the GUI sends.
         upscale_video.build_parser().parse_args(command[3:])
@@ -7183,6 +7186,393 @@ class GuiSmokeTests(unittest.TestCase):
                     expected = [5 * index for index in range(frames)]
                     self.assertEqual(len(levels), frames, (fps, mode))
                     self.assertTrue(all(abs(got - want) <= 1 for got, want in zip(levels, expected)), (fps, mode, levels))
+
+    def test_cq_continuity_frames_line_up_with_the_next_chunks_lead_in(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def frame_levels(path: Path) -> list[int]:
+            capture = cv2.VideoCapture(str(path))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(int(round(frame.mean())))
+            capture.release()
+            return levels
+
+        frames = 48
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            for fps in (24.0, 25.0):
+                source = folder / f"source_{fps:g}.mkv"
+                raw = b"".join(bytes([5 * index]) * (64 * 48 * 3) for index in range(frames))
+                subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                     "-r", f"{fps:g}", "-i", "-", "-c:v", "ffv1", str(source)],
+                    input=raw, check=True,
+                )
+                for mode in ("resample", "retime"):
+                    plan = upscale_video.cq_chunk_plan(frames, fps, 1.0, 12, mode)
+                    (first_start, first_end, _, _), (start, end, lead, model) = plan[0], plan[1]
+                    count = upscale_video.cq_continuity_frames(lead, fps, mode)
+                    self.assertEqual(count % 8, 1)
+                    # An identity "render" of the first chunk, at the source rate.
+                    previous = folder / f"previous_{fps:g}_{mode}.mkv"
+                    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(source), "-vf",
+                                    f"trim=start_frame={first_start}:end_frame={first_end},setpts=N/({fps:g}*TB)",
+                                    "-c:v", "ffv1", str(previous)], check=True)
+                    guide = folder / f"guide_{fps:g}_{mode}.mkv"
+                    previous_frames = first_end - first_start
+                    upscale_video.prepare_cq_working_frames(
+                        ffmpeg, previous, guide, previous_frames - lead, previous_frames, count, fps, mode, 64, 48,
+                    )
+                    prepared = folder / f"prepared_{fps:g}_{mode}.mkv"
+                    upscale_video.prepare_cq_chunk(
+                        ffmpeg, source, prepared, start, end, model, fps, 64, 48, mode, True, common.file_fingerprint(source),
+                    )
+                    guide_levels = frame_levels(guide)
+                    self.assertEqual(len(guide_levels), count, (fps, mode))
+                    self.assertEqual(guide_levels, frame_levels(prepared)[:count], (fps, mode))
+
+    def test_cq_guide_shots_render_first_and_their_frames_are_trimmed_back_off(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def frame_levels(path: Path) -> list[int]:
+            capture = cv2.VideoCapture(str(path))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(int(round(frame.mean())))
+            capture.release()
+            return levels
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            raw = b"".join(bytes([4 * index]) * (64 * 48 * 3) for index in range(60))
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                 "-r", "24", "-i", "-", "-c:v", "ffv1", str(source)],
+                input=raw, check=True,
+            )
+            manifest = folder / "shots.csv"
+            # Shot 1 is guided by shot 3, so it renders last.
+            manifest.write_text("start_frame,end_frame,cq_guide_shots\n0,20,40\n20,40,\n40,60,\n", encoding="utf-8")
+            args = upscale_video.build_parser().parse_args([
+                "--input", str(source), "--method", "ltx25cq", "--cq-short-edge", "64", "--shot-manifest", str(manifest),
+            ])
+            calls: list[dict] = []
+
+            def identity_render(_args, chunk_input, partial, _width, _height, frames, locked=None):
+                calls.append({
+                    "input": frame_levels(chunk_input),
+                    "frames": frames,
+                    "locked": frame_levels(locked[0]) if locked else [],
+                })
+                shutil.copy2(chunk_input, partial)
+                return partial
+
+            info = common.video_info(source)
+            with mock.patch.object(upscale_video, "ROOT", folder), \
+                    mock.patch.object(upscale_video, "cq_run", side_effect=identity_render):
+                stitched = upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+                levels = frame_levels(stitched)
+
+        self.assertEqual(len(calls), 3)
+        # Shots 2 and 3 render plainly, then shot 1 after 9 frames of shot 3's render.
+        self.assertAlmostEqual(calls[0]["input"][0], 80, delta=1)
+        self.assertAlmostEqual(calls[1]["input"][0], 160, delta=1)
+        guided = calls[2]
+        self.assertEqual(len(guided["locked"]), 9)
+        self.assertEqual(guided["frames"] % 8, 1)
+        self.assertEqual(guided["input"][:9], guided["locked"])
+        self.assertTrue(all(159 <= level < 240 for level in guided["locked"]), guided["locked"])
+        self.assertAlmostEqual(guided["input"][9], 0, delta=1)
+        # The identity "render" comes back as the source: the guide frames are trimmed off exactly.
+        self.assertEqual(len(levels), 60)
+        self.assertTrue(all(abs(level - 4 * index) <= 1 for index, level in enumerate(levels)), levels)
+
+    def test_cq_thumbnails_cover_exactly_the_asked_frames(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            source = Path(tmp_text) / "source.mkv"
+            frames = []
+            for index in range(40):
+                # A bright bar that moves across the frame, so every frame looks different.
+                frame = np.zeros((48, 64, 3), dtype=np.uint8)
+                frame[:, index:index + 16] = 255
+                frames.append(frame.tobytes())
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                 "-r", "24", "-i", "-", "-c:v", "ffv1", str(source)],
+                input=b"".join(frames), check=True,
+            )
+            first = upscale_video.cq_thumbnails(ffmpeg, source, 30, 31)
+            shot = upscale_video.cq_thumbnails(ffmpeg, source, 10, 35)
+
+        self.assertEqual(first.shape[0], 1)
+        self.assertEqual(shot.shape[0], 25)
+        self.assertEqual(int(np.abs(shot - first[0]).mean(axis=1).argmin()), 20)
+
+    def test_cq_shot_chunk_order_spreads_out_from_the_anchor(self) -> None:
+        self.assertEqual(upscale_video.cq_shot_chunk_order(0, 1), [])
+        self.assertEqual(upscale_video.cq_shot_chunk_order(1, 3), [(0, None)])
+        self.assertEqual(upscale_video.cq_shot_chunk_order(3, 1), [(0, None), (1, "forward"), (2, "forward")])
+        self.assertEqual(
+            upscale_video.cq_shot_chunk_order(4, 2),
+            [(1, None), (2, "forward"), (3, "forward"), (0, "backward")],
+        )
+        self.assertEqual(upscale_video.cq_shot_chunk_order(3, 9), [(2, None), (1, "backward"), (0, "backward")])
+
+    def test_cq_chunks_before_the_anchor_render_backwards_from_it(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        import cv2
+
+        def frame_levels(path: Path) -> list[int]:
+            capture = cv2.VideoCapture(str(path))
+            levels = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                levels.append(int(round(frame.mean())))
+            capture.release()
+            return levels
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            raw = b"".join(bytes([4 * index]) * (64 * 48 * 3) for index in range(60))
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                 "-r", "24", "-i", "-", "-c:v", "ffv1", str(source)],
+                input=raw, check=True,
+            )
+            manifest = folder / "shots.csv"
+            # One 60-frame shot in three 1-second chunks, taking its look from the last.
+            manifest.write_text("start_frame,end_frame,cq_anchor_chunk\n0,60,3\n", encoding="utf-8")
+            args = upscale_video.build_parser().parse_args([
+                "--input", str(source), "--method", "ltx25cq", "--cq-short-edge", "64", "--cq-chunk-seconds", "1",
+                "--shot-manifest", str(manifest),
+            ])
+            calls: list[dict] = []
+
+            def identity_render(_args, chunk_input, partial, _width, _height, _frames, locked=None):
+                calls.append({"input": frame_levels(chunk_input), "locked": frame_levels(locked[0]) if locked else []})
+                shutil.copy2(chunk_input, partial)
+                return partial
+
+            info = common.video_info(source)
+            with mock.patch.object(upscale_video, "ROOT", folder), \
+                    mock.patch.object(upscale_video, "cq_run", side_effect=identity_render):
+                levels = frame_levels(upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source)))
+
+        self.assertEqual(len(calls), 3)
+        # The last chunk renders first, forwards; then the middle and first chunks, backwards,
+        # each starting from the frames it shares with the chunk after it.
+        self.assertLess(calls[0]["input"][0], calls[0]["input"][5])
+        self.assertEqual(calls[0]["locked"], [])
+        for call in calls[1:]:
+            self.assertGreater(call["input"][0], call["input"][5])
+            self.assertEqual(len(call["locked"]), 9)
+            self.assertTrue(all(abs(a - b) <= 1 for a, b in zip(call["locked"], call["input"])), call)
+        self.assertGreater(calls[1]["input"][0], calls[2]["input"][0])
+        # Rendered backwards and turned round again, every frame comes back in order.
+        self.assertEqual(len(levels), 60)
+        self.assertTrue(all(abs(level - 4 * index) <= 1 for index, level in enumerate(levels)), levels)
+
+    def test_cq_guide_change_re_renders_only_the_guided_shot(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            raw = b"".join(bytes([4 * index]) * (64 * 48 * 3) for index in range(60))
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                 "-r", "24", "-i", "-", "-c:v", "ffv1", str(source)],
+                input=raw, check=True,
+            )
+            manifest = folder / "shots.csv"
+            manifest.write_text("start_frame,end_frame,cq_guide_shots\n0,20,\n20,40,\n40,60,\n", encoding="utf-8")
+            args = upscale_video.build_parser().parse_args([
+                "--input", str(source), "--method", "ltx25cq", "--cq-short-edge", "64", "--shot-manifest", str(manifest),
+            ])
+            rendered: list[int] = []
+
+            def identity_render(_args, chunk_input, partial, _width, _height, _frames, locked=None):
+                rendered.append(len(rendered))
+                shutil.copy2(chunk_input, partial)
+                return partial
+
+            info = common.video_info(source)
+            with mock.patch.object(upscale_video, "ROOT", folder), \
+                    mock.patch.object(upscale_video, "cq_run", side_effect=identity_render):
+                first = upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+                before = upscale_video.cq_range_fingerprint(first, common.file_fingerprint(first), {})
+                first_ranges = [before(0, 20), before(20, 40), before(40, 60)]
+                renders_first = len(rendered)
+                # Shot 3 now follows shot 1: only shot 3 is rendered again.
+                manifest.write_text("start_frame,end_frame,cq_guide_shots\n0,20,\n20,40,\n40,60,0\n", encoding="utf-8")
+                second = upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+                after = upscale_video.cq_range_fingerprint(second, common.file_fingerprint(second), {})
+                second_ranges = [after(0, 20), after(20, 40), after(40, 60)]
+                # A render without a chunk map falls back to keying on the whole file.
+                no_map = upscale_video.cq_range_fingerprint(source, common.file_fingerprint(source), {})
+
+        self.assertEqual(renders_first, 3)
+        self.assertEqual(len(rendered), 4)
+        # The finisher keys its splits on these, so it redoes only shot 3's frames.
+        self.assertEqual(first_ranges[:2], second_ranges[:2])
+        self.assertNotEqual(first_ranges[2], second_ranges[2])
+        self.assertIsNone(no_map)
+
+    def test_upscale_only_shot_list_columns_do_not_stale_other_stages(self) -> None:
+        sys.path.insert(0, str(app.ROOT / "scripts"))
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            output = folder / "out.mp4"
+            output.write_bytes(b"video")
+            row = {"start_frame": "0", "end_frame": "20", "prompt": "a", "cq_guide_shots": "", "upscale_strength": ""}
+            common.write_signature(output, {"manifest_fingerprint": {"sha256": "old"}, "shot_input": {"row": dict(row)}})
+            edited = dict(row, cq_guide_shots="40", upscale_strength="60", cq_anchor_chunk="2")
+            # Colorize signs each shot's row: upscale-only columns and the whole-file hash are ignored.
+            self.assertTrue(common.signature_matches(output, {"manifest_fingerprint": {"sha256": "new"}, "shot_input": {"row": edited}}))
+            self.assertFalse(common.signature_matches(output, {"manifest_fingerprint": {"sha256": "new"}, "shot_input": {"row": dict(edited, prompt="b")}}))
+
+            manifest = folder / "shots.csv"
+            command = ["python", "colorize_video.py", str(manifest)]
+
+            def stamps(text: str) -> tuple[str, str]:
+                manifest.write_text(text, encoding="utf-8")
+                return (
+                    stage_stamps.compute_stamp(command, [], "label", stage_stamps.stage_ignored_columns("colour")),
+                    stage_stamps.compute_stamp(command, [], "label", stage_stamps.stage_ignored_columns("upscale")),
+                )
+
+            plain = stamps("start_frame,end_frame,prompt,cq_guide_shots\n0,20,a,\n")
+            guided = stamps("start_frame,end_frame,prompt,cq_guide_shots\n0,20,a,40\n")
+            prompted = stamps("start_frame,end_frame,prompt,cq_guide_shots\n0,20,b,40\n")
+        self.assertEqual(plain[0], guided[0])
+        self.assertNotEqual(plain[1], guided[1])
+        self.assertNotEqual(guided[0], prompted[0])
+
+    def test_replace_unless_identical_keeps_a_re_encode_of_the_same_frames(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24:duration=1",
+                 "-c:v", "ffv1", str(source)],
+                check=True,
+            )
+            target, partial, other = folder / "split.mkv", folder / "split.partial.mkv", folder / "other.partial.mkv"
+            for path in (target, partial):
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(source), "-c:v", "ffv1", "-f", "matroska", str(path)], check=True)
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(source), "-vf", "negate", "-c:v", "ffv1", str(other)], check=True)
+            original = common.file_fingerprint(target)["sha256"]
+            self.assertNotEqual(original, common.file_fingerprint(partial)["sha256"])
+
+            common.replace_unless_identical(partial, target)
+            kept = common.file_fingerprint(target)["sha256"]
+            common.replace_unless_identical(other, target)
+            replaced = common.file_fingerprint(target)["sha256"]
+
+        self.assertEqual(kept, original)
+        self.assertNotEqual(replaced, original)
+
+    def test_cq_render_order_puts_guide_shots_first_and_breaks_loops(self) -> None:
+        self.assertEqual(upscale_video.cq_render_order(3, {}), ([0, 1, 2], {0: [], 1: [], 2: []}))
+        order, usable = upscale_video.cq_render_order(4, {0: [2], 1: [3, 0]})
+        self.assertEqual(order, [2, 0, 3, 1])
+        self.assertEqual(usable[0], [2])
+        self.assertEqual(usable[1], [3, 0])
+        # Shots 0 and 1 guide each other: the earlier one renders first, without its guide.
+        order, usable = upscale_video.cq_render_order(2, {0: [1], 1: [0]})
+        self.assertEqual(order, [0, 1])
+        self.assertEqual(usable, {0: [], 1: [0]})
+
+    def test_cq_guide_window_ends_on_the_best_match_inside_one_chunk(self) -> None:
+        distances = [5.0] * 30
+        distances[12] = 1.0
+        distances[2] = 0.5  # too early for a whole window
+        self.assertEqual(upscale_video.cq_guide_window(distances, 100, [(100, 130)], 8), (105, 113))
+        # A best match straddling two chunks is out; the window must sit inside one render.
+        self.assertEqual(upscale_video.cq_guide_window(distances, 100, [(100, 110), (110, 130)], 8), (100, 108))
+        self.assertIsNone(upscale_video.cq_guide_window([1.0] * 5, 0, [(0, 5)], 8))
+
+    def test_cq_guide_shots_come_from_the_shot_list_as_shot_starts(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            manifest.write_text(
+                "start_frame,end_frame,cq_guide_shots\n0,20,45;25\n20,40,\n40,60,5;0;20;40;55\n60,96,999\n",
+                encoding="utf-8",
+            )
+            args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq", "--shot-manifest", str(manifest)])
+            source = app.ROOT / "input" / "example.mp4"
+            with mock.patch.object(upscale_video, "video_info", return_value={"width": 64, "height": 48, "fps": 24.0, "frames": 96}):
+                guides = upscale_video.cq_guide_shots(args, source)
+        # Frames resolve to the shots holding them; a shot never guides itself, repeats collapse,
+        # and a frame past the end lands on the last shot (which then guides nothing new).
+        self.assertEqual(guides, {0: [40, 20], 40: [0, 20]})
+
+    def test_cq_continuity_frame_counts_fit_the_lead_in(self) -> None:
+        self.assertEqual(upscale_video.cq_continuity_frames(0, 24.0, "resample"), 0)
+        self.assertEqual(upscale_video.cq_continuity_frames(8, 24.0, "resample"), 9)
+        self.assertEqual(upscale_video.cq_continuity_frames(8, 25.0, "resample"), 9)
+        self.assertEqual(upscale_video.cq_continuity_frames(8, 24.0, "retime"), 1)
+        self.assertEqual(upscale_video.cq_continuity_frames(24, 24.0, "resample"), 25)
+        self.assertEqual(upscale_video.cq_continuity_frames(17, 24.0, "retime"), 17)
+
+    def test_cq_continuity_writes_the_start_frames_over_the_first_latents(self) -> None:
+        args = upscale_video.build_parser().parse_args(["--input", "input/example.mp4", "--method", "ltx25cq"])
+        common_inputs = dict(
+            unet=upscale_video.cq_base_model(args), lora=args.cq_lora, lora_strength=args.cq_lora_strength,
+            text_encoder=args.ltx25_text_encoder, vae=args.ltx25_video_vae, prompt="", negative_prompt="",
+            guide_strength=1.0, cfg=1.0, seed=42,
+        )
+        plain = upscale_video.ltx_ic_lora_prompt("example.mp4", 30.0, 153, 1280, 704, "p", **common_inputs)
+        continued = upscale_video.ltx_ic_lora_prompt(
+            "example.mp4", 30.0, 153, 1280, 704, "p", **common_inputs,
+            start_video="previous.mkv", start_frames=9, start_strength=0.8,
+        )
+
+        self.assertNotIn("21", plain)
+        self.assertEqual(plain["10"]["inputs"]["latent"], ["9", 0])
+        self.assertEqual(continued["20"]["class_type"], "VHS_LoadVideo")
+        self.assertEqual(continued["20"]["inputs"]["video"], "previous.mkv")
+        self.assertEqual(continued["20"]["inputs"]["frame_load_cap"], 9)
+        self.assertEqual(continued["21"]["class_type"], "LTXVImgToVideoInplace")
+        self.assertEqual(continued["21"]["inputs"]["latent"], ["9", 0])
+        self.assertEqual(continued["21"]["inputs"]["image"], ["20", 0])
+        self.assertEqual(continued["21"]["inputs"]["strength"], 0.8)
+        self.assertEqual(continued["10"]["inputs"]["latent"], ["21", 0])
 
     def test_cq_luma_only_shots_keep_source_colour_at_delivery(self) -> None:
         try:
@@ -8102,6 +8492,61 @@ class GuiSmokeTests(unittest.TestCase):
             ".preview.compact .aspect-preview-frame canvas",
         ):
             self.assertIn(selector, override)
+
+    def test_shot_cq_guides_are_saved_as_frames_and_shown_as_shot_numbers(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            manifest.write_text("start_frame,end_frame\n0,10\n10,20\n20,30\n30,40\n", encoding="utf-8")
+            manifest_text = app.rel(manifest)
+
+            numbers = references.update_shot_cq_guides(manifest_text, 3, "3, 1, 3")
+            with manifest.open(encoding="utf-8", newline="") as handle:
+                stored = [row.get("cq_guide_shots", "") for row in csv.DictReader(handle)]
+            # Splitting shot 1 renumbers the later shots, but the guides follow their frames.
+            references.split_manifest_shot(manifest_text, 0, 5 / 24)
+            renumbered = references.shot_rows(manifest_text)[-1]["cq_guide_shot_numbers"]
+            with self.assertRaises(ValueError):
+                references.update_shot_cq_guides(manifest_text, 0, "1")
+            with self.assertRaises(ValueError):
+                references.update_shot_cq_guides(manifest_text, 0, "9")
+            cleared = references.update_shot_cq_guides(manifest_text, 4, "")
+
+        self.assertEqual(numbers, [3, 1])
+        self.assertEqual(stored, ["", "", "", "20;0"])
+        self.assertEqual(renumbered, [4, 1])
+        self.assertEqual(cleared, [])
+
+    def test_shot_cq_anchor_endpoint_writes_the_shot_list_column(self) -> None:
+        server = app.create_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+                manifest = Path(tmp_text) / "shots.csv"
+                manifest.write_text("start_frame,end_frame\n0,400\n400,420\n", encoding="utf-8")
+
+                def post(value: str) -> dict:
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/shot-cq-anchor",
+                        data=json.dumps({"manifest": app.rel(manifest), "index": 0, "chunk": value}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return json.loads(response.read().decode("utf-8"))
+
+                def column() -> list[str]:
+                    with manifest.open(encoding="utf-8", newline="") as handle:
+                        return [row.get("cq_anchor_chunk", "") for row in csv.DictReader(handle)]
+
+                self.assertTrue(post("3")["ok"])
+                self.assertEqual(column(), ["3", ""])
+                post("1")  # the first chunk is the default, so nothing is stored
+                self.assertEqual(column(), ["", ""])
+                post("bogus")
+                self.assertEqual(column(), ["", ""])
+        finally:
+            server.shutdown()
 
     def test_shot_cq_luma_only_endpoint_writes_the_shot_list_column(self) -> None:
         server = app.create_server("127.0.0.1", 0)

@@ -15,10 +15,15 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import sys
 from pathlib import Path
 
-from .config import ROOT
+from .config import ROOT, SCRIPTS
 from .paths import resolve
+
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+from common import SHOT_LIST_UPSCALE_COLUMNS  # noqa: E402
 
 STAMP_DIR = ROOT / ".cache" / "stage_stamps"
 
@@ -33,21 +38,30 @@ SCANNED_SUFFIXES = {".csv", ".json"}
 MAX_SCANNED_BYTES = 8 * 1024 * 1024
 
 
-def compute_stamp(command: list[str], outputs: list[str], label: str) -> str:
-    """Digest of a phase's inputs. `label` is the command as logged (secrets redacted)."""
+def compute_stamp(command: list[str], outputs: list[str], label: str, ignored_columns: frozenset[str] = frozenset()) -> str:
+    """Digest of a phase's inputs. `label` is the command as logged (secrets redacted).
+
+    `ignored_columns` are shot-list columns the phase never reads (see stage_ignored_columns).
+    """
     excluded = {_identity(resolve(path)) for path in outputs if path}
     files: dict[str, list[int]] = {}
     for arg in command:
         path = _input_file(arg)
         if path is None or _identity(path) in excluded:
             continue
-        files[_identity(path)] = _csv_content(path) if path.suffix.lower() == ".csv" else _stat(path)
+        files[_identity(path)] = _csv_content(path, ignored_columns) if path.suffix.lower() == ".csv" else _stat(path)
         if path.suffix.lower() in SCANNED_SUFFIXES:
             for ref in _referenced_files(path):
                 if _identity(ref) not in excluded:
                     files[_identity(ref)] = _stat(ref)
     payload = json.dumps({"command": label, "files": files}, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def stage_ignored_columns(stage_key: str) -> frozenset[str]:
+    """Shot-list columns that are not inputs of this phase: the per-shot upscale choices
+    (strength, CQ colour, guide shots, anchor chunk) belong to Upscaling alone."""
+    return frozenset() if stage_key == "upscale" else SHOT_LIST_UPSCALE_COLUMNS
 
 
 def stamp_path(stage_key: str, outputs: list[str]) -> Path:
@@ -99,18 +113,19 @@ def _manifest_lines(path: Path) -> list[str] | None:
         return None
 
 
-def _manifest_rows(lines: list[str]) -> list[dict[str, str]]:
+def _manifest_rows(lines: list[str], ignored_columns: frozenset[str] = frozenset()) -> list[dict[str, str]]:
     rows = csv.DictReader(line for line in lines if not line.startswith("#"))
-    return [{key: value for key, value in row.items() if key not in DERIVED_COLUMNS} for row in rows]
+    skipped = DERIVED_COLUMNS | ignored_columns
+    return [{key: value for key, value in row.items() if key not in skipped} for row in rows]
 
 
-def _csv_content(path: Path):
+def _csv_content(path: Path, ignored_columns: frozenset[str] = frozenset()):
     """A manifest's inputs by content (headers + rows without bookkeeping columns), not its mtime."""
     lines = _manifest_lines(path)
     if lines is None:
         return _stat(path)
     headers = [line for line in lines if line.startswith("#")]
-    payload = json.dumps([headers, _manifest_rows(lines)], sort_keys=True, default=str)
+    payload = json.dumps([headers, _manifest_rows(lines, ignored_columns)], sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

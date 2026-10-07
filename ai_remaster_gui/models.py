@@ -283,6 +283,7 @@ STAGES = (
             ("cq_guide_strength", "CQ source fidelity", "range:0|100|1", "100"),
             ("cq_lora_strength", "CQ LoRA strength", "number", "1.0"),
             ("cq_chunk_seconds", "CQ max chunk seconds", "number", "15"),
+            ("cq_continuity", "CQ chunk continuity", "range:0|100|1", "100"),
             ("cq_seed", "CQ seed", "number", "42"),
             ("cq_prompt", "CQ prompt (optional)", "text", ""),
             ("blend_strength", "Default AI upscale strength", "range:0|100|1", "100"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -176,6 +177,8 @@ def shot_rows(
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "upscale_strength": row.get("upscale_strength", ""),
                 "cq_luma_only": row.get("cq_luma_only", ""),
+                "cq_guide_shots": row.get("cq_guide_shots", ""),
+                "cq_anchor_chunk": row.get("cq_anchor_chunk", ""),
                 "prompt": row.get("prompt", ""),
                 "reference_items": item_references,
                 "reference_count": len(item_references),
@@ -197,7 +200,47 @@ def shot_rows(
         out.append(item)
         start_frame = end_frame_exclusive
         start = end
+    for item in out:
+        item["cq_guide_shot_numbers"] = guide_shot_numbers(out, str(item.get("cq_guide_shots", "")), int(item["index"]))
     return out
+
+
+def guide_shot_numbers(rows: list[dict[str, object]], frames_text: str, own_index: int = -1) -> list[int]:
+    """Shot numbers (1-based) of the shots holding the stored guide frames.
+
+    Guides are stored as frames, not shot numbers, so splitting or merging other shots
+    never points a guide at the wrong shot.
+    """
+    numbers: list[int] = []
+    for frame in (int(text) for text in re.findall(r"\d+", frames_text)):
+        for row in rows:
+            if int(row["start_frame"]) <= frame < int(row["end_boundary_frame"]) or row is rows[-1]:
+                if int(row["index"]) != own_index and int(row["index"]) + 1 not in numbers:
+                    numbers.append(int(row["index"]) + 1)
+                break
+    return numbers
+
+
+def update_shot_cq_guides(manifest_text: str, index: int, numbers_text: str) -> list[int]:
+    """Store a shot's guide shots, given as shot numbers, as the frames those shots start on."""
+    from upscale_video import CQ_MAX_GUIDE_SHOTS
+
+    rows = shot_rows(manifest_text)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Shot {index + 1} does not exist.")
+    frames: list[str] = []
+    for number in (int(text) for text in re.findall(r"\d+", numbers_text)):
+        if number < 1 or number > len(rows):
+            raise ValueError(f"There is no shot {number}; the shot list has {len(rows)} shots.")
+        if number == index + 1:
+            raise ValueError("A shot cannot guide itself.")
+        frame = str(rows[number - 1]["start_frame"])
+        if frame not in frames:
+            frames.append(frame)
+    if len(frames) > CQ_MAX_GUIDE_SHOTS:
+        raise ValueError(f"Choose at most {CQ_MAX_GUIDE_SHOTS} guide shots.")
+    update_manifest_row(resolve(manifest_text), index, {"cq_guide_shots": ";".join(frames)})
+    return guide_shot_numbers(shot_rows(manifest_text), ";".join(frames), index)
 
 def shot_rows_for_indices(manifest_text: str, indices: Iterable[int], include_previews: bool = True) -> list[dict[str, object]]:
     wanted = {index for index in indices if index >= 0}

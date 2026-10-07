@@ -52,6 +52,7 @@ from .references import (
     split_manifest_shot,
     shot_rows_for_indices,
     update_shot_boundary,
+    update_shot_cq_guides,
     update_shot_fade,
 )
 from .scrub_sheets import SHEETS_ROOT, sheet_status
@@ -456,6 +457,19 @@ class Handler(BaseHTTPRequestHandler):
                 update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"cq_luma_only": raw})
                 return {"luma_only": raw, "state": state.APP.state("upscale")}
             self._send_result("Shot CQ colour update", update_cq_luma_only)
+        elif parsed.path == "/api/shot-cq-guides":
+            def update_cq_guides():
+                numbers = update_shot_cq_guides(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("shots", "")))
+                return {"guide_shots": numbers, "state": state.APP.state("upscale")}
+            self._send_result("Shot CQ guide shots update", update_cq_guides)
+        elif parsed.path == "/api/shot-cq-anchor":
+            def update_cq_anchor():
+                # "" or 1 anchors the shot on its first chunk, as before.
+                raw = str(data.get("chunk", "")).strip()
+                raw = raw if raw.isdigit() and int(raw) > 1 else ""
+                update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"cq_anchor_chunk": raw})
+                return {"chunk": raw, "state": state.APP.state("upscale")}
+            self._send_result("Shot CQ anchor chunk update", update_cq_anchor)
         elif parsed.path == "/api/reference-regenerate":
             self._send_action("Reference regeneration", lambda: state.APP.run_reference_regeneration(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("provider", "qwen")), int(data.get("reference_index", 0))))
         elif parsed.path == "/api/reference-add":

@@ -197,6 +197,7 @@ function drawUpscale() {
   }
   bindUpscaleComparison();
   bindUpscaleShotComparisons();
+  bindCqLookThumbs();
   showCommand('upscale');
 }
 
@@ -209,7 +210,7 @@ function upscaleMainFields(st) {
     backend = settings('upscale').cq_finish || 'flashvsr';
     fieldKeys.push(
       'cq_finish', 'cq_base', 'cq_short_edge', 'cq_frame_rate', 'cq_colour', 'cq_guide_strength',
-      'cq_lora_strength', 'cq_chunk_seconds', 'cq_seed', 'cq_prompt',
+      'cq_lora_strength', 'cq_chunk_seconds', 'cq_continuity', 'cq_seed', 'cq_prompt',
     );
   }
   fieldKeys.push(...upscaleBackendFieldKeys(backend));
@@ -416,6 +417,171 @@ function upscaleShotCqLumaHtml(s, row, manifest) {
         CQ luma only (keep source colour)
       </label>
       <small>${own ? 'Custom for this shot' : 'Project CQ colour setting'}</small>
+    </div>
+    ${upscaleShotCqGuidesHtml(row, manifest)}
+    ${upscaleShotCqAnchorHtml(s, row, manifest)}
+  `;
+}
+
+function upscaleShotCqAnchorHtml(s, row, manifest) {
+  // Mirrors cq_chunk_plan: a shot longer than the CQ chunk limit splits into equal pieces.
+  const fps = Number(row.fps) || 24;
+  const length = Math.max(1, Number(row.end_boundary_frame) - Number(row.start_frame));
+  const limit = Math.max(1, Math.round(Number(s.cq_chunk_seconds || 15) * fps));
+  const pieces = Math.ceil(length / limit);
+  if (pieces < 2) return '';
+  // Blank (or 1) is Automatic: the look carries on from the start of the shot, as every
+  // unsplit shot's does.
+  const chosen = Math.min(pieces, Math.max(1, Number(row.cq_anchor_chunk) || 1));
+  const automatic = chosen === 1;
+  const parts = Array.from({ length: pieces }, (_, piece) => {
+    const from = Math.floor(length * piece / pieces) / fps;
+    const to = Math.floor(length * (piece + 1) / pieces) / fps;
+    const middle = Number(row.start) + (from + to) / 2;
+    const selected = !automatic && piece + 1 === chosen;
+    const label = `${from.toFixed(1)}–${to.toFixed(1)} s`;
+    return `
+      <button type="button" class="cq-look-part ${selected ? 'is-selected' : ''}" data-label="${label}"
+        onclick="openCqLookViewer(${row.index},${piece + 1})" title="Enlarge to compare and choose">
+        <img data-cq-look-thumb data-index="${row.index}" data-time="${middle.toFixed(3)}" alt="">
+        <span>${label}</span>
+      </button>`;
+  }).join('');
+  return `
+    <div class="cq-look" data-shot-index="${row.index}" data-manifest="${esc(manifest)}" data-chosen="${automatic ? '' : chosen}">
+      <div class="cq-look-head">
+        <strong title="CQ renders at most ${Number(s.cq_chunk_seconds || 15)} s at a time, so this shot is made in ${pieces} parts, each starting from the one beside it so they match. Automatic carries the look on from the start of the shot, like every other shot. Choose a part (shown from the latest upscale) to make the whole shot follow its colours, clothes and faces instead; the other parts are then re-rendered from it.">Shot look</strong>
+        <button type="button" class="cq-look-auto ${automatic ? 'is-selected' : ''}" onclick="saveShotCqAnchor(${jsArg(manifest)},${row.index},'')">Automatic</button>
+      </div>
+      <div class="cq-look-parts">${parts}</div>
+      <small>${automatic
+        ? `CQ makes this shot in ${pieces} parts; the look carries on from the start, as in other shots. Click a part to enlarge, compare and choose.`
+        : `The whole shot follows the look of part ${chosen}. Automatic goes back to the usual behaviour.`}</small>
+    </div>
+  `;
+}
+
+// The enlarged view of a shot's parts: one at a time (arrow keys step between them, which shows
+// colour changes best) or all side by side, with "Use this look" on each.
+let cqLookView = null;
+
+function openCqLookViewer(index, focus) {
+  const look = document.querySelector(`.cq-look[data-shot-index="${index}"]`);
+  if (!look) return;
+  const parts = [...look.querySelectorAll('.cq-look-part')].map((button, piece) => ({
+    number: piece + 1,
+    label: button.dataset.label,
+    src: button.querySelector('img').getAttribute('src') || '',
+  }));
+  cqLookView = {
+    index,
+    manifest: look.dataset.manifest,
+    chosen: Number(look.dataset.chosen) || 0,
+    parts,
+    focus: focus || 0,
+  };
+  drawCqLookViewer();
+}
+
+function drawCqLookViewer() {
+  const view = cqLookView;
+  if (!view) return;
+  let modal = document.getElementById('cqLookModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'cqLookModal';
+    modal.className = 'image-modal';
+    document.body.appendChild(modal);
+    document.addEventListener('keydown', cqLookViewerKeys);
+  }
+  modal.classList.remove('hidden');
+  const shown = view.focus ? view.parts.filter(part => part.number === view.focus) : view.parts;
+  const figure = part => {
+    const using = view.chosen === part.number;
+    return `
+      <figure class="cq-look-big ${using ? 'is-selected' : ''}">
+        ${part.src
+          ? `<img src="${part.src}" alt="Part ${part.number}" ${view.focus ? '' : `onclick="stepCqLookViewer(0, ${part.number})" title="Enlarge this part"`}>`
+          : '<div class="cq-look-missing">Not upscaled yet</div>'}
+        <figcaption>
+          <span>Part ${part.number} of ${view.parts.length} · ${part.label}</span>
+          <button type="button" class="${using ? '' : 'primary'}" ${using ? 'disabled' : ''} onclick="chooseCqLook(${part.number})">${using ? 'Using this look' : 'Use this look'}</button>
+        </figcaption>
+      </figure>`;
+  };
+  modal.innerHTML = `
+    <div class="image-modal-backdrop" onclick="closeCqLookViewer()"></div>
+    <div class="image-modal-panel cq-look-panel">
+      <div class="image-modal-heading">
+        <strong>Shot ${view.index + 1} look${view.focus ? ` · part ${view.focus}` : ' · all parts'}</strong>
+        <div class="actions">
+          ${view.focus ? `
+            <button type="button" onclick="stepCqLookViewer(-1)" ${view.focus === 1 ? 'disabled' : ''} aria-label="Previous part">◀</button>
+            <button type="button" onclick="stepCqLookViewer(1)" ${view.focus === view.parts.length ? 'disabled' : ''} aria-label="Next part">▶</button>
+            <button type="button" onclick="stepCqLookViewer(0, 0)">Side by side</button>`
+          : `<button type="button" onclick="stepCqLookViewer(0, 1)">One at a time</button>`}
+          <button type="button" class="${view.chosen ? '' : 'is-selected'}" onclick="chooseCqLook(0)" title="The look carries on from the start of the shot, as in other shots">Automatic</button>
+          <button type="button" onclick="closeCqLookViewer()">Close</button>
+        </div>
+      </div>
+      <div class="cq-look-grid" style="--cq-look-columns:${shown.length}">${shown.map(figure).join('')}</div>
+      <small class="cq-look-hint">Frames are from the latest upscale, at the middle of each part. ${view.focus ? 'Use ◀ ▶ or the arrow keys to flick between parts.' : 'Click a frame to enlarge it.'}</small>
+    </div>
+  `;
+}
+
+function stepCqLookViewer(delta, focus = null) {
+  if (!cqLookView) return;
+  const count = cqLookView.parts.length;
+  cqLookView.focus = focus !== null ? focus : Math.min(count, Math.max(1, cqLookView.focus + delta));
+  drawCqLookViewer();
+}
+
+function cqLookViewerKeys(event) {
+  const modal = document.getElementById('cqLookModal');
+  if (!cqLookView || !modal || modal.classList.contains('hidden')) return;
+  if (event.key === 'Escape') closeCqLookViewer();
+  else if (event.key === 'ArrowLeft' && cqLookView.focus) stepCqLookViewer(-1);
+  else if (event.key === 'ArrowRight' && cqLookView.focus) stepCqLookViewer(1);
+  else return;
+  event.preventDefault();
+}
+
+async function chooseCqLook(number) {
+  const view = cqLookView;
+  if (!view) return;
+  closeCqLookViewer();
+  // Part 1 is what Automatic already does, so it is stored as Automatic.
+  await saveShotCqAnchor(view.manifest, view.index, number > 1 ? String(number) : '');
+}
+
+function closeCqLookViewer() {
+  const modal = document.getElementById('cqLookModal');
+  if (modal) modal.classList.add('hidden');
+  cqLookView = null;
+}
+
+function bindCqLookThumbs() {
+  // Each part's thumbnail is the latest upscale at that part's middle frame.
+  document.querySelectorAll('img[data-cq-look-thumb]').forEach(async image => {
+    const query = new URLSearchParams({ index: image.dataset.index, time: image.dataset.time });
+    try {
+      const result = await api('/api/upscale-shot-comparison?' + query.toString());
+      if (result.ok && (result.after || result.before)) image.src = media(result.after || result.before);
+    } catch (err) {
+      // A missing thumbnail leaves the part's time label to identify it.
+    }
+  });
+}
+
+function upscaleShotCqGuidesHtml(row, manifest) {
+  const numbers = row.cq_guide_shot_numbers || [];
+  const id = `shotCqGuides_${row.index}`;
+  return `
+    <div class="upscale-shot-guides">
+      <label for="${id}" title="CQ renders this shot straight after a moment of each guide shot's finished render, so it carries on their colours, clothes and faces. Use shots from the same scene, ideally the same camera set-up (e.g. the other A shots of an A/B conversation). Guide shots are rendered first; changing a guide re-renders the shots it guides.">Guide shots</label>
+      <input id="${id}" type="text" inputmode="numeric" placeholder="e.g. 3, 7" value="${esc(numbers.join(', '))}" onchange="saveShotCqGuides(${jsArg(manifest)},${row.index},this.value)">
+      <small>${numbers.length ? `Follows the look of shot${numbers.length > 1 ? 's' : ''} ${numbers.join(', ')}` : 'None: CQ chooses this shot’s colours on its own'}</small>
     </div>
   `;
 }

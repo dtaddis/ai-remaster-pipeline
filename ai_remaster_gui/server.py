@@ -1613,7 +1613,9 @@ class PipelineApp:
         cmd = self.local_command_for(stage_key, run_flags=False) if outputs else []
         if not cmd:
             return ""
-        return stage_stamps.compute_stamp(cmd, outputs, redact_command_for_log(cmd))
+        return stage_stamps.compute_stamp(
+            cmd, outputs, redact_command_for_log(cmd), stage_stamps.stage_ignored_columns(stage_key),
+        )
 
     def stage_is_current(self, stage_key: str) -> bool:
         """True when every output exists and the stage last finished with exactly today's inputs.
@@ -2407,6 +2409,7 @@ class PipelineApp:
             add(["--cq-guide-strength", str(float(values.get("cq_guide_strength", "100") or 100) / 100.0)])
             add(["--cq-lora-strength", values.get("cq_lora_strength") or "1.0"])
             add(["--cq-chunk-seconds", values.get("cq_chunk_seconds") or "15"])
+            add(["--cq-continuity", str(float(values.get("cq_continuity", "100") or 100) / 100.0)])
             add(["--cq-seed", values.get("cq_seed") or "42"])
             # Empty arguments are dropped below, which would leave the flag without a value.
             if values.get("cq_prompt", "").strip():

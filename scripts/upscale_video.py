@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
+import hashlib
+import json
 import math
 import re
 import shutil
@@ -9,7 +12,7 @@ import subprocess
 import tempfile
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt_with_progress, wait_for_comfy
 from common import ROOT, copy_to_comfy_input, ffprobe_for, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
@@ -409,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cq-short-edge", type=int, default=720, help="Short edge the CQ Enhancer works at; the author's workflow uses 720.")
     parser.add_argument("--cq-frame-rate", choices=["resample", "retime"], default="resample", help="resample converts to 30 fps by repeating frames, as the author's workflow does; retime plays the original frames at 30 fps. Either way every source frame comes back once.")
     parser.add_argument("--cq-chunk-seconds", type=float, default=15.0, help="Longest source span per CQ render; chunks also split at --shot-manifest cuts, and longer shots split evenly. The author's workflow uses 153 frames at 30 fps (about 5 s).")
+    parser.add_argument("--cq-continuity", type=float, default=1.0, help="How firmly a CQ chunk inside a shot starts from the previous chunk's render of their overlap (0-1), so colours and invented detail carry across; 0 renders every chunk independently. Raise --overlap-frames for a longer hand-over.")
     parser.add_argument("--cq-colour", choices=["model", "source"], default="model", help="Default for shots without their own cq_luma_only: model keeps the CQ render's colour (it can colourise black-and-white film); source keeps the source's colour and takes only brightness detail. Applied when delivering, so changing it never re-renders.")
     parser.add_argument("--cq-seed", type=int, default=42)
     parser.add_argument("--cq-prompt", default="", help="The CQ LoRA needs no prompt. It samples without CFG, so there is no negative prompt.")
@@ -481,6 +485,10 @@ def read_upscale_shots(
             "strength": normalized_blend_strength(row.get("upscale_strength", ""), default_strength),
             # Blank inherits --cq-colour; only meaningful for a CQ-enhanced upscale.
             "luma_only": truthy(luma_text) if (luma_text := str(row.get("cq_luma_only") or "").strip()) else default_luma_only,
+            # Frames inside the shots whose CQ render this shot borrows its look from.
+            "guides": [int(frame) for frame in re.findall(r"\d+", str(row.get("cq_guide_shots") or ""))],
+            # The chunk of a long shot whose look the rest of the shot follows (1 = its first).
+            "anchor_chunk": int(anchor) if (anchor := str(row.get("cq_anchor_chunk") or "").strip()).isdigit() else 1,
             "fade": truthy(row.get("fade_to_next")),
             "crossfade_seconds": row.get("crossfade_seconds", ""),
         })
@@ -935,11 +943,15 @@ def ltx_ic_lora_prompt(
     seed: int,
     distilled_lora: str = "",
     distilled_lora_strength: float = CQ_DISTILLED_LORA_STRENGTH,
+    start_video: str = "",
+    start_frames: int = 0,
+    start_strength: float = 1.0,
 ) -> dict[str, Any]:
     """Build a video-only LTX 2.5 prompt that re-renders the loaded video through an IC-LoRA.
 
     The LoRA's reference_downscale_factor metadata sets the guide scale, so the same graph
-    serves the 2x Pixel Spatial upscaler and the same-size CQ Enhancer.
+    serves the 2x Pixel Spatial upscaler and the same-size CQ Enhancer. A start video
+    (8n+1 frames) is written over the first latent frames, so the render continues from it.
     """
     graph = {
         "1": {
@@ -1059,6 +1071,24 @@ def ltx_ic_lora_prompt(
             "inputs": {"model": ["2", 0], "lora_name": distilled_lora, "strength_model": float(distilled_lora_strength)},
         }
         graph["3"]["inputs"]["model"] = ["19", 0]
+    if start_video and start_frames > 0:
+        # The author's CQ workflow keeps a (bypassed) first-frame conditioning slot here,
+        # between the empty latent and the IC-LoRA guide.
+        graph["20"] = {
+            "class_type": "VHS_LoadVideo",
+            "inputs": {**graph["1"]["inputs"], "video": start_video, "frame_load_cap": int(start_frames)},
+        }
+        graph["21"] = {
+            "class_type": "LTXVImgToVideoInplace",
+            "inputs": {
+                "vae": ["8", 0],
+                "image": ["20", 0],
+                "latent": ["9", 0],
+                "strength": float(start_strength),
+                "bypass": False,
+            },
+        }
+        graph["10"]["inputs"]["latent"] = ["21", 0]
     return graph
 
 
@@ -1072,6 +1102,9 @@ LTX_IC_LORA_NODE_TYPES = {
     "LTXAddVideoICLoRAGuide": "ComfyUI-LTXVideo",
     "LTXVCropGuides": "ComfyUI-LTXVideo",
 }
+# Each guide shot adds about a third of a second to its shot's generation.
+CQ_MAX_GUIDE_SHOTS = 4
+CQ_LOCKED_START_NODE_TYPES = {**LTX_IC_LORA_NODE_TYPES, "LTXVImgToVideoInplace": "ComfyUI core (update ComfyUI)"}
 
 
 def ltx25_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int) -> Path:
@@ -1157,10 +1190,19 @@ def cq_chunk_plan(
             start = shot_start + length * piece // pieces
             end = shot_start + length * (piece + 1) // pieces
             lead = min(overlap, start - shot_start)
-            span = end - start + lead
-            working = span if mode == "retime" else int(math.ceil(span * CQ_FPS / max(fps, 0.001)))
+            working = cq_working_frames(end - start + lead, fps, mode)
             plan.append((start - lead, end, lead, max(9, int(math.ceil((working - 1) / 8.0)) * 8 + 1)))
     return plan
+
+
+def cq_working_frames(source_frames: int, fps: float, mode: str) -> int:
+    """30 fps working frames that cover ``source_frames`` source frames."""
+    return source_frames if mode == "retime" else int(math.ceil(source_frames * CQ_FPS / max(fps, 0.001)))
+
+
+def cq_source_frames_for(working_frames: int, fps: float, mode: str) -> int:
+    """Fewest source frames whose working-rate conversion yields ``working_frames`` frames of them alone."""
+    return working_frames if mode == "retime" else int(math.ceil((working_frames - 1) * fps / CQ_FPS)) + 1
 
 
 def cq_default_luma_only(args: argparse.Namespace) -> bool:
@@ -1181,6 +1223,181 @@ def cq_shot_cuts(args: argparse.Namespace, source: Path) -> list[int]:
     return sorted({int(shot["start"]) for shot in shots if 0 < int(shot["start"]) < frames - 1})
 
 
+def cq_working_rate_filter(mode: str) -> str:
+    """Filters taking a stream timed at its source rate onto the 30 fps working rate."""
+    # Retiming declares each source frame 1/30 s long; the fps filter then only snaps those
+    # timestamps onto the exact 30 fps grid, which the millisecond timebase cannot hold.
+    return f"fps={CQ_FPS:g}" if mode == "resample" else f"setpts=N/({CQ_FPS:g}*TB),fps={CQ_FPS:g}"
+
+
+def cq_continuity_frames(lead: int, fps: float, mode: str) -> int:
+    """Working frames that show only a chunk's lead-in, rounded down to LTX's 8n+1 frame counts."""
+    if lead <= 0:
+        return 0
+    available = lead if mode == "retime" else int((lead - 1) * CQ_FPS / max(fps, 0.001)) + 1
+    return (available - 1) // 8 * 8 + 1
+
+
+def cq_reverse_filter(fps: float, reverse: bool) -> str:
+    """Filters that play a (scaled, source-rate) stream backwards, or nothing."""
+    return f"reverse,setpts=N/({fps:.8f}*TB)," if reverse else ""
+
+
+def prepare_cq_working_frames(
+    ffmpeg: str, video: Path, target: Path, start: int, end: int, frames: int, fps: float, mode: str,
+    width: int, height: int, reverse: bool = False,
+) -> None:
+    """Source-rate frames [start, end) of ``video`` as the first ``frames`` working-rate frames.
+
+    They are timed exactly as prepare_cq_chunk times a chunk, so the previous chunk's render of
+    a lead-in lines up frame for frame with the next chunk's input. ``reverse`` plays them
+    backwards, matching a chunk prepared in reverse.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    vf = (
+        f"trim=start_frame={max(0, start)}:end_frame={end},setpts=N/({fps:.8f}*TB),"
+        f"scale={width}:{height}:flags=lanczos,setsar=1,{cq_reverse_filter(fps, reverse)}"
+        f"{cq_working_rate_filter(mode)},trim=end_frame={frames}"
+    )
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(video), "-vf", vf, "-an", "-r", f"{CQ_FPS:g}", "-fps_mode", "cfr",
+            "-frames:v", str(frames), *working_codec_args(), *working_container_args(partial), str(partial),
+        ],
+        check=True,
+    )
+    replace_with_retry(partial, target, f"CQ working frames {target.name}")
+
+
+def concat_cq_working(ffmpeg: str, parts: list[Path], target: Path, frames: int) -> None:
+    """Join working-rate clips end to end into one 30 fps clip of ``frames`` frames."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    inputs = [item for part in parts for item in ("-i", str(part))]
+    joined = "".join(f"[{index}:v]" for index in range(len(parts)))
+    subprocess.run(
+        [
+            ffmpeg, "-y", *inputs, "-filter_complex", f"{joined}concat=n={len(parts)}:v=1:a=0,setpts=N/({CQ_FPS:g}*TB)",
+            "-an", "-r", f"{CQ_FPS:g}", "-fps_mode", "cfr", "-frames:v", str(frames),
+            *working_codec_args(), *working_container_args(partial), str(partial),
+        ],
+        check=True,
+    )
+    replace_with_retry(partial, target, f"CQ joined clip {target.name}")
+
+
+def cq_thumbnails(ffmpeg: str, video: Path, start: int, end: int) -> Any:
+    """Tiny normalised greyscale frames [start, end) of ``video``, for matching shots by eye."""
+    import numpy as np
+
+    width, height = 32, 18
+    result = subprocess.run(
+        [
+            ffmpeg, "-v", "error", "-i", str(video), "-vf",
+            f"trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS,scale={width}:{height}:flags=area,format=gray",
+            "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-",
+        ],
+        check=True, capture_output=True,
+    )
+    frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, height * width).astype(np.float32)
+    # Exposure differences between shots of one set-up should not hide the match.
+    frames -= frames.mean(axis=1, keepdims=True)
+    frames /= frames.std(axis=1, keepdims=True) + 1.0
+    return frames
+
+
+def cq_guide_window(
+    distances: list[float], guide_start: int, chunks: list[tuple[int, int]], length: int,
+) -> tuple[int, int] | None:
+    """Source frames [start, end) of a guide shot to show before a guided shot's first frame.
+
+    ``distances`` scores each frame of the guide shot (from ``guide_start``) against that first
+    frame. The window ends on the best match, so the cut it makes looks like a cut within one
+    set-up, and it lies inside one rendered chunk.
+    """
+    best: tuple[float, int] | None = None
+    for chunk_start, chunk_end in chunks:
+        for frame in range(max(chunk_start + length - 1, guide_start), chunk_end):
+            offset = frame - guide_start
+            if 0 <= offset < len(distances) and (best is None or distances[offset] < best[0]):
+                best = (distances[offset], frame)
+    return None if best is None else (best[1] - length + 1, best[1] + 1)
+
+
+def cq_render_order(shot_count: int, guides: dict[int, list[int]]) -> tuple[list[int], dict[int, list[int]]]:
+    """Shots in render order, each after its guide shots, and the guides each one can use.
+
+    Guide shots that lead back to the shot itself are dropped from it; the earliest such shot
+    renders with only the guides already rendered.
+    """
+    remaining = list(range(shot_count))
+    done: set[int] = set()
+    order: list[int] = []
+    usable: dict[int, list[int]] = {}
+    while remaining:
+        shot = next((shot for shot in remaining if all(guide in done for guide in guides.get(shot, []))), remaining[0])
+        usable[shot] = [guide for guide in guides.get(shot, []) if guide in done]
+        remaining.remove(shot)
+        done.add(shot)
+        order.append(shot)
+    return order, usable
+
+
+def cq_shot_chunk_order(count: int, anchor: int) -> list[tuple[int, str | None]]:
+    """A shot's chunk positions in render order, each with how it joins the chunks already done.
+
+    The anchor (1-based) renders on its own (None), the chunks after it continue "forward" from
+    the one before, and then the chunks before it continue "backward" from the one after.
+    """
+    if count <= 0:
+        return []
+    first = max(0, min(count - 1, anchor - 1))
+    return [
+        (first, None),
+        *((piece, "forward") for piece in range(first + 1, count)),
+        *((piece, "backward") for piece in range(first - 1, -1, -1)),
+    ]
+
+
+def cq_anchor_chunks(args: argparse.Namespace, source: Path) -> dict[int, int]:
+    """Shots anchored on a later chunk, as {shot start frame: chunk number (1-based)}."""
+    manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
+    if manifest is None or not manifest.is_file():
+        return {}
+    info = video_info(source)
+    frames = int(info["frames"])
+    bounds = [0, *cq_shot_cuts(args, source), frames]
+    anchors: dict[int, int] = {}
+    for shot in read_upscale_shots(manifest, frames, args.fps or float(info["fps"]), 1.0):
+        if shot["anchor_chunk"] > 1:
+            start = bounds[bisect.bisect_right(bounds, min(frames - 1, int(shot["start"]))) - 1]
+            anchors[start] = shot["anchor_chunk"]
+    return anchors
+
+
+def cq_guide_shots(args: argparse.Namespace, source: Path) -> dict[int, list[int]]:
+    """Guide shots from the shot list, as {shot start frame: [guide shot start frames]}."""
+    manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
+    if manifest is None or not manifest.is_file():
+        return {}
+    info = video_info(source)
+    frames = int(info["frames"])
+    bounds = [0, *cq_shot_cuts(args, source), frames]
+
+    def shot_start(frame: int) -> int:
+        return bounds[bisect.bisect_right(bounds, max(0, min(frames - 1, frame))) - 1]
+
+    guides: dict[int, list[int]] = {}
+    for shot in read_upscale_shots(manifest, frames, args.fps or float(info["fps"]), 1.0):
+        own = shot_start(int(shot["start"]))
+        picked = [start for start in dict.fromkeys(shot_start(frame) for frame in shot["guides"]) if start != own]
+        if picked:
+            guides[own] = picked[:CQ_MAX_GUIDE_SHOTS]
+    return guides
+
+
 def prepare_cq_chunk(
     ffmpeg: str,
     source: Path,
@@ -1194,17 +1411,19 @@ def prepare_cq_chunk(
     mode: str,
     force: bool,
     source_fingerprint: dict[str, Any],
+    reverse: bool = False,
 ) -> None:
+    """Source frames [start, end) at the working size and rate, padded to ``model_frames``.
+
+    ``reverse`` plays them backwards, so a chunk can start from the chunk after it.
+    """
     if target.exists() and not force and split_matches_source(target, source_fingerprint):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
-    # Retiming declares each source frame 1/30 s long; the fps filter then only snaps those
-    # timestamps onto the exact 30 fps grid, which the millisecond timebase cannot hold.
-    to_working_rate = f"fps={CQ_FPS:g}" if mode == "resample" else f"setpts=N/({CQ_FPS:g}*TB),fps={CQ_FPS:g}"
     vf = (
         f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),"
-        f"scale={width}:{height}:flags=lanczos,setsar=1,{to_working_rate},"
+        f"scale={width}:{height}:flags=lanczos,setsar=1,{cq_reverse_filter(fps, reverse)}{cq_working_rate_filter(mode)},"
         f"tpad=stop_mode=clone:stop={model_frames},trim=end_frame={model_frames}"
     )
     subprocess.run(
@@ -1230,16 +1449,24 @@ def normalize_cq_chunk(
     keep_frames: int,
     fps: float,
     mode: str,
+    skip_working: int = 0,
+    reverse: bool = False,
 ) -> None:
-    """Return a 30 fps CQ render to the source rate, one output frame per source frame."""
+    """Return a 30 fps CQ render to the source rate, one output frame per source frame.
+
+    ``skip_working`` working frames (a guide-shot prefix) are dropped first; ``reverse`` turns
+    a chunk rendered backwards the right way round.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
     # Resampling repeated some source frames; the nearest working frame to each source
     # timestamp is always a render of that source frame, because 30 fps is the faster rate.
     to_source_rate = f"setpts=N/({CQ_FPS:g}*TB),fps={fps:.8f}" if mode == "resample" else f"setpts=N/({fps:.8f}*TB),fps={fps:.8f}"
+    skip = f"trim=start_frame={skip_working}," if skip_working > 0 else ""
+    forwards = f",reverse,setpts=N/({fps:.8f}*TB)" if reverse else ""
     vf = (
-        f"{to_source_rate},trim=start_frame={trim_start}:end_frame={trim_start + keep_frames},"
-        f"setpts=N/({fps:.8f}*TB),scale={width}:{height}:flags=lanczos,setsar=1"
+        f"{skip}{to_source_rate},trim=start_frame={trim_start}:end_frame={trim_start + keep_frames},"
+        f"setpts=N/({fps:.8f}*TB),scale={width}:{height}:flags=lanczos,setsar=1{forwards}"
     )
     subprocess.run(
         [
@@ -1251,7 +1478,11 @@ def normalize_cq_chunk(
     replace_with_retry(partial, target, f"CQ normalized chunk {target.name}")
 
 
-def cq_run(args: argparse.Namespace, source: Path, partial: Path, width: int, height: int, frames: int) -> Path:
+def cq_run(
+    args: argparse.Namespace, source: Path, partial: Path, width: int, height: int, frames: int,
+    locked: tuple[Path, int, float] | None = None,
+) -> Path:
+    """Render one CQ chunk; ``locked`` (video, frame count, strength) fixes its first frames to an earlier render."""
     comfy_dir = resolve_path(args.comfy_dir)
     comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
     if not (comfy_dir / "main.py").exists():
@@ -1259,8 +1490,10 @@ def cq_run(args: argparse.Namespace, source: Path, partial: Path, width: int, he
     dev_base = args.cq_base == "dev"
     ensure_ltx25_cq_enhancer_models(comfy_dir, dev_base=dev_base)
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
-    ensure_node_types(args.comfy_url, LTX_IC_LORA_NODE_TYPES, "LTX 2.5 CQ enhancement")
+    node_types = CQ_LOCKED_START_NODE_TYPES if locked else LTX_IC_LORA_NODE_TYPES
+    ensure_node_types(args.comfy_url, node_types, "LTX 2.5 CQ enhancement")
     video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale_cq")
+    start_video = copy_to_comfy_input(locked[0], comfy_dir, "arp_upscale_cq") if locked else ""
     prefix = f"arp_upscale/{safe_stem(source.name)}_cq_{width}x{height}"
     prompt = ltx_ic_lora_prompt(
         video_name, CQ_FPS, frames, width, height, prefix,
@@ -1275,6 +1508,9 @@ def cq_run(args: argparse.Namespace, source: Path, partial: Path, width: int, he
         guide_strength=args.cq_guide_strength,
         cfg=1.0,
         seed=args.cq_seed,
+        start_video=start_video,
+        start_frames=locked[1] if locked else 0,
+        start_strength=locked[2] if locked else 1.0,
     )
     print(f"Sending LTX 2.5 CQ enhancer prompt nodes: {sorted(node['class_type'] for node in prompt.values())}", flush=True)
     history = queue_prompt_with_progress(args.comfy_url, prompt, args.poll_seconds, {"15", "17"})
@@ -1316,47 +1552,255 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
         flush=True,
     )
     # Within a shot, each chunk keeps its overlap lead-in: both neighbours rendered those frames,
-    # and dissolving between the two renders hides the jump between independent generations.
-    # A chunk starting a shot has no lead-in and simply cuts, as the source does.
-    chunks: list[tuple[Path, int]] = []
-    digits = max(4, int(math.log10(len(plan))) + 1)
-    for index, (start_frame, end_frame, trim_start, model_frames) in enumerate(plan):
-        name = f"{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}"
-        chunk_input = chunk_dir / f"cq_input_{name}.mkv"
-        chunk_raw = chunk_dir / f"cq_raw_{name}.mp4"
-        chunk_final = chunk_dir / f"cq_render_{name}.mkv"
-        print(
-            f"CQ enhance chunk {index + 1}/{len(plan)}: frames {start_frame}-{end_frame}, "
-            f"crossfade {trim_start}, LTX window {model_frames}",
-            flush=True,
-        )
-        prepare_cq_chunk(
-            ffmpeg, source, chunk_input, start_frame, end_frame, model_frames, fps,
-            width, height, mode, args.force, source_fingerprint,
-        )
-        chunk_sig = cq_signature(args, chunk_input, width, height)
-        if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, width, height):
-            print(f"Reuse CQ enhanced chunk: {chunk_final}", flush=True)
-            chunks.append((chunk_final, trim_start))
-            continue
-        reusable = None if args.force else find_reusable_upscale_chunk(chunk_dir, chunk_final.name, chunk_sig, width, height)
-        if reusable:
-            shutil.copy2(reusable, chunk_final)
-            shutil.copy2(reusable.with_suffix(reusable.suffix + ".sig.json"), chunk_final.with_suffix(chunk_final.suffix + ".sig.json"))
-            print(f"Reuse CQ enhanced chunk from compatible cache: {reusable}", flush=True)
-            chunks.append((chunk_final, trim_start))
-            continue
-        cq_run(args, chunk_input, chunk_raw, width, height, model_frames)
-        normalize_cq_chunk(ffmpeg, chunk_raw, chunk_final, width, height, 0, end_frame - start_frame, fps, mode)
-        write_signature(chunk_final, chunk_sig)
-        print(f"Wrote CQ enhanced chunk: {chunk_final}", flush=True)
-        chunk_raw.unlink(missing_ok=True)
-        chunks.append((chunk_final, trim_start))
+    # and dissolving between the two renders hides the jump between them. With continuity on, a
+    # chunk's lead-in starts from the previous chunk's render of it, so it carries on that chunk's
+    # colours and invented detail instead of guessing afresh. A chunk starting a shot has no
+    # lead-in and simply cuts, as the source does; with guide shots it is rendered after them,
+    # straight after a few of their rendered frames, so it carries their look across the cut.
+    # A shot's anchor chunk (its first unless the shot list picks another) renders first; the
+    # chunks before it are rendered backwards, each starting from the chunk after it.
     frames = int(info["frames"])
+    bounds = [0, *shot_cuts, frames]
+    shot_chunks: dict[int, list[int]] = {}
+    for index, chunk in enumerate(plan):
+        shot_chunks.setdefault(bisect.bisect_right(bounds, chunk[0]) - 1, []).append(index)
+    guides = {
+        bisect.bisect_right(bounds, shot_start) - 1: [bisect.bisect_right(bounds, guide) - 1 for guide in guide_starts]
+        for shot_start, guide_starts in cq_guide_shots(args, source).items()
+    }
+    order, usable_guides = cq_render_order(len(bounds) - 1, guides)
+    anchors = {
+        bisect.bisect_right(bounds, shot_start) - 1: number
+        for shot_start, number in cq_anchor_chunks(args, source).items()
+    }
+    rendered: dict[int, Path] = {}
+    digits = max(4, int(math.log10(len(plan))) + 1)
+    position = 0
+    for shot in order:
+        indices = shot_chunks.get(shot, [])
+        for piece, direction in cq_shot_chunk_order(len(indices), anchors.get(shot, 1)):
+            index = indices[piece]
+            position += 1
+            start_frame, end_frame, trim_start, model_frames = plan[index]
+            name = f"{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}"
+            # A chunk rendered backwards starts from the chunk after it, so it can continue only
+            # when that chunk overlaps it; it is then prepared, and rendered, in reverse.
+            following_lead = plan[index + 1][2] if direction == "backward" else 0
+            backwards = bool(following_lead and args.cq_continuity > 0)
+            chunk_input = chunk_dir / f"cq_input_{'rev_' if backwards else ''}{name}.mkv"
+            chunk_raw = chunk_dir / f"cq_raw_{name}.mp4"
+            chunk_final = chunk_dir / f"cq_render_{name}.mkv"
+            # Progress counts in render order, which guide shots can take out of timeline order.
+            print(
+                f"CQ enhance chunk {position}/{len(plan)}: frames {start_frame}-{end_frame}, "
+                f"crossfade {trim_start}, LTX window {model_frames}",
+                flush=True,
+            )
+            guide_shots = usable_guides.get(shot, []) if direction is None else []
+            prefix = prepare_cq_guide_prefix(
+                ffmpeg, source, chunk_dir, name, start_frame, guide_shots, bounds, shot_chunks, plan, rendered,
+                fps, mode, width, height,
+            ) if guide_shots else None
+            temporary: list[Path] = []
+            locked = None
+            skip_working = 0
+            if prefix:
+                # The shot's own frames start on a latent boundary, straight after the guide frames.
+                body_frames = int(math.ceil(cq_working_frames(end_frame - start_frame, fps, mode) / 8.0)) * 8
+                body = chunk_dir / f"cq_body_{name}.mkv"
+                prepare_cq_chunk(
+                    ffmpeg, source, body, start_frame, end_frame, body_frames, fps,
+                    width, height, mode, args.force, source_fingerprint,
+                )
+                chunk_input = chunk_dir / f"cq_guided_{name}.mkv"
+                locked_video = chunk_dir / f"cq_locked_{name}.mkv"
+                concat_cq_working(ffmpeg, [*prefix["sources"], body], chunk_input, prefix["frames"] + body_frames)
+                concat_cq_working(ffmpeg, prefix["renders"], locked_video, prefix["frames"])
+                temporary = [*prefix["sources"], *prefix["renders"], chunk_input, locked_video]
+                model_frames = prefix["frames"] + body_frames
+                skip_working = prefix["frames"]
+                locked = (locked_video, prefix["frames"], 1.0)
+            else:
+                prepare_cq_chunk(
+                    ffmpeg, source, chunk_input, start_frame, end_frame, model_frames, fps,
+                    width, height, mode, args.force, source_fingerprint, reverse=backwards,
+                )
+            chunk_sig = cq_signature(args, chunk_input, width, height)
+            if prefix:
+                chunk_sig["guides"] = prefix["signature"]
+            continuity_frames = 0
+            if args.cq_continuity > 0 and direction == "forward":
+                continuity_frames = cq_continuity_frames(trim_start, fps, mode)
+                previous_frames = plan[index - 1][1] - plan[index - 1][0]
+                # The previous chunk's render of this chunk's lead-in: its last frames.
+                handover = (rendered[index - 1], previous_frames - trim_start, previous_frames)
+            elif backwards:
+                continuity_frames = cq_continuity_frames(following_lead, fps, mode)
+                # The next chunk's render of its own lead-in, which is this chunk's last frames.
+                handover = (rendered[index + 1], 0, following_lead)
+            if continuity_frames:
+                continuity = chunk_dir / f"cq_continue_{name}.mkv"
+                neighbour_sha256 = file_fingerprint(handover[0])["sha256"]
+                # Only continued chunks carry this, so a shot's anchor chunk keeps its identity.
+                chunk_sig["continuity"] = {
+                    "strength": args.cq_continuity,
+                    "frames": continuity_frames,
+                    **(
+                        {"direction": "backward", "next_sha256": neighbour_sha256}
+                        if backwards else {"previous_sha256": neighbour_sha256}
+                    ),
+                }
+            try:
+                if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, width, height):
+                    print(f"Reuse CQ enhanced chunk: {chunk_final}", flush=True)
+                    rendered[index] = chunk_final
+                    continue
+                reusable = None if args.force else find_reusable_upscale_chunk(chunk_dir, chunk_final.name, chunk_sig, width, height)
+                if reusable:
+                    shutil.copy2(reusable, chunk_final)
+                    shutil.copy2(reusable.with_suffix(reusable.suffix + ".sig.json"), chunk_final.with_suffix(chunk_final.suffix + ".sig.json"))
+                    print(f"Reuse CQ enhanced chunk from compatible cache: {reusable}", flush=True)
+                    rendered[index] = chunk_final
+                    continue
+                if continuity_frames:
+                    prepare_cq_working_frames(
+                        ffmpeg, handover[0], continuity, handover[1], handover[2],
+                        continuity_frames, fps, mode, width, height, reverse=backwards,
+                    )
+                    temporary.append(continuity)
+                    locked = (continuity, continuity_frames, args.cq_continuity)
+                    neighbour = "backwards from the next chunk's first" if backwards else "from the previous chunk's last"
+                    print(f"Continuing {neighbour} {continuity_frames} working frame(s)", flush=True)
+                if prefix:
+                    shots_text = ", ".join(str(guide + 1) for guide in prefix["shots"])
+                    print(f"Guided by shot(s) {shots_text}: {prefix['frames']} rendered frame(s) before the cut", flush=True)
+                cq_run(args, chunk_input, chunk_raw, width, height, model_frames, locked)
+                normalize_cq_chunk(
+                    ffmpeg, chunk_raw, chunk_final, width, height, 0, end_frame - start_frame, fps, mode, skip_working,
+                    reverse=backwards,
+                )
+                write_signature(chunk_final, chunk_sig)
+                print(f"Wrote CQ enhanced chunk: {chunk_final}", flush=True)
+                chunk_raw.unlink(missing_ok=True)
+                rendered[index] = chunk_final
+            finally:
+                for path in temporary:
+                    path.unlink(missing_ok=True)
+    chunks = [(rendered[index], plan[index][2]) for index in range(len(plan))]
     # The render keeps CQ's colour; "source colour" (luma only) is applied per shot at delivery.
     crossfade_chunks(ffmpeg, chunks, fps, frames, source, target, out_width, out_height)
     write_signature(target, sig)
+    write_cq_chunk_map(target, plan, rendered, fps, (out_width, out_height))
     return target
+
+
+def cq_chunk_map_path(render: Path) -> Path:
+    return render.with_suffix(render.suffix + ".chunks.json")
+
+
+def write_cq_chunk_map(
+    render: Path, plan: list[tuple[int, int, int, int]], rendered: dict[int, Path], fps: float, size: tuple[int, int],
+) -> None:
+    """Record which chunk render made which frames of a stitched CQ render.
+
+    Re-stitching re-encodes the whole film, and a lossy encode changes every frame a little, so
+    the finishing pass cannot tell an untouched stretch by its pixels; it asks this map instead.
+    """
+    payload = {
+        "render_sha256": file_fingerprint(render)["sha256"],
+        "fps": fps,
+        "size": list(size),
+        "chunks": [
+            [start, end, lead, file_fingerprint(rendered[index])["sha256"]]
+            for index, (start, end, lead, _model_frames) in enumerate(plan)
+        ],
+    }
+    cq_chunk_map_path(render).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def cq_range_fingerprint(
+    render: Path, render_fingerprint: dict[str, Any], prepared: dict[str, Any],
+) -> Callable[[int, int], dict[str, Any]] | None:
+    """Content identity of frames [start, end) of a stitched CQ render: the chunk renders that
+    made them. ``prepared`` describes any whole-film step between the render and the finisher.
+
+    None when the render has no chunk map of its own (made before the map existed); the
+    finisher then keys its splits on the whole file, as before.
+    """
+    try:
+        chunk_map = json.loads(cq_chunk_map_path(render).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if chunk_map.get("render_sha256") != render_fingerprint.get("sha256"):
+        return None
+
+    def fingerprint(start: int, end: int) -> dict[str, Any]:
+        makers = [chunk for chunk in chunk_map["chunks"] if chunk[0] < end and start < chunk[1]]
+        payload = json.dumps(
+            {"fps": chunk_map["fps"], "size": chunk_map["size"], "prepared": prepared, "range": [start, end], "chunks": makers},
+            sort_keys=True,
+        )
+        return {"size": -1, "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest()}
+
+    return fingerprint
+
+
+def prepare_cq_guide_prefix(
+    ffmpeg: str, source: Path, chunk_dir: Path, name: str, shot_start: int, guide_shots: list[int],
+    bounds: list[int], shot_chunks: dict[int, list[int]], plan: list[tuple[int, int, int, int]],
+    rendered: dict[int, Path], fps: float, mode: str, width: int, height: int,
+) -> dict[str, Any] | None:
+    """Working-rate frames of each guide shot to play before a shot: its source and its CQ render.
+
+    From each guide shot it takes the frames ending on the one most like the shot's first frame;
+    the most alike shot goes last, right before the cut. The first guide gives 9 frames and each
+    further one 8, so the prefix is a whole number of LTX latents (8n+1 frames).
+    """
+    import numpy as np
+
+    first = cq_thumbnails(ffmpeg, source, shot_start, shot_start + 1)[0]
+    candidates = []
+    for guide in guide_shots:
+        distances = np.abs(cq_thumbnails(ffmpeg, source, bounds[guide], bounds[guide + 1]) - first).mean(axis=1)
+        candidates.append((float(distances.min()), guide, [float(value) for value in distances]))
+    candidates.sort(key=lambda item: -item[0])
+    sources: list[Path] = []
+    renders: list[Path] = []
+    signature: list[dict[str, Any]] = []
+    shots: list[int] = []
+    total = 0
+    for _score, guide, distances in candidates:
+        frames = 8 if sources else 9
+        length = cq_source_frames_for(frames, fps, mode)
+        chunk_ranges = [(plan[index][0], plan[index][1]) for index in shot_chunks.get(guide, [])]
+        window = cq_guide_window(distances, bounds[guide], chunk_ranges, length)
+        if window is None:
+            print(f"Guide shot {guide + 1} is too short to guide with; skipping it", flush=True)
+            continue
+        chunk_index = next(
+            index for index in shot_chunks[guide] if plan[index][0] <= window[0] and window[1] <= plan[index][1]
+        )
+        render = rendered[chunk_index]
+        offset = plan[chunk_index][0]
+        part = len(sources)
+        source_part = chunk_dir / f"cq_guide_{name}_{part}_source.mkv"
+        render_part = chunk_dir / f"cq_guide_{name}_{part}_render.mkv"
+        prepare_cq_working_frames(ffmpeg, source, source_part, window[0], window[1], frames, fps, mode, width, height)
+        prepare_cq_working_frames(
+            ffmpeg, render, render_part, window[0] - offset, window[1] - offset, frames, fps, mode, width, height,
+        )
+        sources.append(source_part)
+        renders.append(render_part)
+        shots.append(guide)
+        signature.append({
+            "shot_start": bounds[guide],
+            "window": list(window),
+            "render_sha256": file_fingerprint(render)["sha256"],
+        })
+        total += frames
+    if not sources:
+        return None
+    return {"sources": sources, "renders": renders, "frames": total, "signature": signature, "shots": shots}
 
 
 def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any]:
@@ -1365,6 +1809,10 @@ def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any
     return {
         **cq_signature(args, source, width, height),
         "shot_cuts": cq_shot_cuts(args, source),
+        **({"guide_shots": [[shot, guides] for shot, guides in sorted(guide_shots.items())]} if (guide_shots := cq_guide_shots(args, source)) else {}),
+        **({"anchor_chunks": [[shot, number] for shot, number in sorted(anchors.items())]} if (anchors := cq_anchor_chunks(args, source)) else {}),
+        # Left out when off, so renders made before continuity existed stay reusable.
+        **({"continuity": args.cq_continuity} if args.cq_continuity > 0 else {}),
         # Always CQ's own colour now: luma-only moved to delivery. Older "model" renders stay reusable.
         "colour": "model",
         "output_width": out_width,
@@ -1665,7 +2113,9 @@ def chunked_standard_upscale_run(
     source_fingerprint: dict[str, Any],
     method: str,
     audio_source: Path | None = None,
+    range_fingerprint: Callable[[int, int], dict[str, Any]] | None = None,
 ) -> None:
+    """Upscale ``source`` in chunks; ``range_fingerprint`` keys each chunk's split on what made its frames."""
     if method not in {"flashvsr", "seedvr2"}:
         raise ValueError(f"Unsupported standard upscale method: {method}")
     runner = flashvsr_run if method == "flashvsr" else seedvr2_run
@@ -1708,7 +2158,8 @@ def chunked_standard_upscale_run(
         chunk_raw = chunk_dir / f"raw_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_final = chunk_dir / f"final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mkv"
         print(f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
-        split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, source_fingerprint)
+        split_fingerprint = range_fingerprint(start_frame, end_frame) if range_fingerprint else source_fingerprint
+        split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, split_fingerprint)
         chunk_sig = signature(args, chunk_input, output_width, output_height)
         if not args.force and resumable_upscale_chunk(chunk_final, chunk_sig, output_width, output_height):
             print(f"Reuse upscaled chunk: {chunk_final}", flush=True)
@@ -1740,6 +2191,7 @@ def chunked_ltx25_run(
     output_height: int,
     info: dict[str, Any],
     source_fingerprint: dict[str, Any],
+    range_fingerprint: Callable[[int, int], dict[str, Any]] | None = None,
 ) -> None:
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = args.fps or float(info["fps"])
@@ -1776,7 +2228,8 @@ def chunked_ltx25_run(
         )
         prepare_ltx25_chunk(
             ffmpeg, source, chunk_input, start_frame, end_frame, model_frames, fps,
-            reference_width, reference_height, args.force, source_fingerprint,
+            reference_width, reference_height, args.force,
+            range_fingerprint(start_frame, end_frame) if range_fingerprint else source_fingerprint,
         )
         chunk_sig = signature(args, chunk_input, output_width, output_height)
         if not args.force and resumable_upscale_chunk(
@@ -1983,10 +2436,12 @@ def run(args: argparse.Namespace) -> int:
         processing_source = source
         processing_info = info
         processing_fingerprint = sig["source_fingerprint"]
+        range_fingerprint = None
         if method == "ltx25cq":
             processing_source = cq_enhance(args, source, info, sig["source_fingerprint"])
             processing_info = video_info(processing_source)
             processing_fingerprint = file_fingerprint(processing_source)
+            cq_render, cq_render_fingerprint = processing_source, processing_fingerprint
             print(f"Finishing CQ-enhanced video with {BACKEND_LABELS[backend]}: {processing_source}", flush=True)
         if backend == "flashvsr" and args.flashvsr_pre_downscale:
             processing_source = pre_downscale_source(
@@ -1994,10 +2449,17 @@ def run(args: argparse.Namespace) -> int:
             )
             processing_info = video_info(processing_source)
             processing_fingerprint = file_fingerprint(processing_source)
+        if method == "ltx25cq":
+            # A guide shot or anchor change re-renders a few CQ chunks but re-encodes the whole
+            # stitched render; the finisher redoes only the chunks those CQ chunks feed.
+            range_fingerprint = cq_range_fingerprint(
+                cq_render, cq_render_fingerprint,
+                {"width": int(processing_info["width"]), "height": int(processing_info["height"])},
+            )
         if backend == "ltx25":
             chunked_ltx25_run(
                 backend_args, processing_source, ai_output, output_width, output_height, processing_info,
-                processing_fingerprint,
+                processing_fingerprint, range_fingerprint,
             )
         elif backend == "lanczos":
             lanczos_upscale_run(find_ffmpeg(args.ffmpeg), processing_source, ai_output, output_width, output_height, source)
@@ -2005,6 +2467,7 @@ def run(args: argparse.Namespace) -> int:
             chunked_standard_upscale_run(
                 backend_args, processing_source, ai_output, output_width, output_height,
                 processing_info, processing_fingerprint, backend, audio_source=source,
+                range_fingerprint=range_fingerprint,
             )
         write_signature(ai_output, sig)
     else:

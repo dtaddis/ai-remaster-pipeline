@@ -216,6 +216,8 @@ const FIELD_DESCRIPTIONS = {
     'Strength of the CQ Enhancer LoRA. The author uses 1.0.',
   'upscale.cq_chunk_seconds':
     'Longest span the CQ Enhancer renders in one generation. With a shot list, each shot is rendered whole so all its frames match, and only a shot longer than this is split into equal pieces that dissolve into each other across the Overlap frames; shot changes simply cut. Without a shot list the film is split into equal pieces up to this length. Longer chunks take more VRAM and time (the cost grows faster than the length), and the LoRA author renders about 5 seconds (153 frames at 30 fps).',
+  'upscale.cq_continuity':
+    'When a long shot is split into several CQ chunks, each chunk after the first starts from the previous chunk’s render of the Overlap frames, so it carries on the same colours, clothing and faces instead of inventing them afresh. 100 locks those frames; 0 renders every chunk independently (the old behaviour). Raise Overlap frames to 16-24 for a longer hand-over. Chunks are then rendered in order, and re-rendering one re-renders the rest of its shot.',
   'upscale.cq_seed':
     'Controls the detail the CQ Enhancer synthesizes. Keep it fixed for reproducible output; change it to try another restoration.',
   'upscale.cq_prompt':
