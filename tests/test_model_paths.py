@@ -223,5 +223,106 @@ shared:
             )
 
 
+class _DroppingHub:
+    """Stands in for httpx.Client: serves `data`, honours Range (unless told not to), and closes
+    the connection after `per_connection` bytes, as the Hub's CDN did on multi-GB files."""
+
+    def __init__(self, data: bytes, per_connection: int, honour_range: bool = True, status: int = 200) -> None:
+        self.data, self.per_connection, self.honour_range, self.status = data, per_connection, honour_range, status
+        self.ranges: list[str] = []
+
+    def client(self, *args, **kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def stream(self, method: str, url: str, headers: dict | None = None):
+        import contextlib
+
+        import httpx
+
+        hub = self
+        start = 0
+        range_header = (headers or {}).get("Range", "")
+        hub.ranges.append(range_header)
+        if range_header and hub.honour_range:
+            start = int(range_header.split("=")[1].rstrip("-"))
+
+        class Response:
+            status_code = hub.status if hub.status != 200 else (206 if start else 200)
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    request = httpx.Request("GET", url)
+                    raise httpx.HTTPStatusError("denied", request=request, response=httpx.Response(self.status_code, request=request))
+
+            def iter_bytes(self, size: int):
+                body = hub.data[start:]
+                yield body[: hub.per_connection]
+                if len(body) > hub.per_connection:
+                    raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+        return contextlib.nullcontext(Response())
+
+
+class ResumableDownloadTests(unittest.TestCase):
+    def run_download(self, hub: _DroppingHub, size: int, cache: Path) -> Path:
+        import httpx
+        import huggingface_hub  # noqa: F401  (its annotations use httpx.Client, so import before patching)
+        import huggingface_hub.utils  # noqa: F401
+
+        with (
+            mock.patch.object(httpx, "Client", hub.client),
+            mock.patch("huggingface_hub.utils.build_hf_headers", return_value={"authorization": "Bearer hf_test"}),
+            mock.patch.object(dependency_manager.time, "sleep"),
+        ):
+            return dependency_manager.resumable_hf_download("owner/repo", "dir/model.safetensors", cache, size)
+
+    def test_dropped_connections_resume_where_they_stopped(self) -> None:
+        data = bytes(range(256)) * 40
+        hub = _DroppingHub(data, per_connection=3000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.run_download(hub, len(data), Path(tmp))
+            self.assertEqual(path.read_bytes(), data)
+            self.assertFalse(path.with_name(path.name + ".incomplete").exists())
+        self.assertEqual(hub.ranges, ["", "bytes=3000-", "bytes=6000-", "bytes=9000-"])
+
+    def test_partial_left_by_an_earlier_run_is_continued(self) -> None:
+        data = b"abcdefghij" * 100
+        hub = _DroppingHub(data, per_connection=10_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp) / "arp-downloads" / "owner--repo" / "dir" / "model.safetensors.incomplete"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(data[:400])
+            self.assertEqual(self.run_download(hub, len(data), Path(tmp)).read_bytes(), data)
+        self.assertEqual(hub.ranges, ["bytes=400-"])
+
+    def test_server_ignoring_range_restarts_the_file(self) -> None:
+        data = b"0123456789" * 50
+        hub = _DroppingHub(data, per_connection=10_000, honour_range=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp) / "arp-downloads" / "owner--repo" / "dir" / "model.safetensors.incomplete"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"x" * 100)
+            self.assertEqual(self.run_download(hub, len(data), Path(tmp)).read_bytes(), data)
+
+    def test_access_denied_is_not_retried_and_is_recognised(self) -> None:
+        hub = _DroppingHub(b"secret", per_connection=10, status=403)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(Exception) as caught:
+            self.run_download(hub, 6, Path(tmp))
+        self.assertTrue(dependency_manager.huggingface_access_denied(caught.exception))
+        self.assertEqual(len(hub.ranges), 1)
+
+    def test_no_progress_gives_up(self) -> None:
+        hub = _DroppingHub(b"0123456789", per_connection=0)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(RuntimeError, "without progress"):
+            self.run_download(hub, 10, Path(tmp))
+        self.assertEqual(len(hub.ranges), dependency_manager.DOWNLOAD_STALLED_ATTEMPTS)
+
+
 if __name__ == "__main__":
     unittest.main()

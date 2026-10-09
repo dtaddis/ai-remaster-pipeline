@@ -254,6 +254,14 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
     os.environ["PYTHONIOENCODING"] = "utf-8"
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    # Plain resumable HTTP rather than Xet: Xet assembles the file elsewhere and leaves the cache's
+    # .incomplete file at 0 bytes, so ARP's progress (which watches that file) shows nothing, and
+    # Xet transfers were seen to stall indefinitely (2026-10-08, Qwen-Image-2.1 / Viggle repos).
+    # huggingface_hub reads HF_HUB_DISABLE_XET once at import, so set its constant directly.
+    from huggingface_hub import constants as hf_constants
+
+    old_disable_xet = hf_constants.HF_HUB_DISABLE_XET
+    hf_constants.HF_HUB_DISABLE_XET = True
     try:
         for model in models:
             destination = resolve_comfy_model_path(comfy_dir, model.destination)
@@ -293,6 +301,7 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
         restore_env("PYTHONIOENCODING", old_python_io)
         restore_env("HF_HUB_DISABLE_PROGRESS_BARS", old_progress)
         restore_env("HF_HUB_DISABLE_SYMLINKS_WARNING", old_symlink_warning)
+        hf_constants.HF_HUB_DISABLE_XET = old_disable_xet
 
 
 def restore_env(name: str, value: str | None) -> None:
@@ -348,7 +357,10 @@ def download_hf_file(repo: str, filename: str, cache_root: Path, total_size: int
         )
         progress_thread.start()
     try:
-        downloaded = Path(hf_hub_download(**kwargs))
+        if total_size > 0:
+            downloaded = resumable_hf_download(repo, filename, cache_root, total_size)
+        else:
+            downloaded = Path(hf_hub_download(**kwargs))
         if total_size > 0:
             print("Download progress: 100%", flush=True)
         return downloaded
@@ -356,6 +368,60 @@ def download_hf_file(repo: str, filename: str, cache_root: Path, total_size: int
         stop_progress.set()
         if progress_thread:
             progress_thread.join(timeout=1)
+
+
+# Attempts in a row that may add no bytes before a download is abandoned.
+DOWNLOAD_STALLED_ATTEMPTS = 6
+
+
+def resumable_hf_download(repo: str, filename: str, cache_root: Path, total_size: int) -> Path:
+    """Fetch one Hub file over HTTP, resuming with Range requests when the connection drops.
+
+    hf_hub_download restarts from zero on every attempt and deletes its partial on failure, and
+    the Hub's CDN was seen closing connections about 5 GB into multi-GB files (2026-10-08), so a
+    large model could never finish on a slower line. The partial is kept as <file>.incomplete in
+    ARP's cache, which report_hf_download_progress watches, and survives restarts of ARP too.
+    """
+    import httpx
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
+    target = cache_root / "arp-downloads" / repo.replace("/", "--") / filename
+    if target.is_file() and target.stat().st_size == total_size:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + ".incomplete")
+    url = hf_hub_url(repo, filename)
+    headers = build_hf_headers()
+    stalled = 0
+    while True:
+        have = partial.stat().st_size if partial.exists() else 0
+        if have >= total_size:
+            break
+        try:
+            request_headers = {**headers, "Range": f"bytes={have}-"} if have else headers
+            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60.0)) as client:
+                with client.stream("GET", url, headers=request_headers) as response:
+                    response.raise_for_status()
+                    # A server that ignores Range sends the whole file again: start over.
+                    mode = "ab" if have and response.status_code == 206 else "wb"
+                    with partial.open(mode) as handle:
+                        for chunk in response.iter_bytes(8 * 1024 * 1024):
+                            handle.write(chunk)
+        except httpx.HTTPStatusError:
+            raise
+        except (httpx.HTTPError, OSError) as exc:
+            now = partial.stat().st_size if partial.exists() else 0
+            stalled = 0 if now > have else stalled + 1
+            if stalled >= DOWNLOAD_STALLED_ATTEMPTS:
+                raise RuntimeError(f"Download of {repo}/{filename} keeps failing without progress: {exc}") from exc
+            print(f"Connection dropped at {format_bytes(now)} of {format_bytes(total_size)} ({type(exc).__name__}); resuming.", flush=True)
+            time.sleep(min(30, 2 ** stalled))
+    if partial.stat().st_size != total_size:
+        partial.unlink()
+        raise RuntimeError(f"Download of {repo}/{filename} came back the wrong size; it will restart next time.")
+    partial.replace(target)
+    return target
 
 
 def cache_file_sizes(cache_root: Path) -> dict[Path, int]:
