@@ -90,6 +90,34 @@ class ComfyOutputTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "signature changed"):
                 comfy_api.ensure_arp_ltx_compatible("http://127.0.0.1:8797")
 
+    def test_free_comfy_models_posts_unload_flags_and_tolerates_empty_body(self) -> None:
+        sent = []
+
+        class EmptyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout):
+            sent.append((request.full_url, request.get_method(), request.data))
+            return EmptyResponse()
+
+        with mock.patch.object(comfy_api.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                mock.patch.object(comfy_api.time, "sleep") as sleep:
+            comfy_api.free_comfy_models("http://127.0.0.1:8188/")
+
+        self.assertEqual(sent, [("http://127.0.0.1:8188/free", "POST", b'{"unload_models": true, "free_memory": true}')])
+        sleep.assert_called_once()
+
+    def test_free_comfy_models_does_not_fail_the_run_when_comfy_is_unreachable(self) -> None:
+        with mock.patch.object(comfy_api.urllib.request, "urlopen", side_effect=comfy_api.urllib.error.URLError("refused")), \
+                mock.patch.object(comfy_api.time, "sleep") as sleep:
+            comfy_api.free_comfy_models("http://127.0.0.1:8188")
+
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

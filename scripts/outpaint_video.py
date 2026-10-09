@@ -12,7 +12,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from comfy_api import ensure_arp_ltx_compatible, extract_output_files, ensure_node_types, node_by_id, object_info, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
+from comfy_api import ensure_arp_ltx_compatible, extract_output_files, ensure_node_types, free_comfy_models, node_by_id, object_info, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, workflow_to_prompt
 from common import (
     QWEN_IMAGE_EDIT_MODEL,
     ROOT,
@@ -3656,6 +3656,9 @@ def main() -> int:
             if args.ltx_version == "2.5":
                 # Only a ComfyUI started after this node shipped has it; older ones keep the plain loader.
                 args.cached_gguf_text_encode = "ARPLTXCachedGGUFTextEncode" in object_info(args.comfy_url)
+        # A full-length chunk needs the whole card; leftovers from upscaling/colorizing push it into shared memory.
+        print("Asking ComfyUI to unload models left over from earlier phases...", flush=True)
+        free_comfy_models(args.comfy_url)
 
     prepare_command = [
         sys.executable,

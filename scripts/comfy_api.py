@@ -55,6 +55,29 @@ def wait_for_comfy(comfy_url: str, timeout_seconds: float = 180.0, poll_seconds:
     raise RuntimeError(f"ComfyUI did not become ready at {comfy_url} within {timeout_seconds:.0f}s. Last error: {last_error}")
 
 
+def free_comfy_models(comfy_url: str, settle_seconds: float = 2.0) -> None:
+    """Unload every model a long-lived ComfyUI still holds from earlier phases.
+
+    ComfyUI does not always evict an idle model from another phase (e.g. the CQ
+    Enhancer's LTX copy) when a new prompt loads, so a full-length outpaint chunk
+    ends up with no VRAM for its weights and spills into shared memory, about 10x
+    slower. The /free flags are consumed by the idle prompt worker; the short wait
+    keeps the next queued prompt from overtaking them.
+    """
+    payload = json.dumps({'unload_models': True, 'free_memory': True}).encode('utf-8')
+    request = urllib.request.Request(
+        f"{comfy_url.rstrip('/')}/free", data=payload, method='POST', headers={'Content-Type': 'application/json'},
+    )
+    try:
+        # /free answers with an empty body, so http_json's JSON decode doesn't apply.
+        with urllib.request.urlopen(request, timeout=30):
+            pass
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        print(f"Could not ask ComfyUI to unload idle models ({exc}); continuing.", flush=True)
+        return
+    time.sleep(settle_seconds)
+
+
 def object_info(comfy_url: str) -> dict[str, Any]:
     return http_json('GET', f"{comfy_url.rstrip('/')}/object_info", timeout=30)
 
