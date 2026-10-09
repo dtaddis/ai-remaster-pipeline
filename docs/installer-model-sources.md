@@ -63,6 +63,23 @@ separate permission from the model authors.
 - VAE: `Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors`
 - Lightning LoRA: `lightx2v/Qwen-Image-Edit-2511-Lightning/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`
 
+## Qwen-Image-2.1 (optional guide-editor engine)
+
+Not installed up front. Fetched the first time **Qwen-Image-2.1** is used, either from the
+guide editor's **Edit with** list or as the Reference Generation **Method** (about 17 GB):
+
+- Diffusion model: `Viggle/Qwen-Image-2.1-viggle-turbo/Qwen-Image-2.1-viggle-turbo-v0.3-6step-int8_convrot.safetensors`
+  (Viggle's 6-step turbo distill merged into the base transformer; same Qwen Research License)
+- Text encoder: `Comfy-Org/Qwen-Image-2.1/text_encoders/qwen3vl_8b_int8_convrot.safetensors`
+- VAE: `Comfy-Org/Qwen-Image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors`
+
+Qwen-Image-2.1 is covered by the Qwen Research License, which allows research and evaluation
+use only; commercial use needs a separate licence from Alibaba. The guide editor shows this
+when the engine is selected. Qwen-Image-Edit-2511 (above) is Apache-2.0 and stays the default.
+
+The 40-step base transformer (`Comfy-Org/Qwen-Image-2.1/diffusion_models/qwen_image_2.1_int8_convrot.safetensors`)
+is fetched only when `qwen21_edit_guide_image.py` or `qwen21_generate_reference.py` is run with `--quality base`.
+
 ## Soundtrack (Create Audio Track)
 
 Fetched on demand when the Create Audio Track stage first runs (and prefetched by

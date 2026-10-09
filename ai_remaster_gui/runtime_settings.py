@@ -334,6 +334,10 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     if reference_model in {"", "gpt-image-2"}:
         defaults["references"]["openai_image_model"] = "gpt-image-2.5-sunburst"
     defaults["references"].setdefault("openai_send_references", "false")
+    defaults["references"].setdefault("previous_reference_count", "3")
+    defaults["references"].setdefault("qwen21_describe", "true")
+    defaults["references"].setdefault("qwen21_send_references", "true")
+    defaults["references"].setdefault("qwen21_reference_count", "2")
     old_reference_prompts = {
         "",
         "Colorize this image.",

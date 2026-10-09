@@ -5570,9 +5570,109 @@ class GuiSmokeTests(unittest.TestCase):
         command = app.APP.command_for("references")
 
         self.assertIn("openai_generate_reference.py", " ".join(command))
-        self.assertIn("--reference-count", command)
+        self.assertEqual(command[command.index("--reference-count") + 1], "3")  # the default count
         self.assertIn("--no-normalize-to-source-size", command)
         self.assertNotIn("qwen_colorize_references.py", " ".join(command))
+
+        app.APP.settings["references"]["previous_reference_count"] = "5"
+        command = app.APP.command_for("references")
+        self.assertEqual(command[command.index("--reference-count") + 1], "5")
+        app.APP.settings["references"]["openai_send_references"] = "false"
+        self.assertNotIn("--reference-count", app.APP.command_for("references"))
+
+    def test_previous_reference_count_is_ticked_editable_and_clamped(self) -> None:
+        count = server.previous_reference_count
+        self.assertEqual(count({}), 0)
+        self.assertEqual(count({"openai_send_references": "false", "previous_reference_count": "6"}), 0)
+        self.assertEqual(count({"openai_send_references": "true"}), 3)
+        self.assertEqual(count({"openai_send_references": "true", "previous_reference_count": "6"}), 6)
+        self.assertEqual(count({"openai_send_references": "true", "previous_reference_count": "40"}), 9)
+        self.assertEqual(count({"openai_send_references": "true", "previous_reference_count": "-2"}), 0)
+        self.assertEqual(count({"openai_send_references": "true", "previous_reference_count": "lots"}), 3)
+
+    def test_qwen21_reference_generation_describes_stills_and_sends_references_only_with_descriptions(self) -> None:
+        refs = app.APP.settings["references"]
+        # Defaults: describe each still, with two previous references. The OpenAI count is separate.
+        for key in ("qwen21_describe", "qwen21_send_references", "qwen21_reference_count"):
+            refs.pop(key, None)
+        refs.update({"manifest": "manifests/references/demo.csv", "method": "qwen21", "openai_send_references": "true", "previous_reference_count": "6"})
+        command = app.APP.command_for("references")
+        self.assertIn("qwen21_generate_reference.py", " ".join(command))
+        self.assertNotIn("qwen_colorize_references.py", " ".join(command))
+        self.assertIn("--describe", command)
+        self.assertEqual(command[command.index("--reference-count") + 1], "2")
+
+        self.assertEqual(server.qwen21_reference_args({"qwen21_reference_count": "9"}), ["--describe", "--reference-count", "2"])  # held to two
+        self.assertEqual(server.qwen21_reference_args({"qwen21_reference_count": "1"}), ["--describe", "--reference-count", "1"])
+        self.assertEqual(server.qwen21_reference_args({"qwen21_send_references": "false"}), ["--describe"])
+        # Without descriptions 2.1 copies the references, so none are sent.
+        self.assertEqual(server.qwen21_reference_args({"qwen21_describe": "false", "qwen21_send_references": "true"}), [])
+        refs.update({"qwen21_describe": "true", "qwen21_send_references": "true", "qwen21_reference_count": "1"})
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "refs.csv"
+            source = folder / "bw.png"
+            color = folder / "color.png"
+            source.write_bytes(b"bw")
+            app.write_manifest_details(
+                manifest, "input/example.mp4", ["enabled", "end", "source_reference", "color_reference"],
+                [{"enabled": "true", "end": "00:00:01.000", "source_reference": app.rel(source), "color_reference": app.rel(color)}],
+            )
+            single, output = server.qwen21_reference_regeneration_command(str(manifest), 0)
+        self.assertIn("qwen21_generate_reference.py", " ".join(single))
+        self.assertIn("--describe", single)
+        self.assertEqual(single[single.index("--reference-count") + 1], "1")
+        self.assertEqual(single[single.index("--row-index") + 1], "0")
+        self.assertEqual(output, app.rel(color))
+
+    def test_qwen21_reference_graph_feeds_previous_references_as_extra_images(self) -> None:
+        import qwen21_generate_reference as qwen21_ref
+
+        graph = qwen21_ref.build_prompt("still.png", ["ref1.png", "ref2.png"], "colour it", seed=3, prefix="p", canvas=(1856, 800))
+        encode = graph["20"]["inputs"]
+        self.assertEqual(encode["images.image_1"], ["1", 0])
+        self.assertEqual(graph[encode["images.image_2"][0]]["inputs"]["image"], "ref1.png")
+        self.assertEqual(graph[encode["images.image_3"][0]]["inputs"]["image"], "ref2.png")
+        self.assertNotIn("images.image_4", encode)
+        self.assertEqual(graph["23"]["inputs"]["latent_image"], ["20", 2])  # latent follows the still
+        self.assertEqual(graph["23"]["class_type"], "SamplerCustomAdvanced")  # turbo by default
+        for node in graph.values():
+            for value in node["inputs"].values():
+                if isinstance(value, list):
+                    self.assertIn(value[0], graph)
+
+    def test_qwen21_reference_prompt_carries_the_description_and_the_copy_check_spots_copies(self) -> None:
+        import argparse
+
+        import numpy as np
+
+        import qwen21_generate_reference as qwen21_ref
+
+        args = argparse.Namespace(prompt="Colorize this image.", prompt_suffix="Preserve detail.", add_prompt="Warm lamps.")
+        described = qwen21_ref.still_prompt(args, "Two men talk by a lamp.", 2)
+        self.assertTrue(described.startswith("Colorize this image. <image1> is a black-and-white film frame that shows: Two men talk by a lamp."))
+        self.assertIn("<image2>, <image3> are other shots of the same scene", described)
+        self.assertTrue(described.endswith("Preserve detail. Warm lamps."))
+        self.assertIn("<image2> is another shot", qwen21_ref.still_prompt(args, "A man.", 1))
+        plain = qwen21_ref.still_prompt(args, "", 0)
+        self.assertEqual(plain, "Colorize this image. Preserve detail. Warm lamps.")
+
+        graph = qwen21_ref.describe_prompt("still.png")
+        self.assertEqual(graph["50"]["class_type"], "TextGenerate")
+        self.assertEqual(graph["50"]["inputs"]["image"], ["1", 0])
+        self.assertEqual(graph[qwen21_ref.DESCRIBE_NODE_ID]["class_type"], "PreviewAny")
+
+        rng = np.random.default_rng(0)
+        scene = (rng.random((90, 160)) * 255).astype(np.uint8)
+        other = (rng.random((90, 160)) * 255).astype(np.uint8)
+        grey = np.stack([scene] * 3, axis=2)
+        tinted = np.clip(np.stack([scene * 1.1, scene * 0.95, scene * 0.7], axis=2), 0, 255).astype(np.uint8)
+        self.assertGreater(qwen21_ref.structure_score(tinted, grey), 0.95)  # coloured, same picture
+        self.assertLess(qwen21_ref.structure_score(np.stack([other] * 3, axis=2), grey), qwen21_ref.COPY_THRESHOLD)
+        # A different size still compares on the source's grid.
+        bigger = np.repeat(np.repeat(tinted, 2, axis=0), 2, axis=1)
+        self.assertGreater(qwen21_ref.structure_score(bigger, grey), 0.9)
 
     def test_openai_reference_max_size_preserves_aspect_and_api_limits(self) -> None:
         from PIL import Image
@@ -5910,6 +6010,80 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("openai_edit_guide_image.py", " ".join(remembered))
         self.assertEqual(sidecar["engine"], "openai")
         self.assertNotIn("sk-test", json.dumps(sidecar))
+
+    def test_guide_edit_preview_command_routes_to_qwen_image_21(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            guide = folder / "guide.png"
+            Image.new("RGB", (16, 9), (32, 32, 32)).save(guide)
+            rows = [{"chunk_index": "0", "start_frame": "0", "end_frame": "24",
+                     "guide_frames": json.dumps([{"frame_idx": 0, "strength": 0.7, "image": app.rel(guide)}])}]
+            app.write_outpaint_chunk_rows(manifest, rows)
+            app.APP.settings["outpaint"]["guide_edit_method"] = "qwen21"
+            fake_state = {"manifest": app.rel(manifest), "rows": [{"index": 0}]}
+            try:
+                with mock.patch.object(outpaint_guides, "outpaint_chunks_state", return_value=fake_state):
+                    self.assertEqual(outpaint_guides.guide_edit_engine(), "qwen21")
+                    command, output = app.guide_edit_preview_command(0, 0, "fill the bars", "iVBORw0KGgo=")
+                    sidecar = json.loads(app.resolve(output + ".json").read_text(encoding="utf-8"))
+            finally:
+                app.APP.settings["outpaint"].pop("guide_edit_method", None)
+
+        joined = " ".join(command)
+        self.assertIn("qwen21_edit_guide_image.py", joined)
+        self.assertNotIn("edit_reference_image.py", joined)
+        self.assertIn("--mask", command)
+        self.assertIn("--comfy-url", command)
+        self.assertEqual(sidecar["engine"], "qwen21")
+        # The 2.1 engine renders in ComfyUI, so the runner starts it like the 2511 engine.
+        self.assertIn("qwen21", outpaint_guides.COMFY_GUIDE_EDIT_ENGINES)
+        self.assertNotIn("openai", outpaint_guides.COMFY_GUIDE_EDIT_ENGINES)
+
+    def test_qwen21_guide_edit_canvas_and_graph(self) -> None:
+        import qwen21_edit_guide_image as qwen21
+
+        self.assertEqual(qwen21.canvas_size(1280, 704), (1280, 704))
+        for width, height in ((1866, 800), (3840, 1646), (4096, 1716), (1920, 1080), (300, 170)):
+            canvas_w, canvas_h = qwen21.canvas_size(width, height)
+            self.assertEqual((canvas_w % 32, canvas_h % 32), (0, 0))
+            self.assertLessEqual(canvas_w * canvas_h, qwen21.DEFAULT_MAX_PIXELS * 1.05)
+            self.assertLessEqual(canvas_w, max(32, round(width / 32) * 32))  # never enlarged
+            self.assertAlmostEqual(canvas_w / canvas_h, width / height, delta=0.06)
+
+        # Turbo (default): Viggle's 6-step distill on its resolution-shifted schedule.
+        graph = qwen21.build_prompt("src.png", "mask.png", "fill", seed=7, grow_px=16, prefix="p", canvas=(1024, 1024))
+        encode = graph["20"]["inputs"]
+        self.assertEqual(graph["20"]["class_type"], "TextEncodeQwenImage21")
+        self.assertEqual(encode["images.image_1"], ["5", 0])
+        self.assertEqual(encode["resolution"], 0)
+        self.assertEqual(graph["10"]["inputs"]["unet_name"], qwen21.QWEN_IMAGE_21_TURBO_DIFFUSION)
+        sampler = graph["23"]
+        self.assertEqual(sampler["class_type"], "SamplerCustomAdvanced")
+        self.assertEqual(sampler["inputs"]["latent_image"], ["22", 0])  # denoised only under the noise mask
+        self.assertEqual(graph["26"]["inputs"]["noise_seed"], 7)
+        sigmas = [float(value) for value in graph["29"]["inputs"]["sigmas"].split(",")]
+        self.assertEqual(len(sigmas), 7)  # six steps, ending at 0
+        self.assertEqual((sigmas[0], sigmas[-1]), (1.0, 0.0))
+        self.assertTrue(all(a > b for a, b in zip(sigmas, sigmas[1:])))
+        # Viggle's shift at 1024x1024: mu = 0.6935 lifts the 0.25 node to about 0.40.
+        self.assertAlmostEqual(sigmas[5], 0.4001, places=3)
+        self.assertGreater(qwen21.turbo_sigmas(1856, 800)[5], qwen21.turbo_sigmas(512, 512)[5])  # more pixels, more shift
+        self.assertEqual(graph[qwen21.SAVE_NODE_ID]["class_type"], "SaveImage")
+        # The base model keeps a plain 30-step KSampler.
+        base = qwen21.build_prompt("src.png", "mask.png", "fill", seed=7, grow_px=16, prefix="p", canvas=(1024, 1024), quality="base")
+        self.assertEqual(base["10"]["inputs"]["unet_name"], qwen21.QWEN_IMAGE_21_DIFFUSION)
+        self.assertEqual(base["23"]["class_type"], "KSampler")
+        self.assertEqual((base["23"]["inputs"]["cfg"], base["23"]["inputs"]["steps"]), (1.0, qwen21.BASE_STEPS))
+        self.assertNotIn("29", base)
+        # Every link points at a node in the graph.
+        for built in (graph, base):
+            for node in built.values():
+                for value in node["inputs"].values():
+                    if isinstance(value, list):
+                        self.assertIn(value[0], built)
 
     def test_guide_edit_without_mask_or_black_bars_is_refused(self) -> None:
         import numpy as np

@@ -631,13 +631,33 @@ def _guide_editor_source(chunk_index: int, guide_index: int, frames: list[dict])
         raise FileNotFoundError("Could not prepare a guide image for editing.")
     return preview_rel, prepared, source_seconds
 
-GUIDE_EDIT_ENGINES = ("qwen", "openai")
+# "qwen" is Qwen-Image-Edit-2511 (Apache-2.0). "qwen21" is Qwen-Image-2.1, research/evaluation
+# licence only: opt-in, and the editor warns when it is picked.
+GUIDE_EDIT_ENGINES = ("qwen", "qwen21", "openai")
+GUIDE_EDIT_ENGINE_LABELS = {"qwen": "Qwen", "qwen21": "Qwen-Image-2.1", "openai": "OpenAI"}
+# Engines that render in the local ComfyUI.
+COMFY_GUIDE_EDIT_ENGINES = ("qwen", "qwen21")
 
 
 def guide_edit_engine(engine: str = "") -> str:
     """The guide editor's model: the one asked for, else the remembered choice, else Qwen."""
     chosen = (engine or state.APP.settings.get("outpaint", {}).get("guide_edit_method", "")).strip().lower()
     return chosen if chosen in GUIDE_EDIT_ENGINES else "qwen"
+
+
+def _qwen21_guide_edit_command(source: Path, mask: str, output: Path, prompt: str) -> list[str]:
+    values = state.APP.settings.get("references", {})
+    config = current_config()
+    return [
+        sys.executable, "-u", str(SCRIPTS / "qwen21_edit_guide_image.py"),
+        "--source-image", str(source),
+        "--mask", mask,
+        "--output", rel(output),
+        "--instruction", prompt,
+        "--comfy-url", values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188"),
+        "--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
+        "--comfy-output-root", comfy_output_root_for(config),
+    ]
 
 
 def _openai_guide_edit_command(source: Path, mask: str, output: Path, prompt: str) -> list[str]:
@@ -683,6 +703,8 @@ def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: 
     prompt = _guide_edit_prompt(instruction, sampled_color)
     if engine == "openai":
         cmd = _openai_guide_edit_command(source, mask, output, prompt)
+    elif engine == "qwen21":
+        cmd = _qwen21_guide_edit_command(source, mask, output, prompt)
     else:
         values = state.APP.settings.get("references", {})
         config = current_config()

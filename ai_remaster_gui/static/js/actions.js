@@ -502,9 +502,11 @@ function ensureReferenceEditorModal() {
           <div id="referenceEditEngineRow" class="hidden">
             <label for="referenceEditEngine">Edit with</label>
             <select id="referenceEditEngine" onchange="setReferenceEditEngine(this.value)">
-              <option value="qwen">Qwen (local)</option>
+              <option value="qwen">Qwen 2511 (local)</option>
+              <option value="qwen21">Qwen-Image-2.1 (local, non-commercial)</option>
               <option value="openai">OpenAI Cloud Editing</option>
             </select>
+            <div id="referenceEditEngineWarning" class="hidden">${qwen21LicenseWarning('guide frames')}</div>
           </div>
           <div class="actions">
             <button id="referenceEditApply" class="primary" type="button" onclick="submitReferenceEditPreview()">Apply with Qwen</button>
@@ -1149,20 +1151,24 @@ function referenceMaskDataUrl() {
   return out.toDataURL('image/png');
 }
 
-// Guide frames can be edited with local Qwen (default) or OpenAI's image model; reference
-// stills always use Qwen. The guide choice is remembered in the outpaint settings.
+// Guide frames can be edited with local Qwen 2511 (default), Qwen-Image-2.1 (non-commercial
+// licence, warned about below the picker) or OpenAI's image model; reference stills always use
+// Qwen. The guide choice is remembered in the outpaint settings.
+const GUIDE_EDIT_ENGINE_LABELS = { qwen: 'Qwen', qwen21: 'Qwen-Image-2.1', openai: 'OpenAI' };
+
 function setReferenceEditEngine(engine) {
   const guideMode = referenceEditor.mode === 'guide';
-  referenceEditor.engine = guideMode && engine === 'openai' ? 'openai' : 'qwen';
+  referenceEditor.engine = guideMode && GUIDE_EDIT_ENGINE_LABELS[engine] ? engine : 'qwen';
   const select = document.getElementById('referenceEditEngine');
   if (select) select.value = referenceEditor.engine;
   document.getElementById('referenceEditEngineRow')?.classList.toggle('hidden', !guideMode);
+  document.getElementById('referenceEditEngineWarning')?.classList.toggle('hidden', referenceEditor.engine !== 'qwen21');
   const apply = document.getElementById('referenceEditApply');
   if (apply) apply.textContent = `Apply with ${referenceEditEngineLabel()}`;
 }
 
 function referenceEditEngineLabel() {
-  return referenceEditor.engine === 'openai' ? 'OpenAI' : 'Qwen';
+  return GUIDE_EDIT_ENGINE_LABELS[referenceEditor.engine] || 'Qwen';
 }
 
 async function submitReferenceEditPreview() {

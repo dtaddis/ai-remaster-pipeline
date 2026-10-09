@@ -440,6 +440,7 @@ function selectOptionLabel(key, option) {
   if (key === 'repair_device' && option === 'cuda') return 'NVIDIA GPU (CUDA)';
   if (key === 'repair_device' && option === 'cpu') return 'CPU';
   if (key === 'method' && option === 'qwen') return 'Qwen 2511 (local)';
+  if (key === 'method' && option === 'qwen21') return 'Qwen-Image-2.1 (local, non-commercial)';
   if (key === 'method' && option === 'openai') return 'OpenAI API (cloud)';
   if ((key === 'method' || key === 'colorization_method') && option === 'cmnet2') return 'CMNET2 (multi-reference)';
   if ((key === 'method' || key === 'colorization_method') && option === 'colormnet') return 'ColorMNet (single reference)';

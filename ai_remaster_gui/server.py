@@ -94,6 +94,9 @@ from .references import (
     recent_color_references,
     reference_name_for_time,
     openai_reference_regeneration_command,
+    previous_reference_count,
+    qwen21_reference_args,
+    qwen21_reference_regeneration_command,
     reference_edit_prompt,
     reference_regeneration_command,
     accept_reference_edit,
@@ -134,6 +137,8 @@ from .lifecycle import (
     stop_started_comfy,
 )
 from .outpaint_guides import (
+    COMFY_GUIDE_EDIT_ENGINES,
+    GUIDE_EDIT_ENGINE_LABELS,
     NoEditRegionError,
     _build_guide_frames_view,
     _get_guide_manifest,
@@ -1865,8 +1870,14 @@ class PipelineApp:
             add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
             add(["--size", values.get("openai_image_size") or "auto", "--quality", values.get("openai_image_quality") or "auto"])
             add(["--no-normalize-to-source-size"])
-            if is_true(values, "openai_send_references"):
-                add(["--reference-count", "3"])
+            if previous_reference_count(values):
+                add(["--reference-count", str(previous_reference_count(values))])
+        elif values.get("method") == "qwen21":
+            cmd = [sys.executable, "-u", str(SCRIPTS / "qwen21_generate_reference.py")]
+            add = cmd.extend
+            add(["--manifest", values.get("manifest", ""), "--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
+            add(["--comfy-url", values.get("comfy_url") or comfy_url_for(config), "--comfy-dir", comfy_dir_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+            add(qwen21_reference_args(values))
         else:
             cmd = [sys.executable, "-u", str(SCRIPTS / "qwen_colorize_references.py")]
             add = cmd.extend
@@ -2088,6 +2099,8 @@ class PipelineApp:
             return False, "Missing settings: " + ", ".join(missing)
         if stage_key == "references" and values.get("method", "qwen") == "openai" and not values.get("openai_api_key", "").strip():
             return False, "Add your OpenAI API key in Settings before running OpenAI Reference Generation."
+        if stage_key == "references" and values.get("method") == "qwen21" and stage_uses_runpod(stage_key, values):
+            return False, "Qwen-Image-2.1 Reference Generation runs locally only. Set Qwen compute to local."
         if (
             stage_key == "colour"
             and values.get("method", "deepexemplar") == "openai"
@@ -2165,14 +2178,17 @@ class PipelineApp:
         return True, f"Started outpaint chunk {index + 1}"
 
     def run_reference_regeneration(self, manifest_text: str, index: int, provider: str = "qwen", reference_index: int = 0) -> tuple[bool, str]:
-        provider = "openai" if (provider == "openai" or self.settings.get("references", {}).get("method") == "openai") else "qwen"
-        if provider == "qwen":
+        method = self.settings.get("references", {}).get("method")
+        provider = "openai" if (provider == "openai" or method == "openai") else "qwen21" if method == "qwen21" else "qwen"
+        if provider != "openai":
             ok, message = ensure_comfy_available_for_stage("Reference Generation")
             if not ok:
                 return False, message
         try:
             if provider == "openai":
                 cmd, output = openai_reference_regeneration_command(manifest_text, index, reference_index)
+            elif provider == "qwen21":
+                cmd, output = qwen21_reference_regeneration_command(manifest_text, index, reference_index)
             else:
                 cmd, output = reference_regeneration_command(manifest_text, index, reference_index)
         except Exception as exc:
@@ -2185,7 +2201,7 @@ class PipelineApp:
             self.running_reference_manifest = manifest_text
             self.running_reference_index = index
             self.run_started_at = time.time()
-            label = "OpenAI" if provider == "openai" else "Qwen"
+            label = {"openai": "OpenAI", "qwen21": "Qwen-Image-2.1"}.get(provider, "Qwen")
             self.log.append(f"Regenerating colour reference {reference_index + 1} with {label} for shot {index + 1}: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
             try:
@@ -2636,7 +2652,7 @@ class PipelineApp:
             raise  # The HTTP layer reports its type so the editor shows it as a popup.
         except Exception as exc:
             return False, str(exc), ""
-        if engine == "qwen":
+        if engine in COMFY_GUIDE_EDIT_ENGINES:
             ok, message = ensure_comfy_available_for_stage("Guide Frame Editing")
             if not ok:
                 return False, message, ""
@@ -2647,7 +2663,7 @@ class PipelineApp:
             self.running_stage_key = "outpaint"
             self.run_started_at = time.time()
             mode = "masked" if mask_data else "unmasked"
-            label = "OpenAI" if engine == "openai" else "Qwen"
+            label = GUIDE_EDIT_ENGINE_LABELS[engine]
             self.log.append(f"Generating {mode} {label} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}")
             self.log.append("> " + redact_command_for_log(cmd))
             try:

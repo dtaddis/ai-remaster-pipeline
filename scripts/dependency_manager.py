@@ -174,6 +174,25 @@ QWEN_IMAGE_EDIT_MODELS = [
     HfModel("lightx2v/Qwen-Image-Edit-2511-Lightning", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", "models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"),
 ]
 
+# Qwen-Image-2.1 (unified generate + edit, Sep 2026): an opt-in guide-editor engine and Reference
+# Generation method. Its Qwen Research License allows research/evaluation use only, so it is never
+# installed up front; these are fetched the first time the user picks it. The text encoder and VAE
+# are ComfyUI's own int8 (convrot) / bf16 builds, as in its image_qwen_image_2_1_image_edit
+# template. The transformer is Viggle's 6-step turbo distill (2.1's "Lightning", same research
+# licence) merged into the same int8 convrot format: ~17 GB in all. The 40-step base transformer
+# is fetched only when a script is run with --quality base.
+QWEN_IMAGE_21_DIFFUSION = "qwen_image_2.1_int8_convrot.safetensors"
+QWEN_IMAGE_21_TURBO_DIFFUSION = "Qwen-Image-2.1-viggle-turbo-v0.3-6step-int8_convrot.safetensors"
+QWEN_IMAGE_21_TEXT_ENCODER = "qwen3vl_8b_int8_convrot.safetensors"
+QWEN_IMAGE_21_VAE = "qwen_image_2.1_vae_bf16.safetensors"
+QWEN_IMAGE_21_LICENSE_URL = "https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE"
+QWEN_IMAGE_21_SHARED_MODELS = [
+    HfModel("Comfy-Org/Qwen-Image-2.1", f"text_encoders/{QWEN_IMAGE_21_TEXT_ENCODER}", f"models/text_encoders/{QWEN_IMAGE_21_TEXT_ENCODER}"),
+    HfModel("Comfy-Org/Qwen-Image-2.1", f"vae/{QWEN_IMAGE_21_VAE}", f"models/vae/{QWEN_IMAGE_21_VAE}"),
+]
+QWEN_IMAGE_21_TURBO_MODEL = HfModel("Viggle/Qwen-Image-2.1-viggle-turbo", QWEN_IMAGE_21_TURBO_DIFFUSION, f"models/diffusion_models/{QWEN_IMAGE_21_TURBO_DIFFUSION}")
+QWEN_IMAGE_21_BASE_MODEL = HfModel("Comfy-Org/Qwen-Image-2.1", f"diffusion_models/{QWEN_IMAGE_21_DIFFUSION}", f"models/diffusion_models/{QWEN_IMAGE_21_DIFFUSION}")
+
 # Music score: Stable Audio Open, loaded by ComfyUI core audio nodes from models/checkpoints.
 # NOTE: stable-audio-open-1.0 is a *gated* repo - the user must accept its licence on Hugging
 # Face and authenticate (`hf auth login` / HF_TOKEN) for the download to succeed. Audio models
@@ -583,6 +602,10 @@ def ensure_cleanup_models(comfy_dir: Path) -> None:
 
 def ensure_qwen_image_edit_models(comfy_dir: Path) -> None:
     ensure_hf_models(comfy_dir, QWEN_IMAGE_EDIT_MODELS)
+
+
+def ensure_qwen_image_21_models(comfy_dir: Path, turbo: bool = True) -> None:
+    ensure_hf_models(comfy_dir, [QWEN_IMAGE_21_TURBO_MODEL if turbo else QWEN_IMAGE_21_BASE_MODEL, *QWEN_IMAGE_21_SHARED_MODELS])
 
 
 def ensure_audio_models(comfy_dir: Path, music: bool = True, sfx: bool = True) -> None:

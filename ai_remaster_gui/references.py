@@ -821,9 +821,66 @@ def openai_reference_regeneration_command(manifest_text: str, index: int, refere
     # source frame. Per-frame OpenAI colorization intentionally does not use
     # this flag because its output must match the video processing dimensions.
     cmd.append("--no-normalize-to-source-size")
-    if values.get("openai_send_references", "false") == "true":
-        cmd.extend(["--reference-count", "3"])
+    count = previous_reference_count(values)
+    if count:
+        cmd.extend(["--reference-count", str(count)])
     cmd.append("--force")
+    return cmd, output
+
+# OpenAI can be shown earlier colour references, held to nine. Qwen-Image-2.1 gets its own setting,
+# held to two and only with "Describe each still" (qwen21_reference_args).
+MAX_PREVIOUS_REFERENCES = 9
+MAX_QWEN21_REFERENCES = 2
+
+
+def previous_reference_count(values: dict[str, str]) -> int:
+    """How many nearby colour references go with each still: the count set on the Reference
+    Generation tab (default 3) when "Also send previous images as references" is ticked, else 0.
+    The tick box keeps its original openai_ key so saved settings carry over."""
+    if values.get("openai_send_references", "false") != "true":
+        return 0
+    try:
+        count = int(str(values.get("previous_reference_count", "3")).strip() or 3)
+    except ValueError:
+        count = 3
+    return max(0, min(MAX_PREVIOUS_REFERENCES, count))
+
+
+def qwen21_reference_args(values: dict[str, str]) -> list[str]:
+    """Qwen-Image-2.1's description and previous-reference arguments. Describing each still is on
+    unless turned off, and references (default 2, at most 2) only go with it: without the
+    description 2.1 copies the reference shots instead of colouring its own frame."""
+    if values.get("qwen21_describe", "true") == "false":
+        return []
+    args = ["--describe"]
+    if values.get("qwen21_send_references", "true") != "false":
+        try:
+            count = int(str(values.get("qwen21_reference_count", "2")).strip() or 2)
+        except ValueError:
+            count = 2
+        count = max(0, min(MAX_QWEN21_REFERENCES, count))
+        if count:
+            args += ["--reference-count", str(count)]
+    return args
+
+
+def qwen21_reference_regeneration_command(manifest_text: str, index: int, reference_index: int = 0) -> tuple[list[str], str]:
+    manifest, _row, _source, output = reference_row_io(manifest_text, index, reference_index)
+    values = state.APP.settings.get("references", {})
+    config = current_config()
+    cmd = [
+        sys.executable, "-u", str(SCRIPTS / "qwen21_generate_reference.py"),
+        "--manifest", rel(manifest),
+        "--row-index", str(index),
+        "--reference-index", str(reference_index),
+        "--prompt", values.get("prompt", REFERENCE_PROMPT),
+        "--prompt-suffix", values.get("prompt_suffix", REFERENCE_PROMPT_SUFFIX),
+        "--comfy-url", values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188"),
+        "--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
+        "--comfy-output-root", comfy_output_root_for(config),
+        *qwen21_reference_args(values),
+        "--force",
+    ]
     return cmd, output
 
 def regenerate_reference_image(manifest_text: str, index: int, reference_index: int = 0) -> dict[str, str]:

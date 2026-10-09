@@ -281,14 +281,55 @@ function shotStageVisibleFields(st, s = {}) {
   return st.fields;
 }
 
+// OpenAI can be shown nearby colour references (up to 9). Qwen 2511 takes a single image, so it
+// gets no such option. Qwen-Image-2.1 copies reference shots into the new still unless the still's
+// own content is described in the prompt (tested 2026-10-09 on The Most Dangerous Game), so its
+// references need "Describe each still" and are held to two; see qwen21_generate_reference.py.
 function referenceGenerationOptionsHtml(s) {
-  if ((s.method || 'qwen') !== 'openai') return '';
+  const method = s.method || 'qwen';
+  if (method === 'qwen21') {
+    const describe = s.qwen21_describe !== 'false';
+    return `
+      ${qwen21LicenseWarning('colour references')}
+      <div class="checks">
+        <label>
+          <input data-field="qwen21_describe" type="checkbox" ${describe ? 'checked' : ''}>
+          Describe each still (Qwen3-VL, about 4 s each)
+        </label>
+        <label>
+          <input data-field="qwen21_send_references" type="checkbox" ${s.qwen21_send_references !== 'false' ? 'checked' : ''} ${describe ? '' : 'disabled'}>
+          Also send
+          <input data-field="qwen21_reference_count" type="number" min="1" max="2" step="1" value="${esc(s.qwen21_reference_count || '2')}" class="inline-number" aria-label="Number of previous images to send" ${describe ? '' : 'disabled'}>
+          previous images as references
+        </label>
+      </div>
+      <p class="field-help">The description of each still (who is in frame, poses, framing, background) is what stops
+      Qwen-Image-2.1 copying the reference shots instead of colouring its own frame, so references are only sent with it,
+      at most two. A still whose composition still changes is coloured again without references.</p>
+    `;
+  }
+  if (method !== 'openai') return '';
+  const count = esc(s.previous_reference_count || '3');
   return `
     <div class="checks">
       <label>
         <input data-field="openai_send_references" type="checkbox" ${s.openai_send_references === 'true' ? 'checked' : ''}>
-        Also send (3) previous images as references
+        Also send
+        <input data-field="previous_reference_count" type="number" min="1" max="9" step="1" value="${count}" class="inline-number" aria-label="Number of previous images to send">
+        previous images as references
       </label>
+    </div>
+  `;
+}
+
+function qwen21LicenseWarning(useLabel) {
+  return `
+    <div class="inline-warning">
+      <strong>Qwen-Image-2.1 is licensed for research and evaluation only.</strong>
+      Its Qwen Research License does not allow commercial use without a separate licence from Alibaba,
+      and that includes ${esc(useLabel)} for a remaster you sell or monetise. Use Qwen 2511 for commercial
+      work. The first run downloads about 17 GB of model files.
+      <a href="https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE" target="_blank" rel="noopener">View licence</a>.
     </div>
   `;
 }

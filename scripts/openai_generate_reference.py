@@ -275,7 +275,9 @@ def nearby_reference_images(rows: list[dict[str, str]], row_index: int, count: i
     return ordered[:count]
 
 
-def generate_manifest(args: argparse.Namespace) -> None:
+def manifest_rows_to_generate(args: argparse.Namespace) -> tuple[list[dict[str, str]], list[tuple[int, dict[str, str]]]]:
+    """Every reference row (one per shot reference) and the (index, row) pairs to generate: one
+    shot reference with --row-index/--reference-index, else every enabled row up to --limit."""
     manifest = resolve_path(args.manifest)
     shot_rows = read_manifest(manifest, enabled_only=args.row_index is None)
     if args.row_index is not None:
@@ -297,6 +299,12 @@ def generate_manifest(args: argparse.Namespace) -> None:
         selected_rows = list(enumerate(rows))
     elif args.row_index is None:
         selected_rows = list(enumerate(rows))
+    return rows, selected_rows
+
+
+def generate_manifest(args: argparse.Namespace) -> None:
+    manifest = resolve_path(args.manifest)
+    rows, selected_rows = manifest_rows_to_generate(args)
     print(f"Manifest: {manifest}", flush=True)
     print(f"Rows: {len(selected_rows)}", flush=True)
     for index, row in selected_rows:
