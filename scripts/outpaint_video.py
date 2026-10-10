@@ -17,6 +17,7 @@ from common import (
     QWEN_IMAGE_EDIT_MODEL,
     ROOT,
     copy_to_comfy_input,
+    ffprobe_for,
     file_fingerprint,
     find_ffmpeg,
     load_local_config,
@@ -3222,6 +3223,18 @@ def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fp
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
 
 
+def count_video_packets(ffmpeg: str, path: Path) -> int:
+    """Exact frame count of a stream-copied video, read from the container without decoding."""
+    result = subprocess.run(
+        [ffprobe_for(ffmpeg), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    try:
+        return int(result.stdout.strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return -1
+
+
 def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool, intermediate_profile: str = "high") -> None:
     if output.exists() and not force:
         return
@@ -3273,8 +3286,16 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             cursor = total_frames
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        print(f"Stitching {len(piece_paths)} piece(s) into {output.name} ({total_frames} frames)", flush=True)
-        run_ffmpeg_with_progress([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"trim=end_frame={total_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-frames:v", str(total_frames), "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], total_frames, "Stitch progress")
+        # Every piece was just encoded with the same codec settings and starts on a keyframe, so
+        # the concat demuxer can join them without a second whole-clip encode (which took as
+        # long as all the pieces together and cost another generation). The exact packet count
+        # guards the join; anything unexpected falls back to the frame-accurate re-encode.
+        print(f"Joining {len(piece_paths)} piece(s) into {output.name} ({total_frames} frames)", flush=True)
+        subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(list_file), "-map", "0:v:0", "-c", "copy", *container_args(str(partial), intermediate_profile), str(partial)], check=True)
+        joined_frames = count_video_packets(ffmpeg, partial)
+        if joined_frames != total_frames:
+            print(f"Joined stitch has {joined_frames} frame(s), expected {total_frames}; re-encoding the stitch instead.", flush=True)
+            run_ffmpeg_with_progress([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"trim=end_frame={total_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-frames:v", str(total_frames), "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], total_frames, "Stitch progress")
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 

@@ -737,8 +737,20 @@ class PipelineApp:
                     label = f"Chunk {chunk['current']}/{chunk['total']} rendering in ComfyUI ({chunk['done']} done){eta}"
                 else:
                     label = f"Chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done){eta}"
-            # Stitching and finalizing are each one whole-clip encode; their own progress
-            # lines replace the chunk label so the bar keeps moving after the last chunk.
+            # Stitching re-encodes each chunk's kept frames and finalizing is one whole-clip
+            # encode; their own progress lines replace the chunk label so the bar keeps moving
+            # after the last chunk.
+            stitched, stitch_total = 0, 0
+            for line in log_text.splitlines():
+                if line.startswith("Stitch chunk ") and "/" in line:
+                    try:
+                        left, right = line[len("Stitch chunk "):].split(":", 1)[0].split("/", 1)
+                        stitched, stitch_total = int(left), int(right)
+                    except ValueError:
+                        pass
+            if stitch_total and percent < 100:
+                percent = max(percent, 90 + (stitched - 1) * 4 // stitch_total)
+                label = f"Stitching chunk {stitched}/{stitch_total}"
             for marker, floor, span, text in (
                 ("Stitch progress:", 90, 4, "Stitching outpainted video"),
                 ("Finalize progress:", 94, 5, "Finalizing outpainted video"),
