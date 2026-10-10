@@ -26,6 +26,7 @@ from common import (
     resolve_path,
     root_relative,
     resumable_output,
+    run_ffmpeg_with_progress,
     safe_stem,
     signature_path,
     split_sidecar_path,
@@ -3272,7 +3273,8 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
             cursor = total_frames
         list_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in piece_paths), encoding="utf-8")
         partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"trim=end_frame={total_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-frames:v", str(total_frames), "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], check=True)
+        print(f"Stitching {len(piece_paths)} piece(s) into {output.name} ({total_frames} frames)", flush=True)
+        run_ffmpeg_with_progress([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-vf", f"trim=end_frame={total_frames},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1", "-frames:v", str(total_frames), "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(partial), intermediate_profile), str(partial)], total_frames, "Stitch progress")
         replace_with_retry(partial, output, f"Stitched outpaint video {output.name}")
 
 

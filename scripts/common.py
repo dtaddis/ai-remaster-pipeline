@@ -264,6 +264,56 @@ def replace_with_retry(source: Path, target: Path, label: str | None = None, att
             time.sleep(delay)
 
 
+def run_ffmpeg_with_progress(command: list[str], total_frames: int, label: str, interval: float = 2.0) -> None:
+    """Run a long ffmpeg encode, printing "<label>: N% (frames, fps), ETA m:ss" as it goes.
+
+    ARP's console hides ffmpeg's own carriage-return status lines, so a whole-clip encode
+    would otherwise sit silent for many minutes and look hung. The GUI reads the same lines
+    to drive the stage progress bar."""
+    total = max(1, int(total_frames))
+    command = [command[0], "-nostats", "-progress", "pipe:1", *command[1:]]
+    started = time.monotonic()
+    last_print = 0.0
+    last_percent = -1
+    frame = 0
+
+    def report(final: bool = False) -> None:
+        nonlocal last_print, last_percent
+        percent = min(100, int(frame * 100 / total))
+        now = time.monotonic()
+        if percent == last_percent or (not final and now - last_print < interval):
+            return
+        elapsed = max(0.001, now - started)
+        rate = frame / elapsed
+        eta = format_duration((total - frame) / rate) if rate > 0 and frame < total else ("0:00" if frame >= total else "calculating")
+        print(f"{label}: {percent}% ({frame}/{total} frames, {rate:.1f} fps), ETA {eta}", flush=True)
+        last_print, last_percent = now, percent
+
+    print(f"{label}: 0% (0/{total} frames), ETA calculating", flush=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    assert process.stdout is not None
+    for line in process.stdout:
+        key, _, value = line.strip().partition("=")
+        if key == "frame":
+            try:
+                frame = int(value)
+            except ValueError:
+                continue
+            report()
+        elif key == "progress" and value == "end":
+            report(final=True)
+    returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+
+
+def format_duration(seconds: float) -> str:
+    total = int(round(max(0.0, seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:d}:{secs:02d}"
+
+
 def replace_unless_identical(partial: Path, target: Path, label: str | None = None) -> None:
     """Promote partial to target, but keep the existing target when it is identical so resume
     signatures that fingerprint it stay valid.

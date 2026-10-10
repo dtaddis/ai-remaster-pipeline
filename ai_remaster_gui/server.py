@@ -70,6 +70,7 @@ from .process_utils import (
     first_int_after,
     format_duration,
     install_progress_status,
+    marker_progress_status,
     outpaint_chunk_progress,
     outpaint_eta_label,
     recomp_progress,
@@ -736,6 +737,16 @@ class PipelineApp:
                     label = f"Chunk {chunk['current']}/{chunk['total']} rendering in ComfyUI ({chunk['done']} done){eta}"
                 else:
                     label = f"Chunk {chunk['current']}/{chunk['total']} ({chunk['done']} done){eta}"
+            # Stitching and finalizing are each one whole-clip encode; their own progress
+            # lines replace the chunk label so the bar keeps moving after the last chunk.
+            for marker, floor, span, text in (
+                ("Stitch progress:", 90, 4, "Stitching outpainted video"),
+                ("Finalize progress:", 94, 5, "Finalizing outpainted video"),
+            ):
+                encode = marker_progress_status(log_text, marker)
+                if encode and percent < 100:
+                    percent = max(percent, floor + int(encode["percent"]) * span // 100)
+                    label = f"{text} {encode['percent']}%{download_eta_label(encode)}"
         elif self.running_stage_key == "shots":
             if "detected " in lower:
                 percent, label = max(percent, 75), "Shots detected"

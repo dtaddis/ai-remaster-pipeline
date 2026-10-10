@@ -27,8 +27,12 @@ def download_progress_percent(text: str) -> int | None:
 
 
 def download_progress_status(text: str) -> dict[str, str | int] | None:
+    return marker_progress_status(text, "Download progress:")
+
+
+def marker_progress_status(text: str, marker: str) -> dict[str, str | int] | None:
+    """Latest "<marker> N% ..., ETA x" line as {"percent", "eta"} (or a free-text "note")."""
     latest: dict[str, str | int] | None = None
-    marker = "Download progress:"
     for line in text.splitlines():
         if marker not in line:
             continue

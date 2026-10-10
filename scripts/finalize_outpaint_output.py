@@ -5,7 +5,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import file_fingerprint, resolve_path, root_relative, resumable_output, video_info, write_signature
+from common import file_fingerprint, resolve_path, root_relative, resumable_output, run_ffmpeg_with_progress, video_info, write_signature
 from intermediate_video import codec_args as intermediate_codec_args, container_args
 
 
@@ -197,7 +197,7 @@ def main():
     if args.dry_run:
         return 0
     output.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(command, check=True)
+    run_ffmpeg_with_progress(command, int(info['frames']), 'Finalize progress')
     replace_with_retry(partial, output)
     write_signature(output, sig)
     print(f'Wrote restored outpaint: {output}')
