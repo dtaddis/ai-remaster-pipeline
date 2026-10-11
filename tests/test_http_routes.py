@@ -122,11 +122,11 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertTrue(any("Shot merge failed: kaboom" in line for line in state.APP.log))
 
     def test_send_result_side_effect_only_returns_ok(self) -> None:
-        with mock.patch.object(http_handler, "update_manifest_row", return_value=None) as row:
+        with mock.patch.object(http_handler, "update_reference_prompt", return_value={}) as save:
             handler = _Handler("/api/shot-prompt", {"manifest": "m.csv", "index": 1, "prompt": "hi"})
             handler.do_POST()
         self.assertEqual(handler.responses["json"], {"ok": True})
-        row.assert_called_once()
+        save.assert_called_once_with("m.csv", 1, 0, "hi")  # no reference_index: reference 1
 
     def test_shot_boundary_returns_row_patch_instead_of_full_state(self) -> None:
         with (

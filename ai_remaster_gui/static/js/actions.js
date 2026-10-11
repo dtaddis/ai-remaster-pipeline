@@ -82,8 +82,8 @@ async function refreshReferenceRowFromState(nextState, index) {
   lastRenderSignature = renderSignature();
 }
 
-async function saveShotPrompt(manifest, index, prompt) {
-  const result = await postJson('/api/shot-prompt', { manifest, index, prompt });
+async function saveShotPrompt(manifest, index, prompt, reference_index = 0) {
+  const result = await postJson('/api/shot-prompt', { manifest, index, prompt, reference_index });
   if (!result.ok) return alert(result.error || 'Could not save prompt');
 
   state = await api(stateUrl());

@@ -28,6 +28,7 @@ from reference_sets import (  # noqa: E402
     additional_references,
     append_reference_item,
     encode_additional_references,
+    expanded_reference_rows,
     reference_items,
     remove_reference_item,
     update_reference_item,
@@ -461,6 +462,17 @@ def update_shot_ltx_strength(manifest_text: str, index: int, key: str, raw: str)
     update_manifest_row(resolve(manifest_text), index, {key: value})
     return {key: value}
 
+def update_reference_prompt(manifest_text: str, index: int, reference_index: int, prompt: str) -> dict[str, str]:
+    """One reference's own prompt. Reference 1's is the row's prompt column (the old shot prompt);
+    each extra reference keeps its own, so later references no longer go out with a blank one."""
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    update_reference_item(rows[index], reference_index, {"prompt": prompt})
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    return {"prompt": prompt}
+
 def update_reference_guide_strength(manifest_text: str, index: int, reference_index: int, raw: str) -> dict[str, str]:
     """One reference frame's own LTX guide strength ('' follows the Colour tab)."""
     value = _strength_text(raw, 0.0, 1.0)
@@ -832,6 +844,7 @@ def reference_regeneration_command(manifest_text: str, index: int, reference_ind
         "--save-node-id",
         values.get("save_node_id", "auto"),
         *reference_seed_args(values),
+        *[item for path in qwen_reference_images(manifest_text, index, reference_index, qwen_reference_count(values)) for item in ("--reference-image", path)],
         "--force",
     ]
     if values.get("prompt_node_id"):
@@ -884,6 +897,34 @@ def openai_reference_regeneration_command(manifest_text: str, index: int, refere
 # held to two and only with "Describe each still" (qwen21_reference_args).
 MAX_PREVIOUS_REFERENCES = 9
 MAX_QWEN21_REFERENCES = 2
+
+
+def qwen_reference_count(values: dict[str, str]) -> int:
+    """Nearby shots' colour references Qwen 2511 is also shown (0-2): the count on the Reference
+    Generation tab when its "Also send" box is ticked. A shot's own other references always go."""
+    if values.get("qwen_send_references", "false") != "true":
+        return 0
+    try:
+        count = int(str(values.get("qwen_reference_count", "2")).strip() or 2)
+    except ValueError:
+        count = 2
+    return max(0, min(2, count))
+
+
+def qwen_reference_images(manifest_text: str, index: int, reference_index: int, count: int) -> list[str]:
+    """The colour references to show Qwen 2511 with one shot reference (see reference_images_for)."""
+    from qwen_colorize_references import reference_images_for
+
+    manifest = resolve(manifest_text)
+    _source_video, _fields, shot_rows = read_manifest_details(manifest)
+    rows = expanded_reference_rows(shot_rows)
+    position = next(
+        (i for i, row in enumerate(rows) if row.get("_shot_index") == str(index) and row.get("_reference_index") == str(reference_index)),
+        None,
+    )
+    if position is None:
+        return []
+    return [rel(path) for path in reference_images_for(rows, position, count)]
 
 
 def previous_reference_count(values: dict[str, str]) -> int:

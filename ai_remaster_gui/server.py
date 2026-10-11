@@ -98,6 +98,7 @@ from .references import (
     previous_reference_count,
     qwen21_reference_args,
     reference_seed_args,
+    qwen_reference_count,
     qwen21_reference_regeneration_command,
     reference_edit_prompt,
     reference_regeneration_command,
@@ -1933,6 +1934,8 @@ class PipelineApp:
             add(["--model-backend", values.get("model_backend", "gguf"), "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
             add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "auto"), "--save-node-id", values.get("save_node_id", "auto")])
             add(reference_seed_args(values))
+            if qwen_reference_count(values):
+                add(["--reference-count", str(qwen_reference_count(values))])
             if values.get("prompt_node_id"):
                 add(["--prompt-node-id", values["prompt_node_id"]])
         if values.get("limit"):

@@ -5993,6 +5993,77 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(first.name, "shot_0003")
         self.assertEqual(second.name, "shot_0003_ref02")
 
+    def test_qwen_2511_is_shown_the_shots_own_references_first(self) -> None:
+        import qwen_colorize_references as qwen
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            for name in ("s0", "s1", "s1b", "s2", "c0", "c1", "c1b", "c2"):
+                (folder / f"{name}.png").write_bytes(name.encode())
+            extra = [{"selected_frame": "40", "source_reference": app.rel(folder / "s1b.png"), "color_reference": app.rel(folder / "c1b.png"), "prompt": ""}]
+            manifest = folder / "refs.csv"
+            app.write_manifest_details(
+                manifest, "input/example.mp4",
+                ["enabled", "end", "source_reference", "color_reference", "prompt", "additional_references"],
+                [
+                    {"enabled": "true", "end": "00:00:01.000", "source_reference": app.rel(folder / "s0.png"), "color_reference": app.rel(folder / "c0.png"), "prompt": "", "additional_references": ""},
+                    {"enabled": "true", "end": "00:00:02.000", "source_reference": app.rel(folder / "s1.png"), "color_reference": app.rel(folder / "c1.png"), "prompt": "", "additional_references": json.dumps(extra)},
+                    {"enabled": "true", "end": "00:00:03.000", "source_reference": app.rel(folder / "s2.png"), "color_reference": app.rel(folder / "c2.png"), "prompt": "", "additional_references": ""},
+                ],
+            )
+            references = sys.modules["ai_remaster_gui.references"]
+            own_only = references.qwen_reference_images(app.rel(manifest), 1, 1, 0)
+            topped_up = references.qwen_reference_images(app.rel(manifest), 1, 0, 2)
+            alone = references.qwen_reference_images(app.rel(manifest), 2, 0, 0)
+            app.APP.settings["references"].update({"method": "qwen", "qwen_send_references": "false"})
+            single, _output = references.reference_regeneration_command(str(manifest), 1, 1)
+
+        # A new keyframe always sees its shot's other reference; neighbours only fill free slots.
+        self.assertEqual(own_only, [app.rel(folder / "c1.png")])
+        self.assertEqual(topped_up, [app.rel(folder / "c1b.png"), app.rel(folder / "c0.png")])
+        self.assertEqual(alone, [])
+        self.assertEqual(single[single.index("--reference-image") + 1], app.rel(folder / "c1.png"))
+
+    def test_each_reference_is_generated_with_its_own_prompt(self) -> None:
+        references = sys.modules["ai_remaster_gui.references"]
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            for name in ("s0", "c0", "s1", "c1"):
+                (folder / f"{name}.png").write_bytes(name.encode())
+            extra = [{"selected_frame": "20", "source_reference": app.rel(folder / "s1.png"), "color_reference": app.rel(folder / "c1.png"), "prompt": ""}]
+            manifest = folder / "refs.csv"
+            app.write_manifest_details(
+                manifest, "input/example.mp4",
+                ["enabled", "end", "source_reference", "color_reference", "prompt", "additional_references"],
+                [{"enabled": "true", "end": "00:00:01.000", "source_reference": app.rel(folder / "s0.png"), "color_reference": app.rel(folder / "c0.png"),
+                  "prompt": "", "additional_references": json.dumps(extra)}],
+            )
+            references.update_reference_prompt(app.rel(manifest), 0, 0, "Red funnels.")
+            references.update_reference_prompt(app.rel(manifest), 0, 1, "Mickey's shorts are red.")
+            app.APP.settings["references"].update({"method": "qwen", "qwen_send_references": "false"})
+            first, _ = references.reference_regeneration_command(str(manifest), 0, 0)
+            second, _ = references.reference_regeneration_command(str(manifest), 0, 1)
+            row = app.read_manifest(manifest)[0]
+
+        self.assertEqual(row["prompt"], "Red funnels.")
+        self.assertEqual(first[first.index("--add-prompt") + 1], "Red funnels.")
+        # Before, an extra reference's empty own prompt hid everything and it went out with none.
+        self.assertEqual(second[second.index("--add-prompt") + 1], "Mickey's shorts are red.")
+
+    def test_qwen_2511_reference_options_leave_existing_stills_reusable(self) -> None:
+        import qwen_colorize_references as qwen
+
+        args = qwen.build_parser().parse_args(["--manifest", "x.csv", "--workflow", "w.json"])
+        plain = qwen.signature(args, Path(__file__), Path(__file__), "p")
+        self.assertNotIn("reference_count", plain)  # a shot's own references never make a still stale
+        args.reference_count = 2
+        self.assertEqual(qwen.signature(args, Path(__file__), Path(__file__), "p")["reference_count"], 2)
+        self.assertEqual(qwen.reference_images_prompt("Colour it.", 0), "Colour it.")
+        self.assertIn("Images 2 and 3 are already coloured frames", qwen.reference_images_prompt("Colour it.", 2))
+        server = sys.modules["ai_remaster_gui.server"]
+        self.assertEqual(server.qwen_reference_count({}), 0)
+        self.assertEqual(server.qwen_reference_count({"qwen_send_references": "true", "qwen_reference_count": "9"}), 2)
+
     def test_reference_seed_is_passed_only_when_fixed(self) -> None:
         server = sys.modules["ai_remaster_gui.server"]
         self.assertEqual(server.reference_seed_args({}), [])

@@ -40,6 +40,7 @@ from .paths import resolve, resolve_served
 from .references import (
     accept_reference_edit,
     update_reference_guide_strength,
+    update_reference_prompt,
     update_shot_ltx_strength,
     add_reference_frame,
     delete_color_reference,
@@ -412,7 +413,9 @@ class Handler(BaseHTTPRequestHandler):
                 "state": state.APP.state("references"),
             })
         elif parsed.path == "/api/shot-prompt":
-            self._send_result("Shot prompt save", lambda: update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"prompt": str(data.get("prompt", ""))}) or {})
+            self._send_result("Reference prompt save", lambda: update_reference_prompt(
+                str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0)), str(data.get("prompt", "")),
+            ))
         elif parsed.path == "/api/shot-enabled":
             self._send_result("Shot enabled save", lambda: update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"enabled": "true" if data.get("enabled") else "false"}) or {})
         elif parsed.path == "/api/shot-merge":

@@ -24,6 +24,11 @@ DEFAULT_PROMPT_SUFFIX = (
     'Keep black ink deep, whites clean, and props/backgrounds naturally coloured.'
 )
 DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
+# Qwen 2511 takes up to three images: the frame being coloured plus two colour references.
+MAX_REFERENCE_IMAGES = 2
+# The result must keep the grey frame's composition; below this it copied a reference instead
+# (the measure and threshold are Qwen-Image-2.1's, see qwen21_generate_reference.py).
+COPY_THRESHOLD = 0.45
 DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434'
 DEFAULT_OLLAMA_VISION_MODEL = 'qwen2.5vl:7b'
 REFERENCE_DESCRIPTION_PROMPT = (
@@ -186,6 +191,75 @@ def build_prompt(args: argparse.Namespace, extra_description: str = '', row_prom
     return ' '.join(part for part in parts if part).strip()
 
 
+def reference_images_prompt(prompt: str, count: int) -> str:
+    """Say which picture is coloured and that the others only lend their colours."""
+    if not count:
+        return prompt
+    images, them, their = ("Image 2 is an already coloured frame", "it", "its") if count == 1 else ("Images 2 and 3 are already coloured frames", "them", "their")
+    return (
+        f"{prompt} Image 1 is the black-and-white frame to colourise: keep exactly its drawing, composition, "
+        f"characters, poses and background. {images} from the same film: use {them} only as a guide to the colours "
+        f"of the same characters, objects and scenery, and do not copy {their} composition or contents into image 1."
+    )
+
+
+def reference_images_for(rows: list[dict[str, str]], index: int, count: int) -> list[Path]:
+    """Colour references to show Qwen with one still. The shot's own references for its other
+    frames always go (the same scene, so the palette a new keyframe must keep); the nearest other
+    shots' fill any remaining of count slots. At most MAX_REFERENCE_IMAGES in all."""
+    shot = rows[index].get('_shot_index')
+
+    def shot_number(position: int) -> int:
+        try:
+            return int(rows[position].get('_shot_index', position))
+        except ValueError:
+            return position
+
+    own, others = [], []
+    for other_index, row in enumerate(rows):
+        if other_index == index:
+            continue
+        candidate = resolve_path(row_target(row)) if row_target(row) else None
+        if not candidate or not candidate.is_file():
+            continue
+        if shot is not None and row.get('_shot_index') == shot:
+            own.append((abs(other_index - index), candidate))
+        else:
+            # Nearness counts shots, not reference slots; the earlier shot wins a tie.
+            distance = abs(shot_number(other_index) - shot_number(index))
+            others.append((distance, 0 if other_index < index else 1, candidate))
+    chosen = [path for _distance, path in sorted(own, key=lambda item: item[0])][:MAX_REFERENCE_IMAGES]
+    fill = max(0, min(count, MAX_REFERENCE_IMAGES) - len(chosen))
+    chosen += [path for _distance, _later, path in sorted(others, key=lambda item: (item[0], item[1]))][:fill]
+    return chosen
+
+
+def reference_colours(args: argparse.Namespace, references: list[Path]) -> str:
+    """Each reference's colours as words, from Qwen3-VL (cached per image).
+
+    Shown only as images, Qwen 2511 carried a reference's scenery colours but not its characters'
+    (shot 3: Mickey's red shorts came out blue). With the colours also described it matched the
+    approved reference: blue hat, red shorts, yellow shoes, green hills.
+    """
+    from dependency_manager import QWEN_IMAGE_21_SHARED_MODELS, ensure_hf_models
+    from ltx_colorize import COLOUR_REQUEST, describe_image
+
+    encoder = next(model for model in QWEN_IMAGE_21_SHARED_MODELS if 'text_encoders' in model.destination)
+    ensure_hf_models(resolve_path(args.comfy_dir), [encoder])
+    parts = []
+    for position, path in enumerate(references, start=2):
+        text = describe_image(args, path, COLOUR_REQUEST)
+        if text:
+            parts.append(f'The colours in image {position}, to use for the same things in image 1: {text}')
+    return ' '.join(parts)
+
+
+def prepare_reference_image(path: Path, comfy_dir: Path) -> str:
+    """A colour reference as a ComfyUI input. The encoder resizes it itself (and reads it as a
+    second picture of its own), so it is copied as it is."""
+    return copy_to_comfy_input(path, comfy_dir, 'arp_qwen_ref_images')
+
+
 def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, prompt: str) -> dict[str, Any]:
     return {
         'version': 5,
@@ -206,6 +280,10 @@ def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, 
         'gguf_model': args.gguf_model if args.model_backend == 'gguf' else None,
         # A random seed (-1) never makes a still stale; a chosen seed is part of what it was made with.
         **({'seed': args.seed} if args.seed >= 0 else {}),
+        # Which images were shown is left out on purpose: a neighbour's new take would otherwise
+        # make every later still stale in a batch run. Only opting into nearby shots is recorded,
+        # so existing references stay reusable.
+        **({'reference_count': args.reference_count} if args.reference_count > 0 else {}),
     }
 
 
@@ -259,6 +337,8 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
     comfy_image = copy_to_comfy_input(source_path, resolve_path(args.comfy_dir), 'arp_qwen_refs')
     link_lookup = {int(link.get('id')): link for link in links if isinstance(link, dict) and 'id' in link}
     source_image_link: dict[str, Any] | None = None
+    reference_names = list(getattr(args, 'active_reference_names', []) or [])[:MAX_REFERENCE_IMAGES]
+    reference_targets: dict[int, dict[str, Any]] = {}
 
     def subgraph_input_name(slot: int) -> str:
         if 0 <= slot < len(subgraph_inputs) and isinstance(subgraph_inputs[slot], dict):
@@ -281,7 +361,10 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
                 source_image_link = link
                 item['link'] = 900001
             elif input_name in {'image2', 'image3'}:
-                item['link'] = None
+                position = 0 if input_name == 'image2' else 1
+                item['link'] = 900002 + position if position < len(reference_names) else None
+                if item['link'] is not None:
+                    reference_targets.setdefault(position, link)
             elif input_name == 'prompt':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'prompt')}
@@ -341,6 +424,26 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
         'target_slot': int(source_image_link.get('target_slot', 0)),
         'type': 'IMAGE',
     })
+    for position, target in sorted(reference_targets.items()):
+        reference_load_id = 90003 + position
+        nodes.append({
+            'id': reference_load_id,
+            'type': 'LoadImage',
+            'inputs': [{'name': 'image', 'type': 'COMBO', 'widget': {'name': 'image'}}],
+            'outputs': [{'name': 'IMAGE', 'type': 'IMAGE', 'links': [900002 + position]}],
+            'widgets_values': [reference_names[position]],
+        })
+        links.append({
+            'id': 900002 + position,
+            'origin_id': reference_load_id,
+            'origin_slot': 0,
+            'target_id': int(target.get('target_id')),
+            'target_slot': int(target.get('target_slot', 0)),
+            'type': 'IMAGE',
+        })
+
+    if reference_targets:
+        vision_only_references(nodes, links)
 
     output_link = next((link for link in links if isinstance(link, dict) and int(link.get('target_id', 0)) == -20), None)
     if not output_link:
@@ -376,6 +479,48 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
 
     flat = {'nodes': nodes, 'links': [link_to_list(link) for link in links]}
     return workflow_to_prompt(flat, save_id)
+
+
+def vision_only_references(nodes: list[dict[str, Any]], links: list[dict[str, Any]]) -> None:
+    """Let the colour references be seen but not redrawn.
+
+    TextEncodeQwenImageEditPlus turns every image into vision tokens and, when it has a VAE, also
+    into a reference latent, which Qwen reproduces: with the shot's own reference attached it
+    redrew that reference's pose instead of colouring the grey frame (shot 3, composition 0.32).
+    So the encoders lose their VAE (every image is vision only) and a ReferenceLatent node gives
+    each conditioning back the grey frame alone, from the graph's own VAEEncode of image 1.
+    """
+    encoders = [node for node in nodes if isinstance(node, dict) and node.get('type') == 'TextEncodeQwenImageEditPlus']
+    encode = next((node for node in nodes if isinstance(node, dict) and node.get('type') == 'VAEEncode'), None)
+    if not encoders or encode is None:
+        raise RuntimeError('The Qwen 2511 workflow has no TextEncodeQwenImageEditPlus/VAEEncode pair to give the colour references.')
+    for item in (inp for encoder in encoders for inp in encoder.get('inputs') or []):
+        if item.get('name') == 'vae':
+            item['link'] = None
+    next_link = 900020
+    for offset, encoder in enumerate(encoders):
+        reference_id = 90010 + offset
+        conditioning_link, latent_link = next_link, next_link + 1
+        next_link += 2
+        consumers = [link for link in links if isinstance(link, dict) and int(link.get('origin_id', 0)) == int(encoder['id'])]
+        for link in consumers:
+            link['origin_id'], link['origin_slot'] = reference_id, 0
+        for output in encoder.get('outputs') or []:
+            output['links'] = [conditioning_link]
+        for output in encode.get('outputs') or []:
+            output['links'] = [*(output.get('links') or []), latent_link]
+        nodes.append({
+            'id': reference_id,
+            'type': 'ReferenceLatent',
+            'inputs': [
+                {'name': 'conditioning', 'type': 'CONDITIONING', 'link': conditioning_link},
+                {'name': 'latent', 'type': 'LATENT', 'link': latent_link},
+            ],
+            'outputs': [{'name': 'CONDITIONING', 'type': 'CONDITIONING', 'links': [int(link['id']) for link in consumers]}],
+            'widgets_values': [],
+        })
+        links.append({'id': conditioning_link, 'origin_id': int(encoder['id']), 'origin_slot': 0, 'target_id': reference_id, 'target_slot': 0, 'type': 'CONDITIONING'})
+        links.append({'id': latent_link, 'origin_id': int(encode['id']), 'origin_slot': 0, 'target_id': reference_id, 'target_slot': 1, 'type': 'LATENT'})
 
 
 def link_to_list(link: Any) -> Any:
@@ -534,6 +679,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--prompt-widget', default='0', help='Widget name for API-format workflows, or widget index for normal exported workflows.')
     parser.add_argument('--save-node-id', default='auto')
     parser.add_argument('--save-prefix-widget', default='0', help='Widget name for API-format workflows, or widget index for normal exported workflows.')
+    parser.add_argument('--reference-image', action='append', default=[], type=Path, help='A colour reference to show Qwen as image 2 or 3 (at most two); can be repeated.')
+    parser.add_argument('--reference-count', type=int, default=0, help=f'Without --reference-image: a still always sees its own shot\'s other colour references; nearby shots\' fill up to this many (0-{MAX_REFERENCE_IMAGES}).')
+    parser.add_argument('--describe-references', action=argparse.BooleanOptionalAction, default=True, help='Describe each colour reference\'s colours (Qwen3-VL) into the prompt; images alone carry scenery colours but not characters\'.')
     parser.add_argument('--seed', type=int, default=-1, help='Sampler seed; -1 picks a new random seed for every still, so each attempt differs.')
     parser.add_argument('--poll-seconds', type=float, default=2.0)
     parser.add_argument('--limit', type=int)
@@ -556,7 +704,9 @@ def main_with_args(args: argparse.Namespace) -> int:
         rows = rows[:args.limit]
     print(f'Manifest: {manifest}')
     print(f'Rows: {len(rows)}')
-    print(f'Qwen mode: {args.model_backend}; one source image only; extra references are converted to text guidance when enabled.')
+    reference_note = 'the given colour references' if args.reference_image else (
+        "its shot's other colour references" + (f", topped up to {min(args.reference_count, MAX_REFERENCE_IMAGES)} from nearby shots" if args.reference_count else ''))
+    print(f'Qwen mode: {args.model_backend}; each still with {reference_note}.')
     rows_without_source = [row for row in rows if not row_source(row).strip()]
     if rows_without_source:
         print(f'Skipping {len(rows_without_source)} shot(s) with no guide frame (empty source_reference).')
@@ -586,6 +736,15 @@ def main_with_args(args: argparse.Namespace) -> int:
             continue
         ref_note = f', described refs={len(refs)}' if refs else ''
         args.active_seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
+        shown = [resolve_path(path) for path in args.reference_image if resolve_path(path).is_file()][:MAX_REFERENCE_IMAGES] or reference_images_for(rows, index, args.reference_count)
+        shown = [path for path in shown if path.resolve() != dst.resolve()]
+        args.active_reference_names = [prepare_reference_image(path, comfy_dir) for path in shown] if not args.dry_run else [path.name for path in shown]
+        colours = reference_colours(args, shown) if shown and args.describe_references and not args.dry_run else ''
+        # The colours as words go with the redo without images too: text alone cannot be copied.
+        base_prompt = f'{prompt} {colours}'.strip()
+        prompt = f'{reference_images_prompt(prompt, len(shown))} {colours}'.strip()
+        if shown:
+            print(f'Qwen colour references {index:04d}: ' + ', '.join(path.name for path in shown), flush=True)
         print(f'Colorize {index:04d}: {src} -> {dst}{ref_note}')
         print(f'Qwen prompt {index:04d}: {prompt}')
         print(f'Qwen seed {index:04d}: {args.active_seed}', flush=True)
@@ -601,10 +760,13 @@ def main_with_args(args: argparse.Namespace) -> int:
         prompt_payload = patch_workflow(args, workflow, src, dst, prompt)
         if args.print_api_prompt:
             print(json.dumps(prompt_payload, indent=2))
-        prompt_id = queue_prompt(args.comfy_url, prompt_payload)
-        print(f'Queued ComfyUI prompt: {prompt_id}', flush=True)
-        history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
-        produced = newest_output(extract_output_files(history, resolve_path(args.comfy_output_root)))
+        produced = render(args, prompt_payload)
+        if shown and composition_score(produced, src) < COPY_THRESHOLD:
+            print(f'Composition check {index:04d}: the colour references took over this still; colouring it again without them.', flush=True)
+            args.active_reference_names = []
+            workflow = load_workflow(workflow_path)
+            patch_qwen_model_backend(args, workflow)
+            produced = render(args, patch_workflow(args, workflow, src, dst, base_prompt))
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(dst.suffix + '.partial')
         shutil.copy2(produced, tmp)
@@ -614,6 +776,27 @@ def main_with_args(args: argparse.Namespace) -> int:
         write_signature(dst, sig)
         print(f'Wrote {dst}')
     return 0
+
+
+def render(args: argparse.Namespace, prompt_payload: dict[str, Any]) -> Path:
+    prompt_id = queue_prompt(args.comfy_url, prompt_payload)
+    print(f'Queued ComfyUI prompt: {prompt_id}', flush=True)
+    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    return newest_output(extract_output_files(history, resolve_path(args.comfy_output_root)))
+
+
+def composition_score(result: Path, source: Path) -> float:
+    """How well a still keeps its grey frame's composition (1.0 the same picture, a copy near 0)."""
+    from PIL import Image
+    import numpy as np
+    from qwen21_generate_reference import structure_score
+
+    with Image.open(source) as grey, Image.open(result) as coloured:
+        grey_rgb = np.asarray(grey.convert('RGB'))
+        coloured_rgb = np.asarray(coloured.convert('RGB').resize((grey_rgb.shape[1], grey_rgb.shape[0])))
+    score = structure_score(coloured_rgb, grey_rgb)
+    print(f'Composition check: {score:.2f} (copies score under {COPY_THRESHOLD})', flush=True)
+    return score
 
 
 def main() -> int:

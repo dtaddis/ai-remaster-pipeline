@@ -306,6 +306,23 @@ function referenceSeedHtml(s) {
 }
 
 function referenceModelOptionsHtml(s, method) {
+  if (method === 'qwen') {
+    return `
+      <div class="checks">
+        <label>
+          <input data-field="qwen_send_references" type="checkbox" ${s.qwen_send_references === 'true' ? 'checked' : ''}>
+          Also send
+          <input data-field="qwen_reference_count" type="number" min="1" max="2" step="1" value="${esc(s.qwen_reference_count || '2')}" class="inline-number" aria-label="Number of nearby shots' references to send">
+          nearby shots' references
+        </label>
+      </div>
+      <p class="field-help">Qwen 2511 is always shown the shot's own colour references for its other frames, so a new
+      reference frame keeps the same colours. It takes at most two, and nearby shots' references fill any free slot.
+      Each one's colours are also described in words (Qwen3-VL, cached per image): shown only as a picture, the scenery
+      colours carried over but not the characters'. A still that still comes out with another frame's composition is
+      coloured again with the described colours only.</p>
+    `;
+  }
   if (method === 'qwen21') {
     const describe = s.qwen21_describe !== 'false';
     return `
@@ -695,6 +712,8 @@ function referenceAnchorCard(manifest, row, idx, item) {
         data-fps="${fps}"
         oninput="this.dataset.referenceTimeDirty='true';updateReferenceAnchorPreview('${esc(manifest)}',${idx},${referenceIndex},this.value,'${image}','${label}',${fps})"
       >
+      <label>Prompt</label>
+      <textarea data-reference-prompt="${idx}_${referenceIndex}" onblur="saveShotPrompt('${esc(manifest)}',${idx},this.value,${referenceIndex})" placeholder="Optional extra direction for this reference frame">${esc(item.prompt || '')}</textarea>
       <div class="shot-tools">
         <button type="button" onclick="useReferenceAnchorFrame('${esc(manifest)}',${idx},${referenceIndex},document.getElementById('${slider}').value,${fps})">Use Frame</button>
         <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx},${referenceIndex})">Use Custom Image</button>
@@ -796,8 +815,6 @@ function referencePromptTools({ manifest, row, idx }) {
   const rp = stageProgress('references');
 
   return `
-    <label>Shot prompt</label>
-    <textarea data-shot-prompt="${idx}" onblur="saveShotPrompt('${esc(manifest)}',${idx},this.value)" placeholder="Optional extra direction for this shot">${esc(row.prompt || '')}</textarea>
     <div class="shot-tools">
       <button type="button" onclick="chooseCustomReference('${esc(manifest)}',${idx})">
         Use Custom Image

@@ -64,3 +64,4 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 
 .checks input.inline-number{width:56px;padding:4px 6px}
 .ltx-shot-controls{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 14px;border-top:1px solid var(--line);padding-top:10px}.ltx-shot-controls>label{grid-column:1/-1;margin:0}.ltx-strength-control label{display:flex;justify-content:space-between;margin:0}.ltx-strength-control output{font-variant-numeric:tabular-nums}.ltx-strength-control input[type=range]{width:100%;padding:0}.ltx-strength-control .upscale-shot-actions{margin-top:4px}
+.reference-anchor-card textarea{width:100%;min-height:56px;margin-bottom:6px}
