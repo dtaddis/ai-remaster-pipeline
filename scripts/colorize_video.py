@@ -1096,7 +1096,8 @@ def run(args: argparse.Namespace) -> int:
             )
         elif args.method == "ltx":
             plan, _transitions = shot_plan(rows, int(source_info["frames"]), float(source_info["fps"]))
-            chunks = sum(len(ltx_colorize.shot_chunks(item["start"], item["end"], ltx_colorize.CHUNK_FRAMES, args.ltx_overlap_frames)) for item in plan)
+            chunk_frames = ltx_colorize.chunk_frames_for(args.ltx_chunk_seconds, float(source_info["fps"]))
+            chunks = sum(len(ltx_colorize.shot_chunks(item["start"], item["end"], chunk_frames, args.ltx_overlap_frames)) for item in plan)
             print(
                 f"Would colorize {len(rows)} shot(s) in {chunks} LTX chunk(s) at {target_width}x{target_height}: "
                 f"{source_video} -> {output}",

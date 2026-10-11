@@ -1962,6 +1962,7 @@ class PipelineApp:
             return cmd
         if method == "ltx":
             add(["--comfy-dir", comfy_dir_for(config), "--comfy-url", comfy_url_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+            add(["--ltx-chunk-seconds", values.get("ltx_chunk_seconds", "15") or "15"])
             add(["--ltx-lora-strength", values.get("ltx_lora_strength", "1") or "1"])
             add(["--ltx-reference-strength", values.get("ltx_reference_strength", "1") or "1"])
             add_bool_flags(cmd, values, ("ltx_describe",), default="true")

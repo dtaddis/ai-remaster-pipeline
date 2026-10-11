@@ -178,6 +178,7 @@ STAGES = (
             ("colormnet_feature_encoder", "ColorMNet encoder", "select:resnet50|vgg19|dinov2_vits|dinov2_vitb|dinov2_vitl|clip_vitb", "resnet50"),
             ("colormnet_text_guidance", "ColorMNet text guidance", "text", ""),
             ("ltx_describe", "Describe shots with Qwen3-VL", "checkbox", "true"),
+            ("ltx_chunk_seconds", "LTX max chunk length (s)", "range:2|20|0.5", "15"),
             ("ltx_lora_strength", "LTX Colorizer strength", "range:0.5|1|0.05", "1"),
             ("ltx_reference_strength", "Reference guide strength", "range:0|1|0.05", "1"),
         ),

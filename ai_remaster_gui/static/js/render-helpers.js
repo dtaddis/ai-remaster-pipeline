@@ -121,6 +121,8 @@ const FIELD_DESCRIPTIONS = {
     'How strongly the colorized chroma layer contributes, as a percentage.',
   'colour.ltx_describe':
     'Qwen3-VL describes each shot\'s grey frame and the colours in its reference; both go into the LTX prompt, which the Colorization LoRA was trained to read. Off uses a generic prompt and relies on the reference guide frame alone.',
+  'colour.ltx_chunk_seconds':
+    'Longest single LTX pass. A shot up to this long is coloured in one go, which keeps its colour consistent; longer shots are split into overlapping chunks joined by crossfades. The Colorization LoRA was trained on 5-second clips, and longer chunks take more time and memory per pass.',
   'colour.ltx_lora_strength':
     'Colorization LoRA strength. Lightricks suggest 0.8-0.9 if colour bleeds or oversaturates.',
   'colour.ltx_reference_strength':
@@ -478,6 +480,7 @@ const RANGE_FIELD_UNITS = {
   temperature: ' K',
   color_opacity: '%',
   color_luminance: '%',
+  ltx_chunk_seconds: ' s',
 };
 
 const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'edge_left', 'edge_right', 'edge_top', 'edge_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity', 'color_luminance']);

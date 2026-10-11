@@ -6524,12 +6524,14 @@ class GuiSmokeTests(unittest.TestCase):
         app.APP.settings["colour"].update({
             "manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "ltx",
             "ltx_lora_strength": "0.85", "ltx_reference_strength": "0.9", "ltx_describe": "false",
+            "ltx_chunk_seconds": "12.5",
         })
 
         command = app.APP.command_for("colour")
 
         self.assertEqual(command[command.index("--method") + 1], "ltx")
         self.assertEqual(command[command.index("--ltx-lora-strength") + 1], "0.85")
+        self.assertEqual(command[command.index("--ltx-chunk-seconds") + 1], "12.5")
         self.assertEqual(command[command.index("--ltx-reference-strength") + 1], "0.9")
         self.assertIn("--no-ltx-describe", command)
         self.assertIn("--comfy-url", command)

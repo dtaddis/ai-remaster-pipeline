@@ -2305,6 +2305,11 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     video_name = copy_to_comfy_input(prepared, comfy_dir, "arp_outpaint")
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
+    # The Dearchive author's graph caps the loader at 201 frames; ARP's prepared clip is exactly
+    # one chunk, so load all of it (a longer chunk otherwise loses its tail from the IC guide).
+    load_node = node_by_id(workflow, args.load_video_node_id) if args.load_video_node_id else None
+    if load_node and isinstance(load_node.get("widgets_values"), dict) and "frame_load_cap" in load_node["widgets_values"]:
+        load_node["widgets_values"]["frame_load_cap"] = 0
 
     # Guide image path: LoadImage (2004) -> ResizeImageMaskNode (5090) -> LTXVPreprocess (3336)
     # -> LTXVImgToVideoConditionOnly (3159) -> LTXAddVideoICLoRAGuide (5012) latent input.

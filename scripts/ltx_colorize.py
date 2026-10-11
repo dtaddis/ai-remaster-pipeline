@@ -38,6 +38,9 @@ from intermediate_video import codec_args, container_args, vhs_inputs_for_profil
 VERSION = 2
 MODEL_SIZE_MULTIPLE = 32
 CHUNK_FRAMES = 121  # the LoRA's 960x544x121 training bucket
+# Longer than the training bucket by default, so most shots are one chunk: a cut-free shot then
+# gets one consistent pass instead of several joined at crossfades. Shots longer than this split.
+DEFAULT_CHUNK_SECONDS = 15.0
 DEFAULT_HEIGHT = 544
 DEFAULT_OVERLAP = 17
 DESCRIBE_NODE_ID = "52"
@@ -70,6 +73,7 @@ DESCRIBE_NODES = {"TextGenerate": "ComfyUI core (0.37 or newer)"}
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("LTX Colorizer")
     group.add_argument("--ltx-height", type=int, default=DEFAULT_HEIGHT, help="Generation height; the LoRA was trained at 544 (960x544).")
+    group.add_argument("--ltx-chunk-seconds", type=float, default=DEFAULT_CHUNK_SECONDS, help="Longest LTX chunk; a shot up to this long is coloured in one pass, longer shots are split. Rounded to 8n+1 frames.")
     group.add_argument("--ltx-overlap-frames", type=int, default=DEFAULT_OVERLAP, help="Minimum frames shared by neighbouring chunks of a long shot.")
     group.add_argument("--ltx-lora-strength", type=float, default=1.0)
     group.add_argument("--ltx-reference-strength", type=float, default=1.0, help="Guide strength of the colour reference at its own frame.")
@@ -85,6 +89,7 @@ def settings_signature(args: argparse.Namespace) -> dict[str, Any]:
         "ltx_version": VERSION,
         "ltx_height": args.ltx_height,
         "ltx_overlap_frames": args.ltx_overlap_frames,
+        "ltx_chunk_seconds": args.ltx_chunk_seconds,
         "ltx_lora_strength": args.ltx_lora_strength,
         "ltx_reference_strength": args.ltx_reference_strength,
         "ltx_continuity_strength": args.ltx_continuity_strength,
@@ -100,6 +105,11 @@ def ltx_dimensions(width: int, height: int, target_height: int = DEFAULT_HEIGHT)
     out_h = max(MODEL_SIZE_MULTIPLE, round(target_height / MODEL_SIZE_MULTIPLE) * MODEL_SIZE_MULTIPLE)
     out_w = max(MODEL_SIZE_MULTIPLE, round(width * out_h / height / MODEL_SIZE_MULTIPLE) * MODEL_SIZE_MULTIPLE)
     return out_w, out_h
+
+
+def chunk_frames_for(seconds: float, fps: float) -> int:
+    """The longest chunk in frames for a duration: LTX needs 8n + 1, at least the 9-frame minimum."""
+    return max(1, round((max(0.5, float(seconds)) * fps - 1) / 8)) * 8 + 1
 
 
 def shot_chunks(start: int, end: int, chunk_frames: int = CHUNK_FRAMES, overlap: int = DEFAULT_OVERLAP) -> list[tuple[int, int]]:
@@ -474,7 +484,7 @@ def run_ltx_colorization(
     segments: list[Path] = []
     for shot, (row, item) in enumerate(zip(rows, plan)):
         start, end = item["start"], item["end"]
-        chunks = shot_chunks(start, end, CHUNK_FRAMES, args.ltx_overlap_frames)
+        chunks = shot_chunks(start, end, chunk_frames_for(args.ltx_chunk_seconds, fps), args.ltx_overlap_frames)
         anchors = [
             ref for ref in references[shot]
             if ref["selected_frame"] is not None and start <= ref["selected_frame"] < end

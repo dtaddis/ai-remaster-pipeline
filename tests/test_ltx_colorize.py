@@ -34,6 +34,15 @@ class ShotChunkTests(unittest.TestCase):
             for (_, previous_last), (first, _) in zip(chunks, chunks[1:]):
                 self.assertGreaterEqual(previous_last - first, 17, length)
 
+    def test_chunk_length_is_whole_ltx_frames(self) -> None:
+        self.assertEqual(ltx_colorize.chunk_frames_for(5, 24), 121)
+        self.assertEqual(ltx_colorize.chunk_frames_for(15, 23.976), 361)
+        self.assertEqual((ltx_colorize.chunk_frames_for(7.3, 25) - 1) % 8, 0)
+        # A 14-second shot is one chunk at the 15-second default, four at the old 5 seconds.
+        shot = int(14 * 23.976)
+        self.assertEqual(len(ltx_colorize.shot_chunks(0, shot, ltx_colorize.chunk_frames_for(15, 23.976))), 1)
+        self.assertEqual(len(ltx_colorize.shot_chunks(0, shot, ltx_colorize.chunk_frames_for(5, 23.976))), 4)
+
     def test_processing_starts_at_the_reference_chunk_and_works_outwards(self) -> None:
         chunks = ltx_colorize.shot_chunks(0, 400, 121, 17)
         anchor = ltx_colorize.anchor_chunk(chunks, [250])
