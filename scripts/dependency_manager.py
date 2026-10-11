@@ -167,6 +167,14 @@ CLEANUP_MODELS = [
     HfModel("oumoumad/ltx-2.3-dearchive-lora", "lora_weights_step_05000.safetensors", "models/loras/ltx-2.3-dearchive-lora.safetensors"),
 ]
 
+# Lightricks' Colorization IC-LoRA: the grayscale shot is its full-video reference and it redraws
+# the whole picture, brightness included. Gated (auto-approved) on Hugging Face.
+LTX_COLORIZE_LORA = "ltx-2.3-22b-ic-lora-colorization-0.9.safetensors"
+LTX_COLORIZE_MODELS = [
+    *LTX_BASE_MODELS,
+    HfModel("Lightricks/LTX-2.3-22b-IC-LoRA-Colorization", LTX_COLORIZE_LORA, f"models/loras/{LTX_COLORIZE_LORA}"),
+]
+
 QWEN_IMAGE_EDIT_MODELS = [
     HfModel("unsloth/Qwen-Image-Edit-2511-GGUF", QWEN_IMAGE_EDIT_MODEL, f"models/diffusion_models/{QWEN_IMAGE_EDIT_MODEL}"),
     HfModel("Comfy-Org/Qwen-Image_ComfyUI", "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors", "models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"),
@@ -598,6 +606,10 @@ def ensure_ltx25_cq_enhancer_models(comfy_dir: Path, dev_base: bool = False) -> 
 
 def ensure_cleanup_models(comfy_dir: Path) -> None:
     ensure_hf_models(comfy_dir, CLEANUP_MODELS)
+
+
+def ensure_ltx_colorize_models(comfy_dir: Path) -> None:
+    ensure_hf_models(comfy_dir, LTX_COLORIZE_MODELS)
 
 
 def ensure_qwen_image_edit_models(comfy_dir: Path) -> None:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import artifact_ids as aid
+import ltx_colorize
 import openai_generate_reference as openai_images
 from reference_sets import reference_items
 from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
@@ -69,7 +70,7 @@ def parse_time(text: str) -> float:
 
 
 def method_suffix(method: str) -> str:
-    if method in {"colormnet", "cmnet2", "openai"}:
+    if method in {"colormnet", "cmnet2", "openai", "ltx"}:
         return method
     return "deepexemplar"
 
@@ -285,6 +286,8 @@ def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
                 "colormnet_text_guidance_weight": args.colormnet_text_guidance_weight,
             }
         )
+    elif args.method == "ltx":
+        settings.update(ltx_colorize.settings_signature(args))
     elif args.method == "cmnet2":
         settings.update(
             {
@@ -1001,7 +1004,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--source-video", help="Override the # source_video from the manifest.")
     parser.add_argument("--output")
-    parser.add_argument("--method", choices=["deepexemplar", "colormnet", "cmnet2", "openai", "both"], default="deepexemplar")
+    parser.add_argument("--method", choices=["deepexemplar", "colormnet", "cmnet2", "openai", "ltx", "both"], default="deepexemplar")
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     parser.add_argument("--comfy-output-root", default="")
@@ -1035,6 +1038,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openai-quality", default="auto")
     parser.add_argument("--openai-timeout", type=float, default=900.0)
     parser.add_argument("--openai-max-retries", type=int, default=5)
+    ltx_colorize.add_arguments(parser)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--ffmpeg")
@@ -1073,7 +1077,10 @@ def run(args: argparse.Namespace) -> int:
     output = resolve_path(args.output) if args.output else default_output(manifest, source_from_manifest, args.method)
     source_info = video_info(source_video)
     source_width, source_height = int(source_info["width"]), int(source_info["height"])
-    target_width, target_height = processing_dimensions(source_width, source_height, args.processing_height)
+    if args.method == "ltx":
+        target_width, target_height = ltx_colorize.ltx_dimensions(source_width, source_height, args.ltx_height)
+    else:
+        target_width, target_height = processing_dimensions(source_width, source_height, args.processing_height)
     sig = signature(args, manifest, source_video, rows)
     if not args.force and resumable_output(output, sig, width=target_width, height=target_height):
         print(f"Reuse colorized video: {output}", flush=True)
@@ -1085,6 +1092,14 @@ def run(args: argparse.Namespace) -> int:
                 f"Would send {int(source_info['frames'])} frame edit request(s) to {args.openai_model}: "
                 f"{source_video} -> {output}; references per shot: {counts}; "
                 f"up to {max(0, int(args.openai_previous_frames))} preceding frame(s).",
+                flush=True,
+            )
+        elif args.method == "ltx":
+            plan, _transitions = shot_plan(rows, int(source_info["frames"]), float(source_info["fps"]))
+            chunks = sum(len(ltx_colorize.shot_chunks(item["start"], item["end"], ltx_colorize.CHUNK_FRAMES, args.ltx_overlap_frames)) for item in plan)
+            print(
+                f"Would colorize {len(rows)} shot(s) in {chunks} LTX chunk(s) at {target_width}x{target_height}: "
+                f"{source_video} -> {output}",
                 flush=True,
             )
         elif args.method == "cmnet2":
@@ -1117,6 +1132,13 @@ def run(args: argparse.Namespace) -> int:
     processing_video = prepare_processing_video(ffmpeg, source_video, target_width, target_height, source_width, source_height)
     info = video_info(processing_video)
     width, height, fps, total_frames = int(info["width"]), int(info["height"]), float(info["fps"]), int(info["frames"])
+    if args.method == "ltx":
+        plan, transitions = shot_plan(rows, total_frames, fps)
+        segments = ltx_colorize.run_ltx_colorization(args, processing_video, rows, plan, row_references, ffmpeg, width, height, fps)
+        stitch_colorized(ffmpeg, segments, transitions, output, fps, safe_stem(source_video.name))
+        write_signature(output, sig)
+        print(f"Wrote LTX Colorizer video: {output}", flush=True)
+        return 0
     if args.method == "cmnet2":
         return run_cmnet2_colorization(
             args,

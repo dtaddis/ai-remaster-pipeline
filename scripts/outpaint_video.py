@@ -1979,9 +1979,11 @@ def _patch_extra_guides(
     if not extra_guides:
         return
 
+    # The official graph's IC guide is 5114; Dearchive's is 5012, and its 5114 is only a Note.
     base_guide_id = 5114
     try:
-        node_by_id(workflow, str(base_guide_id))
+        if not str(node_by_id(workflow, str(base_guide_id)).get("type", "")).startswith("LTXAddVideoICLoRAGuide"):
+            base_guide_id = 5012
     except KeyError:
         base_guide_id = 5012
 

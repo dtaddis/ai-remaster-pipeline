@@ -82,6 +82,7 @@ function recompControlFields(st) {
     'saturation',
     'temperature',
     'color_opacity',
+    'color_luminance',
     'reference_luminance_match',
     'reference_luminance_strength',
     'encoder',
@@ -96,6 +97,9 @@ function recompControlFields(st) {
 function referenceLuminanceStatusHtml() {
   const s = settings('recomp');
   if (s.reference_luminance_match !== 'true') {
+    if (colorLuminanceShare(s) > 0) {
+      return '<p class="shot-empty">Reference luminance matching is off; broad brightness follows the colour layer by the chosen share.</p>';
+    }
     return '<p class="shot-empty">Reference luminance matching is off; the original monochrome luminance will be retained exactly.</p>';
   }
   const analysis = state.reference_luminance || {};
@@ -905,7 +909,7 @@ function drawAccurateColorComposite(canvas, mainVideo, colorVideo, scratch, scra
   scratchCtx.clearRect(0, 0, width, height);
   scratchCtx.drawImage(colorVideo, 0, 0, width, height);
   const color = scratchCtx.getImageData(0, 0, width, height);
-  applyColorComposite(base.data, color.data, settings('recomp'), referenceLuminanceCurveAt(activeMain.currentTime || 0));
+  applyColorComposite(base.data, color.data, settings('recomp'), referenceLuminanceCurveAt(mainVideo.currentTime || 0), width, height);
   ctx.putImageData(base, 0, 0);
 }
 
@@ -958,11 +962,15 @@ function remapReferenceLuminance(value, curve) {
   return value;
 }
 
-function applyColorComposite(base, color, s, luminanceCurve = null) {
+function applyColorComposite(base, color, s, luminanceCurve = null, width = 0, height = 0) {
   const saturation = normalizedPercent(s.saturation || 100, 1);
   const opacity = Math.max(0, Math.min(1, normalizedPercent(s.color_opacity || 100, 1)));
   const [redBalance, blueBalance] = kelvinBalance(s.temperature || 6500);
-  for (let i = 0; i < base.length; i += 4) {
+  const pixels = base.length / 4;
+  const baseY = new Float32Array(pixels);
+  const colorY = new Float32Array(pixels);
+  // First pass: grade the colour layer in place and note both layers' brightness.
+  for (let i = 0, p = 0; i < base.length; i += 4, p += 1) {
     const br = base[i];
     const bg = base[i + 1];
     const bb = base[i + 2];
@@ -973,11 +981,25 @@ function applyColorComposite(base, color, s, luminanceCurve = null) {
     const shadow = 1 - Math.max(cr, cg, cb) / 255;
     cr = clampByte(cr + redBalance * shadow * 255);
     cb = clampByte(cb + blueBalance * shadow * 255);
-    cr = br * (1 - opacity) + cr * opacity;
-    cg = bg * (1 - opacity) + cg * opacity;
-    cb = bb * (1 - opacity) + cb * opacity;
-    const sourceY = 0.299 * br + 0.587 * bg + 0.114 * bb;
-    const y = remapReferenceLuminance(sourceY, luminanceCurve);
+    color[i] = br * (1 - opacity) + cr * opacity;
+    color[i + 1] = bg * (1 - opacity) + cg * opacity;
+    color[i + 2] = bb * (1 - opacity) + cb * opacity;
+    baseY[p] = remapReferenceLuminance(0.299 * br + 0.587 * bg + 0.114 * bb, luminanceCurve);
+    colorY[p] = 0.299 * color[i] + 0.587 * color[i + 1] + 0.114 * color[i + 2];
+  }
+  // Mirrors final_composite.append_color_luminance: Y += share * (blur(colour) - blur(base)).
+  const share = colorLuminanceShare(s);
+  if (share > 0 && width * height === pixels) {
+    const radius = Math.max(1, Math.round(Math.max(1, height / 360)));
+    const baseBlur = boxBlurPlane(baseY, width, height, radius);
+    const colorBlur = boxBlurPlane(colorY, width, height, radius);
+    for (let p = 0; p < pixels; p += 1) baseY[p] += share * (colorBlur[p] - baseBlur[p]);
+  }
+  for (let i = 0, p = 0; i < base.length; i += 4, p += 1) {
+    const cr = color[i];
+    const cg = color[i + 1];
+    const cb = color[i + 2];
+    const y = Math.max(0, Math.min(255, baseY[p]));
     const u = -0.168736 * cr - 0.331264 * cg + 0.5 * cb + 128;
     const v = 0.5 * cr - 0.418688 * cg - 0.081312 * cb + 128;
     base[i] = clampByte(y + 1.402 * (v - 128));
@@ -985,6 +1007,36 @@ function applyColorComposite(base, color, s, luminanceCurve = null) {
     base[i + 2] = clampByte(y + 1.772 * (u - 128));
     base[i + 3] = 255;
   }
+}
+
+function colorLuminanceShare(s) {
+  const number = Number(s.color_luminance || 0);
+  return Number.isFinite(number) ? Math.max(0, Math.min(1, number / 100)) : 0;
+}
+
+// Separable box blur, close enough to the export's Gaussian at these radii.
+function boxBlurPlane(plane, width, height, radius) {
+  const across = new Float32Array(plane.length);
+  const out = new Float32Array(plane.length);
+  const span = radius * 2 + 1;
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = -radius; x <= radius; x += 1) sum += plane[row + Math.max(0, Math.min(width - 1, x))];
+    for (let x = 0; x < width; x += 1) {
+      across[row + x] = sum / span;
+      sum += plane[row + Math.min(width - 1, x + radius + 1)] - plane[row + Math.max(0, x - radius)];
+    }
+  }
+  for (let x = 0; x < width; x += 1) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y += 1) sum += across[Math.max(0, Math.min(height - 1, y)) * width + x];
+    for (let y = 0; y < height; y += 1) {
+      out[y * width + x] = sum / span;
+      sum += across[Math.min(height - 1, y + radius + 1) * width + x] - across[Math.max(0, y - radius) * width + x];
+    }
+  }
+  return out;
 }
 
 function normalizedPercent(value, fallback) {

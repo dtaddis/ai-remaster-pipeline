@@ -119,6 +119,14 @@ const FIELD_DESCRIPTIONS = {
     'Color layer saturation as a percentage before chroma is blended onto the luminance of the base composite.',
   'recomp.color_opacity':
     'How strongly the colorized chroma layer contributes, as a percentage.',
+  'colour.ltx_describe':
+    'Qwen3-VL describes each shot\'s grey frame and the colours in its reference; both go into the LTX prompt, which the Colorization LoRA was trained to read. Off uses a generic prompt and relies on the reference guide frame alone.',
+  'colour.ltx_lora_strength':
+    'Colorization LoRA strength. Lightricks suggest 0.8-0.9 if colour bleeds or oversaturates.',
+  'colour.ltx_reference_strength':
+    'How firmly the shot\'s colour reference is imposed at its own frame. Neighbouring chunks of a long shot are then guided by each other\'s overlap frames.',
+  'recomp.color_luminance':
+    'How much of the colour layer\'s brightness to use. 0% keeps the film\'s own luminance exactly, so a colour can never be darker or lighter than the grey it replaces: near-white shorts coloured red come out pale pink. Raise it for a colouriser that redraws brightness (LTX Colorizer). Only broad brightness comes across; the source keeps its line work and grain.',
   'recomp.reference_luminance_match':
     'Derive one stable tonal curve for each shot by comparing its original black-and-white reference with its approved colour reference. This brings the moving result closer to the reference lighting without frame-by-frame exposure flicker.',
   'recomp.reference_luminance_strength':
@@ -443,6 +451,7 @@ function selectOptionLabel(key, option) {
   if (key === 'method' && option === 'qwen21') return 'Qwen-Image-2.1 (local, non-commercial)';
   if (key === 'method' && option === 'openai') return 'OpenAI API (cloud)';
   if ((key === 'method' || key === 'colorization_method') && option === 'cmnet2') return 'CMNET2 (multi-reference)';
+  if ((key === 'method' || key === 'colorization_method') && option === 'ltx') return 'LTX Colorizer (redraws brightness)';
   if ((key === 'method' || key === 'colorization_method') && option === 'colormnet') return 'ColorMNet (single reference)';
   if ((key === 'method' || key === 'colorization_method') && option === 'deepexemplar') return 'Deep Exemplar (single reference)';
   if (key === 'colorization_method' && option === 'openai') return 'OpenAI Cloud';
@@ -468,9 +477,10 @@ const RANGE_FIELD_UNITS = {
   saturation: '%',
   temperature: ' K',
   color_opacity: '%',
+  color_luminance: '%',
 };
 
-const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'edge_left', 'edge_right', 'edge_top', 'edge_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity']);
+const RANGE_NUDGE_FIELDS = new Set(['chunk_seconds', 'source_fidelity', 'edge_left', 'edge_right', 'edge_top', 'edge_bottom', 'feather_pixels', 'saturation', 'temperature', 'color_opacity', 'color_luminance']);
 
 function rangeDisplayValue(key, value) {
   const number = Number(value);

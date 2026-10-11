@@ -274,9 +274,10 @@ function shotStageVisibleFields(st, s = {}) {
     const method = s.method || 'deepexemplar';
     if (method === 'openai') return st.fields.filter(field => common.has(field[0]) || cloud.has(field[0]));
     if (method === 'cmnet2') return st.fields.filter(field => common.has(field[0]));
+    if (method === 'ltx') return st.fields.filter(field => (common.has(field[0]) && field[0] !== 'processing_height') || field[0].startsWith('ltx_'));
     if (method === 'colormnet') return st.fields.filter(field => common.has(field[0]) || legacyColorMNet.has(field[0]));
     if (method === 'deepexemplar') return st.fields.filter(field => common.has(field[0]) || deep.has(field[0]));
-    return st.fields.filter(field => !cloud.has(field[0]));
+    return st.fields.filter(field => !cloud.has(field[0]) && !field[0].startsWith('ltx_'));
   }
   return st.fields;
 }
@@ -352,6 +353,9 @@ function shotDetectionInputStatus(s) {
 function colorizationMethodWarning(s) {
   if (s.method === 'openai') {
     return '<div class="inline-warning">OpenAI Cloud makes one paid image-edit request per video frame. Completed frames are cached for safe resume. The existing colour is retained as evidence, unlike the compulsory grayscale input used by Deep Exemplar and ColorMNet.</div>';
+  }
+  if (s.method === 'ltx') {
+    return '<div class="inline-warning">LTX Colorizer redraws each shot with Lightricks\' LTX-2.3 Colorization IC-LoRA (LTX-2 Community License), guided by the shot\'s colour reference at its frame. Unlike Deep Exemplar and ColorMNet it can change brightness, so a white garment can turn red: raise <b>Luminance from colour layer</b> in Recomposition to keep that. Roughly 1-2 minutes per 5-second chunk on a 24 GB GPU.</div>';
   }
   if (s.method === 'cmnet2') {
     return '<div class="inline-warning">CMNET2 preloads every approved reference frame for each shot into permanent memory. It inherits ColorMNet\'s non-commercial CC BY-NC-SA 4.0 terms.</div>';
@@ -555,6 +559,7 @@ function colourSegmentCard(context) {
 function colorizationLabel(method) {
   if (method === 'openai') return 'OpenAI Cloud';
   if (method === 'cmnet2') return 'CMNET2';
+  if (method === 'ltx') return 'LTX Colorizer';
   if (method === 'colormnet') return 'ColorMNet';
   if (method === 'both') return 'Deep Exemplar and ColorMNet';
   return 'Deep Exemplar';

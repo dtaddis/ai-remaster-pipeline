@@ -6445,6 +6445,24 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--processing-height") + 1], "1080")
         self.assertNotIn("--output", command)
 
+    def test_colorization_command_passes_ltx_colorizer_settings(self) -> None:
+        app.APP.settings["colour"].update({
+            "manifest": "manifests/references/colorize_manifest_demo_shots_auto.csv", "method": "ltx",
+            "ltx_lora_strength": "0.85", "ltx_reference_strength": "0.9", "ltx_describe": "false",
+        })
+
+        command = app.APP.command_for("colour")
+
+        self.assertEqual(command[command.index("--method") + 1], "ltx")
+        self.assertEqual(command[command.index("--ltx-lora-strength") + 1], "0.85")
+        self.assertEqual(command[command.index("--ltx-reference-strength") + 1], "0.9")
+        self.assertIn("--no-ltx-describe", command)
+        self.assertIn("--comfy-url", command)
+        self.assertNotIn("--frame-propagate", command)
+        # Picking the LTX Colorizer also points Recomposition's colour layer at it.
+        app.APP.update_settings("colour", {"method": "ltx"})
+        self.assertEqual(app.APP.settings["recomp"]["colorization_method"], "ltx")
+
     def test_skip_outpainting_uses_pipeline_source_for_shot_detection(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "true", "section_start": "0", "section_end": ""})
 
@@ -6493,6 +6511,20 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--manifest") + 1], "manifests/references/example_shots.csv")
         self.assertIn("--reference-luminance-match", command)
         self.assertEqual(command[command.index("--reference-luminance-strength") + 1], "76")
+
+    def test_recomposition_command_passes_colour_luminance_share(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "colorize": "true"})
+        app.APP.settings["recomp"].update(
+            {
+                "source": "input/example.mp4",
+                "colorized_video": "intermediate/outpainted_colorized/example_color.mp4",
+                "color_luminance": "65",
+            }
+        )
+
+        command = app.APP.command_for("recomp")
+
+        self.assertEqual(command[command.index("--color-luminance") + 1], "65")
 
     def test_no_overview_steps_selected_leaves_only_output_tab(self) -> None:
         app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "false", "section_start": "0", "section_end": ""})

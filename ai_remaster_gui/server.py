@@ -1106,7 +1106,7 @@ class PipelineApp:
         elif stage == "global" and ({"cleanup", "stabilize", "colorize", "expand_outpaint", "upscale"} & set(values)):
             self.hydrate_stage_inputs("global")
         elif stage == "colour" and "method" in values:
-            if values.get("method") in {"deepexemplar", "colormnet", "cmnet2", "openai"}:
+            if values.get("method") in {"deepexemplar", "colormnet", "cmnet2", "ltx", "openai"}:
                 self.settings.setdefault("recomp", {})["colorization_method"] = str(values["method"])
             self.hydrate_stage_inputs("colour")
         elif stage == "recomp" and "colorization_method" in values:
@@ -1937,6 +1937,12 @@ class PipelineApp:
             if values.get("openai_prompt"):
                 add(["--openai-prompt", values["openai_prompt"]])
             return cmd
+        if method == "ltx":
+            add(["--comfy-dir", comfy_dir_for(config), "--comfy-url", comfy_url_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+            add(["--ltx-lora-strength", values.get("ltx_lora_strength", "1") or "1"])
+            add(["--ltx-reference-strength", values.get("ltx_reference_strength", "1") or "1"])
+            add_bool_flags(cmd, values, ("ltx_describe",), default="true")
+            return cmd
         if method == "cmnet2":
             add(["--cmnet2-dir", str(ROOT / "vendor" / "cmnet2")])
             add(["--comfy-dir", comfy_dir_for(config)])
@@ -1966,6 +1972,7 @@ class PipelineApp:
                 add(["--manifest", values["manifest"]])
             add_bool_flags(cmd, values, ("reference_luminance_match",), default="false")
             add(["--reference-luminance-strength", values.get("reference_luminance_strength", "70")])
+            add(["--color-luminance", values.get("color_luminance", "0") or "0"])
         if outpainted:
             add(["--feather-pixels", values.get("feather_pixels", "80")])
         add(["--saturation", values.get("saturation", "82"), "--temperature", values.get("temperature", "6500"), "--color-opacity", values.get("color_opacity", "100"), "--encoder", values.get("encoder", "h264")])

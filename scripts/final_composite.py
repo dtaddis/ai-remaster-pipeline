@@ -44,6 +44,8 @@ def signature(args):
     # Leave the flag out while it is off so composites made before it existed stay reusable.
     if not values.get('native_source_resolution'):
         values.pop('native_source_resolution', None)
+    if not color_luminance_share(args):
+        values.pop('color_luminance', None)
     # Custom-mask composites made before the mask was feathered have a hard cut-out edge;
     # only those need re-rendering, so the marker is keyed to having a mask at all.
     if values.get('custom_mask'):
@@ -218,6 +220,35 @@ def normalized_percent(value: float, default: float = 1.0) -> float:
     except (TypeError, ValueError):
         return default
     return number / 100.0 if number > 4.0 else number
+
+
+def color_luminance_share(args) -> float:
+    """--color-luminance as 0-1. Always a percentage, unlike the older sliders' "above 4" rule."""
+    try:
+        return max(0.0, min(1.0, float(getattr(args, 'color_luminance', 0) or 0) / 100.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def color_luminance_sigma(height: int | None) -> float:
+    """Blur radius that splits brightness: coarser than this comes from the colour layer, finer
+    detail (line work, grain) stays the source's. 2 px at 720p, scaled with the frame."""
+    return max(1.0, (height or 720) / 360.0)
+
+
+def append_color_luminance(filters: list[str], base_label: str, color_label: str, share: float, sigma: float) -> str:
+    """Move the base's brightness towards the colour layer's, at the coarse scale only.
+
+    Y = base + share * (blur(colour) - blur(base)). A colouriser that redraws brightness (LTX
+    turning Mickey's near-white shorts red, i.e. darker) is otherwise thrown away, because the
+    composite always keeps the source's Y. Works in 16-bit so the signed difference survives.
+    """
+    filters.append(f'[{base_label}]format=gray16le,split=2[lumabase][lumabase1]')
+    filters.append(f'[lumabase1]gblur=sigma={sigma:.3f}[lumabaseblur]')
+    filters.append(f'[{color_label}]extractplanes=y,setsar=1,format=gray16le,gblur=sigma={sigma:.3f}[lumacolblur]')
+    filters.append("[lumacolblur][lumabaseblur]blend=all_expr='clip(A-B+32768,0,65535)'[lumadiff]")
+    filters.append(f"[lumabase][lumadiff]blend=all_expr='clip(A+{share:.6f}*(B-32768),0,65535)',format=gray[lumashifted]")
+    return 'lumashifted'
 
 
 def temperature_balance(value: float) -> tuple[float, float]:
@@ -532,7 +563,15 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             color_source = 'colblend'
         else:
             color_source = 'colfmt'
-        filters.append(f'[basefmt]extractplanes=y,setsar=1[basey];[{color_source}]extractplanes=u+v[colu0][colv0]')
+        luminance_share = color_luminance_share(args)
+        if luminance_share > 0:
+            filters.append(f'[{color_source}]split=2[colchroma][colluma]')
+            filters.append('[basefmt]extractplanes=y,setsar=1[baseyraw]')
+            frame_height = out_h or (base_size[1] if base_size else (source_size[1] if source_size else None))
+            basey = append_color_luminance(filters, 'baseyraw', 'colluma', luminance_share, color_luminance_sigma(frame_height))
+            filters.append(f'[{basey}]setsar=1[basey];[colchroma]extractplanes=u+v[colu0][colv0]')
+        else:
+            filters.append(f'[basefmt]extractplanes=y,setsar=1[basey];[{color_source}]extractplanes=u+v[colu0][colv0]')
         filters.append('[colu0]setsar=1[colu];[colv0]setsar=1[colv]')
         final_frame = max((int(item['end_frame']) for item in (luminance_plan or []) if item.get('end_frame') is not None), default=0)
         output_label = 'vouttimed' if final_frame else 'vout'
@@ -667,6 +706,7 @@ def build_parser():
     parser.add_argument('--manifest', help='Shot manifest containing source_reference and color_reference pairs.')
     parser.add_argument('--reference-luminance-match', action=argparse.BooleanOptionalAction, default=False, help='Match each shot luminance to its colour reference using one stable tonal curve per shot.')
     parser.add_argument('--reference-luminance-strength', type=float, default=70.0, help='Strength of the shot-level reference luminance curve, from 0 to 100 percent.')
+    parser.add_argument('--color-luminance', type=float, default=0.0, help='Percent of the colour layer\'s brightness to take, 0-100. The source keeps its fine detail; only coarser brightness changes (a white garment coloured red) come across. 0 keeps the source luminance exactly.')
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
     parser.add_argument('--native-source-resolution', action='store_true', help='Composite at the original source resolution: scale the outpainted canvas so the (trimmed) source overlays it 1:1 instead of resampling the source down or up to the outpaint size.')
