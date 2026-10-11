@@ -409,10 +409,25 @@ DEFAULT_ANCHOR_PROMPT = "Replace the black bars."
 CUSTOM_PAGE_VIEWS = {"shots", "references", "colour", "recomp", "upscale", "output"}
 
 
+def project_marker_file() -> Path:
+    """Beside the settings file: the project last saved or opened, so a restart keeps saving there."""
+    return SETTINGS_FILE.with_name(SETTINGS_FILE.stem + ".project")
+
+
+def remembered_project_path() -> Path | None:
+    """The settings file already holds the open project's settings; this restores which file it was."""
+    try:
+        text = project_marker_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    path = Path(text) if text else None
+    return path if path and path.is_file() else None
+
+
 class PipelineApp:
     def __init__(self) -> None:
         self.settings = load_settings()
-        self.project_path: Path | None = None
+        self.project_path: Path | None = remembered_project_path()
         self.log: list[str] = ConsoleLog()
         self.process: subprocess.Popen[str] | None = None
         self.quitting = False
@@ -547,6 +562,9 @@ class PipelineApp:
 
     def save(self) -> None:
         SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
+
+    def remember_project_path(self) -> None:
+        project_marker_file().write_text(f"{self.project_path}\n" if self.project_path else "", encoding="utf-8")
 
     def console_progress(self, percent: int | float, label: str) -> None:
         reporter = getattr(self.log, "progress", None)
@@ -1326,6 +1344,7 @@ class PipelineApp:
             # Projects only bundle files inside ARP's folder.
             import_outside_guide_images(resolve(chunk_manifest))
         write_project_file(path, self.settings)
+        self.remember_project_path()
         self.log.append(f"Saved ARP project: {path}")
         return {"path": str(path)}
 
@@ -1344,6 +1363,7 @@ class PipelineApp:
         self.adopt_saved_project_artifacts()
         self.hydrate_stage_inputs("")
         self.save()
+        self.remember_project_path()
         self.log.append(f"Loaded ARP project: {path}")
         return {"path": str(path)}
 

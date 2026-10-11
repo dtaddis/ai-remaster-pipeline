@@ -6407,6 +6407,24 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(suggestion.parent, folder)
         self.assertEqual(suggestion.name, "example.arpp")
 
+    def test_open_project_path_survives_a_restart(self) -> None:
+        server = sys.modules["ai_remaster_gui.server"]
+        marker = server.project_marker_file()
+        self.assertNotEqual(marker.resolve(), (app.ROOT / ".ai_remaster_gui.project").resolve())  # isolated from the live file
+        previous = app.APP.project_path
+        try:
+            with tempfile.TemporaryDirectory() as tmp_text:
+                project = Path(tmp_text) / "film.arpp"
+                project.write_bytes(b"")
+                app.APP.project_path = project
+                app.APP.remember_project_path()
+                self.assertEqual(server.remembered_project_path(), project)
+                project.unlink()
+                self.assertIsNone(server.remembered_project_path())  # a deleted project is not restored
+        finally:
+            app.APP.project_path = previous
+            marker.unlink(missing_ok=True)
+
     def test_browse_initial_path_uses_last_browse_dir_without_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
             folder = Path(tmp_text)
