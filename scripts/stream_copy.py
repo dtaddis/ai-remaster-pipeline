@@ -36,8 +36,20 @@ def stream_format(ffmpeg: str, path: Path) -> tuple:
         capture_output=True, text=True, check=True,
     )
     streams = json.loads(result.stdout or "{}").get("streams") or [{}]
-    stream = streams[0]
+    stream = dict(streams[0])
+    # An untagged pixel aspect is square: a clip piped through raw frames carries no tag, one
+    # copied from a normalised render says 1:1, and both are the same square pixels.
+    if str(stream.get("sample_aspect_ratio", "")) in {"", "N/A", "0:1"}:
+        stream["sample_aspect_ratio"] = "1:1"
     return tuple(str(stream.get(key, "")) for key in ("codec_name", "profile", "width", "height", "pix_fmt", "sample_aspect_ratio", "r_frame_rate"))
+
+
+def require_frames(ffmpeg: str, path: Path, expected_frames: int, what: str) -> None:
+    """Fail loudly rather than hand a short or long video to the next stage."""
+    frames = count_video_packets(ffmpeg, path)
+    if frames != expected_frames:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"{what} came out with {frames} frame(s) instead of {expected_frames}; it was not saved.")
 
 
 def _verified(ffmpeg: str, output: Path, expected_frames: int, what: str) -> bool:

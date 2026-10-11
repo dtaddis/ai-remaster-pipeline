@@ -30,7 +30,7 @@ from common import (
     write_signature,
 )
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args
-from stream_copy import copy_join, count_video_packets
+from stream_copy import copy_join, count_video_packets, require_frames
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 REFERENCE_INPUT_COPY_STRATEGY = "content-keyed-v1"
@@ -625,6 +625,10 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     cmd = [
         ffmpeg,
         "-y",
+        # Segments can differ in colour tags; without -reinit_filter 0 each change rebuilds the
+        # filter graph, restarting setpts' N, and the fps filter then drops thousands of frames.
+        "-reinit_filter",
+        "0",
         "-f",
         "concat",
         "-safe",
@@ -644,8 +648,9 @@ def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     ]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
-    replace_with_retry(partial, output)
     concat.unlink(missing_ok=True)
+    require_frames(ffmpeg, partial, expected, "The colourised video")
+    replace_with_retry(partial, output)
 
 
 def transition_groups(transitions: list[int]) -> list[tuple[int, int]]:

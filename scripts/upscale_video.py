@@ -47,7 +47,7 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
     "text, compression artifacts, film damage, dust, scratches"
 )
-from stream_copy import copy_head, copy_join, count_video_packets
+from stream_copy import copy_head, copy_join, count_video_packets, require_frames
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, migrate_profile_name
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
@@ -2112,9 +2112,10 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: P
         expected = sum(count_video_packets(ffmpeg, chunk) for chunk in chunks)
         if not copy_join(ffmpeg, chunks, video_partial, expected, working_container_args(video_partial)):
             subprocess.run([
-                ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                ffmpeg, "-y", "-reinit_filter", "0", "-f", "concat", "-safe", "0", "-i", str(list_file),
                 "-an", *working_codec_args(), *working_container_args(video_partial), str(video_partial),
             ], check=True)
+            require_frames(ffmpeg, video_partial, expected, "The joined upscale")
     mux_audio(ffmpeg, video_partial, audio_source, output)
     video_partial.unlink(missing_ok=True)
 
