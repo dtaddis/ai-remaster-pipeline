@@ -5,6 +5,7 @@ import base64
 import copy
 import csv
 import json
+import random
 import re
 import shutil
 from pathlib import Path
@@ -203,6 +204,8 @@ def signature(args: argparse.Namespace, workflow_path: Path, source_path: Path, 
         'normalize_to_source_size': not args.no_normalize_to_source_size,
         'model_backend': args.model_backend,
         'gguf_model': args.gguf_model if args.model_backend == 'gguf' else None,
+        # A random seed (-1) never makes a still stale; a chosen seed is part of what it was made with.
+        **({'seed': args.seed} if args.seed >= 0 else {}),
     }
 
 
@@ -221,7 +224,18 @@ def patch_workflow(args: argparse.Namespace, workflow: dict[str, Any], source_pa
     save_node = node_by_id(workflow, save_id)
     prefix = str(Path('ai_remaster_qwen') / output_path.stem).replace('\\', '/')
     set_widget(save_node, args.save_prefix_widget, prefix)
+    for node in iter_workflow_nodes(workflow):
+        inputs = node.get('inputs')
+        if (node.get('type') or node.get('class_type')) in {'KSampler', 'RandomNoise'} and isinstance(inputs, dict):
+            for name in ('seed', 'noise_seed'):
+                if name in inputs:
+                    inputs[name] = active_seed(args)
     return workflow_to_prompt(workflow, save_id)
+
+
+def active_seed(args: argparse.Namespace) -> int:
+    """The seed for the still being made now; main_with_args picks it per still."""
+    return int(getattr(args, 'active_seed', 1))
 
 
 def has_frontend_subgraphs(workflow: dict[str, Any]) -> bool:
@@ -275,7 +289,7 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
             elif input_name == 'seed':
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'seed')}
-                set_workflow_widget(node, item.get('name', 'seed'), 1)
+                set_workflow_widget(node, item.get('name', 'seed'), active_seed(args))
             elif input_name in {'value', 'enable_turbo_mode'}:
                 item['link'] = None
                 item['widget'] = {'name': item.get('name', 'value')}
@@ -357,7 +371,7 @@ def subgraph_workflow_to_prompt(args: argparse.Namespace, workflow: dict[str, An
         if named:
             node['widgets_values'] = named
         if class_type == 'KSampler' and isinstance(node.get('widgets_values'), dict):
-            node['widgets_values']['seed'] = 1
+            node['widgets_values']['seed'] = active_seed(args)
             node['widgets_values']['control_after_generate'] = 'fixed'
 
     flat = {'nodes': nodes, 'links': [link_to_list(link) for link in links]}
@@ -520,6 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--prompt-widget', default='0', help='Widget name for API-format workflows, or widget index for normal exported workflows.')
     parser.add_argument('--save-node-id', default='auto')
     parser.add_argument('--save-prefix-widget', default='0', help='Widget name for API-format workflows, or widget index for normal exported workflows.')
+    parser.add_argument('--seed', type=int, default=-1, help='Sampler seed; -1 picks a new random seed for every still, so each attempt differs.')
     parser.add_argument('--poll-seconds', type=float, default=2.0)
     parser.add_argument('--limit', type=int)
     parser.add_argument('--dry-run', action='store_true')
@@ -570,8 +585,10 @@ def main_with_args(args: argparse.Namespace) -> int:
             print(f'Reuse {index:04d}: {dst}')
             continue
         ref_note = f', described refs={len(refs)}' if refs else ''
+        args.active_seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
         print(f'Colorize {index:04d}: {src} -> {dst}{ref_note}')
         print(f'Qwen prompt {index:04d}: {prompt}')
+        print(f'Qwen seed {index:04d}: {args.active_seed}', flush=True)
         workflow = load_workflow(workflow_path)
         patch_qwen_model_backend(args, workflow)
         if args.dry_run:

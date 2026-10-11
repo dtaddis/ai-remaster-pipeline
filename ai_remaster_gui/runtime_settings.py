@@ -338,6 +338,7 @@ def normalize_settings(defaults: dict[str, dict[str, str]], include_newest_sourc
     defaults["references"].setdefault("qwen21_describe", "true")
     defaults["references"].setdefault("qwen21_send_references", "true")
     defaults["references"].setdefault("qwen21_reference_count", "2")
+    defaults["references"].setdefault("reference_seed", "-1")
     old_reference_prompts = {
         "",
         "Colorize this image.",

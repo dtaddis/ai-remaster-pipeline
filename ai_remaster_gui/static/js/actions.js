@@ -335,6 +335,8 @@ const referenceEditor = {
   mode: 'reference',
   manifest: '',
   index: -1,
+  referenceIndex: 0,
+  item: null,
   chunkIndex: -1,
   guideIndex: -1,
   row: null,
@@ -361,13 +363,17 @@ const referenceEditor = {
   recolourStroke: null,
 };
 
-function openReferenceEditor(manifest, index) {
+function openReferenceEditor(manifest, index, referenceIndex = 0) {
   const rows = (state.shot_views && state.shot_views.references) || [];
   const row = rows[index];
-  if (!row || !row.color_reference) return;
+  // Each of a shot's references is edited on its own; reference 1 is the shot row itself.
+  const item = row && ((row.reference_items || [])[referenceIndex] || (referenceIndex === 0 ? row : null));
+  if (!row || !item || !item.color_reference) return;
   referenceEditor.mode = 'reference';
   referenceEditor.manifest = manifest;
   referenceEditor.index = index;
+  referenceEditor.referenceIndex = referenceIndex;
+  referenceEditor.item = item;
   referenceEditor.chunkIndex = -1;
   referenceEditor.guideIndex = -1;
   referenceEditor.row = row;
@@ -376,15 +382,17 @@ function openReferenceEditor(manifest, index) {
   referenceEditor.preview = '';
   referenceEditor.samPoints = [];
   ensureReferenceEditorModal();
-  document.getElementById('referenceEditTitle').textContent = `Shot ${index + 1} Reference Editor`;
-  document.getElementById('referenceEditInstruction').value = row.prompt || '';
+  document.getElementById('referenceEditTitle').textContent = referenceIndex
+    ? `Shot ${index + 1} Reference ${referenceIndex + 1} Editor`
+    : `Shot ${index + 1} Reference Editor`;
+  document.getElementById('referenceEditInstruction').value = item.prompt || row.prompt || '';
   clearReferenceSample();
   document.getElementById('referenceEditPreview').innerHTML = missingImage('No preview yet');
   document.getElementById('referenceEditRecent').innerHTML = referenceRecentHtml(row);
   setReferenceEditEngine('qwen');
   document.getElementById('referenceEditModal').classList.remove('hidden');
   setReferenceTool(referenceEditor.tool);
-  loadReferenceEditorImage(media(row.color_reference) + '&t=' + (row.color_reference_mtime || Date.now()));
+  loadReferenceEditorImage(media(item.color_reference) + '&t=' + (item.color_reference_mtime || Date.now()));
 }
 
 async function openGuideEditor(chunkIndex, guideIndex, fallbackPath = '') {
@@ -403,6 +411,8 @@ async function openGuideEditor(chunkIndex, guideIndex, fallbackPath = '') {
   referenceEditor.mode = 'guide';
   referenceEditor.manifest = '';
   referenceEditor.index = -1;
+  referenceEditor.referenceIndex = 0;
+  referenceEditor.item = null;
   referenceEditor.chunkIndex = chunkIndex;
   referenceEditor.guideIndex = guideIndex;
   referenceEditor.row = row;
@@ -1039,6 +1049,7 @@ async function saveReferencePaint() {
     : await postJson('/api/reference-paint-save', {
         manifest: referenceEditor.manifest,
         index: referenceEditor.index,
+        reference_index: referenceEditor.referenceIndex,
         image,
       });
   if (!result.ok) {
@@ -1053,8 +1064,8 @@ async function saveReferencePaint() {
       referenceEditor.guide.image_exists = true;
     }
     referenceEditor.guideSourcePath = result.image || referenceEditor.guideSourcePath;
-  } else if (referenceEditor.row) {
-    referenceEditor.row.color_reference = result.color_reference || referenceEditor.row.color_reference;
+  } else if (referenceEditor.item) {
+    referenceEditor.item.color_reference = result.color_reference || referenceEditor.item.color_reference;
   }
   state = result.state || state;
   if (status) status.textContent = 'Recolour saved. Revert restores the previous image.';
@@ -1108,6 +1119,7 @@ async function requestReferenceSamMask(point) {
         ...payload,
         manifest: referenceEditor.manifest,
         index: referenceEditor.index,
+        reference_index: referenceEditor.referenceIndex,
       });
   if (!result.ok) return alert(result.error || 'Smart mask failed');
   const img = new Image();
@@ -1201,6 +1213,7 @@ async function submitReferenceEditPreview() {
         ...payload,
         manifest: referenceEditor.manifest,
         index: referenceEditor.index,
+        reference_index: referenceEditor.referenceIndex,
       });
   if (!result.ok) {
     status.textContent = result.error || result.message || 'Could not start reference edit';
@@ -1272,6 +1285,7 @@ async function acceptReferenceEditPreview() {
     : await postJson('/api/reference-edit-accept', {
         manifest: referenceEditor.manifest,
         index: referenceEditor.index,
+        reference_index: referenceEditor.referenceIndex,
         preview: referenceEditor.preview,
       });
   if (!result.ok) return alert(result.error || 'Could not accept edit');
@@ -1292,6 +1306,7 @@ async function revertReferenceEdit() {
     : await postJson('/api/reference-edit-revert', {
         manifest: referenceEditor.manifest,
         index: referenceEditor.index,
+        reference_index: referenceEditor.referenceIndex,
       });
   if (!result.ok) return alert(result.error || 'Could not revert edit');
   state = result.state || await api(stateUrl());

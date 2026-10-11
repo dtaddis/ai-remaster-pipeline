@@ -97,6 +97,7 @@ from .references import (
     openai_reference_regeneration_command,
     previous_reference_count,
     qwen21_reference_args,
+    reference_seed_args,
     qwen21_reference_regeneration_command,
     reference_edit_prompt,
     reference_regeneration_command,
@@ -1921,6 +1922,7 @@ class PipelineApp:
             add(["--manifest", values.get("manifest", ""), "--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
             add(["--comfy-url", values.get("comfy_url") or comfy_url_for(config), "--comfy-dir", comfy_dir_for(config), "--comfy-output-root", comfy_output_root_for(config)])
             add(qwen21_reference_args(values))
+            add(reference_seed_args(values))
         else:
             cmd = [sys.executable, "-u", str(SCRIPTS / "qwen_colorize_references.py")]
             add = cmd.extend
@@ -1930,6 +1932,7 @@ class PipelineApp:
             add(["--comfy-dir", comfy_dir_for(config), "--comfy-output-root", comfy_output_root_for(config)])
             add(["--model-backend", values.get("model_backend", "gguf"), "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
             add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "auto"), "--save-node-id", values.get("save_node_id", "auto")])
+            add(reference_seed_args(values))
             if values.get("prompt_node_id"):
                 add(["--prompt-node-id", values["prompt_node_id"]])
         if values.get("limit"):
@@ -2268,12 +2271,12 @@ class PipelineApp:
             threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
         return True, f"Started {provider} reference regeneration for shot {index + 1}."
 
-    def run_reference_edit_preview(self, manifest_text: str, index: int, instruction: str, mask_data: str = "", sampled_color: str = "") -> tuple[bool, str, str]:
+    def run_reference_edit_preview(self, manifest_text: str, index: int, instruction: str, mask_data: str = "", sampled_color: str = "", reference_index: int = 0) -> tuple[bool, str, str]:
         ok, message = ensure_comfy_available_for_stage("Reference Editing")
         if not ok:
             return False, message, ""
         try:
-            cmd, output = reference_edit_preview_command(manifest_text, index, instruction, mask_data, sampled_color)
+            cmd, output = reference_edit_preview_command(manifest_text, index, instruction, mask_data, sampled_color, reference_index)
         except Exception as exc:
             return False, str(exc), ""
         with self.lock:
@@ -2285,7 +2288,7 @@ class PipelineApp:
             self.running_reference_index = index
             self.run_started_at = time.time()
             mode = "masked" if mask_data else "unmasked"
-            self.log.append(f"Generating {mode} reference edit preview for shot {index + 1}: {output}")
+            self.log.append(f"Generating {mode} reference edit preview for shot {index + 1}, reference {reference_index + 1}: {output}")
             self.log.append("> " + redact_command_for_log(cmd))
             try:
                 self.process = subprocess.Popen(cmd, **self.child_process_kwargs())

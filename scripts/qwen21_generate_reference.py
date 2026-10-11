@@ -171,7 +171,7 @@ def generate(args: argparse.Namespace, references: list[Path]) -> Path:
     references = [path for path in references if path.is_file()][:MAX_REFERENCE_IMAGES] if args.describe else []
     seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
     steps = len(TURBO_SIGMA_NODES) if args.quality == "turbo" else BASE_STEPS
-    print(f"Qwen-Image-2.1 {args.quality} reference ({steps} steps): {source} -> {output}", flush=True)
+    print(f"Qwen-Image-2.1 {args.quality} reference ({steps} steps, seed {seed}): {source} -> {output}", flush=True)
     if args.dry_run:
         print(f"Qwen-Image-2.1 prompt: {still_prompt(args, '<description>' if args.describe else '', len(references))}", flush=True)
         return output

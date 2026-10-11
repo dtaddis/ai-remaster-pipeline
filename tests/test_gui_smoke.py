@@ -5916,6 +5916,63 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(reverted["color_reference"], app.rel(color))
         self.assertEqual(after_revert["color_reference_previous"], app.rel(edit))
 
+    def test_additional_reference_can_be_edited_and_reverted_on_its_own(self) -> None:
+        from reference_sets import additional_references
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "refs.csv"
+            paths = {name: folder / f"{name}.png" for name in ("bw", "color", "bw2", "color2", "edit2")}
+            for name, path in paths.items():
+                path.write_bytes(name.encode())
+            extra = [{"selected_frame": "12", "source_reference": app.rel(paths["bw2"]), "color_reference": app.rel(paths["color2"]), "prompt": ""}]
+            app.write_manifest_details(
+                manifest, "input/example.mp4",
+                ["enabled", "end", "source_reference", "color_reference", "prompt", "additional_references"],
+                [{"enabled": "true", "end": "00:00:01.000", "source_reference": app.rel(paths["bw"]), "color_reference": app.rel(paths["color"]),
+                  "prompt": "", "additional_references": json.dumps(extra)}],
+            )
+            untouched = app.read_manifest(manifest)[0]["additional_references"]
+
+            app.accept_reference_edit(app.rel(manifest), 0, app.rel(paths["edit2"]), reference_index=1)
+            after_accept = app.read_manifest(manifest)[0]
+            reverted = app.revert_reference_edit(app.rel(manifest), 0, reference_index=1)
+            after_revert = app.read_manifest(manifest)[0]
+
+        # Reference 1 is left alone; reference 2 swaps and remembers what it replaced.
+        self.assertEqual(after_accept["color_reference"], app.rel(paths["color"]))
+        self.assertEqual(additional_references(after_accept)[0]["color_reference"], app.rel(paths["edit2"]))
+        self.assertEqual(additional_references(after_accept)[0]["color_reference_previous"], app.rel(paths["color2"]))
+        self.assertEqual(reverted["color_reference"], app.rel(paths["color2"]))
+        self.assertEqual(additional_references(after_revert)[0]["color_reference"], app.rel(paths["color2"]))
+        # References never edited encode exactly as before (no empty history key).
+        self.assertNotIn("color_reference_previous", untouched)
+
+    def test_each_reference_has_its_own_edit_history_folder(self) -> None:
+        references = sys.modules["ai_remaster_gui.references"]
+        first = references.reference_edit_dir("manifests/references/demo.csv", 3)
+        second = references.reference_edit_dir("manifests/references/demo.csv", 3, 1)
+        self.assertEqual(first.name, "shot_0003")
+        self.assertEqual(second.name, "shot_0003_ref02")
+
+    def test_reference_seed_is_passed_only_when_fixed(self) -> None:
+        server = sys.modules["ai_remaster_gui.server"]
+        self.assertEqual(server.reference_seed_args({}), [])
+        self.assertEqual(server.reference_seed_args({"reference_seed": "-1"}), [])
+        self.assertEqual(server.reference_seed_args({"reference_seed": "junk"}), [])
+        self.assertEqual(server.reference_seed_args({"reference_seed": "1234"}), ["--seed", "1234"])
+
+    def test_qwen_reference_graph_uses_the_chosen_seed(self) -> None:
+        import qwen_colorize_references as qwen
+
+        args = qwen.build_parser().parse_args(["--manifest", "x.csv", "--workflow", "w.json"])
+        self.assertEqual(args.seed, -1)
+        self.assertNotIn("seed", qwen.signature(args, Path(__file__), Path(__file__), "p"))  # random takes stay reusable
+        args.seed = 77
+        self.assertEqual(qwen.signature(args, Path(__file__), Path(__file__), "p")["seed"], 77)
+        args.active_seed = 4242
+        self.assertEqual(qwen.active_seed(args), 4242)
+
     def test_guide_edit_preview_command_always_uses_masked_runner(self) -> None:
         from PIL import Image
 

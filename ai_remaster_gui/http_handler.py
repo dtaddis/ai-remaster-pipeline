@@ -493,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                 int(data.get("width", 1)),
                 int(data.get("height", 1)),
                 int(data.get("tolerance", 10)),
+                int(data.get("reference_index", 0)),
             )})
         elif parsed.path == "/api/guide-frame-mask-sam":
             self._send_result("Guide smart mask", lambda: {**sam_guide_mask(
@@ -510,13 +511,14 @@ class Handler(BaseHTTPRequestHandler):
                 str(data.get("instruction", "")),
                 str(data.get("mask", "")),
                 str(data.get("sampled_color", "")),
+                int(data.get("reference_index", 0)),
             ), view="references", extra_key="preview")
         elif parsed.path == "/api/reference-edit-accept":
-            self._send_result("Reference edit accept", lambda: {**accept_reference_edit(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("preview", ""))), "state": state.APP.state("references")})
+            self._send_result("Reference edit accept", lambda: {**accept_reference_edit(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("preview", "")), int(data.get("reference_index", 0))), "state": state.APP.state("references")})
         elif parsed.path == "/api/reference-edit-revert":
-            self._send_result("Reference edit revert", lambda: {**revert_reference_edit(str(data.get("manifest", "")), int(data.get("index", 0))), "state": state.APP.state("references")})
+            self._send_result("Reference edit revert", lambda: {**revert_reference_edit(str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0))), "state": state.APP.state("references")})
         elif parsed.path == "/api/reference-paint-save":
-            self._send_result("Reference paint save", lambda: {**save_reference_paint(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("image", ""))), "state": state.APP.state("references")})
+            self._send_result("Reference paint save", lambda: {**save_reference_paint(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("image", "")), int(data.get("reference_index", 0))), "state": state.APP.state("references")})
         elif parsed.path == "/api/export-media":
             self._send_result("Media export", lambda: {**export_media_file(str(data.get("path", "")))})
         elif parsed.path == "/api/outpaint-chunk":

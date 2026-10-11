@@ -288,6 +288,24 @@ function shotStageVisibleFields(st, s = {}) {
 // references need "Describe each still" and are held to two; see qwen21_generate_reference.py.
 function referenceGenerationOptionsHtml(s) {
   const method = s.method || 'qwen';
+  return referenceModelOptionsHtml(s, method) + (method === 'openai' ? '' : referenceSeedHtml(s));
+}
+
+// OpenAI has no seed: every request already differs.
+function referenceSeedHtml(s) {
+  return `
+    <div class="checks">
+      <label>
+        Seed
+        <input data-field="reference_seed" type="number" min="-1" step="1" value="${esc(s.reference_seed || '-1')}" class="inline-number" aria-label="Qwen seed">
+      </label>
+    </div>
+    <p class="field-help">-1 picks a new random seed every time, so regenerating a reference gives a different take.
+    Each take logs the seed it used; enter that number to make the same take again.</p>
+  `;
+}
+
+function referenceModelOptionsHtml(s, method) {
   if (method === 'qwen21') {
     const describe = s.qwen21_describe !== 'false';
     return `
@@ -618,10 +636,7 @@ function referenceAnchorCard(manifest, row, idx, item) {
         </div>
         <div>
           <label>Colour reference</label>
-          ${colorReady ? (referenceIndex === 0
-            ? colorReferenceThumb(manifest, idx, colorUrl, row, 0)
-            : `<div class="thumb-wrap"><img src="${colorUrl}" alt="Colour keyframe" onclick="openImageModal(this.src,${jsArg('Colour keyframe')})"><button class="icon-button" type="button" title="Delete colour reference" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">&#128465;</button></div>`)
-            : missingImage('Colour reference missing')}
+          ${colorReady ? colorReferenceThumb(manifest, idx, colorUrl, item, referenceIndex) : missingImage('Colour reference missing')}
         </div>
       </div>
       <label>Reference frame</label>
@@ -721,11 +736,12 @@ function updateReferencesDynamicStatus() {
   refreshShotRows('references', rows);
 }
 
-function colorReferenceThumb(manifest, idx, colorUrl, row, referenceIndex = 0) {
+// reference is the shot row (reference 1) or one of its reference_items; both carry color_reference_edited.
+function colorReferenceThumb(manifest, idx, colorUrl, reference, referenceIndex = 0) {
   return `
     <div class="thumb-wrap">
-      <img src="${colorUrl}" alt="" onclick="openReferenceEditor('${esc(manifest)}',${idx})" title="Open advanced reference editor">
-      ${row.color_reference_edited ? '<span class="edit-badge">Edited</span>' : ''}
+      <img src="${colorUrl}" alt="" onclick="openReferenceEditor('${esc(manifest)}',${idx},${referenceIndex})" title="Open advanced reference editor">
+      ${reference.color_reference_edited ? '<span class="edit-badge">Edited</span>' : ''}
       <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference('${esc(manifest)}',${idx},${referenceIndex})">&#128465;</button>
     </div>
   `;

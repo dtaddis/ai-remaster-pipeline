@@ -133,6 +133,7 @@ def shot_rows(
             reference_seconds = (reference_frame / fps) if reference_frame is not None else selected
             reference_seconds = max(start, min(end, reference_seconds))
             item_color = reference.get("color_reference", "")
+            item_versions = reference_edit_versions(manifest_text, index, reference_index=reference_index)
             item_references.append({
                 "reference_index": reference_index,
                 "selected_frame": reference_frame if reference_frame is not None else int(round(reference_seconds * fps)),
@@ -142,6 +143,7 @@ def shot_rows(
                 "color_reference": item_color,
                 "source_reference_mtime": file_mtime(reference.get("source_reference", "")),
                 "color_reference_mtime": file_mtime(item_color),
+                "color_reference_edited": bool(item_color and item_color in item_versions),
                 "prompt": reference.get("prompt", ""),
             })
         color_reference_versions = reference_edit_versions(manifest_text, index)
@@ -268,12 +270,14 @@ def recent_color_references(rows: list[dict[str, str]], row_index: int, limit: i
     ordered.extend(path for _distance, path in sorted(later, key=lambda item: item[0]))
     return ordered[:limit]
 
-def reference_edit_dir(manifest_text: str, index: int) -> Path:
+def reference_edit_dir(manifest_text: str, index: int, reference_index: int = 0) -> Path:
+    """One edit history per reference; reference 1 keeps the shot folder it always had."""
     stem = safe_stem(resolve(manifest_text).stem or "references")
-    return ROOT / "intermediate" / "outpainted_references_color_edits" / stem / f"shot_{index:04d}"
+    folder = f"shot_{index:04d}" if reference_index <= 0 else f"shot_{index:04d}_ref{reference_index + 1:02d}"
+    return ROOT / "intermediate" / "outpainted_references_color_edits" / stem / folder
 
-def reference_edit_versions(manifest_text: str, index: int, limit: int = 8) -> list[str]:
-    folder = reference_edit_dir(manifest_text, index)
+def reference_edit_versions(manifest_text: str, index: int, limit: int = 8, reference_index: int = 0) -> list[str]:
+    folder = reference_edit_dir(manifest_text, index, reference_index)
     if not folder.exists():
         return []
     paths = sorted(
@@ -283,8 +287,8 @@ def reference_edit_versions(manifest_text: str, index: int, limit: int = 8) -> l
     )
     return [rel(path) for path in paths[:limit]]
 
-def next_reference_edit_output(manifest_text: str, index: int) -> Path:
-    folder = reference_edit_dir(manifest_text, index)
+def next_reference_edit_output(manifest_text: str, index: int, reference_index: int = 0) -> Path:
+    folder = reference_edit_dir(manifest_text, index, reference_index)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     base = folder / f"edit_{stamp}.png"
@@ -297,14 +301,14 @@ def next_reference_edit_output(manifest_text: str, index: int) -> Path:
             return candidate
         suffix += 1
 
-def save_reference_edit_mask(manifest_text: str, index: int, mask_data: str) -> str:
+def save_reference_edit_mask(manifest_text: str, index: int, mask_data: str, reference_index: int = 0) -> str:
     if not mask_data:
         return ""
     import base64
 
     payload = mask_data.split(",", 1)[1] if "," in mask_data else mask_data
     raw = base64.b64decode(payload)
-    folder = reference_edit_dir(manifest_text, index)
+    folder = reference_edit_dir(manifest_text, index, reference_index)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"mask_{time.strftime('%Y%m%d_%H%M%S')}.png"
     path.write_bytes(raw)
@@ -325,15 +329,15 @@ def reference_edit_prompt(instruction: str, sampled_color: str = "") -> str:
     prompt = " ".join(part for part in parts if part).strip()
     return prompt or "Refine this colour reference while preserving the original composition and identity."
 
-def reference_edit_preview_command(manifest_text: str, index: int, instruction: str, mask_data: str = "", sampled_color: str = "") -> tuple[list[str], str]:
-    _manifest, _row, _source, output = reference_row_io(manifest_text, index)
+def reference_edit_preview_command(manifest_text: str, index: int, instruction: str, mask_data: str = "", sampled_color: str = "", reference_index: int = 0) -> tuple[list[str], str]:
+    _manifest, _row, _source, output = reference_row_io(manifest_text, index, reference_index)
     current = output
     if not resolve(current).is_file():
         raise FileNotFoundError(f"Colour reference does not exist yet: {current}")
     values = state.APP.settings.get("references", {})
     config = current_config()
-    mask = save_reference_edit_mask(manifest_text, index, mask_data)
-    edit_output = next_reference_edit_output(manifest_text, index)
+    mask = save_reference_edit_mask(manifest_text, index, mask_data, reference_index)
+    edit_output = next_reference_edit_output(manifest_text, index, reference_index)
     prompt = reference_edit_prompt(instruction, sampled_color)
     comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
     comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
@@ -410,6 +414,7 @@ def reference_edit_preview_command(manifest_text: str, index: int, instruction: 
             {
                 "manifest": rel(resolve(manifest_text)),
                 "index": index,
+                "reference_index": reference_index,
                 "source_image": current,
                 "mask": mask,
                 "instruction": instruction,
@@ -424,45 +429,60 @@ def reference_edit_preview_command(manifest_text: str, index: int, instruction: 
     )
     return cmd, rel(edit_output)
 
-def accept_reference_edit(manifest_text: str, index: int, preview_path: str) -> dict[str, str]:
-    manifest, row, _source, current = reference_row_io(manifest_text, index)
+def set_reference_colour(manifest_text: str, index: int, reference_index: int, colour: str, previous: str) -> None:
+    """Point one of a shot's references at a new colour image, remembering the one it replaces."""
+    values = {"color_reference": colour, "color_reference_previous": previous}
+    if reference_index <= 0:
+        update_manifest_row(resolve(manifest_text), index, values)
+        return
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    update_reference_item(rows[index], reference_index, values)
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+
+def reference_label(index: int, reference_index: int) -> str:
+    return f"shot {index + 1}" if reference_index <= 0 else f"shot {index + 1} reference {reference_index + 1}"
+
+def accept_reference_edit(manifest_text: str, index: int, preview_path: str, reference_index: int = 0) -> dict[str, str]:
+    _manifest, _row, _source, current = reference_row_io(manifest_text, index, reference_index)
     preview = resolve(preview_path)
     if not preview.is_file():
         raise FileNotFoundError(f"Edited reference not found: {preview}")
-    update_manifest_row(manifest, index, {"color_reference": rel(preview), "color_reference_previous": current})
-    state.APP.log.append(f"Accepted edited colour reference for shot {index + 1}: {rel(preview)}")
+    set_reference_colour(manifest_text, index, reference_index, rel(preview), current)
+    state.APP.log.append(f"Accepted edited colour reference for {reference_label(index, reference_index)}: {rel(preview)}")
     return {"color_reference": rel(preview), "previous": current}
 
-def revert_reference_edit(manifest_text: str, index: int) -> dict[str, str]:
-    manifest, row, _source, current = reference_row_io(manifest_text, index)
+def revert_reference_edit(manifest_text: str, index: int, reference_index: int = 0) -> dict[str, str]:
+    _manifest, row, _source, current = reference_row_io(manifest_text, index, reference_index)
     previous = row.get("color_reference_previous", "")
     if not previous:
-        versions = reference_edit_versions(manifest_text, index, limit=20)
+        versions = reference_edit_versions(manifest_text, index, limit=20, reference_index=reference_index)
         candidates = [path for path in versions if path != current]
         previous = candidates[0] if candidates else ""
     if not previous:
-        raise RuntimeError("No previous colour reference is recorded for this shot.")
+        raise RuntimeError("No previous colour reference is recorded for this reference.")
     if not resolve(previous).is_file():
         raise FileNotFoundError(f"Previous colour reference not found: {previous}")
-    update_manifest_row(manifest, index, {"color_reference": previous, "color_reference_previous": current})
-    state.APP.log.append(f"Reverted edited colour reference for shot {index + 1}: {previous}")
+    set_reference_colour(manifest_text, index, reference_index, previous, current)
+    state.APP.log.append(f"Reverted edited colour reference for {reference_label(index, reference_index)}: {previous}")
     return {"color_reference": previous, "previous": current}
 
-def save_reference_paint(manifest_text: str, index: int, image_data: str) -> dict[str, str]:
+def save_reference_paint(manifest_text: str, index: int, image_data: str, reference_index: int = 0) -> dict[str, str]:
     if not image_data:
         raise ValueError("No painted image data was provided.")
     import base64
 
     payload = image_data.split(",", 1)[1] if "," in image_data else image_data
     raw = base64.b64decode(payload)
-    _manifest, _row, _source, current = reference_row_io(manifest_text, index)
-    output = next_reference_edit_output(manifest_text, index)
+    _manifest, _row, _source, current = reference_row_io(manifest_text, index, reference_index)
+    output = next_reference_edit_output(manifest_text, index, reference_index)
     output.write_bytes(raw)
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(
             {
                 "manifest": rel(resolve(manifest_text)),
                 "index": index,
+                "reference_index": reference_index,
                 "source_image": current,
                 "instruction": "Manual recolour paint",
                 "output": rel(output),
@@ -472,10 +492,10 @@ def save_reference_paint(manifest_text: str, index: int, image_data: str) -> dic
         + "\n",
         encoding="utf-8",
     )
-    return accept_reference_edit(manifest_text, index, rel(output))
+    return accept_reference_edit(manifest_text, index, rel(output), reference_index)
 
-def sam_reference_mask(manifest_text: str, index: int, points: list[dict], width: int, height: int, tolerance: int = 10) -> dict[str, str]:
-    _manifest, _row, _source, output = reference_row_io(manifest_text, index)
+def sam_reference_mask(manifest_text: str, index: int, points: list[dict], width: int, height: int, tolerance: int = 10, reference_index: int = 0) -> dict[str, str]:
+    _manifest, _row, _source, output = reference_row_io(manifest_text, index, reference_index)
     source = resolve(output)
     if not source.is_file():
         raise FileNotFoundError(f"Colour reference does not exist yet: {output}")
@@ -779,6 +799,7 @@ def reference_regeneration_command(manifest_text: str, index: int, reference_ind
         values.get("load_image_node_id", "auto"),
         "--save-node-id",
         values.get("save_node_id", "auto"),
+        *reference_seed_args(values),
         "--force",
     ]
     if values.get("prompt_node_id"):
@@ -846,6 +867,17 @@ def previous_reference_count(values: dict[str, str]) -> int:
     return max(0, min(MAX_PREVIOUS_REFERENCES, count))
 
 
+def reference_seed_args(values: dict[str, str]) -> list[str]:
+    """The Qwen sampler seed: -1 (or blank) is a new random seed every attempt, so regenerating
+    a still gives a different take; a fixed number repeats a take. Random is the scripts' own
+    default, so it adds nothing and leaves the stage command (and Run Whole's stamp) unchanged."""
+    try:
+        seed = int(str(values.get("reference_seed", "-1")).strip() or -1)
+    except ValueError:
+        seed = -1
+    return ["--seed", str(seed)] if seed >= 0 else []
+
+
 def qwen21_reference_args(values: dict[str, str]) -> list[str]:
     """Qwen-Image-2.1's description and previous-reference arguments. Describing each still is on
     unless turned off, and references (default 2, at most 2) only go with it: without the
@@ -879,6 +911,7 @@ def qwen21_reference_regeneration_command(manifest_text: str, index: int, refere
         "--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui")),
         "--comfy-output-root", comfy_output_root_for(config),
         *qwen21_reference_args(values),
+        *reference_seed_args(values),
         "--force",
     ]
     return cmd, output

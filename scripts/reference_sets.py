@@ -6,12 +6,16 @@ from typing import Any
 
 EXTRA_REFERENCES_FIELD = "additional_references"
 REFERENCE_KEYS = ("selected_frame", "source_reference", "color_reference", "prompt")
+# Kept only when set, so references without an edit history encode exactly as before.
+OPTIONAL_REFERENCE_KEYS = ("color_reference_previous",)
 
 
 def _clean_item(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    return {key: str(value.get(key, "") or "") for key in REFERENCE_KEYS}
+    item = {key: str(value.get(key, "") or "") for key in REFERENCE_KEYS}
+    item.update({key: str(value[key]) for key in OPTIONAL_REFERENCE_KEYS if value.get(key)})
+    return item
 
 
 def additional_references(row: dict[str, str]) -> list[dict[str, str]]:
@@ -44,7 +48,7 @@ def encode_additional_references(items: list[dict[str, str]]) -> str:
 
 def update_reference_item(row: dict[str, str], reference_index: int, values: dict[str, Any]) -> None:
     reference_index = int(reference_index)
-    updates = {key: str(value or "") for key, value in values.items() if key in REFERENCE_KEYS}
+    updates = {key: str(value or "") for key, value in values.items() if key in REFERENCE_KEYS or key in OPTIONAL_REFERENCE_KEYS}
     if reference_index == 0:
         row.update(updates)
         return
