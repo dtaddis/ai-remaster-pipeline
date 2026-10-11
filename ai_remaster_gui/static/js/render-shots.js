@@ -570,8 +570,50 @@ function colourSegmentCard(context) {
         <label>Segment</label>
         <p class="shot-time">${esc(colorizationLabel(method))} uses this reference for the selected shot range.</p>
       </div>
+      ${method === 'ltx' ? ltxShotControlsHtml(context.manifest, row) : ''}
     </article>
   `;
+}
+
+// A shot's own LTX Colorizer strength, and each reference frame's own guide strength. A blank
+// value follows the Colour tab's setting.
+function ltxShotControlsHtml(manifest, row) {
+  const s = settings('colour');
+  const own = value => String(value ?? '').trim() !== '';
+  const globalLora = Number(s.ltx_lora_strength || 1);
+  const globalReference = Number(s.ltx_reference_strength || 1);
+  const idx = row.index;
+  const control = (id, label, value, min, max, inherited, inheritNote, onchange, resetLabel, onreset) => `
+    <div class="ltx-strength-control">
+      <label for="${id}">${label} <output>${value.toFixed(2)}</output></label>
+      <input id="${id}" type="range" min="${min}" max="${max}" step="0.05" value="${value}"
+        oninput="this.previousElementSibling.querySelector('output').value=Number(this.value).toFixed(2)"
+        onchange="${onchange}">
+      <div class="upscale-shot-actions">
+        <small>${inherited ? inheritNote : 'Set here'}</small>
+        <button type="button" onclick="${onreset}" ${inherited ? 'disabled' : ''}>${resetLabel}</button>
+      </div>
+    </div>`;
+  const references = (row.reference_items || []).map(item => {
+    const ri = Number(item.reference_index || 0);
+    const inherited = !own(item.guide_strength);
+    const value = inherited ? globalReference : Number(item.guide_strength);
+    return control(
+      `ltxRefStrength_${idx}_${ri}`, `Reference ${ri + 1} (frame ${esc(item.selected_frame)})`, value, 0, 1, inherited,
+      `Using the ${globalReference.toFixed(2)} default`,
+      `saveReferenceLtxStrength(${jsArg(manifest)},${idx},${ri},this.value)`,
+      'Use Default', `saveReferenceLtxStrength(${jsArg(manifest)},${idx},${ri},'')`,
+    );
+  }).join('');
+  return `
+    <div class="ltx-shot-controls">
+      <label>LTX Colorizer for this shot</label>
+      ${control(`ltxLora_${idx}`, 'Colorizer strength', own(row.ltx_lora_strength) ? Number(row.ltx_lora_strength) : globalLora, 0, 1.5,
+        !own(row.ltx_lora_strength), `Using the ${globalLora.toFixed(2)} default`,
+        `saveShotLtxStrength(${jsArg(manifest)},${idx},'ltx_lora_strength',this.value)`,
+        'Use Default', `saveShotLtxStrength(${jsArg(manifest)},${idx},'ltx_lora_strength','')`)}
+      ${references ? `<label>Reference frame strength</label>${references}` : ''}
+    </div>`;
 }
 
 function colorizationLabel(method) {

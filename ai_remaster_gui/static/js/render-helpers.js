@@ -126,7 +126,7 @@ const FIELD_DESCRIPTIONS = {
   'colour.ltx_lora_strength':
     'Colorization LoRA strength. Lightricks suggest 0.8-0.9 if colour bleeds or oversaturates.',
   'colour.ltx_reference_strength':
-    'How firmly the shot\'s colour reference is imposed at its own frame. Neighbouring chunks of a long shot are then guided by each other\'s overlap frames.',
+    'How firmly each colour reference is imposed at its own frame. Any reference frame can have its own strength on its shot\'s card below. Neighbouring chunks of a long shot are then guided by each other\'s overlap frames.',
   'recomp.color_luminance':
     'How much of the colour layer\'s brightness to use. 0% keeps the film\'s own luminance exactly, so a colour can never be darker or lighter than the grey it replaces: near-white shorts coloured red come out pale pink. Raise it for a colouriser that redraws brightness (LTX Colorizer). Only broad brightness comes across; the source keeps its line work and grain.',
   'recomp.reference_luminance_match':

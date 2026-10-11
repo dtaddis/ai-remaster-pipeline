@@ -6,8 +6,9 @@ from typing import Any
 
 EXTRA_REFERENCES_FIELD = "additional_references"
 REFERENCE_KEYS = ("selected_frame", "source_reference", "color_reference", "prompt")
-# Kept only when set, so references without an edit history encode exactly as before.
-OPTIONAL_REFERENCE_KEYS = ("color_reference_previous",)
+# Kept only when set, so references without an edit history or an own guide strength encode
+# exactly as before. guide_strength is one reference's LTX Colorizer guide strength (0-1).
+OPTIONAL_REFERENCE_KEYS = ("color_reference_previous", "guide_strength")
 
 
 def _clean_item(value: Any) -> dict[str, str]:
@@ -38,6 +39,8 @@ def reference_items(row: dict[str, str]) -> list[dict[str, str]]:
         "color_reference": str(row.get("color_reference") or row.get("reference") or ""),
         "prompt": str(row.get("prompt", "") or ""),
     }
+    # The primary reference's optional keys are the row's own columns.
+    primary.update({key: str(row[key]) for key in OPTIONAL_REFERENCE_KEYS if row.get(key)})
     return [primary, *additional_references(row)]
 
 

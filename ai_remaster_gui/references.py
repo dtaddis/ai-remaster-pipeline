@@ -144,6 +144,7 @@ def shot_rows(
                 "source_reference_mtime": file_mtime(reference.get("source_reference", "")),
                 "color_reference_mtime": file_mtime(item_color),
                 "color_reference_edited": bool(item_color and item_color in item_versions),
+                "guide_strength": reference.get("guide_strength", ""),
                 "prompt": reference.get("prompt", ""),
             })
         color_reference_versions = reference_edit_versions(manifest_text, index)
@@ -179,6 +180,7 @@ def shot_rows(
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "upscale_strength": row.get("upscale_strength", ""),
                 "cq_luma_only": row.get("cq_luma_only", ""),
+                "ltx_lora_strength": row.get("ltx_lora_strength", ""),
                 "cq_guide_shots": row.get("cq_guide_shots", ""),
                 "cq_anchor_chunk": row.get("cq_anchor_chunk", ""),
                 "prompt": row.get("prompt", ""),
@@ -439,6 +441,36 @@ def set_reference_colour(manifest_text: str, index: int, reference_index: int, c
     source_video, fieldnames, rows = read_manifest_details(manifest)
     update_reference_item(rows[index], reference_index, values)
     _write_reference_row(manifest, source_video, fieldnames, rows, index)
+
+LTX_SHOT_STRENGTH_LIMITS = {"ltx_lora_strength": (0.0, 1.5)}
+
+
+def _strength_text(raw: str, low: float, high: float) -> str:
+    """'' keeps inheriting; a number is clamped and written without trailing zeros."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    value = max(low, min(high, float(text)))
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+def update_shot_ltx_strength(manifest_text: str, index: int, key: str, raw: str) -> dict[str, str]:
+    """A shot's own LTX Colorizer strength ('' follows the Colour tab)."""
+    if key not in LTX_SHOT_STRENGTH_LIMITS:
+        raise ValueError(f"Unknown LTX shot setting: {key}")
+    value = _strength_text(raw, *LTX_SHOT_STRENGTH_LIMITS[key])
+    update_manifest_row(resolve(manifest_text), index, {key: value})
+    return {key: value}
+
+def update_reference_guide_strength(manifest_text: str, index: int, reference_index: int, raw: str) -> dict[str, str]:
+    """One reference frame's own LTX guide strength ('' follows the Colour tab)."""
+    value = _strength_text(raw, 0.0, 1.0)
+    manifest = resolve(manifest_text)
+    source_video, fieldnames, rows = read_manifest_details(manifest)
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Manifest row {index} is out of range.")
+    update_reference_item(rows[index], reference_index, {"guide_strength": value})
+    _write_reference_row(manifest, source_video, fieldnames, rows, index)
+    return {"guide_strength": value}
 
 def reference_label(index: int, reference_index: int) -> str:
     return f"shot {index + 1}" if reference_index <= 0 else f"shot {index + 1} reference {reference_index + 1}"

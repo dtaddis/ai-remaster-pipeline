@@ -5948,6 +5948,44 @@ class GuiSmokeTests(unittest.TestCase):
         # References never edited encode exactly as before (no empty history key).
         self.assertNotIn("color_reference_previous", untouched)
 
+    def test_ltx_strengths_are_stored_per_shot_and_per_reference_frame(self) -> None:
+        import colorize_video
+        from reference_sets import additional_references
+
+        references = sys.modules["ai_remaster_gui.references"]
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "refs.csv"
+            for name in ("bw", "color", "bw2", "color2"):
+                (folder / f"{name}.png").write_bytes(name.encode())
+            extra = [{"selected_frame": "12", "source_reference": app.rel(folder / "bw2.png"), "color_reference": app.rel(folder / "color2.png"), "prompt": ""}]
+            app.write_manifest_details(
+                manifest, "input/example.mp4",
+                ["enabled", "end", "selected_frame", "source_reference", "color_reference", "prompt", "additional_references"],
+                [{"enabled": "true", "end": "00:00:01.000", "selected_frame": "5", "source_reference": app.rel(folder / "bw.png"),
+                  "color_reference": app.rel(folder / "color.png"), "prompt": "", "additional_references": json.dumps(extra)}],
+            )
+            before = colorize_video.shot_input_signature(app.read_manifest(manifest)[0])
+
+            references.update_shot_ltx_strength(app.rel(manifest), 0, "ltx_lora_strength", "2.5")  # clamped to 1.5
+            references.update_reference_guide_strength(app.rel(manifest), 0, 0, "0.75")
+            references.update_reference_guide_strength(app.rel(manifest), 0, 1, "0.2")
+            row = app.read_manifest(manifest)[0]
+            refs = colorize_video.row_references(row)
+            after = colorize_video.shot_input_signature(row)
+
+            references.update_reference_guide_strength(app.rel(manifest), 0, 1, "")  # back to the default
+            cleared = app.read_manifest(manifest)[0]
+
+        self.assertEqual(row["ltx_lora_strength"], "1.5")
+        self.assertEqual(row["guide_strength"], "0.75")
+        self.assertEqual([item["guide_strength"] for item in refs], [0.75, 0.2])
+        # LTX-only settings never make another method's cached segments stale.
+        self.assertEqual(before, after)
+        self.assertNotIn("guide_strength", additional_references(cleared)[0])
+        with self.assertRaises(ValueError):  # only the Colorizer strength is per shot
+            references.update_shot_ltx_strength("x.csv", 0, "ltx_reference_strength", "1")
+
     def test_each_reference_has_its_own_edit_history_folder(self) -> None:
         references = sys.modules["ai_remaster_gui.references"]
         first = references.reference_edit_dir("manifests/references/demo.csv", 3)

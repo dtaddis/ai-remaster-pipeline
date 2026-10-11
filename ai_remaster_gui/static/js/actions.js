@@ -1460,6 +1460,20 @@ async function saveShotUpscaleStrength(manifest, index, strength) {
   await redrawWithState(result.state, snap, true);
 }
 
+async function saveShotLtxStrength(manifest, index, key, value) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/shot-ltx-strength', { manifest, index, key, value });
+  if (!result.ok) return alert(result.error || 'Could not update the shot\'s LTX strength');
+  await redrawWithState(result.state, snap, true);
+}
+
+async function saveReferenceLtxStrength(manifest, index, reference_index, value) {
+  const snap = captureScrollState();
+  const result = await postJson('/api/reference-ltx-strength', { manifest, index, reference_index, value });
+  if (!result.ok) return alert(result.error || 'Could not update the reference frame\'s strength');
+  await redrawWithState(result.state, snap, true);
+}
+
 async function saveShotCqLumaOnly(manifest, index, checked) {
   // Matching the project's CQ colour default stores nothing, so the shot keeps following it.
   const projectDefault = settings('upscale').cq_colour === 'source';

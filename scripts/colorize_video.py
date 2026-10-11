@@ -12,7 +12,7 @@ from typing import Any
 import artifact_ids as aid
 import ltx_colorize
 import openai_generate_reference as openai_images
-from reference_sets import reference_items
+from reference_sets import EXTRA_REFERENCES_FIELD, REFERENCE_KEYS, additional_references, reference_items
 from comfy_api import ensure_node_types, extract_output_files, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import (
     ROOT,
@@ -245,9 +245,15 @@ def row_path_signature(row: dict[str, str], key: str) -> dict[str, Any]:
 def shot_input_signature(row: dict[str, str]) -> dict[str, Any]:
     """Everything about a manifest row that can make a cached shot segment stale."""
     refs = row_references(row)
-    unsigned_row_keys = {"color_reference_previous"}
+    unsigned_row_keys = {"color_reference_previous", *LTX_ROW_KEYS}
+    signed = {key: row.get(key, "") for key in sorted(row) if key not in unsigned_row_keys}
+    if signed.get(EXTRA_REFERENCES_FIELD):
+        # Extra references carry their own optional keys; only what they show is signed here.
+        signed[EXTRA_REFERENCES_FIELD] = json.dumps(
+            [{key: item.get(key, "") for key in REFERENCE_KEYS} for item in additional_references(row)], separators=(",", ":"),
+        )
     return {
-        "row": {key: row.get(key, "") for key in sorted(row) if key not in unsigned_row_keys},
+        "row": signed,
         "source_reference": row_path_signature(row, "source_reference"),
         "color_reference": row_path_signature(row, "color_reference"),
         "references": [
@@ -322,6 +328,7 @@ def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows
         "references": [reference_signature(row) for row in rows],
         "shot_inputs": [shot_input_signature(row) for row in rows],
         "settings": method_settings_signature(args),
+        **({"ltx_shots": [ltx_shot_signature(row) for row in rows]} if args.method == "ltx" else {}),
     }
 
 
@@ -345,8 +352,29 @@ def row_references(row: dict[str, str]) -> list[dict[str, Any]]:
         values.append({
             "path": row_reference(effective),
             "selected_frame": optional_int(item.get("selected_frame")),
+            "guide_strength": optional_float(item.get("guide_strength")),
         })
     return values
+
+
+def optional_float(value: str | None) -> float | None:
+    try:
+        text = str(value or "").strip()
+        return float(text) if text else None
+    except ValueError:
+        return None
+
+
+# LTX Colorizer per-shot and per-reference settings. Only the LTX method reads them, so they never
+# make another method's cached segments stale.
+LTX_ROW_KEYS = ("ltx_lora_strength", "guide_strength")
+
+
+def ltx_shot_signature(row: dict[str, str]) -> dict[str, Any]:
+    return {
+        "ltx_lora_strength": row.get("ltx_lora_strength", ""),
+        "guide_strengths": [item["guide_strength"] for item in row_references(row)],
+    }
 
 
 def build_prompt(
@@ -692,7 +720,19 @@ def stitch_colorized(ffmpeg: str, chunks: list[Path], transitions: list[int], ou
             continue
         group_transitions = transitions[left:right]
         group_output = group_dir / f"group_{group_index:04d}_{left:04d}_{right:04d}.mkv"
-        xfade_group(ffmpeg, group_chunks, group_transitions, group_output, fps)
+        # Only a group whose shots or fades changed is crossfaded again.
+        group_sig = {
+            "kind": "colourised crossfade group",
+            "chunks": [file_fingerprint(chunk) for chunk in group_chunks],
+            "transitions": group_transitions,
+            "fps": fps,
+            "profile": CURRENT_INTERMEDIATE_PROFILE,
+        }
+        if resumable_output(group_output, group_sig):
+            print(f"Reuse crossfaded shots {left + 1}-{right + 1}: {group_output.name}", flush=True)
+        else:
+            xfade_group(ffmpeg, group_chunks, group_transitions, group_output, fps)
+            write_signature(group_output, group_sig)
         group_outputs.append(group_output)
     stitch(ffmpeg, group_outputs, output, fps)
 

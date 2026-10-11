@@ -63,3 +63,4 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 .scrub-thumb{width:100%;aspect-ratio:16/9;background:#050607 no-repeat;border:1px solid var(--line);border-radius:6px;overflow:hidden}.shot-card .scrub-thumb img{display:block;border:0;border-radius:0}.scrub-thumb.sheet-ready img{display:none}
 
 .checks input.inline-number{width:56px;padding:4px 6px}
+.ltx-shot-controls{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 14px;border-top:1px solid var(--line);padding-top:10px}.ltx-shot-controls>label{grid-column:1/-1;margin:0}.ltx-strength-control label{display:flex;justify-content:space-between;margin:0}.ltx-strength-control output{font-variant-numeric:tabular-nums}.ltx-strength-control input[type=range]{width:100%;padding:0}.ltx-strength-control .upscale-shot-actions{margin-top:4px}

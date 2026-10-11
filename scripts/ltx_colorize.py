@@ -200,13 +200,22 @@ def shot_prompt(args: argparse.Namespace, row: dict[str, str], references: list[
     return build_prompt(scene, colours)
 
 
-def cleanup_graph_args(args: argparse.Namespace, prepared: Path) -> argparse.Namespace:
+def shot_strength(row: dict[str, str], key: str, default: float) -> float:
+    """A shot's own LTX setting from its manifest column, or the project's when it has none."""
+    try:
+        text = str(row.get(key, "") or "").strip()
+        return float(text) if text else float(default)
+    except ValueError:
+        return float(default)
+
+
+def cleanup_graph_args(args: argparse.Namespace, prepared: Path, lora_strength: float | None = None) -> argparse.Namespace:
     """Clean Up's Dearchive graph settings, retargeted at the Colorization LoRA."""
     import cleanup_video
 
     graph_args = cleanup_video.build_parser().parse_args(["--source", str(prepared)])
     graph_args.cleanup_lora = graph_args.outpaint_lora = LTX_COLORIZE_LORA
-    graph_args.lora_strength = float(args.ltx_lora_strength)
+    graph_args.lora_strength = float(args.ltx_lora_strength if lora_strength is None else lora_strength)
     graph_args.comfy_dir = str(resolve_path(args.comfy_dir))
     graph_args.comfy_url = args.comfy_url
     # The distilled recipe has no CFG; patch_workflow raises Dearchive's guider to 4.0
@@ -227,13 +236,14 @@ def run_chunk(
     height: int,
     fps: float,
     frames: int,
+    lora_strength: float | None = None,
 ) -> None:
     from outpaint_video import patch_workflow
 
     import cleanup_video
 
     comfy_dir = resolve_path(args.comfy_dir)
-    graph_args = cleanup_graph_args(args, prepared)
+    graph_args = cleanup_graph_args(args, prepared, lora_strength)
     graph_args.guide_strength = float(start_guide["strength"]) if start_guide else 0.0
     workflow = json.loads(cleanup_video.DEFAULT_WORKFLOW.read_text(encoding="utf-8-sig"))
     prefix = f"arp_ltx_colorize/{output.stem}"
@@ -481,7 +491,9 @@ def run_ltx_colorization(
     source_sig = file_fingerprint(processing_video)
     work = ROOT / ".cache" / "ltx_colorize" / f"{safe_stem(processing_video.stem)}_{source_sig['sha256'][:12]}"
     work.mkdir(parents=True, exist_ok=True)
-    settings = settings_signature(args)
+    # Strengths are signed per chunk as the values the chunk actually used (a shot's own, or the
+    # project's), so changing a default re-renders only the shots that follow it.
+    settings = {key: value for key, value in settings_signature(args).items() if key not in {"ltx_lora_strength", "ltx_reference_strength"}}
 
     # Describe every shot first, so Qwen3-VL and LTX never compete for VRAM mid-run.
     references = [row_references(row) for row in rows]
@@ -492,6 +504,7 @@ def run_ltx_colorization(
     for shot, (row, item) in enumerate(zip(rows, plan)):
         start, end = item["start"], item["end"]
         chunks = shot_chunks(start, end, chunk_frames_for(args.ltx_chunk_seconds, fps), args.ltx_overlap_frames)
+        lora_strength = shot_strength(row, "ltx_lora_strength", args.ltx_lora_strength)
         anchors = [
             ref for ref in references[shot]
             if ref["selected_frame"] is not None and start <= ref["selected_frame"] < end
@@ -520,7 +533,8 @@ def run_ltx_colorization(
             for ref in anchors:
                 local = ref["selected_frame"] - first
                 if 0 <= local < frames:
-                    guide = {"image": Path(ref["path"]), "frame_idx": local, "strength": args.ltx_reference_strength}
+                    own = ref.get("guide_strength")
+                    guide = {"image": Path(ref["path"]), "frame_idx": local, "strength": args.ltx_reference_strength if own is None else own}
                     if local == 0:
                         start_guide = guide
                     else:
@@ -556,6 +570,7 @@ def run_ltx_colorization(
                 "frames": [first, last],
                 "prompt": prompts[shot],
                 "seed": seed,
+                "lora_strength": lora_strength,
                 "start_guide": guide_signature(start_guide),
                 "guides": [guide_signature(guide) for guide in extra],
                 "settings": settings,
@@ -567,7 +582,7 @@ def run_ltx_colorization(
                 continue
             guide_text = ", ".join(f"{guide['frame_idx']}@{guide['strength']:g}" for guide in ([start_guide] if start_guide else []) + extra) or "none"
             print(f"LTX Colorizer shot {shot + 1}/{len(rows)} chunk {index + 1}/{len(chunks)}: frames {first}-{last}, guides {guide_text}", flush=True)
-            run_chunk(args, prepared, render, prompts[shot], seed, start_guide, extra, width, height, fps, frames)
+            run_chunk(args, prepared, render, prompts[shot], seed, start_guide, extra, width, height, fps, frames, lora_strength)
             write_signature(render, chunk_sig)
 
         segment_sig = {

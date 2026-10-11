@@ -39,6 +39,8 @@ from .outpaint_guides import (
 from .paths import resolve, resolve_served
 from .references import (
     accept_reference_edit,
+    update_reference_guide_strength,
+    update_shot_ltx_strength,
     add_reference_frame,
     delete_color_reference,
     extract_reference_frame,
@@ -449,6 +451,16 @@ class Handler(BaseHTTPRequestHandler):
                 update_manifest_row(resolve(manifest), index, {"upscale_strength": raw})
                 return {"strength": raw, "state": state.APP.state("upscale")}
             self._send_result("Shot upscale strength update", update_upscale_strength)
+        elif parsed.path == "/api/shot-ltx-strength":
+            self._send_result("Shot LTX strength update", lambda: {
+                **update_shot_ltx_strength(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("key", "")), str(data.get("value", ""))),
+                "state": state.APP.state("colour"),
+            })
+        elif parsed.path == "/api/reference-ltx-strength":
+            self._send_result("Reference LTX strength update", lambda: {
+                **update_reference_guide_strength(str(data.get("manifest", "")), int(data.get("index", 0)), int(data.get("reference_index", 0)), str(data.get("value", ""))),
+                "state": state.APP.state("colour"),
+            })
         elif parsed.path == "/api/shot-cq-luma-only":
             def update_cq_luma_only():
                 # "" inherits the CQ colour default; "true"/"false" is this shot's own choice.

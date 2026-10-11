@@ -43,6 +43,12 @@ class ShotChunkTests(unittest.TestCase):
         self.assertEqual(len(ltx_colorize.shot_chunks(0, shot, ltx_colorize.chunk_frames_for(15, 23.976))), 1)
         self.assertEqual(len(ltx_colorize.shot_chunks(0, shot, ltx_colorize.chunk_frames_for(5, 23.976))), 4)
 
+    def test_a_shot_follows_the_project_strength_unless_it_has_its_own(self) -> None:
+        self.assertEqual(ltx_colorize.shot_strength({}, "ltx_lora_strength", 1.0), 1.0)
+        self.assertEqual(ltx_colorize.shot_strength({"ltx_lora_strength": ""}, "ltx_lora_strength", 0.9), 0.9)
+        self.assertEqual(ltx_colorize.shot_strength({"ltx_lora_strength": "0.7"}, "ltx_lora_strength", 1.0), 0.7)
+        self.assertEqual(ltx_colorize.shot_strength({"ltx_lora_strength": "junk"}, "ltx_lora_strength", 0.8), 0.8)
+
     def test_processing_starts_at_the_reference_chunk_and_works_outwards(self) -> None:
         chunks = ltx_colorize.shot_chunks(0, 400, 121, 17)
         anchor = ltx_colorize.anchor_chunk(chunks, [250])
@@ -95,6 +101,68 @@ class WarpedGuideTests(unittest.TestCase):
         other[:, 16:80] = rng.integers(30, 220, (64, 64))
         self.assertGreater(ltx_colorize.match_score(target, target), 0.99)
         self.assertLess(ltx_colorize.match_score(other, target), 0.5)
+
+
+class SelectiveRerenderTests(unittest.TestCase):
+    """Changing one shot's settings re-renders that shot's chunks and nothing else."""
+
+    def test_only_the_shot_whose_settings_changed_renders_again(self) -> None:
+        import shutil
+        from unittest import mock
+
+        import colorize_video
+        from intermediate_video import codec_args
+
+        ffmpeg = find_ffmpeg()
+        width, height, fps, shot_frames = 96, 64, 24.0, 30
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "grey.mkv"
+            subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", f"testsrc=s={width}x{height}:r=24", "-frames:v", str(2 * shot_frames),
+                 "-vf", "hue=s=0", *codec_args("high", fast=True), "-f", "matroska", str(video)],
+                check=True,
+            )
+            rows = []
+            for shot in range(2):
+                reference = root / f"colour_{shot}.png"
+                subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=red:s={width}x{height}", "-frames:v", "1", str(reference)], check=True)
+                rows.append({"start_frame": str(shot * shot_frames), "end_frame": str((shot + 1) * shot_frames),
+                             "selected_frame": str(shot * shot_frames + 10), "source_reference": str(reference), "color_reference": str(reference)})
+            plan, _transitions = colorize_video.shot_plan(rows, 2 * shot_frames, fps)
+            args = colorize_video.build_parser().parse_args(["--manifest", "x.csv", "--method", "ltx", "--no-ltx-describe"])
+            rendered: list[tuple[int, float]] = []
+
+            def fake_render(args_, prepared, output, prompt_text, seed, start_guide, extra, w, h, fps_, frames, lora_strength=None):
+                rendered.append((seed - args.ltx_seed, lora_strength))
+                subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=green:s={w}x{h}:r=24", "-frames:v", str(frames),
+                                *codec_args("high", fast=True), "-f", "matroska", str(output)], check=True)
+
+            def run() -> list[tuple[int, float]]:
+                rendered.clear()
+                with mock.patch.object(ltx_colorize, "run_chunk", fake_render), \
+                        mock.patch.object(ltx_colorize, "ensure_ltx_colorize_models"), \
+                        mock.patch.object(ltx_colorize, "wait_for_comfy"), \
+                        mock.patch.object(ltx_colorize, "ensure_node_types"), \
+                        mock.patch.object(ltx_colorize, "free_comfy_models"):
+                    ltx_colorize.run_ltx_colorization(args, video, rows, plan, colorize_video.row_references, ffmpeg, width, height, fps)
+                return list(rendered)
+
+            work = None
+            try:
+                first = run()
+                again = run()
+                rows[1]["ltx_lora_strength"] = "0.8"
+                changed = run()
+                work = next((ROOT / ".cache" / "ltx_colorize").glob(f"{video.stem}_*"), None)
+            finally:
+                for folder in (ROOT / ".cache" / "ltx_colorize").glob(f"{video.stem}_*"):
+                    shutil.rmtree(folder, ignore_errors=True)
+
+        self.assertEqual(len(first), 2)  # one chunk per shot
+        self.assertEqual(again, [])  # nothing changed, nothing rendered
+        self.assertEqual(changed, [(shot_frames, 0.8)])  # only shot 2 (seed offset = its first frame), at its own strength
+        self.assertIsNotNone(work)
 
 
 class ColourLuminanceCompositeTests(unittest.TestCase):
