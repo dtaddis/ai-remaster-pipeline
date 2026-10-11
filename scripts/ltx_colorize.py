@@ -34,6 +34,7 @@ from comfy_api import ensure_node_types, extract_output_files, free_comfy_models
 from common import ROOT, copy_to_comfy_input, file_fingerprint, newest_output, replace_with_retry, resolve_path, resumable_output, root_relative, safe_stem, write_signature
 from dependency_manager import LTX_COLORIZE_LORA, QWEN_IMAGE_21_TEXT_ENCODER, ensure_ltx_colorize_models
 from intermediate_video import codec_args, container_args, vhs_inputs_for_profile
+from stream_copy import copy_head
 
 VERSION = 2
 MODEL_SIZE_MULTIPLE = 32
@@ -303,6 +304,12 @@ def assemble_shot(
 ) -> None:
     """Join a shot's chunk renders, crossfading wherever they overlap."""
     start, end = chunks[0][0], chunks[-1][1]
+    # A shot covered by one chunk is that chunk's render, already in the working codec.
+    if len(chunks) == 1:
+        copied = output.with_name(output.stem + ".partial" + output.suffix)
+        if copy_head(ffmpeg, renders[0], copied, end - start, container_args(str(copied), profile)):
+            replace_with_retry(copied, output)
+            return
     partial = output.with_name(output.stem + ".partial" + output.suffix)
     writer = subprocess.Popen(
         [

@@ -47,6 +47,7 @@ DEFAULT_LTX25_NEGATIVE_PROMPT = (
     "changed objects, altered composition, duplicate limbs, temporal inconsistency, flicker, invented "
     "text, compression artifacts, film damage, dust, scratches"
 )
+from stream_copy import copy_head, copy_join, count_video_packets
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, migrate_profile_name
 
 UPSCALE_METHODS = {"flashvsr", "seedvr2", "ltx25", "ltx25cq"}
@@ -1274,6 +1275,10 @@ def concat_cq_working(ffmpeg: str, parts: list[Path], target: Path, frames: int)
     """Join working-rate clips end to end into one 30 fps clip of ``frames`` frames."""
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    # Same-format clips that already add up to the frame count are joined without an encode.
+    if copy_join(ffmpeg, parts, partial, frames, working_container_args(partial)):
+        replace_with_retry(partial, target, f"CQ joined clip {target.name}")
+        return
     inputs = [item for part in parts for item in ("-i", str(part))]
     joined = "".join(f"[{index}:v]" for index in range(len(parts)))
     subprocess.run(
@@ -1847,6 +1852,13 @@ def crossfade_chunks(
     """
     if not chunks:
         raise RuntimeError("No CQ chunks were produced.")
+    if len(chunks) == 1 and not (width and height):
+        # One chunk and no resize: nothing to dissolve, so its packets are kept as they are.
+        partial = output.with_suffix(output.suffix + ".video.partial" + output.suffix)
+        if copy_head(ffmpeg, chunks[0][0], partial, frames, working_container_args(partial)):
+            mux_audio(ffmpeg, partial, audio_source, output)
+            partial.unlink(missing_ok=True)
+            return
     rate = Fraction(fps).limit_denominator(1001)
     seconds_per_frame = rate.denominator / rate.numerator
     inputs: list[str] = []
@@ -2095,10 +2107,14 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], audio_source: Path, output: P
         list_file = Path(tmp_text) / "chunks.txt"
         list_file.write_text("".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks), encoding="utf-8")
         print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
-        subprocess.run([
-            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-an", *working_codec_args(), *working_container_args(video_partial), str(video_partial),
-        ], check=True)
+        # The chunks are already in the working codec: join their packets, re-encoding only
+        # if they cannot be joined as they are.
+        expected = sum(count_video_packets(ffmpeg, chunk) for chunk in chunks)
+        if not copy_join(ffmpeg, chunks, video_partial, expected, working_container_args(video_partial)):
+            subprocess.run([
+                ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                "-an", *working_codec_args(), *working_container_args(video_partial), str(video_partial),
+            ], check=True)
     mux_audio(ffmpeg, video_partial, audio_source, output)
     video_partial.unlink(missing_ok=True)
 

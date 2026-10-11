@@ -17,7 +17,6 @@ from common import (
     QWEN_IMAGE_EDIT_MODEL,
     ROOT,
     copy_to_comfy_input,
-    ffprobe_for,
     file_fingerprint,
     find_ffmpeg,
     load_local_config,
@@ -60,6 +59,7 @@ from dependency_manager import (
 )
 from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
+from stream_copy import copy_head, count_video_packets
 from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, existing_comfy_render
 from outpaint_geometry import source_placement
 from ltx_outpaint_workflow_adapter import (
@@ -3216,7 +3216,11 @@ def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context
 
 
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float, intermediate_profile: str = "high") -> None:
-    vf = f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
+    # A piece from the start of its chunk (the first chunk, or a whole one-chunk clip) only cuts
+    # the end, so its packets are copied; a later start needs a keyframe there, hence an encode.
+    if start_frame == 0 and copy_head(ffmpeg, source, target, frame_count, container_args(str(target), intermediate_profile)):
+        return
+    vf =f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
 
 
@@ -3228,18 +3232,6 @@ def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fp
     duration = frame_count / fps
     vf = f"trim=start_frame={last}:end_frame={last + 1},setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={frame_count},fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
-
-
-def count_video_packets(ffmpeg: str, path: Path) -> int:
-    """Exact frame count of a stream-copied video, read from the container without decoding."""
-    result = subprocess.run(
-        [ffprobe_for(ffmpeg), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, check=True,
-    )
-    try:
-        return int(result.stdout.strip().splitlines()[0])
-    except (IndexError, ValueError):
-        return -1
 
 
 def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool, intermediate_profile: str = "high") -> None:

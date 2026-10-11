@@ -30,6 +30,7 @@ from common import (
     write_signature,
 )
 from intermediate_video import codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args
+from stream_copy import copy_join, count_video_packets
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 REFERENCE_INPUT_COPY_STRATEGY = "content-keyed-v1"
@@ -582,6 +583,14 @@ def shot_plan(rows: list[dict[str, str]], total_frames: int, fps: float) -> tupl
 
 def stitch(ffmpeg: str, chunks: list[Path], output: Path, fps: float) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    # The segments are already in the working codec: join their packets rather than re-encoding
+    # the whole film, falling back to the re-encode only if they cannot be joined as they are.
+    partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    expected = sum(count_video_packets(ffmpeg, chunk) for chunk in chunks)
+    print(f"Joining {len(chunks)} colourised segment(s) into {output.name} ({expected} frames)", flush=True)
+    if copy_join(ffmpeg, chunks, partial, expected, working_container_args(partial)):
+        replace_with_retry(partial, output)
+        return
     concat = output.with_suffix(".concat.txt")
     concat.write_text("".join("file '" + str(chunk).replace("'", "'\\''") + "'\n" for chunk in chunks), encoding="utf-8")
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)

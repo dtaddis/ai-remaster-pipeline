@@ -36,6 +36,7 @@ from common import (
 from dependency_manager import ensure_cleanup_models
 from outpaint_video import chunk_ranges, patch_workflow, split_chunk, stitch_chunks
 from prepare_outpaint_input import probe_video
+from stream_copy import count_video_packets, stream_format
 from intermediate_video import audio_codec_args as intermediate_audio_codec_args, codec_args as intermediate_codec_args, comfy_video_combine_inputs, container_args, existing_comfy_render, vhs_inputs_for_profile
 import artifact_ids as aid
 
@@ -1178,6 +1179,28 @@ def first_audio_packet_stream(ffmpeg: str, source: Path) -> int | None:
     return None
 
 
+def _square_or(value: str) -> str:
+    text = str(value or "").replace(":", "/").strip()
+    return "1" if text in {"", "1", "1/1", "0/1", "N/A"} else text
+
+
+def video_already_final(ffmpeg: str, video: Path, width: int, height: int, fps: float, frames: int, sample_aspect_ratio: str) -> bool:
+    """Whether finalize_output's re-encode would change nothing about this video stream."""
+    try:
+        codec, _profile, video_width, video_height, _pix_fmt, sar, rate = stream_format(ffmpeg, video)
+        numerator, _, denominator = rate.partition("/")
+        video_fps = float(numerator) / float(denominator or 1)
+    except (ValueError, ZeroDivisionError, subprocess.CalledProcessError):
+        return False
+    return (
+        bool(codec)
+        and (video_width, video_height) == (str(width), str(height))
+        and abs(video_fps - fps) < 0.01
+        and _square_or(sar) == _square_or(sample_aspect_ratio)
+        and count_video_packets(ffmpeg, video) == frames
+    )
+
+
 def finalize_output(
     ffmpeg: str,
     generated: Path,
@@ -1200,11 +1223,17 @@ def finalize_output(
         f"setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},"
         f"trim=end_frame={frames},fps={fps:.8f},setsar={sample_aspect_ratio}:max=100000"
     )
-    command = [
-        ffmpeg, "-y", "-i", str(generated), "-i", str(source), "-filter:v", vf,
-        "-map", "0:v:0", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
-        *intermediate_codec_args(intermediate_profile),
-    ]
+    if video_already_final(ffmpeg, generated, width, height, fps, frames, sample_aspect_ratio):
+        # The stitched video is already the delivery's size, rate and length, and in the working
+        # codec: only the source audio needs adding, so its packets are copied, not re-encoded.
+        print("Clean Up video already matches the delivery; copying it and adding the audio.", flush=True)
+        command = [ffmpeg, "-y", "-i", str(generated), "-i", str(source), "-map", "0:v:0", "-c:v", "copy"]
+    else:
+        command = [
+            ffmpeg, "-y", "-i", str(generated), "-i", str(source), "-filter:v", vf,
+            "-map", "0:v:0", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
+            *intermediate_codec_args(intermediate_profile),
+        ]
     if audio_stream is None:
         command.append("-an")
     else:
