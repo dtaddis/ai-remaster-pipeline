@@ -7841,6 +7841,68 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotEqual(first_ranges[2], second_ranges[2])
         self.assertIsNone(no_map)
 
+    def test_cq_skipped_shot_keeps_its_source_frames_and_its_cq_render_stays_cached(self) -> None:
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mkv"
+            raw = b"".join(bytes([40 + 2 * index]) * (64 * 48 * 3) for index in range(60))
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x48",
+                 "-r", "24", "-i", "-", "-c:v", "ffv1", str(source)],
+                input=raw, check=True,
+            )
+            manifest = folder / "shots.csv"
+            args = upscale_video.build_parser().parse_args([
+                "--input", str(source), "--method", "ltx25cq", "--cq-short-edge", "64", "--shot-manifest", str(manifest),
+            ])
+            rendered: list[str] = []
+
+            def negating_render(_args, chunk_input, partial, _width, _height, _frames, locked=None):
+                # A stand-in for CQ that is easy to tell from the source: it inverts the picture.
+                rendered.append(chunk_input.name)
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(chunk_input), "-vf", "negate", "-c:v", "ffv1", "-f", "matroska", str(partial)], check=True)
+                return partial
+
+            def level(video: Path, frame: int) -> int:
+                out = subprocess.run(
+                    [ffmpeg, "-loglevel", "error", "-i", str(video), "-vf", f"select=eq(n\\,{frame})", "-frames:v", "1",
+                     "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                    capture_output=True, check=True,
+                ).stdout
+                return out[len(out) // 2]
+
+            info = common.video_info(source)
+            with mock.patch.object(upscale_video, "ROOT", folder), \
+                    mock.patch.object(upscale_video, "cq_run", side_effect=negating_render):
+                manifest.write_text("start_frame,end_frame,cq_skip\n0,20,\n20,40,\n40,60,\n", encoding="utf-8")
+                first = upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+                before = upscale_video.cq_range_fingerprint(first, common.file_fingerprint(first), {})
+                first_ranges = [before(0, 20), before(20, 40), before(40, 60)]
+                renders_first = len(rendered)
+                manifest.write_text("start_frame,end_frame,cq_skip\n0,20,\n20,40,\n40,60,true\n", encoding="utf-8")
+                skipped = upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+                after = upscale_video.cq_range_fingerprint(skipped, common.file_fingerprint(skipped), {})
+                skipped_ranges = [after(0, 20), after(20, 40), after(40, 60)]
+                levels = (level(source, 50), level(skipped, 10), level(skipped, 50))
+                renders_skipped = len(rendered)
+                manifest.write_text("start_frame,end_frame,cq_skip\n0,20,\n20,40,\n40,60,\n", encoding="utf-8")
+                upscale_video.cq_enhance(args, source, info, common.file_fingerprint(source))
+
+        self.assertEqual(renders_first, 3)
+        self.assertEqual(renders_skipped, 3)  # skipping a shot renders nothing new
+        self.assertEqual(len(rendered), 3)  # and switching CQ back on reuses its render
+        source_50, cq_10, skipped_50 = levels
+        self.assertLess(abs(skipped_50 - source_50), 4)  # the skipped shot is its source frames
+        self.assertGreater(cq_10, 128)  # the other shots are still the (inverted) CQ render
+        # The finisher keys its splits on these, so it redoes only the skipped shot's frames.
+        self.assertEqual(first_ranges[:2], skipped_ranges[:2])
+        self.assertNotEqual(first_ranges[2], skipped_ranges[2])
+
     def test_upscale_only_shot_list_columns_do_not_stale_other_stages(self) -> None:
         sys.path.insert(0, str(app.ROOT / "scripts"))
         with tempfile.TemporaryDirectory() as tmp_text:

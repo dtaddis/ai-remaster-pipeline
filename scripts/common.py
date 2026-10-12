@@ -63,7 +63,7 @@ def _fingerprint_key(key: str) -> str:
 # Shot-list columns that only the upscale stage reads. Editing them must not make any other
 # stage's cached work look stale: re-colourising would re-encode the colourised film and so
 # send everything downstream, CQ included, back to the start.
-SHOT_LIST_UPSCALE_COLUMNS = frozenset({"upscale_strength", "cq_luma_only", "cq_guide_shots", "cq_anchor_chunk"})
+SHOT_LIST_UPSCALE_COLUMNS = frozenset({"upscale_strength", "cq_luma_only", "cq_guide_shots", "cq_anchor_chunk", "cq_skip"})
 
 
 def _comparable(value: Any) -> Any:

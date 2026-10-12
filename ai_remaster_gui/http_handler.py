@@ -472,6 +472,12 @@ class Handler(BaseHTTPRequestHandler):
                 update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"cq_luma_only": raw})
                 return {"luma_only": raw, "state": state.APP.state("upscale")}
             self._send_result("Shot CQ colour update", update_cq_luma_only)
+        elif parsed.path == "/api/shot-cq-skip":
+            def update_cq_skip():
+                skip = "true" if str(data.get("skip", "")).strip().lower() == "true" else ""
+                update_manifest_row(resolve(str(data.get("manifest", ""))), int(data.get("index", 0)), {"cq_skip": skip})
+                return {"skip": skip, "state": state.APP.state("upscale")}
+            self._send_result("Shot CQ skip update", update_cq_skip)
         elif parsed.path == "/api/shot-cq-guides":
             def update_cq_guides():
                 numbers = update_shot_cq_guides(str(data.get("manifest", "")), int(data.get("index", 0)), str(data.get("shots", "")))

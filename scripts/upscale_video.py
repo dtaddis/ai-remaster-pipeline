@@ -490,6 +490,8 @@ def read_upscale_shots(
             "guides": [int(frame) for frame in re.findall(r"\d+", str(row.get("cq_guide_shots") or ""))],
             # The chunk of a long shot whose look the rest of the shot follows (1 = its first).
             "anchor_chunk": int(anchor) if (anchor := str(row.get("cq_anchor_chunk") or "").strip()).isdigit() else 1,
+            # Leave this shot out of the CQ Enhancer: the finisher upscales its source frames instead.
+            "cq_skip": truthy(row.get("cq_skip")),
             "fade": truthy(row.get("fade_to_next")),
             "crossfade_seconds": row.get("crossfade_seconds", ""),
         })
@@ -1382,6 +1384,43 @@ def cq_anchor_chunks(args: argparse.Namespace, source: Path) -> dict[int, int]:
     return anchors
 
 
+def cq_skipped_shots(args: argparse.Namespace, source: Path) -> list[int]:
+    """Start frames of the shots the shot list leaves out of the CQ Enhancer."""
+    manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
+    if manifest is None or not manifest.is_file():
+        return []
+    info = video_info(source)
+    frames = int(info["frames"])
+    bounds = [0, *cq_shot_cuts(args, source), frames]
+    return sorted({
+        bounds[bisect.bisect_right(bounds, min(frames - 1, int(shot["start"]))) - 1]
+        for shot in read_upscale_shots(manifest, frames, args.fps or float(info["fps"]), 1.0)
+        if shot["cq_skip"]
+    })
+
+
+def cq_source_chunk(
+    ffmpeg: str, source: Path, target: Path, start: int, end: int, width: int, height: int, fps: float,
+    source_fingerprint: dict[str, Any],
+) -> None:
+    """A skipped shot's chunk: its source frames at the chunk size, in place of a CQ render."""
+    sig = {"kind": "CQ skipped shot source", "source": source_fingerprint, "range": [start, end], "size": [width, height]}
+    if resumable_output(target, sig, width=width, height=height):
+        return
+    partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    vf = f"trim=start_frame={start}:end_frame={end},setpts=N/({fps:.8f}*TB),scale={width}:{height}:flags=lanczos,setsar=1"
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr",
+            "-frames:v", str(end - start), *working_codec_args(), *working_container_args(partial), str(partial),
+        ],
+        check=True,
+    )
+    require_frames(ffmpeg, partial, end - start, f"Source frames {start}-{end} for a skipped CQ shot")
+    replace_with_retry(partial, target, f"CQ skipped-shot chunk {target.name}")
+    write_signature(target, sig)
+
+
 def cq_guide_shots(args: argparse.Namespace, source: Path) -> dict[int, list[int]]:
     """Guide shots from the shot list, as {shot start frame: [guide shot start frames]}."""
     manifest = resolve_path(args.shot_manifest) if getattr(args, "shot_manifest", "") else None
@@ -1578,6 +1617,7 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
         bisect.bisect_right(bounds, shot_start) - 1: number
         for shot_start, number in cq_anchor_chunks(args, source).items()
     }
+    skipped = {bisect.bisect_right(bounds, shot_start) - 1 for shot_start in cq_skipped_shots(args, source)}
     rendered: dict[int, Path] = {}
     digits = max(4, int(math.log10(len(plan))) + 1)
     position = 0
@@ -1595,6 +1635,13 @@ def cq_enhance(args: argparse.Namespace, source: Path, info: dict[str, Any], sou
             chunk_input = chunk_dir / f"cq_input_{'rev_' if backwards else ''}{name}.mkv"
             chunk_raw = chunk_dir / f"cq_raw_{name}.mp4"
             chunk_final = chunk_dir / f"cq_render_{name}.mkv"
+            if shot in skipped:
+                # Its own name, so switching CQ back on for the shot reuses its CQ render.
+                source_chunk = chunk_dir / f"cq_source_{name}.mkv"
+                print(f"CQ chunk {position}/{len(plan)}: frames {start_frame}-{end_frame} skip CQ (shot {shot + 1})", flush=True)
+                cq_source_chunk(ffmpeg, source, source_chunk, start_frame, end_frame, width, height, fps, source_fingerprint)
+                rendered[index] = source_chunk
+                continue
             # Progress counts in render order, which guide shots can take out of timeline order.
             print(
                 f"CQ enhance chunk {position}/{len(plan)}: frames {start_frame}-{end_frame}, "
@@ -1816,6 +1863,7 @@ def cq_output_signature(args: argparse.Namespace, source: Path) -> dict[str, Any
         "shot_cuts": cq_shot_cuts(args, source),
         **({"guide_shots": [[shot, guides] for shot, guides in sorted(guide_shots.items())]} if (guide_shots := cq_guide_shots(args, source)) else {}),
         **({"anchor_chunks": [[shot, number] for shot, number in sorted(anchors.items())]} if (anchors := cq_anchor_chunks(args, source)) else {}),
+        **({"skipped_shots": skipped} if (skipped := cq_skipped_shots(args, source)) else {}),
         # Left out when off, so renders made before continuity existed stay reusable.
         **({"continuity": args.cq_continuity} if args.cq_continuity > 0 else {}),
         # Always CQ's own colour now: luma-only moved to delivery. Older "model" renders stay reusable.

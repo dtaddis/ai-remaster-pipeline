@@ -414,7 +414,14 @@ function upscaleShotCqLumaHtml(s, row, manifest) {
   const projectDefault = s.cq_colour === 'source';
   const own = String(row.cq_luma_only || '').trim().toLowerCase();
   const checked = own === 'true' || own === 'false' ? own === 'true' : projectDefault;
+  const skip = String(row.cq_skip || '').trim().toLowerCase() === 'true';
   return `
+    <div class="upscale-shot-actions">
+      <label class="checkbox-field" title="Leave this shot out of the CQ Enhancer: the finishing upscaler works on its source frames instead. Use it where CQ redraws something it should not, such as faces or eyes.">
+        <input type="checkbox" ${skip ? 'checked' : ''} onchange="saveShotCqSkip(${jsArg(manifest)},${row.index},this.checked)">
+        Skip CQ for this shot
+      </label>
+    </div>
     <div class="upscale-shot-actions">
       <label class="checkbox-field" title="Take only brightness detail from the CQ Enhancer and keep this shot's source colour. Applied when the upscale is delivered, so changing it does not re-render.">
         <input type="checkbox" ${checked ? 'checked' : ''} onchange="saveShotCqLumaOnly(${jsArg(manifest)},${row.index},this.checked)">

@@ -181,6 +181,7 @@ def shot_rows(
                 "crossfade_seconds": row.get("crossfade_seconds", ""),
                 "upscale_strength": row.get("upscale_strength", ""),
                 "cq_luma_only": row.get("cq_luma_only", ""),
+                "cq_skip": row.get("cq_skip", ""),
                 "ltx_lora_strength": row.get("ltx_lora_strength", ""),
                 "cq_guide_shots": row.get("cq_guide_shots", ""),
                 "cq_anchor_chunk": row.get("cq_anchor_chunk", ""),
