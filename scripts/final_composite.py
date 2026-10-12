@@ -10,6 +10,7 @@ import frame_masks
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, safe_stem, write_signature
 from outpaint_geometry import crop_box, native_source_layout, source_placement
 from reference_luminance import ffmpeg_curve, identity_curve, reference_luminance_plan
+from stream_copy import count_video_packets
 
 CUSTOM_MASK_FEATHER_VERSION = 1
 
@@ -584,6 +585,12 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
     return ';'.join(filters)
 
 
+# Every layer is retimed with setpts=N. If an input's frame properties change mid-stream (a colour
+# layer joined from segments with different colour tags), ffmpeg rebuilds the filter graph, N restarts
+# at 0, and the composite ends early: Steamboat's 7:41 recomp came out 1:33 long.
+KEEP_FILTERS = ['-reinit_filter', '0']
+
+
 def input_args(outpainted: Path | None, source: Path, colorized: Path | None, custom_mask: Path | None) -> tuple[list[str], str]:
     """Build ffmpeg's input list for the composite, plus the audio stream to map.
 
@@ -596,13 +603,13 @@ def input_args(outpainted: Path | None, source: Path, colorized: Path | None, cu
     """
     inputs: list[str] = []
     if outpainted:
-        inputs += ['-i', str(outpainted), '-i', str(source)]
+        inputs += [*KEEP_FILTERS, '-i', str(outpainted), *KEEP_FILTERS, '-i', str(source)]
         audio_input = '1:a?'
     else:
-        inputs += ['-i', str(source)]
+        inputs += [*KEEP_FILTERS, '-i', str(source)]
         audio_input = '0:a?'
     if colorized:
-        inputs += ['-i', str(colorized)]
+        inputs += [*KEEP_FILTERS, '-i', str(colorized)]
     if custom_mask:
         inputs += ['-i', str(custom_mask)]
     return inputs, audio_input
@@ -677,7 +684,13 @@ def run(args):
     if duration > 0:
         print(f'Composite frames: {max(1, int(round(duration * fps)))} at {fps:.6f} fps', flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
+    expected_frames = count_video_packets(ffmpeg, outpainted or source)
     subprocess.run(cmd, check=True)
+    frames = count_video_packets(ffmpeg, partial)
+    # A frame or two may go to -shortest against the audio; anything more is a broken composite.
+    if expected_frames > 0 and abs(frames - expected_frames) > 2:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(f'The composite came out with {frames} frame(s) instead of {expected_frames}; it was not saved.')
     replace_with_retry(partial, output)
     write_signature(output, sig)
     print(f'Wrote composite: {output}')

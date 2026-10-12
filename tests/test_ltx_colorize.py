@@ -205,3 +205,69 @@ class ColourLuminanceCompositeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _encode(ffmpeg: str, output: Path, colour: str, frames: int, tagged: bool) -> None:
+    """A VP9 working-codec clip: tagged BT.709 like a VideoHelperSuite render, or untagged."""
+    from intermediate_video import codec_args
+
+    tags = ["-vf", "scale=out_color_matrix=bt709:out_range=tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"] if tagged else []
+    subprocess.run(
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c={colour}:s=96x64:r=24", "-frames:v", str(frames),
+         *tags, *codec_args("high", fast=True), "-f", "matroska", str(output)],
+        check=True,
+    )
+
+
+def _raw_yuv(ffmpeg: str, video: Path) -> np.ndarray:
+    raw = subprocess.run([ffmpeg, "-v", "error", "-i", str(video), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-"], check=True, capture_output=True).stdout
+    return np.frombuffer(raw, np.uint8).reshape(3, 64, 96)
+
+
+class ColourTagTests(unittest.TestCase):
+    def test_crossfaded_shot_uses_the_same_matrix_and_tags_as_a_copied_render(self) -> None:
+        from stream_copy import stream_format
+
+        ffmpeg = find_ffmpeg()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            renders = [root / "a.mkv", root / "b.mkv"]
+            for render in renders:
+                _encode(ffmpeg, render, "0xC03020", 40, tagged=True)
+            shot = root / "shot.mkv"
+            ltx_colorize.assemble_shot(ffmpeg, [(0, 40), (30, 70)], renders, shot, 96, 64, 24.0, 8, "high")
+            tags = subprocess.run(
+                [ffmpeg.replace("ffmpeg.exe", "ffprobe.exe") if ffmpeg.endswith(".exe") else "ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=color_space", "-of", "csv=p=0", str(shot)],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            # Recomposition copies the colour layer's chroma planes, so they must match a copied render's.
+            render_uv, shot_uv = _raw_yuv(ffmpeg, renders[0])[1:], _raw_yuv(ffmpeg, shot)[1:]
+            self.assertEqual(stream_format(ffmpeg, shot), stream_format(ffmpeg, renders[0]))
+        self.assertEqual(tags, "bt709")
+        self.assertLessEqual(int(np.abs(render_uv.astype(int) - shot_uv.astype(int)).max()), 2)
+
+    def test_composite_keeps_every_frame_when_the_colour_layer_changes_tags(self) -> None:
+        from stream_copy import copy_join, count_video_packets
+
+        ffmpeg = find_ffmpeg()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = [root / f"part{index}.mkv" for index in range(4)]
+            for index, part in enumerate(parts):
+                _encode(ffmpeg, part, "0xC03020", 24, tagged=index % 2 == 0)
+            colour, source, output = root / "colour.mkv", root / "source.mkv", root / "out.mp4"
+            self.assertTrue(copy_join(ffmpeg, parts, colour, 96))
+            _encode(ffmpeg, source, "0x808080", 96, tagged=False)
+            subprocess.run(
+                [sys.executable, str(SCRIPTS / "final_composite.py"), "--source", str(source), "--colorized", str(colour),
+                 "--output", str(output), "--ffmpeg", ffmpeg],
+                check=True, capture_output=True,
+            )
+            self.assertEqual(count_video_packets(ffmpeg, output), 96)
+
+    def test_video_inputs_never_rebuild_the_filter_graph(self) -> None:
+        inputs, _audio = final_composite.input_args(Path("outpainted.mkv"), Path("source.mkv"), Path("colour.mkv"), Path("mask.png"))
+        for name in ("outpainted.mkv", "source.mkv", "colour.mkv"):
+            at = inputs.index(name)
+            self.assertEqual(inputs[at - 3:at - 1], ["-reinit_filter", "0"], name)

@@ -301,6 +301,18 @@ class FrameReader:
         self.process.wait()
 
 
+def bt709_args(profile: str) -> list[str]:
+    """Encode RGB frames the way VideoHelperSuite writes the chunk renders: BT.709 matrix and tags.
+
+    Left to ffmpeg's defaults, RGB goes to YUV with the BT.601 matrix and no tags, so a crossfaded
+    shot would sit between single-chunk shots (copied renders, tagged BT.709) on a different matrix:
+    Recomposition takes the colour layer's chroma planes as they are, and every tag change rebuilds
+    its filter graph mid-film. FFV1 (lossless) keeps RGB and needs neither."""
+    if "-pix_fmt" not in codec_args(profile):
+        return []
+    return ["-vf", "scale=out_color_matrix=bt709:out_range=tv", "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+
+
 def assemble_shot(
     ffmpeg: str,
     chunks: list[tuple[int, int]],
@@ -324,7 +336,7 @@ def assemble_shot(
     writer = subprocess.Popen(
         [
             ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-            "-r", f"{fps:.8f}", "-i", "-", "-an", *codec_args(profile), *container_args(str(partial), profile), str(partial),
+            "-r", f"{fps:.8f}", "-i", "-", "-an", *bt709_args(profile), *codec_args(profile), *container_args(str(partial), profile), str(partial),
         ],
         stdin=subprocess.PIPE,
     )
@@ -588,6 +600,7 @@ def run_ltx_colorization(
         segment_sig = {
             "version": VERSION,
             "kind": "LTX Colorizer shot",
+            "colour_matrix": "bt709",
             "chunks": [file_fingerprint(render) for render in renders],
             "ranges": chunks,
         }
