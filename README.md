@@ -4,332 +4,72 @@
 
 # ARP - AI Remaster Pipeline
 
-ARP is a local GUI app for remastering public-domain or properly licensed film material with ComfyUI-powered AI tools.
+A local GUI for remastering public-domain or licensed archive film with ComfyUI models: clean up, stabilise, outpaint to widescreen, colourise from reference stills, add a soundtrack and upscale. You run the whole job from one page, then inspect and adjust any stage where the AI needs steering.
 
-It is built around an old-film workflow: choose source material, optionally clean archive damage and stabilize gate weave per shot, outpaint it to a wider aspect ratio, detect shots, generate color reference stills, colorize the video from those references, and finally recomposite the result so the original center footage stays as faithful as possible.
-
-The app is still alpha software, but the goal is simple: you should be able to run the whole remaster from the GUI, then inspect and adjust each stage when the AI needs a little human steering.
+Alpha software. Windows + NVIDIA is the supported path.
 
 <p align="center">
   <img src="assets/screenshots/walkthrough/arp-walkthrough-overview.jpg" alt="ARP Overview tab showing source video metadata, preview frames, and whole-pipeline progress">
 </p>
 
-## What It Does
-
-- Outpaints 4:3 or similar archive footage into common target aspect ratios such as `16:9`, `9:16`, `4:3`, `3:4`, `1:1`, `21:9`, `2.39:1`, and `1.85:1`.
-- Splits video into shots and lets you review, merge, enable, disable, and adjust shot boundaries.
-- Generates per-shot reference frames and colorizes them with Qwen Image Edit.
-- Optionally reconstructs vertical scratches with masked ProPainter inpainting, corrects light/dark vignettes, then restores archive footage with the LTX 2.3 Dearchive LoRA at a selectable model-safe output resolution (720p by default).
-- Uses reference-guided video colorization for the outpainted footage.
-- Recombines the original, outpainted, and colorized layers into a final output.
-- Keeps intermediate files deterministic and resumable, so reruns can reuse valid existing work.
-
-## Install
-
-### Requirements
-
-- Windows with an NVIDIA GPU is the currently supported installer path. The installer defaults to CUDA 13.0 PyTorch wheels.
-- Python 3.13 is required. On Windows, install it from [python.org](https://www.python.org/downloads/) with the Python Launcher option enabled, or make sure `python.exe` is on `PATH`.
-- Git is required so the installer can clone and update ARP's managed ComfyUI runtime and required custom nodes.
-- Internet access is required during installation for Python packages, ComfyUI, FFmpeg, and optional model downloads.
-- ComfyUI is required as the AI backend. The installer can clone it for you, or you can point ARP at an existing ComfyUI checkout.
-
-#### Hardware And Storage Planning
-
-ARP is a large, compute-intensive workflow. These are planning figures rather than hard limits because memory use and render time depend heavily on the enabled stages, working resolution, chunk length, and model settings:
-
-- **GPU:** 16 GB of NVIDIA VRAM is a practical floor for conservative settings and lower working resolutions. **24 GB is recommended** and is the basis for defaults such as 720p AI DeScratch. 48 GB or more gives useful headroom for higher resolutions, longer chunks, and less aggressive tiling.
-- **System RAM:** 32 GB is a practical minimum; **64 GB is recommended**, particularly when large model components are offloaded from the GPU.
-- **Installation and models:** allow roughly 15 GB for the Python/ComfyUI runtime before models, and about **85-100 GB** for the main video, image, and LoRA model set. Models are downloaded only when a stage needs them, so a partial workflow uses less.
-- **Free disk space:** start with at least **150 GB free** for installation and the main models. **250 GB or more is recommended** when running complete projects. The Hugging Face download cache can temporarily retain another copy of large model files, and intermediate videos can consume tens or hundreds of gigabytes depending on source length, resolution, and enabled stages.
-
-AI processing is normally much slower than the source running time, and resolution alone is not enough to predict it reliably. Benchmark the intended settings on a representative 10-30 second section, multiply that stage's elapsed time by the ratio of full duration to test duration, then allow additional time for review and regenerated chunks. Short tests may take minutes to hours; a feature-length, multi-stage restoration can take days to months. Moving from 720p to 1080p can increase both time and memory use substantially.
-
-### Windows
-
-Run:
-
-```bat
-install_windows.bat
-```
-
-The installer creates this repo's `.venv`, installs FFmpeg locally, and uses an ARP-managed ComfyUI checkout at `tools\comfyui`.
-
-That managed checkout is the recommended path. Re-running `install_windows.bat` refreshes ComfyUI and the required custom nodes with fast-forward Git updates, while preserving downloaded models and generated outputs.
-
-If the installer cannot find Python 3.13, it will prompt you to install it and retry detection.
-
-If Python 3.13 is installed somewhere custom, point the installer at the actual executable. Common python.org install paths are:
-
-```bat
-install_windows.bat -PythonLauncher "%LocalAppData%\Programs\Python\Python313\python.exe"
-install_windows.bat -PythonLauncher "C:\Program Files\Python313\python.exe"
-```
-
-If you intentionally want to use an existing ComfyUI checkout instead:
-
-```bat
-install_windows.bat -ComfyDir D:\path\to\ComfyUI
-```
-
-When you pass `-ComfyDir`, ARP treats that checkout as external: it can install/update required custom nodes there, but it will not update ComfyUI core itself. Keep external ComfyUI checkouts current yourself with `git pull` and `pip install -r requirements.txt`.
-
-Python packages are installed into ARP's `.venv`, not into a separate ComfyUI virtual environment. The managed ComfyUI checkout is used as the AI backend.
-
-Models and LoRAs are downloaded on demand when a stage first needs them. If a large Hugging Face download is interrupted, rerun the same stage and the download should resume. You can prefetch the main model set with:
-
-```bat
-install_windows.bat -DownloadModels
-```
-
-ARP respects Hugging Face's `HF_HOME` and `HF_HUB_CACHE` environment variables. You can also set
-`ARP_HF_CACHE_DIR` for an ARP-specific cache override. For an existing ComfyUI installation, model
-downloads also follow the default section of `extra_model_paths.yaml`, including its
-`download_model_base` setting.
-
-Useful installer options:
-
-```bat
-install_windows.bat -NonInteractive
-install_windows.bat -SkipDeepExemplar
-install_windows.bat -InstallCorrelationExtension
-install_windows.bat -TorchIndexUrl https://download.pytorch.org/whl/cu130
-```
-
-ColorMNet and CMNET2 use a PyTorch correlation fallback by default with the same output quality. `-InstallCorrelationExtension` attempts the optional faster CUDA correlation extension for ColorMNet; it requires Visual Studio C++ Build Tools and a local CUDA Toolkit matching the installed PyTorch CUDA build. If the extension cannot build, installation continues in fallback mode. The installer also downloads CMNET2's checkpoint and DINOv2/ResNet support files into the ignored runtime directories under `vendor/cmnet2`.
-
-See [docs/installer-model-sources.md](docs/installer-model-sources.md) for the exact model and LoRA sources.
-
-### macOS And Linux
-
-The full installer is currently Windows-focused. On macOS or Linux, set up a Python virtual environment, install `requirements.txt`, configure an existing ComfyUI directory in `.ai_remaster_config.json`, and launch the GUI with `./launch_gui.sh` or `python -m ai_remaster_gui`.
-
-Cross-platform packaging is planned, but not polished yet.
-
-## Launch The GUI
-
-On Windows:
-
-```bat
-launch_gui.bat
-```
-
-On macOS or Linux:
-
-```sh
-./launch_gui.sh
-```
-
-Or from an activated environment:
-
-```sh
-python -m ai_remaster_gui
-```
-
-The GUI opens as a local web app. It checks ComfyUI at `http://127.0.0.1:8188`; if ComfyUI is configured but not running, ARP can start it in its own console window so you can watch ComfyUI load and render in real time.
-
-ComfyUI runs in that separate console window, where its startup, progress, and any import/custom-node errors are visible live. ARP also records the launch command to `output/logs/comfyui-startup.log` (viewable from Settings → Log file).
-
-Set `AI_REMASTER_NO_COMFY_AUTOSTART=1` if you want to manage ComfyUI yourself.
-
-### RunPod cloud compute
-
-Every processing page has a **Compute** selector. Choose **RunPod cloud worker** to execute that phase on a secure CUDA 13 Pod while keeping the same ARP script, stage settings, paths, resumability, and local result previews. In Settings, paste a RunPod API key; ARP creates a project-local SSH key, provisions a compatible worker, installs ComfyUI and the required nodes on its persistent workspace, uploads the stage inputs, downloads its outputs, and remembers the Pod ID for later phases. The default stops the Pod as soon as the phase completes to end GPU billing.
-
-Portable network storage is the default. It is independent of a physical GPU host, so ARP can replace an unavailable Pod and mount the same models and results on another compatible worker. Leave the volume ID blank and ARP creates it once in the configured data centre, then records both the volume and replacement Pod IDs automatically. The default is 100 GB standard storage in `EU-RO-1`; the Settings page shows the recurring rate before use. Choose a host-tied Pod volume instead if lower short-term storage cost matters more than portability. A network volume is data-centre-specific, so the GPU pool should contain several compatible cards available in that region.
-
-RunPod authentication uses an API key rather than the account's Google login or a RunPod username/password. ARP keeps its provider credentials in the machine-local `.ai_remaster_gui.json` settings and excludes all of them from `.arpp` project bundles and command logs. If `Desktop/Runpod_API_Key.txt` exists, ARP imports it on the next launch without displaying it.
-
-The first cloud phase is intentionally slower because it builds the worker and downloads models. Later phases reuse both the saved Pod and its persistent model storage. ARP requests secure cloud, a public SSH endpoint, CUDA 13, and an availability-optimised GPU pool rather than waiting indefinitely for one exact card. The default image is `runpod/pytorch:1.0.3-cu1300-torch291-ubuntu2404`.
-
-### Intermediate master formats
-
-Settings controls video written inside the processing chain and the master produced by each complete phase:
-
-- **Low bitrate** uses 10-bit VP9 at CRF 36.
-- **Medium bitrate** uses 10-bit VP9 at CRF 27.
-- **High bitrate** uses 10-bit VP9 at CRF 18 and is the recommended restoration default.
-- **Lossless** uses preservation-oriented FFV1 v3.
-
-The chosen profile is passed directly into local and RunPod producers, including temporary scaling, chunk normalization and stitching. This avoids a hidden H.264 generation in operations such as the 720p-to-704p LTX outpainting preparation, and avoids a redundant post-stage transcode. Processing masters use Matroska (`.mkv`); final delivery remains MP4/MOV, and lightweight H.264 browser previews remain separate and compact.
-
-## Basic Workflow
-
-1. Open the Overview tab.
-2. Choose your source material with Browse. Select one video, or select a numbered image sequence (PNG, BMP, JPG/JPEG, DPX, TIFF, or WebP). Set **Image sequence FPS** before browsing, or change it afterward to rebuild the sequence timing. Image sequences are sorted naturally by filename, converted to a 10-bit lossless FFV1 working master, and given a browser-playable preview automatically.
-3. Check the preview frames, duration, resolution, frame rate, codecs, and color/monochrome guess.
-4. Enable Clean Up when the source needs archive restoration, and Stabilize when it has gate weave, jitter, or unwanted frame rotation; both default off. Inside Clean Up, select any combination of AI DeScratch, DeVignette, and Dearchive. Leave Colorize enabled for black-and-white sources, or turn it off if you only want cleanup/stabilization/outpainting.
-5. Click Run Whole Remaster for a first pass.
-6. Use the stage tabs to inspect or rerun individual phases.
-
-Every stage writes predictable intermediate files under `intermediate/`, manifests under `manifests/`, and final renders under `output/reassembled/`.
-
-**Run Whole Remaster is resumable.** It walks the enabled phases in order. Each producer compares a saved signature containing its effective settings and input fingerprints, reuses matching outputs, and regenerates work whose settings, source files, masks, prompts, guides, or upstream outputs changed. Per-chunk phases retain matching chunks. A phase with **Force** enabled deliberately bypasses reuse and runs again.
-
-## Tabs
-
-### Overview
-
-Choose the source video, see useful media info, and run the whole pipeline.
-
-![Overview tab](assets/screenshots/walkthrough/arp-walkthrough-overview.jpg)
-
-### Clean Up
-
-Optional and off by default. Clean Up has three independent operations. **AI DeScratch** builds a visible scratch-only mask, reconstructs only those pixels across neighbouring frames with ProPainter, and composites them back over the untouched source; it is also off by default. DeVignette estimates stationary dark falloff or a pale additive edge veil while preserving black presentation bars. Dearchive applies the LTX 2.3 IC-LoRA at its full `1.0` strength and defaults on. It retains the fast distilled Q4 model and eight-step sigma schedule, with the model card's CFG `4.0` and restoration prompt. The resolution selector defaults to 720p (rounded to the nearest LTX-safe dimensions), and the finished Dearchive file stays at that model resolution rather than being enlarged back to the source dimensions.
-
-The order is DeVignette, AI DeScratch, then Dearchive. AI DeScratch defaults to a 720p working copy and 41-frame windows on a 24 GB GPU, but always returns the source resolution and timing. Sensitivity controls how faint a vertical mark may be before it enters the mask; mask expansion includes damaged edges around each detected line. Enable the mask preview to write a companion `_scratch_mask.mp4`; white shows the detected base mask, before the selected expansion margin. ProPainter's model and upstream code use the NTU S-Lab License 1.0 and are restricted to non-commercial use.
-
-DeVignette defaults to **Auto (prefer GPU)**. ARP uses its installed PyTorch CUDA stack directly and processes frames in adaptive batches when an NVIDIA GPU is available; otherwise it logs the reason and falls back to OpenCV/NumPy on the CPU. The log reports the selected processor, GPU name, batch size, sampled-frame analysis time, frames per second, elapsed time, and ETA.
-
-When Dearchive is enabled it defaults to 4.04-second chunks (97 frames at 24 fps); the UI accepts 2 to 20 seconds and rounds the requested duration at the source frame rate to the nearest LTX-valid `8n + 1` frame count. Its default positive and negative prompts also match the model author's inference examples instead of instructing the model to preserve the archive look. **Source Fidelity** controls the strength of the complete input-video IC-LoRA guide. Its safe default of `1.0` preserves the source most exactly, while lower values let Dearchive repaint more damage at increasing risk of changes to faces, hands, motion, and fine period detail. Dearchive returns the selected model resolution, source frame rate, frame count, and audio. DeVignette and AI DeScratch alone retain the source dimensions.
-
-### Stabilization
-
-Optional and off by default. Stabilization uses FFmpeg's two-pass libvidstab filters to estimate and correct translation and rotation. ARP first detects shot boundaries with the same detector used by Reference Generation, then analyses every shot independently so cuts and dissolves are not interpreted as camera movement. An existing user-reviewed shot manifest takes precedence when available. Smoothing, maximum translation/rotation, fixed safety zoom, and shot sensitivity are adjustable; ARP does not use automatic zoom, so framing cannot pulse or silently crop much more than requested. Stabilized masters inherit the global Intermediate Stage Video profile from Settings. Stabilization runs after Clean Up and before Outpainting or Colorization.
-
-### Outpainting
-
-Set the target aspect ratio, output height, chunk length, overlap frames, and signed per-edge **Trim / Extend** values. Negative values trim source pixels; positive values reserve extra canvas for LTX on that edge. The selected target aspect ratio always remains the outer frame, so positive values can deliberately shrink and position the source inside it to outpaint above, below, left, and right at once. **Auto Trim** detects baked-in bars and writes negative values. The target preview shows the resulting canvas before LTX fills it.
-
-**Create Mask** opens that preview as a paintable canvas. Paint additional source areas that LTX should replace on every frame, or erase strokes to refine the selection. This is intended for rounded film-frame corners, damaged edges, sprocket holes, and other fixed inpaint regions. The painted mask is additive to the automatic Trim / Extend mask. Because its coordinates belong to one exact canvas geometry, changing the target aspect, output size, Trim / Extend values, or black-region mode starts a fresh mask for the new geometry without deleting the old file. The active custom mask is saved with the project, sent to RunPod when cloud compute is selected, and also applied during Recomposition so the generated pixels are not covered again by the original-source layer.
-
-Outpainting is chunked so longer movies can be processed without requiring a huge single ComfyUI job. ARP defaults to 8 overlap frames because LTX can return short chunks; lower values may still work, but the app warns you when the overlap is risky.
-
-Clicking a guide frame opens the guide editor. **Edit with** chooses the model: **Qwen 2511 (local)** (Qwen-Image-Edit-2511), the default; **Qwen-Image-2.1 (local, non-commercial)**; or **OpenAI Cloud Editing**, which uses the OpenAI API key, image model and quality set for Reference Generation. The choice is remembered. Qwen-Image-2.1 is licensed for research and evaluation only (Qwen Research License), so the editor shows a warning when it is selected; do not use it for guides in a remaster you sell or monetise unless you have a commercial licence from Alibaba. Its weights (about 17 GB) download on first use. ARP runs Viggle's 6-step turbo distill of 2.1 (its equivalent of Qwen 2511's Lightning LoRA, about 5× faster than the 40-step base model, under the same research licence). It edits on a canvas of up to 2048×2048 (larger guides are scaled down for the edit), and its result is composited back through the mask in the same way as the OpenAI result described below. Paint a mask to say what to change; with no mask, the black regions at the guide's edges are masked automatically (only near-pure black counts, so faded or dark-grey edges need painting by hand). If there is no mask and no black edge region, ARP says so rather than editing the whole frame. The default instruction, "Repair the area under the mask. Fill black regions and fix discontinuities.", suits both bar filling and repairs. GPT Image treats a mask as a hint rather than a stencil and only accepts certain sizes, so ARP fits the frame onto a size the model accepts (padding rather than stretching), sends the image with a matching alpha mask, then crops the result back and composites it through the mask with a small inward feather. GPT Image also re-renders the whole frame and shifts brightness and contrast region by region (it tends to "clean up" hazy areas), so before compositing ARP measures that shift locally from the unmasked pixels around the mask and undoes it inside the mask; otherwise the edit would show as a brighter or crisper patch with a visible seam. Pixels outside the mask are the original's own, and the edit comes back at the guide's exact size. The unprocessed API result is kept next to the preview as `*_raw.png`.
-
-The model selector offers the established official LTX 2.3 v0.9 graph, its legacy Oumoumad variant, and optional LTX 2.5 two-stage outpainting. LTX 2.5 uses a Q4_K_M distilled transformer, separately offloaded Q5 text encoder, convolutional VAE, and official latent upscaler to fit a 24 GB GPU with useful activation headroom. Its recommended 24 fps mode motion-interpolates lower-rate archival material without changing duration; source cadence remains available when interpolation is undesirable.
-
-**Wan 2.1 VACE (14B), experimental,** is a separate model family behind the same controls. It uses a Q4_K_M GGUF transformer, the UMT5 text encoder, and the lightx2v step-distill LoRA (about 19 GB, none gated, fetched on first use). Wan compresses video far less than LTX, so a 20-second chunk is far too large for one Wan pass: with Wan selected, chunks are capped at 161 frames (about 6.7 seconds at 24 fps). That length fits in 24 GB at 720p and kept invented surroundings steadier than 81-frame chunks in side-by-side tests, for about 1.6 times the render time; larger canvases automatically get shorter chunks to stay within VRAM. Chunk seconds keeps its value, so switching back to an LTX model restores the full chunk length, and set it lower for shorter Wan chunks. When the previous-chunk start guide is on, a Wan chunk opens with the previous chunk's overlap frames, which VACE keeps and continues from, rather than a single guide frame; Wan chunks overlap by at least 13 frames for this. A chunk that contains a shot change is rendered as one pass per shot: ARP finds cuts with the Shot Detection settings, because VACE would otherwise carry the previous shot's surroundings into the new shot. Changing the chunk layout (Chunk seconds, a custom chunk length, or switching between LTX and Wan) moves each guide frame to whichever chunk now contains its frame, so guides stay on the same picture; prompt suffixes and offsets carry over to the chunks covering the same stretch of film. The masks, trim/extend geometry, custom mask, all-black-regions mode, seed guides, and Recomposition are shared with the LTX path. Guide frames fill the generated region of their frame, and their strength sets how firmly VACE keeps them. Wan's prompt should describe the scene (ARP drops LTX's `outpaint` trigger word, which Wan reads as a request to paint); at its CFG-free setting the negative prompt has no effect.
-
-On the Berlin DPX test clip Wan framed the source with borders or panels at most chunk lengths, and without its step-distill LoRA it left the bars black, so treat it as experimental.
-
-**MiniMax H3 (experimental, licence required)** uses H3's Fun ControlNet-Union inpainting on the same masks, context frames, guides and shot-cut handling as Wan. It renders on a canvas of at most 1344x768 pixels (768-pixel short edge), matching H3's training, and each chunk is one pass, capped at what fits in 24 GB: measured on an RTX 4090 as 124 frames at 1536x640, of which the previous chunk's 22 anchored context frames take their share, so chunks are 90 frames (about 3.75 seconds) there, longer on smaller canvases, never beyond H3's trained 362 frames. Longer passes spill weights into system RAM and slow to a crawl. Each chunk continues from the previous one's last 22 finished frames, anchored with H3's own guide mechanism so the model cannot change them. Chunk seconds chooses anything shorter, and chunks overlap by at least 22 frames. The default setup for a 24 GB card is about 38 GB: a Q5_K_M GGUF of the pruned FL2VA transformer, a Q4_K_M GGUF of the Qwen3-VL-32B text encoder, the video VAE and the Fun ControlNet-Union 2.0 patch; **H3 PDD 8-step** adds Alibaba PAI's official PDD distillation (1.4 GB, the same "PDD 8-Step" option Wan2GP offers), loaded by the ComfyUI-MiniMax-H3-PDD-Acc nodes that the installer adds. H3's open weights are released under the MiniMax H3 Community License, which does not cover the EU, the UK, South Korea or the USA. ARP will not download or run H3 until **I am licensed to use MiniMax H3** is ticked; tick it only if you are outside those regions or MiniMax has granted you a licence (apply at platform.minimax.io/h3-license). H3 samples without classifier-free guidance, so the negative prompt has no effect and a guide frame is kept as painted at strength 0.5 or more, ignored below. When the global prompt is only the `outpaint` trigger word, ARP gives H3 a plain scene-continuation prompt instead. On the Berlin DPX test clip H3 avoided Wan's borders and joined cleanly, but painted unrelated objects and people (a statue fragment, a group in crimson costumes, a poor copy of someone just out of shot), so for real work use LTX 2.3 with the Oumoumad LoRA, the default.
-
-ARP derives a frame-aligned binary mask from the prepared canvas. **Generation mask overlap** expands only the mask seen by LTX beneath protected source pixels, preventing very thin requested bands from surviving as the green inpaint sentinel after spatial compression. The final Laplacian composite uses the exact requested crop mask and the untouched prepared source—not the green conditioning image—so the hidden overlap cannot leak into the result. Pure-white mask pixels are selected at full resolution after the pyramid boundary blend, ensuring even a very thin top or bottom strip is taken from the generated image. **Mask seam blend** adjusts only the surrounding boundary transition. The models are gated on Hugging Face: access must first be accepted in the browser for the same individual account used by ARP. Authenticate with `hf auth login --force` (or `HF_TOKEN`) if the saved token still receives a 403.
-
-Outpainting is the slowest stage. On local GPUs, a 20 second 720p-ish LTX chunk can still take several minutes, and 10 minutes is not automatically a sign that something is broken. Very short chunk lengths multiply the number of ComfyUI jobs, so use the default 20 seconds unless you need a cut at a precise point.
-
-1080p Outpainting renders at the nearest model-safe multiple-of-32 canvas (for 16:9, 1920×1088) and Recomposition returns it to the requested 1920×1080 delivery size. When RunPod compute is selected for a high-resolution outpaint, ARP excludes common 24/32 GB cards from that job and requests the configured 48 GB-or-larger choices instead.
-
-If outpainting fails immediately with missing `LTXVInpaintPreprocess`, `LTXVLaplacianPyramidBlend`, or `LTXAddVideoICLoRAGuideAdvanced` nodes, fully close ComfyUI, re-run `install_windows.bat`, choose the same ComfyUI directory, then restart ARP/ComfyUI. These nodes come from [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo), which should live in `ComfyUI\custom_nodes\ComfyUI-LTXVideo`. ARP also uses [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), installed to `ComfyUI\custom_nodes\ComfyUI-GGUF`, for the lightweight GGUF models.
-
-The installer also adds ARP's Gemma 4 compatibility adjustment to ComfyUI-GGUF for the quantized LTX 2.5 text encoder. If LTX 2.5 reports `Unexpected text model architecture type ... 'gemma4'`, fully close ComfyUI and rerun `install_windows.bat` against the same ComfyUI directory before restarting it.
-
-ARP automatically uses PyTorch cross-attention instead of xFormers when it starts ComfyUI on newer GPUs that the pinned xFormers wheel cannot execute on. If you start ComfyUI yourself on such a GPU and see `No operator found for memory_efficient_attention_forward`, add ComfyUI's `--use-pytorch-cross-attention` launch option.
-
-If you use ComfyUI portable, select either the inner folder that contains `main.py` or the portable parent folder; ARP will look for `ComfyUI\main.py` inside it.
-
-### Shot Detection
-
-Review the detected shots, inspect start/middle/end frames, merge shots that should share a reference, and nudge shot boundaries frame by frame.
-
-![Shot Detection tab](assets/screenshots/walkthrough/arp-walkthrough-shot-detection.jpg)
-
-### Reference Generation
-
-Pick the primary reference frame inside each shot, regenerate individual Qwen/OpenAI colour references, delete references you do not like, and add short per-shot prompt notes. For a long pan or another continuity shot, choose **Add Reference**, then scrub that reference's own frame slider to the exact source frame and select **Use Frame**. Additional reference frames remain part of the same shot rather than creating artificial cuts. OpenAI Reference Generation defaults to GPT Image 2.5 Sunburst at maximum quality and the largest supported source-aspect resolution (up to 4K); ARP keeps that high-resolution master rather than shrinking it back to the extracted frame size.
-
-**Method** offers **Qwen 2511 (local)**, **Qwen-Image-2.1 (local, non-commercial)** and **OpenAI API (cloud)**. With OpenAI, **Also send N previous images as references** (N defaults to 3, up to 9) sends the nearest colour references already made, earlier shots first, with each still so the palette stays consistent from shot to shot. Qwen 2511 takes a single image, so the option is not offered for it. Qwen-Image-2.1 has its own two options, both on by default. **Describe each still** has Qwen3-VL (2.1's own text encoder) write two or three sentences about each still (who is in frame, their poses, the framing, the background) into the prompt, which takes about 4 s per still. **Also send N previous images as references** (default 2, at most 2) then sends the nearest colour references at 448 px. References only go with descriptions: in testing, 2.1 given references without a description of its own frame reproduced the earlier shots (people, framing) instead of colouring the still, while described stills with two 448 px references kept all eleven test shots. Each still made with references is also checked against its grey source, and one whose composition has changed is coloured again without references. Qwen-Image-2.1 runs the same 6-step turbo distill, colourises on a canvas of up to 2048×2048, returns the reference at the still's own size, and runs locally only. It is licensed for research and evaluation only (Qwen Research License), so the tab shows a warning when it is selected; do not use it for a remaster you sell or monetise unless you have a commercial licence from Alibaba. Its weights (about 17 GB) download on first use.
-
-![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg)
-
-### Colorization
-
-Review each shot's colour references alongside the corresponding colourized video segment. **CMNET2** preloads every reference frame for a shot into permanent memory and is the local multi-reference option. **OpenAI Cloud** also receives every reference. ColorMNet and Deep Exemplar deliberately use Reference 1 only.
-
-Because Dearchive can introduce colour of its own, ARP converts extracted source stills and the video stream back to neutral grayscale before reference generation and before Deep Exemplar, ColorMNet, or CMNET2. The generated colour reference stays in colour and guides the selected model as usual. OpenAI Cloud is the exception: it may retain existing colour evidence when enhancing footage.
-
-![Colorization tab](assets/screenshots/walkthrough/arp-walkthrough-colorization.jpg)
-
-### Recomposition
-
-Preview and tune the final blend: outpainted video at the bottom, original source in the center with feathered edges, and the colorized layer contributing chroma on top.
-
-**Reference luminance matching** compares each approved colour reference with its original black-and-white reference and derives a bounded tonal curve for that shot. The compositor applies one fixed curve across the entire shot before adding colour chroma, which brings the moving lighting and contrast closer to the reference without introducing frame-by-frame exposure flicker. It defaults to 70% strength so source shadow and highlight detail remain protected; disable it to retain the original monochrome luminance exactly.
-
-![Recomposition tab](assets/screenshots/walkthrough/arp-walkthrough-recomposition.jpg)
-
-### Output
-
-Once recomposition finishes, the Output tab plays the final render.
+## Quick start
+
+| | |
+|---|---|
+| **Needs** | Windows, NVIDIA GPU (24 GB recommended, 16 GB minimum), 64 GB RAM recommended, Python 3.13, Git, 150-250 GB free disk |
+| **Install** | `install_windows.bat` (creates `.venv`, local FFmpeg, and a managed ComfyUI in `tools\comfyui`) |
+| **Launch** | `launch_gui.bat` (macOS/Linux: `./launch_gui.sh`). The GUI starts ComfyUI in its own console if it isn't running. |
+| **Update** | `git pull`, then re-run `install_windows.bat` (keeps models and outputs) |
+| **Models** | Downloaded the first time a stage needs them. Prefetch with `install_windows.bat -DownloadModels`. |
+| **Gated models** | Accept access on Hugging Face, then `hf auth login --force` |
+
+1. **Overview:** browse to a video or numbered image sequence and tick the stages you want.
+2. Click **Run Whole Remaster**.
+3. Review each stage's tab: fix shot boundaries, pick and regenerate colour references, then rerun just that stage.
+4. Watch the result on **Output**. Finished renders are in `output/reassembled/`.
+
+## Cheat-sheet
+
+| Stage | What it does | Main models | Tips |
+|---|---|---|---|
+| Clean Up | DeVignette, scratch repair, archive restoration | ProPainter, LTX 2.3 Dearchive IC-LoRA | Off by default. Dearchive outputs 720p. |
+| Stabilization | Removes gate weave, one shot at a time | FFmpeg vid.stab | No auto-zoom, so framing never pulses. |
+| Outpainting | Extends 4:3 to 16:9, 21:9, 9:16 and so on | LTX 2.3 + Oumoumad LoRA (default), LTX 2.5, Wan VACE, MiniMax H3 | Slowest stage. Paint guide frames to steer it. Keep 20 s chunks. |
+| Shot Detection | Splits the film into shots | OpenCV cut and dissolve detector | Merge, split and nudge cuts. Mark fades. |
+| Reference Generation | Colours one or more stills per shot | Qwen Image Edit 2511, Qwen-Image-2.1, OpenAI | Add extra references to long shots. Each reference has its own prompt and seed. |
+| Colorization | Colours the video from the references | LTX Colorizer, CMNET2, ColorMNet, Deep Exemplar, OpenAI | LTX Colorizer can change shade as well as hue. Strength is set per shot and per reference. |
+| Recomposition | Layers original, outpainted and colour together | FFmpeg / NumPy | Keeps the source centre intact and takes colour from the colour layer. |
+| Create Audio Track | Adds music and sound effects | Stable Audio Open, MMAudio | Optional. Audio is copy-muxed. |
+| Upscaling | Upscales to delivery resolution | FlashVSR, SeedVR2, LTX 2.5 Pixel Spatial, LTX 2.5 CQ Enhancer | Preview faces first. Per-shot AI strength blends with Lanczos. |
+
+- **Compute:** any stage can run on a **RunPod** cloud worker instead of the local GPU (API key in Settings).
+- **Licences:** ProPainter and Qwen-Image-2.1 are non-commercial. MiniMax H3 is region-restricted.
+
+## Why it works this way
+
+- **The original pixels win.** AI output never replaces source footage you already have. Recomposition puts the untouched source back in the centre and blends it into the outpainted edges. It takes colour from the colour layer and luminance only where you ask for it.
+- **Stills decide colour, video models spread it.** Image models make far better colour choices than video colourisers, and a still is quick to review and redo. So colour is decided per shot on stills, and the video model only has to follow them. Long shots get several references, and Qwen 2511 is shown the shot's existing references so they stay consistent.
+- **Shots are the unit of work.** References, strengths, fades and upscale strength all live on the shot list, so a fix touches only the shots it changes.
+- **Fits a 24 GB card.** GGUF Q4 transformers, offloaded text encoders, chunked rendering and tiling keep each stage within one consumer GPU. Chunk lengths respect each model's frame-count rules.
+- **Everything resumes.** Each output records a signature of its inputs and settings. Reruns reuse anything that still matches, down to the chunk, and re-render only what changed.
+- **No needless generations.** Intermediates are 10-bit VP9 or FFV1 masters. Joins and trims are stream copies, and every join is checked for frame count. Neutral grey is fed to colourisers so Dearchive's tint can't leak in.
+
+## Screenshots
+
+| Shot Detection | Reference Generation |
+|---|---|
+| ![Shot Detection tab](assets/screenshots/walkthrough/arp-walkthrough-shot-detection.jpg) | ![Reference Generation tab](assets/screenshots/walkthrough/arp-walkthrough-reference-generation.jpg) |
+| **Colorization** | **Recomposition** |
+| ![Colorization tab](assets/screenshots/walkthrough/arp-walkthrough-colorization.jpg) | ![Recomposition tab](assets/screenshots/walkthrough/arp-walkthrough-recomposition.jpg) |
 
 ![Output tab](assets/screenshots/walkthrough/arp-walkthrough-output.jpg)
 
-### Upscaling and source motion
+## More
 
-The Upscaling page offers four backends. **FlashVSR** remains the fast, established refiner. **SeedVR2** is a heavier one-step video restoration model; the practical default is its 3B FP8 model with five-frame batches for temporal consistency, VAE tiling, VRAM preservation, and balanced BlockSwap. SeedVR2 models download automatically on first use. **LTX 2.5 Pixel Spatial** uses Lightricks' official 2x IC-LoRA with the 2.5 distilled transformer; it synthesizes fine detail from a half-resolution reference and is therefore slower and more creative. Preview identity-critical archival shots before committing to either generative path. The LTX gated LoRA downloads on first use after Hugging Face access has been accepted for `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`.
+- [User guide](docs/user-guide.md): installer options, every stage's settings, RunPod, folder layout and troubleshooting.
+- [Model sources](docs/installer-model-sources.md), [Final composite](docs/final-composite.md), [LTX outpainting prep](docs/ltx-outpainting-prep.md), [Qwen workflow](docs/qwen-image-edit-workflow.md).
+- Backend scripts can be run directly from `wrappers/`. The GUI shows each stage's command before running it.
 
-**LTX 2.5 CQ Enhancer** runs CQdesign's generative restoration LoRA before upscaling. It restores detail at 720p rather than enlarging, so a second backend (FlashVSR, SeedVR2, LTX 2.5 Pixel Spatial or a plain Lanczos resize, chosen with **Then upscale with**) takes the restored video to the target size; **None** delivers CQ's render at its working size instead. The LoRA expects 30 fps; ARP converts each chunk to 30 fps and back, so every source frame comes back once at the source frame rate. By default it reuses the installed distilled transformer; the **Dev** base reproduces the author's recipe (dev transformer plus the distilled LoRA at 0.5) at the cost of about 25 GB of extra downloads. By default the CQ render's own colour is kept, which usually looks natural; it can colourise black-and-white film, though, so **CQ colour** can instead keep the source's colour and take only brightness detail from CQ, leaving colour to the Colorize stage. It is also strongly generative: faces can be redrawn, so preview identity-critical shots and use per-shot AI strength where needed. The restored 720p render is cached, so changing only the finishing backend does not rerun it.
+## Licensing
 
-AI video upscalers can make motion look unnaturally crisp when they reconstruct every frame without the source exposure blur. **Default AI upscale strength** controls a final blend between the full AI render and a conventional Lanczos resize of the same source. Lowering it restores source-derived motion blur and reduces the stop-motion quality without synthesizing new ghost trails.
-
-Selecting Upscaling also enables Shot Detection. The Upscaling page exposes AI strength per shot: a hard cut switches strength on the cut, while a transition marked **Fading transition** in Shot Detection interpolates the strength across the configured crossfade duration. The full-strength AI render is cached separately, so changing only these blend decisions does not rerun the upscale.
-
-### Settings
-
-Settings contains ComfyUI connection details, queue/log inspection, and global pipeline defaults that are useful but too noisy for the main stage tabs.
-
-## ComfyUI And Models
-
-ARP uses ComfyUI as the backend for the AI-heavy stages. The current intended stack includes:
-
-- LTX 2.3 distilled GGUF Q4_K_M for lightweight outpainting.
-- CUDA-accelerated automatic light/dark DeVignette correction for optional archive repair.
-- Masked ProPainter video inpainting for optional AI DeScratch (non-commercial NTU S-Lab licence).
-- LTX 2.3 Dearchive IC-LoRA for optional generative archive cleanup.
-- LTX 2.3 distilled GGUF Q4_K_M and eight-step schedule for Dearchive and lightweight outpainting.
-- Configurable 540p/720p/1080p/source Dearchive processing and delivery resolution.
-- Official LTX 2.3 v0.9 in/outpainting IC-LoRA (full-resolution mask-conditioned pass).
-- SeedVR2, LTX 2.5 Pixel Spatial Upscaler and the LTX 2.5 CQ Enhancer restoration LoRA as alternatives to FlashVSR.
-- Qwen Image Edit 2511 GGUF Q4_K_M for still reference colorization.
-- Qwen Image Edit Lightning LoRA.
-- Deep Exemplar reference-guided video colorization.
-- ColorMNet single-reference and CMNET2 multi-reference video colorization.
-- Optional OpenAI Cloud per-frame colour enhancement with resumable caching.
-
-The repo stores orchestration code, GUI code, workflows, wrappers, docs, and small assets. Runtime media, model caches, ComfyUI installs, and generated outputs are ignored by Git.
-
-ARP bundles the ComfyUI workflow JSONs it needs to queue jobs:
-
-- `workflows/cleanup_ltx/DeArchive.json` for LTX Dearchive cleanup.
-- `workflows/outpaint_ltx/outpaint_LTX-IC.json` for LTX IC outpainting.
-- `workflows/qwen_image_edit/Image Edit (Qwen 2511).json` for Qwen Image Edit reference frames and outpaint guide frames.
-
-Deep Exemplar and ColorMNet video colourisation do not use saved workflow JSON files; ARP builds those ComfyUI API prompts directly from the selected source, manifest, and method. CMNET2 runs directly through its bundled Python runtime rather than ComfyUI. ComfyUI itself and model weights remain external dependencies. ARP bundles the required custom-node packages and CMNET2 runtime source where their licenses allow redistribution; see `vendor/comfyui_custom_nodes/README.md` and `vendor/cmnet2/README.md`.
-
-## Folder Layout
-
-```text
-input/                                   Optional source clips
-intermediate/cleaned/                    Clean Up outputs at the selected Dearchive resolution
-intermediate/stabilized/                 Lossless, scene-aware stabilization outputs
-intermediate/outpaint_prepared/          Expanded/lifted clips prepared for LTX
-intermediate/outpainted/                 Widescreen/outpainted clips
-intermediate/outpainted_references/      Per-shot black-and-white reference stills
-intermediate/outpainted_references_color/ Qwen colorized reference stills
-intermediate/outpainted_colorized/       Reference-guided colorized video
-manifests/references/                    Shot/reference manifests
-output/reassembled/                      Final composited masters
-workflows/                               Bundled ComfyUI workflows used by ARP
-vendor/comfyui_custom_nodes/             Bundled ComfyUI custom nodes used by ARP
-wrappers/                                Batch/shell entry points
-assets/branding/                         Logo, icons, and GitHub artwork
-assets/screenshots/                      README screenshots
-```
-
-## Resume Behavior
-
-ARP writes `.sig.json` sidecars beside generated outputs. If inputs and settings still match, a rerun can reuse existing work. If the source, prompt, workflow, crop, aspect ratio, or other relevant setting changes, the dependent output is regenerated.
-
-The GUI is also designed around deterministic intermediate paths. When one stage completes, the next stage's input fields are populated automatically.
-
-## Direct Script Use
-
-The GUI is the recommended way to use ARP, but the backend scripts are still normal command-line tools. If you want to wire ARP into your own pipeline, look in `wrappers/` for entry points such as `cleanup_video.bat`, `stabilize_video.bat`, `outpaint_video.bat`, `generate_references.bat`, `qwen_colorize_references.bat`, `colorize_video.bat`, and `final_composite.bat`.
-
-Those scripts are what the GUI calls internally, and the GUI shows the equivalent command before running a stage.
-
-## Licensing Notes
-
-Check the licenses for every model, workflow, and source film you use. This repo is orchestration software; it does not grant rights to source films, model weights, LoRAs, ComfyUI custom nodes, Qwen models, Deep Exemplar, or other third-party components.
+ARP is orchestration software. It grants no rights to source films, model weights, LoRAs or third-party nodes, so check each licence before use.
