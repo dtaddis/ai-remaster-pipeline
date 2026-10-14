@@ -2461,10 +2461,15 @@ def run(args: argparse.Namespace) -> int:
     delivery_width, delivery_height = delivery_dimensions(args, output_width, output_height)
     output = resolve_path(args.output) if args.output else default_output(source, output_width, output_height, method)
     sig = signature(args, source, output_width, output_height)
+    if method == "ltx25cq" and backend == "flashvsr" and args.flashvsr_pre_downscale:
+        # The CQ render's late-starting video made the old pre-downscale repeat and drop frames,
+        # so every CQ + FlashVSR render made before this fix is out of sync and must not be reused.
+        sig["finisher_retime"] = "frame_number"
     manifest = resolve_path(args.shot_manifest) if args.shot_manifest else None
     final_sig = dict(sig)
     final_sig.update({
-        "version": 7,
+        # 8: video retimed by frame number, so it starts with the audio.
+        "version": 8,
         "blend_strength": float(args.blend_strength),
         "shot_manifest": root_relative(manifest) if manifest else "",
         "shot_manifest_fingerprint": file_fingerprint(manifest) if manifest and manifest.is_file() else None,
