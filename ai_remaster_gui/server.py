@@ -577,9 +577,15 @@ class PipelineApp:
         """Pipe every worker line back to ARP promptly while keeping one process tree stoppable."""
         child_env = os.environ.copy()
         child_env["PYTHONUNBUFFERED"] = "1"
+        # Workers print shot descriptions and file names. Without an agreed encoding the reader
+        # decodes with the Windows code page, and one curly quote (UTF-8 E2 80 9D) killed it
+        # mid-run: the pipe filled and the worker hung on its next print.
+        child_env["PYTHONIOENCODING"] = "utf-8"
         kwargs: dict = {
             "cwd": ROOT,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "bufsize": 1,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,

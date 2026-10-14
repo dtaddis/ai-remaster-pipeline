@@ -209,6 +209,24 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertEqual((payload["ok"], payload["error"], payload["error_type"]), (False, "nothing to edit", "NoEditRegionError"))
 
 
+class WorkerOutputTests(unittest.TestCase):
+    def test_worker_output_survives_characters_outside_the_windows_code_page(self) -> None:
+        # A curly closing quote is E2 80 9D in UTF-8; 0x9D is undefined in Windows-1252, so a
+        # reader on the code page died there and the worker hung on its next print.
+        import subprocess
+        import sys
+
+        app = server.PipelineApp.__new__(server.PipelineApp)
+        script = "print('A cart labeled “BAE HAY”'); print('done')"
+        # Workers write UTF-8 when the environment says so (as ARP's did) whatever the code page.
+        with mock.patch.dict("os.environ", {"PYTHONIOENCODING": "utf-8"}), mock.patch("locale.getpreferredencoding", return_value="cp1252"):
+            kwargs = app.child_process_kwargs()
+            process = subprocess.Popen([sys.executable, "-c", script], **kwargs)
+            lines = [line.rstrip() for line in process.stdout]
+        process.wait()
+        self.assertEqual(lines, ["A cart labeled “BAE HAY”", "done"])
+
+
 class StateLockTests(unittest.TestCase):
     def test_shot_view_builds_after_app_lock_is_released(self) -> None:
         app = server.PipelineApp.__new__(server.PipelineApp)
