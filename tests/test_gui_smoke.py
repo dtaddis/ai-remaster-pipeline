@@ -7841,6 +7841,43 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotEqual(first_ranges[2], second_ranges[2])
         self.assertIsNone(no_map)
 
+    def test_flashvsr_pre_downscale_keeps_every_frame_in_place_when_the_video_starts_late(self) -> None:
+        # The stitched CQ render's video starts 21 ms in (AAC priming). Retimed with fps, the
+        # first frame was repeated and the whole FlashVSR upscale came out one frame late.
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "late.mkv"
+            raw = b"".join(bytes([10 + 9 * index]) * (64 * 36 * 3) for index in range(24))
+            video = folder / "video.mkv"
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "64x36",
+                 "-r", "24000/1001", "-i", "-", "-c:v", "ffv1", str(video)],
+                input=raw, check=True,
+            )
+            # Audio from 0 and video from 21 ms (over half a frame), as muxing AAC left the CQ render.
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-itsoffset", "0.021", "-i", str(video), "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+                 "-map", "0:v", "-map", "1:a", "-c", "copy", "-c:a", "pcm_s16le", "-t", "1.05", str(source)],
+                check=True,
+            )
+            args = upscale_video.build_parser().parse_args(["--input", str(source), "--method", "flashvsr", "--flashvsr-scale", "2"])
+            with mock.patch.object(upscale_video, "ROOT", folder), \
+                    mock.patch.object(upscale_video, "pre_downscale_dimensions", return_value=(64, 36)):
+                prepared = upscale_video.pre_downscale_source(ffmpeg, args, source, 128, 72, common.video_info(source))
+            levels = list(subprocess.run(
+                [ffmpeg, "-loglevel", "error", "-i", str(prepared), "-vf", "scale=1:1:flags=area,format=gray", "-f", "rawvideo", "-"],
+                capture_output=True, check=True,
+            ).stdout)
+
+        self.assertEqual(len(levels), 24)
+        expected = [10 + 9 * index for index in range(24)]
+        self.assertTrue(all(abs(got - want) <= 3 for got, want in zip(levels, expected)), levels[:6])
+
     def test_cq_skipped_shot_keeps_its_source_frames_and_its_cq_render_stays_cached(self) -> None:
         try:
             ffmpeg = common.find_ffmpeg("")

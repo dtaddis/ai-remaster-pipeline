@@ -2382,6 +2382,10 @@ def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, ou
         "version": 1,
         "tool": "upscale_video.py",
         "method": "flashvsr_pre_downscale",
+        # 2: retimed by frame number. Version 1 retimed with fps, which repeated the first frame
+        # of a render whose video starts late (AAC priming in the CQ render) and so made the
+        # whole FlashVSR upscale one frame late.
+        "retime": "frame_number",
         "source": root_relative(source),
         "source_fingerprint": file_fingerprint(source),
         "target_width": output_width,
@@ -2405,7 +2409,7 @@ def pre_downscale_source(ffmpeg: str, args: argparse.Namespace, source: Path, ou
         "-i",
         str(source),
         "-vf",
-        f"scale={width}:{height}:flags=lanczos,setsar=1,fps={fps:.8f}",
+        f"{frame_clock(fps)},scale={width}:{height}:flags=lanczos,setsar=1",
         "-an",
         "-r",
         f"{fps:.8f}",
@@ -2519,7 +2523,8 @@ def run(args: argparse.Namespace) -> int:
             # stitched render; the finisher redoes only the chunks those CQ chunks feed.
             range_fingerprint = cq_range_fingerprint(
                 cq_render, cq_render_fingerprint,
-                {"width": int(processing_info["width"]), "height": int(processing_info["height"])},
+                # "retime" retires finisher chunks split from the one-frame-late pre-downscale.
+                {"width": int(processing_info["width"]), "height": int(processing_info["height"]), "retime": "frame_number"},
             )
         if backend == "ltx25":
             chunked_ltx25_run(
