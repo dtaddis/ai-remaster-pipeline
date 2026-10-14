@@ -84,8 +84,11 @@ def delivery_audio_args(ffmpeg: str, media: Path) -> list[str]:
 
 def encode_upscale_delivery(ffmpeg: str, ai_upscale: Path, output: Path) -> None:
     partial = output.with_suffix(output.suffix + ".full.partial" + output.suffix)
+    # Muxing AAC into the render's MKV starts its video 21 ms after the audio; copied into the
+    # MP4 that became a whole frame. Retimed by frame number, video and audio both start at 0.
+    fps = float(video_info(ai_upscale)["fps"])
     subprocess.run([
-        ffmpeg, "-y", "-i", str(ai_upscale), "-map", "0:v:0", "-map", "0:a?",
+        ffmpeg, "-y", "-i", str(ai_upscale), "-map", "0:v:0", "-map", "0:a?", "-vf", frame_clock(fps),
         *delivery_codec_args(), *delivery_audio_args(ffmpeg, ai_upscale), "-movflags", "+faststart", str(partial),
     ], check=True)
     replace_with_retry(partial, output, "Full-strength upscaled output")

@@ -7878,6 +7878,35 @@ class GuiSmokeTests(unittest.TestCase):
         expected = [10 + 9 * index for index in range(24)]
         self.assertTrue(all(abs(got - want) <= 3 for got, want in zip(levels, expected)), levels[:6])
 
+    def test_upscale_delivery_starts_video_and_audio_together(self) -> None:
+        # The render's MKV starts its video 21 ms after the audio; the delivered MP4 had it a
+        # whole frame late, so an editor lining clips up by their start showed it out of sync.
+        try:
+            ffmpeg = common.find_ffmpeg("")
+        except Exception:
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            video, render, output = folder / "video.mkv", folder / "render.mkv", folder / "out.mp4"
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=24000/1001:duration=1", "-c:v", "ffv1", str(video)],
+                check=True,
+            )
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-itsoffset", "0.021", "-i", str(video), "-f", "lavfi", "-i", "sine=sample_rate=48000",
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", "1.0", str(render)],
+                check=True,
+            )
+            upscale_video.encode_upscale_delivery(ffmpeg, render, output)
+            starts = subprocess.run(
+                [common.ffprobe_for(ffmpeg), "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "csv=p=0", str(output)],
+                capture_output=True, text=True, check=True,
+            ).stdout.split()
+
+        self.assertIn("video,0.000000", starts)
+        self.assertIn("audio,0.000000", starts)
+
     def test_cq_skipped_shot_keeps_its_source_frames_and_its_cq_render_stays_cached(self) -> None:
         try:
             ffmpeg = common.find_ffmpeg("")
