@@ -8986,6 +8986,17 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn('/static/js/render-cache.js', html)
         self.assertIn('/static/js/app.js', html)
 
+    def test_every_frontend_script_parses(self) -> None:
+        # One unescaped apostrophe in actions.js stopped the whole file loading, so
+        # every button that calls an action (Load project, Browse...) did nothing.
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        for script in sorted((app.ROOT / "ai_remaster_gui" / "static" / "js").glob("*.js")):
+            with self.subTest(script=script.name):
+                result = subprocess.run([node, "--check", str(script)], capture_output=True, text=True, encoding="utf-8")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_chunk_length_checkbox_only_disables_the_length_controls(self) -> None:
         # This once disabled every button under the slider's parent, which meant the
         # nearby +/-1 frame nudges. Those went, so the selector started hitting Save and

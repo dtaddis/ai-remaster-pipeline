@@ -1486,7 +1486,7 @@ async function saveShotCqLumaOnly(manifest, index, checked) {
 async function saveShotCqSkip(manifest, index, checked) {
   const snap = captureScrollState();
   const result = await postJson('/api/shot-cq-skip', { manifest, index, skip: String(checked) });
-  if (!result.ok) return alert(result.error || 'Could not update the shot's CQ choice');
+  if (!result.ok) return alert(result.error || 'Could not update the shot\'s CQ choice');
   await redrawWithState(result.state, snap, true);
 }
 
