@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import io
 import json
 import shutil
 import subprocess
@@ -1685,6 +1686,41 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("min(max(X-2,0),W-1)", filter_text)
         self.assertIn(",12),0,", filter_text)
         self.assertIn("[base][srcm]overlay", filter_text)
+
+    def test_final_composite_extends_vertically_with_square_pixels(self) -> None:
+        # Issue #59: a 16:9 source outpainted to 4:3 (960x704 working canvas, 960x720 delivery)
+        # and recomposed without a colour layer. Scaling the base kept a 45:44 SAR.
+        ffmpeg = final_composite.find_ffmpeg(None)
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            outpainted, source, output = folder / "outpainted.mkv", folder / "source.mkv", folder / "final.mp4"
+            for path, colour, size in ((outpainted, "black", "960x704"), (source, "white", "1280x720")):
+                subprocess.run(
+                    [ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s={size}:r=24:d=0.25", "-c:v", "ffv1", str(path)],
+                    check=True,
+                )
+            args = final_composite.build_parser().parse_args([
+                "--outpainted", str(outpainted), "--source", str(source), "--output", str(output),
+                "--output-width", "960", "--output-height", "720", "--feather-pixels", "4", "--force",
+            ])
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(final_composite.run(args), 0)
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,sample_aspect_ratio", "-of", "default=nw=1:nk=1", str(output)],
+                check=True, capture_output=True, text=True,
+            )
+            frame = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", str(output), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                check=True, capture_output=True,
+            ).stdout
+
+        self.assertEqual(probe.stdout.split(), ["960", "720", "1:1"])
+        # The source fills the width and sits in the middle 540 rows; the generated canvas is above and below.
+        self.assertLess(frame[20 * 960 + 480], 40)
+        self.assertGreater(frame[360 * 960 + 480], 215)
+        self.assertGreater(frame[360 * 960 + 2], 215, "the sides of a vertically extended source are not feathered away")
+        self.assertLess(frame[700 * 960 + 480], 40)
 
     def test_recomposition_command_punches_source_black_when_outpainting_all_black_regions(self) -> None:
         app.APP.settings["global"].update({"source": "input/My Source.mp4", "section_start": "0", "section_end": ""})

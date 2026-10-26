@@ -775,7 +775,11 @@ function colorLayerStyle(s) {
 function originalFeatherStyle(s) {
   const feather = Math.max(1, Number(s.feather_pixels || 80));
   const edge = Math.max(2, Math.min(45, feather / 8));
-  return `-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`;
+  // Fade the edges that meet generated canvas: the sides when the canvas was widened, top and
+  // bottom when it was extended vertically (as originalLayerBoxStyle places the source).
+  const angle = sourceAspectRatio() > targetAspectRatio() ? '180deg' : '90deg';
+  const gradient = `linear-gradient(${angle},transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`;
+  return `-webkit-mask-image:${gradient};mask-image:${gradient}`;
 }
 
 function originalLayerStyle(s) {

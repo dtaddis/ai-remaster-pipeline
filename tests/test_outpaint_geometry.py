@@ -174,7 +174,7 @@ class OutpaintGeometryTests(unittest.TestCase):
         src_chain = next(part for part in filter_text.split(";") if part.endswith("[src]"))
         self.assertIn("crop=w=1400:h=1080:x=20:y=0", src_chain)
         self.assertNotIn("scale=", src_chain)
-        self.assertIn("scale=1920:1080:flags=lanczos[base]", filter_text)
+        self.assertIn("scale=1920:1080:flags=lanczos,setsar=1[base]", filter_text)
         self.assertIn("overlay=x=258:y=0", filter_text)
         # 80px of feather at 720p becomes 120px at 1080p so the blend looks the same.
         self.assertIn("lt(X,120)", filter_text)

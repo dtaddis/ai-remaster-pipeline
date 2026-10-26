@@ -61,6 +61,10 @@ def signature(args):
             values['frame_patch_report_fingerprint'] = file_fingerprint(report)
     else:
         values.pop('frame_masks', None)
+    # Outpainted composites without a colour layer used to keep a non-square SAR; only they
+    # need re-rendering, so coloured ones (whose path already set SAR 1) stay reusable.
+    if values.get('outpainted') and not values.get('colorized'):
+        values['square_pixels'] = 1
     values['tool'] = 'final_composite.py'
     values['version'] = 13
     return values
@@ -514,7 +518,9 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             feather_horizontal = placement.x > 0 or placement.x + placement.width < base_size[0]
             feather_vertical = placement.y > 0 or placement.y + placement.height < base_size[1]
             filters = [
-                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base]',
+                # scale keeps the display aspect, so 1280x704 -> 1280x720 would leave a 45:44 SAR
+                # that only the colour path's setsar used to clear (issue #59).
+                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base},setsar=1[base]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{source_fit}setsar=1[src]',
             ]
             rgb_label, alpha_label = append_source_alpha_mask(
@@ -542,7 +548,7 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             filters.append(f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]')
         else:
             filters = [
-                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
+                f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base},setsar=1[base0]',
                 f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
                 '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
                 f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather, horizontal=True, vertical=True)}'[srcm]",
