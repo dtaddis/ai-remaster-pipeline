@@ -3215,10 +3215,23 @@ def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context
 
 
 
+def _same_codec_as_pieces(ffmpeg: str, source: Path, intermediate_profile: str) -> bool:
+    """True when ``source`` is already in the codec that stitch pieces are encoded with."""
+    args = intermediate_codec_args(intermediate_profile, fast=True)
+    wanted = args[args.index("-c:v") + 1] if "-c:v" in args else ""
+    wanted = {"libvpx-vp9": "vp9"}.get(wanted, wanted)
+    probe = subprocess.run([ffmpeg, "-hide_banner", "-i", str(source)], capture_output=True, text=True, errors="replace")
+    match = re.search(r"Video: (\w+)", probe.stderr)
+    return bool(match) and match.group(1) == wanted
+
+
 def make_piece(ffmpeg: str, source: Path, target: Path, start_frame: int, frame_count: int, fps: float, intermediate_profile: str = "high") -> None:
     # A piece from the start of its chunk (the first chunk, or a whole one-chunk clip) only cuts
     # the end, so its packets are copied; a later start needs a keyframe there, hence an encode.
-    if start_frame == 0 and copy_head(ffmpeg, source, target, frame_count, container_args(str(target), intermediate_profile)):
+    # Copying is only safe when the chunk already uses the pieces' codec: ComfyUI renders are
+    # H.264 for the lossy profiles while re-encoded pieces are VP9, and the concat join cannot
+    # switch decoders mid-stream (it failed with "Invalid data" after the first piece).
+    if start_frame == 0 and _same_codec_as_pieces(ffmpeg, source, intermediate_profile) and copy_head(ffmpeg, source, target, frame_count, container_args(str(target), intermediate_profile)):
         return
     vf =f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)

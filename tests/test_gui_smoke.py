@@ -3023,6 +3023,38 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(counts, [17, 10])
 
+    def test_outpaint_stitch_joins_h264_comfy_renders_with_vp9_pieces(self) -> None:
+        # Lossy profiles get H.264 renders from ComfyUI but encode later pieces as VP9; copying the
+        # first render made the concat join decode VP9 packets as H.264 and fail (issue #62).
+        ffmpeg = outpaint_video.find_ffmpeg()
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"))
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            chunks = []
+            for index in range(2):
+                chunk = folder / f"chunk_{index}.mp4"
+                subprocess.run(
+                    [
+                        ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=8:d=1.25",
+                        "-frames:v", "10", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(chunk),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                chunks.append(chunk)
+            stitched = folder / "stitched.mkv"
+
+            outpaint_video.stitch_chunks(ffmpeg, chunks, [(0, 0, 10), (1, 10, 20)], stitched, 8.0, True, "high")
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=codec_name,nb_read_frames", "-of", "default=nw=1:nk=1", str(stitched)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.split(), ["vp9", "20"])
+
     def test_qwen_seed_guides_do_not_overwrite_existing_set_guides(self) -> None:
         args = argparse.Namespace(
             comfy_output_root="",
