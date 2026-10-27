@@ -3230,6 +3230,29 @@ def inject_overlap_context(ffmpeg: str, chunk: Path, previous_raw: Path, context
 
 
 
+def _cut_in_overlap(ffmpeg: str, chunk: Path, overlap: int) -> int | None:
+    """Index (1..overlap-1) of a hard cut in the first ``overlap`` frames of ``chunk``, else None."""
+    import numpy as np
+
+    w, h = 96, 54
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-i", str(chunk), "-frames:v", str(overlap), "-vf", f"scale={w}:{h}:flags=area,format=gray", "-f", "rawvideo", "-"],
+        capture_output=True,
+    )
+    count = len(proc.stdout) // (w * h)
+    if count < 3:
+        return None
+    # Only the source rectangle matters for a cut, but the full frame is fine at this size.
+    frames = np.frombuffer(proc.stdout[: count * w * h], np.uint8).reshape(count, h, w).astype(np.float32)
+    diffs = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2))
+    best = int(np.argmax(diffs))
+    others = np.delete(diffs, best)
+    baseline = float(np.median(others)) if others.size else 0.0
+    if diffs[best] >= 18.0 and diffs[best] >= 6.0 * max(baseline, 1.0):
+        return best + 1
+    return None
+
+
 def _same_codec_as_pieces(ffmpeg: str, source: Path, intermediate_profile: str) -> bool:
     """True when ``source`` is already in the codec that stitch pieces are encoded with."""
     args = intermediate_codec_args(intermediate_profile, fast=True)
@@ -3260,6 +3283,16 @@ def make_gap_piece(ffmpeg: str, source: Path, target: Path, frame_count: int, fp
     duration = frame_count / fps
     vf = f"trim=start_frame={last}:end_frame={last + 1},setpts=N/({fps:.8f}*TB),tpad=stop_mode=clone:stop_duration={duration:.8f},trim=end_frame={frame_count},fps={fps:.8f},setsar=1"
     subprocess.run([ffmpeg, "-y", "-i", str(source), "-vf", vf, "-an", "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
+
+
+def make_crossfade_piece(ffmpeg: str, first: Path, first_start: int, second: Path, frame_count: int, target: Path, fps: float, intermediate_profile: str = "high") -> None:
+    """``frame_count`` frames dissolving linearly from ``first`` (from ``first_start``) into ``second`` (from 0)."""
+    graph = (
+        f"[0:v]trim=start_frame={first_start}:end_frame={first_start + frame_count},setpts=N/({fps:.8f}*TB),format=yuv444p10le[a];"
+        f"[1:v]trim=start_frame=0:end_frame={frame_count},setpts=N/({fps:.8f}*TB),format=yuv444p10le[b];"
+        f"[a][b]blend=all_expr='A*(1-(N+0.5)/{frame_count})+B*((N+0.5)/{frame_count})',fps={fps:.8f},setsar=1[v]"
+    )
+    subprocess.run([ffmpeg, "-y", "-i", str(first), "-i", str(second), "-filter_complex", graph, "-map", "[v]", "-an", "-frames:v", str(frame_count), "-r", f"{fps:.8f}", "-fps_mode", "cfr", *intermediate_codec_args(intermediate_profile, fast=True), *container_args(str(target), intermediate_profile), str(target)], check=True)
 
 
 def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, int]], output: Path, fps: float, force: bool, intermediate_profile: str = "high") -> None:
@@ -3293,15 +3326,42 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], ranges: list[tuple[int, int, 
                 cursor = start_frame
             trim_start = max(0, cursor - start_frame)
             needed = max(0, min(end_frame, total_frames) - cursor)
+            crossfade: tuple[Path, int, int] | None = None
+            if index + 1 < len(chunks):
+                # A hard cut inside the overlap: hand over to the next chunk on the cut itself.
+                # Otherwise the first frames of the new shot keep this chunk's margins, which were
+                # painted for the old shot, and the margins visibly jump a few frames after the cut.
+                next_start = ranges[index + 1][1]
+                overlap = min(end_frame, total_frames) - next_start
+                if overlap > 1 and next_start >= cursor:
+                    cut = _cut_in_overlap(ffmpeg, chunks[index + 1], overlap)
+                    if cut is not None and next_start + cut > cursor:
+                        print(f"Stitch chunk {index + 1}: source cut at frame {next_start + cut} inside the overlap; switching to chunk {index + 2} there", flush=True)
+                        needed = min(needed, next_start + cut - cursor)
+                    elif cut is None and overlap >= 4 and raw_frames >= (next_start - start_frame) + overlap:
+                        # No cut: crossfade the two renders over the overlap instead of switching on
+                        # one frame, so a background that the next chunk paints slightly differently
+                        # dissolves over a third of a second rather than jumping.
+                        needed = min(needed, next_start - cursor)
+                        crossfade = (chunks[index + 1], overlap, next_start - start_frame)
             available = min(max(0, raw_frames - trim_start), needed)
-            if available <= 0:
+            if available > 0:
+                piece = tmp / f"piece_{index:04d}_{cursor:06d}.mkv"
+                make_piece(ffmpeg, chunk, piece, trim_start, available, fps, intermediate_profile)
+                piece_paths.append(piece)
+                previous_piece = piece
+                cursor += available
+            elif crossfade is None:
                 print(f"Skipping exhausted outpaint chunk {index + 1}: trim_start={trim_start}, raw_frames={raw_frames}", flush=True)
                 continue
-            piece = tmp / f"piece_{index:04d}_{cursor:06d}.mkv"
-            make_piece(ffmpeg, chunk, piece, trim_start, available, fps, intermediate_profile)
-            piece_paths.append(piece)
-            previous_piece = piece
-            cursor += available
+            if crossfade is not None:
+                next_chunk, count, local_start = crossfade
+                piece = tmp / f"xfade_{index:04d}_{cursor:06d}.mkv"
+                print(f"Stitch chunk {index + 1}: crossfading into chunk {index + 2} over frames {cursor}-{cursor + count}", flush=True)
+                make_crossfade_piece(ffmpeg, chunk, local_start, next_chunk, count, piece, fps, intermediate_profile)
+                piece_paths.append(piece)
+                previous_piece = piece
+                cursor += count
         if cursor < total_frames:
             gap = total_frames - cursor
             print(f"Outpaint final gap: filling {gap} frame(s) by holding the last frame.", flush=True)
