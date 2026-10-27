@@ -170,6 +170,22 @@ def post_image_edit(body: bytes, token: str, timeout: float, max_retries: int = 
     raise RuntimeError("OpenAI API request failed without a response.")
 
 
+def log_usage(payload: dict, args: argparse.Namespace, output: Path) -> None:
+    """Append the API's token usage to output/logs/openai_usage.jsonl for spend tracking."""
+    try:
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        log = Path(__file__).resolve().parents[1] / "output" / "logs" / "openai_usage.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"time": _dt.now(_tz.utc).isoformat(), "model": args.model, "size": args.size, "quality": args.quality,
+                 "output": str(output), "usage": payload.get("usage")}
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(entry) + "\n")
+        print(f"OpenAI usage: {payload.get('usage')}", flush=True)
+    except Exception as exc:  # never fail a generation over logging
+        print(f"Usage logging failed: {exc}", flush=True)
+
+
 def first_image_bytes(payload: dict) -> bytes:
     images = payload.get("data") or []
     if not images or not images[0].get("b64_json"):
@@ -214,6 +230,7 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     if args.dry_run:
         return output
     payload = post_image_edit(body, token, args.timeout, int(getattr(args, "max_retries", 5)))
+    log_usage(payload, args, output)
     image_bytes = first_image_bytes(payload)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_suffix(output.suffix + ".partial")
