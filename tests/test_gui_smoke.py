@@ -2578,6 +2578,48 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("between(X\\,168\\,1111)", filter_graph)
         self.assertNotIn("lutrgb", filter_graph)
 
+    def test_outpaint_finish_moves_the_source_rectangle_with_each_chunks_offset(self) -> None:
+        import re
+
+        import numpy as np
+
+        args = finalize_outpaint_output.build_parser().parse_args([
+            "--source", "input.mp4", "--source-x", "40", "--source-y", "0",
+            "--source-width", "80", "--source-height", "90", "--source-moves", "[[6, 0, 0], [null, 30, 0]]",
+        ])
+        filter_graph = finalize_outpaint_output.inverse_filter(args, {"width": 160, "height": 90})
+        mask_expr = re.search(r"geq=lum='([^']+)'", filter_graph).group(1)
+        ffmpeg = outpaint_video.find_ffmpeg()
+        mask = subprocess.run(
+            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=black:s=160x90:r=24:d=0.5",
+             "-vf", f"format=gray,geq=lum='{mask_expr}'", "-f", "rawvideo", "-"],
+            capture_output=True, check=True,
+        ).stdout
+        frames = np.frombuffer(mask, np.uint8).reshape(-1, 90, 160)
+
+        self.assertEqual(len(frames), 12)
+        # Up to the first chunk's end the source covers x 40-119, then it moves 30 px right.
+        self.assertEqual((frames[5, 45, 45], frames[5, 45, 125]), (255, 0))
+        self.assertEqual((frames[6, 45, 45], frames[6, 45, 125]), (0, 255))
+        plain = finalize_outpaint_output.build_parser().parse_args(["--source", "input.mp4"])
+        self.assertNotIn("source_moves", finalize_outpaint_output.signature(plain, Path(__file__), {"width": 160, "height": 90}))
+
+    def test_outpaint_finish_reads_each_chunks_offset_from_the_chunk_list(self) -> None:
+        args = argparse.Namespace(offset_x=0, offset_y=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "chunks.csv"
+            raw = Path(tmp) / "raw.mkv"
+
+            def write(rows):
+                manifest.write_text("chunk_index,end_seconds,offset_x,offset_y\n" + "".join(f"{row}\n" for row in rows), encoding="utf-8")
+
+            write(["0,5.0,12,0", "1,10.0,12,0"])
+            self.assertEqual(outpaint_video.finalize_source_shift(args, manifest, raw), (12, 0, []))
+            write(["0,5.0,0,0", "1,10.0,-8,4"])
+            with mock.patch.object(outpaint_video, "probe_video", return_value={"fps": 24.0}):
+                self.assertEqual(outpaint_video.finalize_source_shift(args, manifest, raw), (0, 0, [[120, 0, 0], [None, -8, 4]]))
+        self.assertEqual(outpaint_video.finalize_source_shift(argparse.Namespace(offset_x=6, offset_y=-2), None, raw), (6, -2, []))
+
     def test_oumoumad_finish_restores_tone_across_generated_edges_too(self) -> None:
         args = finalize_outpaint_output.build_parser().parse_args([
             "--source", "input.mp4", "--restore-tone", "--black-lift", "0.018", "--gamma", "1.06",

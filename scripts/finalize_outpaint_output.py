@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -44,6 +45,23 @@ def source_rectangle(args, info: dict) -> tuple[int, int, int, int] | None:
     return x, y, width, height
 
 
+def source_moves(args) -> list[tuple[int | None, int, int]]:
+    """Per-chunk shifts of the source rectangle: (frame they last until, or None, dx, dy)."""
+    if not getattr(args, 'source_moves', None):
+        return []
+    return [(None if end is None else int(end), int(dx), int(dy)) for end, dx, dy in json.loads(args.source_moves)]
+
+
+def moving_position(base: int, moves: list[tuple[int | None, int, int]], axis: int) -> str:
+    """A geq expression for ``base`` shifted by whichever move covers frame N."""
+    if not moves:
+        return str(base)
+    expr = str(moves[-1][axis])
+    for end, *offset in reversed(moves[:-1]):
+        expr = f'if(lt(N\\,{end})\\,{offset[axis - 1]}\\,{expr})'
+    return f'{base}+{expr}'
+
+
 def inverse_filter(args, info: dict) -> str:
     target_width = int(args.target_width or info["width"])
     target_height = int(args.target_height or info["height"])
@@ -76,7 +94,11 @@ def inverse_filter(args, info: dict) -> str:
         gamma = max(0.1, args.gamma)
         expr = f"if(lt(val/255\\,{lift})\\,0\\,255*pow((val/255-{lift})/(1-{lift})\\,{gamma}))"
         tone_filter = f",lutrgb=r='{expr}':g='{expr}':b='{expr}'"
-    mask_expr = f"if(between(X\\,{x}\\,{right})*between(Y\\,{y}\\,{bottom})\\,255\\,0)"
+    # Each outpaint chunk may offset the source, so the rectangle moves where the chunks hand over.
+    moves = source_moves(args)
+    left_x, right_x = moving_position(x, moves, 1), moving_position(right, moves, 1)
+    top_y, bottom_y = moving_position(y, moves, 2), moving_position(bottom, moves, 2)
+    mask_expr = f"if(between(X\\,{left_x}\\,{right_x})*between(Y\\,{top_y}\\,{bottom_y})\\,255\\,0)"
     return (
         f'[0:v]format=rgb24{tone_filter},split=3[raw][centre][maskbase];'
         f'[raw]{sharpen_filter}[generated];'
@@ -99,6 +121,7 @@ def signature(args, source: Path, info: dict) -> dict:
         'target_width': args.target_width,
         'target_height': args.target_height,
         'source_rectangle': source_rectangle(args, info),
+        **({'source_moves': source_moves(args)} if source_moves(args) else {}),
         'edge_feather': args.edge_feather,
         'edge_sharpen': args.edge_sharpen,
         'encoder': args.encoder,
@@ -144,6 +167,7 @@ def build_parser():
     parser.add_argument('--source-y', type=int, help='Top edge of the protected source region in the rendered canvas.')
     parser.add_argument('--source-width', type=int, help='Width of the protected source region in the rendered canvas.')
     parser.add_argument('--source-height', type=int, help='Height of the protected source region in the rendered canvas.')
+    parser.add_argument('--source-moves', help="JSON [[last frame or null, dx, dy], ...]: shifts of the source rectangle, one per outpaint chunk offset.")
     parser.add_argument('--edge-feather', type=float, default=6.0, help='Soft transition, in pixels, between restored source and generated outpaint.')
     parser.add_argument('--edge-sharpen', type=float, default=0.35, help='Modest unsharp amount applied only to generated outpaint regions; 0 disables it.')
     parser.add_argument('--encoder', choices=['h264', 'prores'], default='h264')

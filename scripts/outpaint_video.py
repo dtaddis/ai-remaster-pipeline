@@ -744,6 +744,21 @@ def bypass_conditioning_resize_nodes(workflow: dict[str, Any]) -> None:
         pass
 
 
+def finalize_source_shift(args, chunk_manifest: Path | None, raw_output: Path) -> tuple[int, int, list[list[int | None]]]:
+    """Where finalize finds the source: one (x, y) shift for the whole clip, or, when the chunks
+    have different offsets, no shift plus [last frame or None, x, y] moves for finalize to follow.
+
+    Each offset takes over where the stitch hands over, at the end of the previous chunk.
+    """
+    spans = chunk_plan.read_offset_spans(chunk_manifest) if chunk_manifest else []
+    if not spans:
+        return int(args.offset_x), int(args.offset_y), []
+    if len(spans) == 1:
+        return spans[0]["x"], spans[0]["y"], []
+    fps = float(probe_video(raw_output).get("fps") or 24.0)
+    return 0, 0, [[None if span["end_seconds"] is None else round(span["end_seconds"] * fps), span["x"], span["y"]] for span in spans]
+
+
 def prepared_source_rectangle(prepared: Path, width: int, height: int) -> tuple[int, int, int, int] | None:
     base_prepared = prepared
     offset_x = 0
@@ -3754,6 +3769,7 @@ def main() -> int:
 
     output_prefix = f"arp_outpaint/{safe_stem(source.name)}_{aspect_slug(args.target_aspect)}_{render_width}x{render_height}"
     print(f"Prepared expanded canvas for ComfyUI: {prepared}", flush=True)
+    chunk_manifest: Path | None = None
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
         chunk_crop, chunk_black = _crop_black(args)
@@ -4012,16 +4028,20 @@ def main() -> int:
     source_rect = prepared_source_rectangle(prepared, render_width, render_height)
     if source_rect and not args.outpaint_all_black_regions:
         left, top, right, bottom = source_rect
-        left += int(args.offset_x)
-        top += int(args.offset_y)
+        shift_x, shift_y, moves = finalize_source_shift(args, chunk_manifest, raw_output)
+        left += shift_x
+        top += shift_y
         left = max(0, min(render_width - 1, left))
         top = max(0, min(render_height - 1, top))
-        right = max(left + 1, min(render_width, right + int(args.offset_x)))
-        bottom = max(top + 1, min(render_height, bottom + int(args.offset_y)))
+        right = max(left + 1, min(render_width, right + shift_x))
+        bottom = max(top + 1, min(render_height, bottom + shift_y))
         finalize_command.extend([
             "--source-x", str(left), "--source-y", str(top),
             "--source-width", str(right - left), "--source-height", str(bottom - top),
         ])
+        if moves:
+            print(f"Finalize follows the outpaint chunks' source offsets: {moves}", flush=True)
+            finalize_command.extend(["--source-moves", json.dumps(moves)])
     if source_monochrome:
         finalize_command.append("--monochrome")
     if args.force:
