@@ -609,7 +609,8 @@ def ensure_cleanup_models(comfy_dir: Path) -> None:
 
 
 def ensure_ltx_colorize_models(comfy_dir: Path) -> None:
-    ensure_hf_models(comfy_dir, LTX_COLORIZE_MODELS)
+    # The shot describer (on by default) runs Qwen3-VL from Qwen-Image-2.1's text encoder.
+    ensure_hf_models(comfy_dir, [*LTX_COLORIZE_MODELS, QWEN_IMAGE_21_SHARED_MODELS[0]])
 
 
 def ensure_qwen_image_edit_models(comfy_dir: Path) -> None:
