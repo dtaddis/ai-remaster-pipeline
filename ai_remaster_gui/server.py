@@ -238,6 +238,7 @@ import artifact_ids as aid  # noqa: E402
 import frame_masks  # noqa: E402
 import reference_luminance as reference_luma  # noqa: E402
 import chunk_plan  # noqa: E402
+from outpaint_geometry import crop_box, source_placement  # noqa: E402
 import minimax_h3_outpaint as h3  # noqa: E402
 import wan_vace_outpaint as wan  # noqa: E402
 from dependency_manager import H3_LICENSE_REQUIRED  # noqa: E402
@@ -1070,6 +1071,7 @@ class PipelineApp:
                     plan = reference_luma.reference_luminance_plan(manifest, manifest_fps(manifest), strength)
                 except Exception as exc:
                     error = str(exc)
+            payload["recomp_layout"] = recomp_preview_layout(settings_snapshot)
             payload["reference_luminance"] = {
                 "enabled": enabled,
                 "plan": plan,
@@ -2019,6 +2021,9 @@ class PipelineApp:
         frame_mask_archive = frame_outpaint_masks_for(self.outpaint_source_for(), outpaint_values)
         if outpainted and frame_mask_archive.is_file():
             add(["--frame-masks", rel(frame_mask_archive)])
+        chunk_manifest = outpaint_chunk_manifest_for(self.outpaint_source_for(), outpaint_values)
+        if outpainted and chunk_manifest and resolve(chunk_manifest).is_file():
+            add(["--outpaint-chunks", chunk_manifest])
         if outpainted and is_true(outpaint_values, "outpaint_all_black_regions"):
             add(["--source-black-transparent"])
             add(["--source-black-threshold", outpaint_values.get("black_mask_threshold", "12")])
@@ -3506,6 +3511,46 @@ def resolved_outpaint_height(source_text: str, target_height_text: str = "720") 
 
 def outpaint_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
     return aid.delivery_size(source_video_height(source_text), aspect, target_height_text)
+
+
+def recomp_preview_layout(settings: dict) -> dict:
+    """Where Recomposition lays the source over the outpainted canvas, for the Recomp preview.
+
+    The same placement final_composite.py uses (trims, extends, each chunk's offset), in
+    delivery-canvas pixels, so the preview never has to guess it from aspect ratios.
+    """
+    values = settings.get("recomp", {})
+    outpaint_values = settings.get("outpaint", {})
+    source_text = values.get("source", "")
+    outpainted_text = values.get("outpainted_video", "")
+    if not source_text or not outpainted_text:
+        return {}
+    source_metrics = video_metrics(resolve(source_text))
+    source_w, source_h = int(source_metrics.get("width") or 0), int(source_metrics.get("height") or 0)
+    if not (source_w and source_h):
+        return {}
+    canvas_w, canvas_h = outpaint_size_for_source(pipeline_source_text(settings), outpaint_values.get("target_aspect", "16:9"), outpaint_values.get("target_height", "720"))
+    crop, _black = _outpaint_crop_black(outpaint_values)
+    placement = source_placement(source_w, source_h, canvas_w, canvas_h, tuple(crop))
+    left, _right, top, _bottom, visible_w, visible_h = crop_box(source_w, source_h, *crop)
+    offsets = []
+    chunk_manifest = outpaint_chunk_manifest_for(outpaint_source_for_settings(settings), outpaint_values)
+    spans = chunk_plan.read_offset_spans(resolve(chunk_manifest)) if chunk_manifest else []
+    if spans:
+        outpainted_metrics = video_metrics(resolve(outpainted_text))
+        outpainted_w = int(outpainted_metrics.get("width") or canvas_w)
+        outpainted_h = int(outpainted_metrics.get("height") or canvas_h)
+        offsets = [
+            dict(span, x=round(span["x"] * canvas_w / outpainted_w), y=round(span["y"] * canvas_h / outpainted_h))
+            for span in spans
+        ]
+    return {
+        "canvas": [canvas_w, canvas_h],
+        "source": [source_w, source_h],
+        "visible": [left, top, visible_w, visible_h],
+        "placement": [placement.x, placement.y, placement.width, placement.height],
+        "offsets": offsets,
+    }
 
 
 def outpaint_work_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:

@@ -112,5 +112,27 @@ class RemapChunkRowsTests(unittest.TestCase):
         self.assertEqual(remapped[2]["custom_seconds"], "")
 
 
+class OffsetSpanTests(unittest.TestCase):
+    def test_each_offset_takes_over_where_the_previous_chunk_ends(self) -> None:
+        rows = [
+            {"chunk_index": "0", "end_seconds": "5.0", "offset_x": "0", "offset_y": "0"},
+            {"chunk_index": "1", "end_seconds": "10.0", "offset_x": "0", "offset_y": "0"},
+            {"chunk_index": "2", "end_seconds": "15.0", "offset_x": "-12", "offset_y": "8"},
+            {"chunk_index": "3", "end_seconds": "20.0", "offset_x": "0", "offset_y": "0"},
+        ]
+
+        self.assertEqual(chunk_plan.offset_spans(rows), [
+            {"start_seconds": 0.0, "end_seconds": 10.0, "x": 0, "y": 0},
+            {"start_seconds": 10.0, "end_seconds": 15.0, "x": -12, "y": 8},
+            {"start_seconds": 15.0, "end_seconds": None, "x": 0, "y": 0},
+        ])
+
+    def test_no_offsets_means_no_spans(self) -> None:
+        rows = [{"end_seconds": "5.0", "offset_x": "0", "offset_y": ""}, {"end_seconds": "9.0"}]
+
+        self.assertEqual(chunk_plan.offset_spans(rows), [])
+        self.assertEqual(chunk_plan.read_offset_spans(Path("does/not/exist.csv")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -6,6 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import chunk_plan
 import frame_masks
 from common import ROOT, file_fingerprint, resolve_path, root_relative, resumable_output, safe_stem, write_signature
 from outpaint_geometry import crop_box, native_source_layout, source_placement
@@ -65,9 +66,43 @@ def signature(args):
     # need re-rendering, so coloured ones (whose path already set SAR 1) stay reusable.
     if values.get('outpainted') and not values.get('colorized'):
         values['square_pixels'] = 1
+    # Only the offsets themselves matter, and only when a chunk has one, so composites of
+    # unshifted outpaints stay reusable whether or not the chunk list is passed.
+    values.pop('outpaint_chunks', None)
+    offsets = source_offsets(args)
+    if offsets:
+        values['source_offsets'] = offsets
     values['tool'] = 'final_composite.py'
     values['version'] = 13
     return values
+
+
+def source_offsets(args) -> list[dict]:
+    """The outpaint chunks' source offsets over time (chunk_plan.offset_spans), or []."""
+    if not (getattr(args, 'outpainted', None) and getattr(args, 'outpaint_chunks', None)):
+        return []
+    return chunk_plan.read_offset_spans(resolve_path(args.outpaint_chunks))
+
+
+def offset_shifts(offsets: list[dict], fps: float, canvas: tuple[int, int], outpainted_size: tuple[int, int]) -> list[tuple[int | None, int, int]]:
+    """Turn offset spans into (end frame or None, x, y) steps in composite-canvas pixels."""
+    scale_x = canvas[0] / max(1, outpainted_size[0])
+    scale_y = canvas[1] / max(1, outpainted_size[1])
+    shifts = []
+    for span in offsets:
+        end = span.get('end_seconds')
+        shifts.append((None if end is None else int(round(float(end) * fps)), int(round(span['x'] * scale_x)), int(round(span['y'] * scale_y))))
+    return shifts
+
+
+def shifted_position(base: int, shifts: list[tuple[int | None, int, int]], axis: int) -> str:
+    """An overlay x or y expression that moves the source with each chunk's offset."""
+    if not shifts:
+        return str(base)
+    expr = str(shifts[-1][axis])
+    for end, *offset in reversed(shifts[:-1]):
+        expr = f'if(lt(n,{end}),{offset[axis - 1]},{expr})'
+    return f"'{base}+{expr}'"
 
 
 def encoder_args(args):
@@ -485,7 +520,7 @@ def feathered_frame_keep_video(archive: Path, custom_mask: Path | None, canvas: 
     return target
 
 
-def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None):
+def build_filter(args, has_color, fps: float, has_outpainted: bool = True, source_size: tuple[int, int] | None = None, base_size: tuple[int, int] | None = None, luminance_plan: list[dict] | None = None, offsets: list[dict] | None = None, outpainted_size: tuple[int, int] | None = None):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, normalized_percent(args.saturation, 0.82))
     color_opacity = max(0.0, min(1.0, normalized_percent(args.color_opacity, 1.0)))
@@ -515,8 +550,14 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
             else:
                 placement = source_placement(source_size[0], source_size[1], base_size[0], base_size[1], crops)
                 source_fit = f"{crop}scale={placement.width}:{placement.height}:flags=lanczos,"
-            feather_horizontal = placement.x > 0 or placement.x + placement.width < base_size[0]
-            feather_vertical = placement.y > 0 or placement.y + placement.height < base_size[1]
+            # Outpainting shifts each chunk's source by that chunk's offset, so the overlay
+            # follows it; an edge that any chunk moves off the canvas border needs a feather.
+            shifts = offset_shifts(offsets, fps, base_size, outpainted_size or base_size) if offsets else []
+            moves = [(dx, dy) for _end, dx, dy in shifts] or [(0, 0)]
+            feather_horizontal = any(placement.x + dx > 0 or placement.x + dx + placement.width < base_size[0] for dx, _dy in moves)
+            feather_vertical = any(placement.y + dy > 0 or placement.y + dy + placement.height < base_size[1] for _dx, dy in moves)
+            overlay_x = shifted_position(placement.x, shifts, 1)
+            overlay_y = shifted_position(placement.y, shifts, 2)
             filters = [
                 # scale keeps the display aspect, so 1280x704 -> 1280x720 would leave a 45:44 SAR
                 # that only the colour path's setsar used to clear (issue #59).
@@ -533,7 +574,17 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 height=placement.height,
                 source_label='src',
             )
-            if custom_mask_input is not None:
+            canvas_keep = custom_mask_input is not None and bool(shifts)
+            if canvas_keep:
+                # The keep mask is drawn on the outpaint canvas, and Outpainting applied it there
+                # whatever the offset, so it cannot be cropped to a source that moves. Lay the
+                # source over the whole base first, then let the mask hold the base back through.
+                filters[0] = filters[0].replace('[base]', '[base0]')
+                filters.extend([
+                    '[base0]split[base][basekeep]',
+                    f'[{custom_mask_input}:v]setpts=N/({fps_text}*TB),scale={base_size[0]}:{base_size[1]}:flags=bilinear,format=gray[customkeep]',
+                ])
+            elif custom_mask_input is not None:
                 # The custom-mask input is already the feathered keep-alpha: a still, or
                 # with frame masks a per-frame video (see feathered_custom_keep_mask and
                 # feathered_frame_keep_video). Fold it into the alpha before it is merged,
@@ -545,7 +596,15 @@ def build_filter(args, has_color, fps: float, has_outpainted: bool = True, sourc
                 alpha_label = 'srcalphacustom'
             filters.append(f'[{rgb_label}]format=rgba[srcrgba]')
             filters.append(f'[srcrgba][{alpha_label}]alphamerge[srcm]')
-            filters.append(f'[base][srcm]overlay=x={placement.x}:y={placement.y}[merged]')
+            if canvas_keep:
+                filters.extend([
+                    f'[base][srcm]overlay=x={overlay_x}:y={overlay_y}[shifted]',
+                    '[shifted]format=rgba[shiftedrgba]',
+                    '[shiftedrgba][customkeep]alphamerge[shiftedm]',
+                    '[basekeep][shiftedm]overlay=x=0:y=0[merged]',
+                ])
+            else:
+                filters.append(f'[base][srcm]overlay=x={overlay_x}:y={overlay_y}[merged]')
         else:
             filters = [
                 f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base},setsar=1[base0]',
@@ -672,7 +731,12 @@ def run(args):
     cmd = [ffmpeg, '-y']
     inputs, audio_input = input_args(outpainted, source, colorized, custom_keep)
     cmd += inputs
-    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
+    offsets = source_offsets(args)
+    outpainted_size = probe_dimensions(ffmpeg, outpainted) if offsets else None
+    if offsets:
+        moves = ', '.join(f"{span['x']:+d},{span['y']:+d} from {span['start_seconds']:.2f}s" for span in offsets)
+        print(f'Source offsets from the outpaint chunks: {moves}', flush=True)
+    cmd += ['-filter_complex', build_filter(args, bool(colorized), fps, bool(outpainted), source_size, base_size, luminance_plan, offsets, outpainted_size), '-map', '[vout]', '-map', audio_input, '-shortest', '-r', f'{fps:.8f}', '-fps_mode', 'cfr']
     partial = output.with_name(f"{output.stem}.partial.{os_safe_pid()}{output.suffix}")
     cmd += encoder_args(args)
     if args.encoder == 'prores':
@@ -734,6 +798,7 @@ def build_parser():
     parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')
     parser.add_argument('--custom-mask', help='Additive full-canvas mask whose selected pixels remain transparent in the source overlay; the source fades back in over --feather-pixels outside them.')
     parser.add_argument('--frame-masks', help='Zip of per-frame patch masks (see frame_masks.py). Each patch stays transparent in the source overlay on its own frame, feathered like --custom-mask.')
+    parser.add_argument('--outpaint-chunks', help='Outpaint chunk manifest. Chunks with a source offset had their source shifted by it, so the overlay is shifted to match.')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)

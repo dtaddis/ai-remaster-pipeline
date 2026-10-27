@@ -120,6 +120,7 @@ function renderSignature() {
     cleanup_comparison: state.cleanup_comparison,
     stabilization_comparison: state.stabilization_comparison,
     reference_luminance: state.reference_luminance,
+    recomp_layout: state.recomp_layout,
     upscale_preview: state.upscale_preview,
     output_selection: state.output_selection,
     source_previews: state.source_previews,

@@ -709,8 +709,10 @@ function liveCompositeHtml(s) {
     return '<p class="shot-empty">Run the earlier phases to preview the live composite.</p>';
   }
 
+  const layout = recompLayout();
+  const shape = layout ? ` style="aspect-ratio:${layout.canvas[0]}/${layout.canvas[1]}"` : '';
   return `
-    <div class="live-composite">
+    <div class="live-composite"${shape}>
       ${s.outpainted_video ? `<video id="recompVideo" class="sync-layer-video live-outpaint" src="${media(s.outpainted_video)}" controls preload="metadata"></video>` : ''}
       ${originalLiveLayerHtml(s, !s.outpainted_video)}
       ${s.colorized_video ? `<video class="sync-layer-video color-preview-source" src="${media(s.colorized_video)}" muted preload="metadata" style="visibility:hidden;pointer-events:none"></video><canvas class="live-color live-color-accurate"></canvas>` : ''}
@@ -720,18 +722,14 @@ function liveCompositeHtml(s) {
 
 function originalLiveLayerHtml(s, asBase = false) {
   if (!s.source) return '';
-  const id = asBase ? ' id="recompVideo"' : '';
-  const controls = asBase ? ' controls' : '';
-  const cls = asBase ? 'live-outpaint live-original' : 'live-original';
-  const style = asBase ? 'object-fit:contain' : originalLayerStyle(s);
-  if (!sourceBlackTransparent()) {
-    return `<video${id} class="sync-layer-video ${cls}" src="${media(s.source)}"${asBase ? '' : ' muted'}${controls} preload="metadata" style="${style}"></video>`;
-  }
-  if (asBase) return `<video${id} class="sync-layer-video ${cls}" src="${media(s.source)}" controls preload="metadata" style="${style}"></video>`;
-  return `
-    <video class="sync-layer-video source-mask-video" src="${media(s.source)}" muted preload="metadata"></video>
-    <canvas class="live-original source-mask-canvas" style="${originalLayerStyle(s)}"></canvas>
-  `;
+  if (asBase) return `<video id="recompVideo" class="sync-layer-video live-outpaint live-original" src="${media(s.source)}" controls preload="metadata" style="object-fit:contain"></video>`;
+  // The window is the part of the canvas the source covers; the video inside it is the whole
+  // source, sized and shifted so that only its trimmed part shows through the window.
+  const fill = `${sourceInWindowStyle()};object-fit:fill`;
+  const picture = sourceBlackTransparent()
+    ? `<video class="sync-layer-video source-mask-video" src="${media(s.source)}" muted preload="metadata"></video><canvas class="source-mask-canvas" style="${fill}"></canvas>`
+    : `<video class="sync-layer-video live-source" src="${media(s.source)}" muted preload="metadata" style="${fill}"></video>`;
+  return `<div class="live-original source-window" style="${sourceWindowStyle(s)}">${picture}</div>`;
 }
 
 function layerPreviewHtml(s) {
@@ -772,18 +770,85 @@ function colorLayerStyle(s) {
   return `filter:saturate(${saturation});opacity:${opacity};hue-rotate(${hue}deg)`;
 }
 
-function originalFeatherStyle(s) {
-  const feather = Math.max(1, Number(s.feather_pixels || 80));
-  const edge = Math.max(2, Math.min(45, feather / 8));
-  // Fade the edges that meet generated canvas: the sides when the canvas was widened, top and
-  // bottom when it was extended vertically (as originalLayerBoxStyle places the source).
-  const angle = sourceAspectRatio() > targetAspectRatio() ? '180deg' : '90deg';
-  const gradient = `linear-gradient(${angle},transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`;
-  return `-webkit-mask-image:${gradient};mask-image:${gradient}`;
+// Where Recomposition puts the source (trims, extends, each outpaint chunk's offset), in
+// delivery-canvas pixels; null until the server has both the source and the outpainted video.
+function recompLayout() {
+  const layout = state.recomp_layout;
+  return layout && layout.canvas && layout.placement ? layout : null;
 }
 
-function originalLayerStyle(s) {
-  return `${originalLayerBoxStyle()};${originalFeatherStyle(s)};object-fit:fill`;
+function sourceShiftAt(seconds) {
+  const offsets = (recompLayout() || {}).offsets || [];
+  const span = offsets.find(item => item.end_seconds == null || seconds < Number(item.end_seconds));
+  return span ? { x: Number(span.x) || 0, y: Number(span.y) || 0 } : { x: 0, y: 0 };
+}
+
+// The edges that meet generated canvas, as final_composite.py decides them: an axis is
+// feathered when the source, at any chunk's offset, stops short of the canvas on that axis.
+function sourceFeatherEdges() {
+  const layout = recompLayout();
+  if (!layout) {
+    const tall = sourceAspectRatio() > targetAspectRatio();
+    return { horizontal: !tall, vertical: tall };
+  }
+  const [width, height] = layout.canvas;
+  const [x, y, w, h] = layout.placement;
+  const moves = layout.offsets && layout.offsets.length ? layout.offsets : [{ x: 0, y: 0 }];
+  return {
+    horizontal: moves.some(move => x + move.x > 0 || x + move.x + w < width),
+    vertical: moves.some(move => y + move.y > 0 || y + move.y + h < height),
+  };
+}
+
+function originalFeatherStyle(s) {
+  const feather = Math.max(1, Number(s.feather_pixels || 80));
+  const layout = recompLayout();
+  // --feather-pixels is measured on the canvas; the gradient runs across the source's box.
+  const percent = size => Math.max(0.5, Math.min(50, layout ? feather / Math.max(1, size) * 100 : feather / 8));
+  const edges = sourceFeatherEdges();
+  const gradients = [];
+  if (edges.horizontal) {
+    const edge = percent(layout && layout.placement[2]);
+    gradients.push(`linear-gradient(90deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`);
+  }
+  if (edges.vertical) {
+    const edge = percent(layout && layout.placement[3]);
+    gradients.push(`linear-gradient(180deg,transparent 0,#000 ${edge}%,#000 ${100 - edge}%,transparent 100%)`);
+  }
+  if (!gradients.length) return '';
+  const image = gradients.join(',');
+  return `-webkit-mask-image:${image};mask-image:${image};-webkit-mask-composite:source-in;mask-composite:intersect`;
+}
+
+function sourceWindowStyle(s, seconds = 0) {
+  const layout = recompLayout();
+  if (!layout) return `overflow:hidden;${originalLayerBoxStyle()};${originalFeatherStyle(s)}`;
+  const [width, height] = layout.canvas;
+  const [x, y, w, h] = layout.placement;
+  const shift = sourceShiftAt(seconds);
+  return `overflow:hidden;left:${(x + shift.x) / width * 100}%;top:${(y + shift.y) / height * 100}%;`
+    + `width:${w / width * 100}%;height:${h / height * 100}%;right:auto;bottom:auto;${originalFeatherStyle(s)}`;
+}
+
+function sourceInWindowStyle() {
+  const layout = recompLayout();
+  if (!layout) return 'left:0;top:0;width:100%;height:100%';
+  const [sourceW, sourceH] = layout.source;
+  const [left, top, visibleW, visibleH] = layout.visible;
+  return `left:${-left / visibleW * 100}%;top:${-top / visibleH * 100}%;`
+    + `width:${sourceW / visibleW * 100}%;height:${sourceH / visibleH * 100}%;right:auto;bottom:auto`;
+}
+
+// Follow the outpaint chunks' offsets as the preview plays.
+function moveSourceWindow(seconds) {
+  const layout = recompLayout();
+  if (!layout || !layout.offsets || !layout.offsets.length) return;
+  const [width, height] = layout.canvas;
+  const shift = sourceShiftAt(seconds);
+  document.querySelectorAll('.source-window').forEach(el => {
+    el.style.left = `${(layout.placement[0] + shift.x) / width * 100}%`;
+    el.style.top = `${(layout.placement[1] + shift.y) / height * 100}%`;
+  });
 }
 
 function originalLayerBoxStyle() {
@@ -839,14 +904,19 @@ function wireEditorVideo() {
   mainVideo.addEventListener('loadedmetadata', () => {
     scrubber.value = 0;
     syncLayers(true);
+    moveSourceWindow(mainVideo.currentTime || 0);
   });
   mainVideo.addEventListener('play', () => {
     syncLayers(true);
     layers.forEach(item => item.play().catch(() => {}));
   });
   mainVideo.addEventListener('pause', () => layers.forEach(item => item.pause()));
-  mainVideo.addEventListener('seeking', () => syncLayers(true));
+  mainVideo.addEventListener('seeking', () => {
+    syncLayers(true);
+    moveSourceWindow(mainVideo.currentTime || 0);
+  });
   mainVideo.addEventListener('timeupdate', () => {
+    moveSourceWindow(mainVideo.currentTime || 0);
     if (mainVideo.duration && !scrubber.matches(':active')) {
       scrubber.value = Math.round((mainVideo.currentTime / mainVideo.duration) * 1000);
     }
@@ -910,10 +980,10 @@ function drawAccurateColorComposite(canvas, mainVideo, colorVideo, scratch, scra
     ctx.fillRect(0, 0, width, height);
   }
 
-  const sourceVideo = document.querySelector('.source-mask-video') || document.querySelector('.live-original:not(.live-outpaint)');
+  const sourceVideo = document.querySelector('.source-mask-video') || document.querySelector('video.live-source');
   const showOriginal = document.getElementById('showLayerOriginal')?.checked ?? true;
   if (sourceVideo && showOriginal && sourceVideo.readyState >= 2) {
-    drawSourceLayerToContext(ctx, sourceVideo, width, height);
+    drawSourceLayerToContext(ctx, sourceVideo, width, height, mainVideo.currentTime || 0);
   }
 
   const base = ctx.getImageData(0, 0, width, height);
@@ -924,26 +994,46 @@ function drawAccurateColorComposite(canvas, mainVideo, colorVideo, scratch, scra
   ctx.putImageData(base, 0, 0);
 }
 
-function drawSourceLayerToContext(ctx, sourceVideo, width, height) {
-  const sourceAspect = sourceVideo.videoWidth / Math.max(1, sourceVideo.videoHeight);
-  const drawH = height;
-  const drawW = Math.max(2, Math.round(drawH * sourceAspect));
-  const x = Math.round((width - drawW) / 2);
-  const y = 0;
+function drawSourceLayerToContext(ctx, sourceVideo, width, height, seconds = 0) {
+  const layout = recompLayout();
+  let crop = [0, 0, sourceVideo.videoWidth, sourceVideo.videoHeight];
+  let x, y, drawW, drawH;
+  let scale = 1;
+  if (layout) {
+    // Same placement as the live layers: the trimmed source, at this moment's chunk offset.
+    scale = width / layout.canvas[0];
+    const videoScale = sourceVideo.videoWidth / Math.max(1, layout.source[0]);
+    crop = layout.visible.map(value => value * videoScale);
+    const shift = sourceShiftAt(seconds);
+    x = Math.round((layout.placement[0] + shift.x) * scale);
+    y = Math.round((layout.placement[1] + shift.y) * scale);
+    drawW = Math.max(2, Math.round(layout.placement[2] * scale));
+    drawH = Math.max(2, Math.round(layout.placement[3] * scale));
+  } else {
+    const sourceAspect = sourceVideo.videoWidth / Math.max(1, sourceVideo.videoHeight);
+    drawH = height;
+    drawW = Math.max(2, Math.round(drawH * sourceAspect));
+    x = Math.round((width - drawW) / 2);
+    y = 0;
+  }
   const temp = document.createElement('canvas');
   temp.width = width;
   temp.height = height;
   const tctx = temp.getContext('2d', { willReadFrequently: true });
-  tctx.drawImage(sourceVideo, x, y, drawW, drawH);
+  tctx.drawImage(sourceVideo, crop[0], crop[1], crop[2], crop[3], x, y, drawW, drawH);
   const image = tctx.getImageData(0, 0, width, height);
   const data = image.data;
-  const feather = Math.max(1, Number(settings('recomp').feather_pixels || 80));
+  const feather = Math.max(1, Number(settings('recomp').feather_pixels || 80) * scale);
+  const edges = sourceFeatherEdges();
   const threshold = sourceBlackTransparent() ? 24 : -1;
   for (let i = 0; i < data.length; i += 4) {
     const pixel = i / 4;
     const px = pixel % width;
-    const edge = Math.min(px - x, x + drawW - px);
-    let alpha = edge <= 0 ? 0 : Math.min(255, 255 * edge / feather);
+    const py = Math.floor(pixel / width);
+    let alpha = 255;
+    if (edges.horizontal) alpha = Math.min(alpha, 255 * Math.min(px - x, x + drawW - px) / feather);
+    if (edges.vertical) alpha = Math.min(alpha, 255 * Math.min(py - y, y + drawH - py) / feather);
+    alpha = Math.max(0, alpha);
     if (threshold >= 0 && Math.max(data[i], data[i + 1], data[i + 2]) <= threshold) alpha = 0;
     data[i + 3] = Math.min(data[i + 3], alpha);
   }

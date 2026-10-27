@@ -7,7 +7,9 @@ guide in it. Keep all chunk-range arithmetic here.
 
 from __future__ import annotations
 
+import csv
 import json
+from pathlib import Path
 
 
 def ltx_valid_frame_count(seconds: float, fps: float) -> int:
@@ -161,3 +163,40 @@ def remap_chunk_rows(
         frames = sorted(placed[index], key=lambda guide: int(guide["frame_idx"]))
         row.update({"guide_frames": json.dumps(frames) if frames else "", "guide_image": "", "guide_end_image": ""})
     return remapped
+
+
+def offset_spans(rows: list[dict[str, str]]) -> list[dict]:
+    """When each chunk's source offset shows in the stitched outpaint, for Recomposition.
+
+    Returns ``{"start_seconds", "end_seconds", "x", "y"}`` spans covering the whole clip (the
+    last one open-ended, ``end_seconds`` None), or [] when no chunk is offset. x and y are in
+    outpainted-video pixels. The stitch plays each chunk on from where the previous one ends,
+    so an offset takes over at the end of the previous chunk, not where its overlap begins.
+    """
+    chunks = []
+    for row in rows:
+        try:
+            chunks.append((float(row["end_seconds"]), int(float(row.get("offset_x") or 0)), int(float(row.get("offset_y") or 0))))
+        except (KeyError, TypeError, ValueError):
+            return []
+    if not any(x or y for _end, x, y in chunks):
+        return []
+    spans: list[dict] = []
+    start = 0.0
+    for end, x, y in sorted(chunks):
+        if spans and (spans[-1]["x"], spans[-1]["y"]) == (x, y):
+            spans[-1]["end_seconds"] = end
+        else:
+            spans.append({"start_seconds": start, "end_seconds": end, "x": x, "y": y})
+        start = end
+    spans[-1]["end_seconds"] = None
+    return spans
+
+
+def read_offset_spans(manifest: str | Path) -> list[dict]:
+    """offset_spans for an outpaint chunk manifest; [] when it is missing or unreadable."""
+    try:
+        with Path(manifest).open("r", encoding="utf-8-sig", newline="") as handle:
+            return offset_spans(list(csv.DictReader(handle)))
+    except (OSError, csv.Error):
+        return []

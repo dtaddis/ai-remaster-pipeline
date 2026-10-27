@@ -1722,6 +1722,79 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertGreater(frame[360 * 960 + 2], 215, "the sides of a vertically extended source are not feathered away")
         self.assertLess(frame[700 * 960 + 480], 40)
 
+    def test_final_composite_follows_each_outpaint_chunks_source_offset(self) -> None:
+        # Outpainting shifts each chunk's source by that chunk's offset; Recomposition has to lay
+        # the source over the same place, or the original and its outpainted copy sit side by side.
+        import cv2
+        import numpy as np
+
+        ffmpeg = final_composite.find_ffmpeg(None)
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            outpainted, source, chunks = folder / "outpainted.mkv", folder / "source.mkv", folder / "chunks.csv"
+            for path, colour, size in ((outpainted, "black", "640x360"), (source, "white", "480x360")):
+                subprocess.run(
+                    [ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s={size}:r=24:d=0.5", "-c:v", "ffv1", str(path)],
+                    check=True,
+                )
+            # Two 0.25 s chunks (6 frames each at 24 fps); the second is shifted 40 px right.
+            chunks.write_text(
+                "chunk_index,start_frame,end_frame,start_seconds,end_seconds,offset_mode,offset_x,offset_y\n"
+                "0,0,6,0.000000,0.250000,inherit,0,0\n"
+                "1,4,12,0.166667,0.500000,custom,40,0\n",
+                encoding="utf-8",
+            )
+            mask = folder / "mask.png"
+            mask_image = np.zeros((360, 640, 4), np.uint8)
+            mask_image[:, 300:340] = 255  # damage to regenerate, drawn on the canvas
+            cv2.imwrite(str(mask), mask_image)
+
+            def composite(name: str, *extra: str) -> list[bytes]:
+                output = folder / name
+                args = final_composite.build_parser().parse_args([
+                    "--outpainted", str(outpainted), "--source", str(source), "--output", str(output),
+                    "--outpaint-chunks", str(chunks), "--feather-pixels", "4", "--force", *extra,
+                ])
+                with mock.patch("sys.stdout", new=io.StringIO()):
+                    self.assertEqual(final_composite.run(args), 0)
+                raw = subprocess.run(
+                    [ffmpeg, "-v", "error", "-i", str(output), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                    check=True, capture_output=True,
+                ).stdout
+                return [raw[i:i + 640 * 360] for i in range(0, len(raw), 640 * 360)]
+
+            plain = composite("plain.mp4")
+            masked = composite("masked.mp4", "--custom-mask", str(mask))
+            unshifted = final_composite.signature(final_composite.build_parser().parse_args([
+                "--outpainted", str(outpainted), "--source", str(source), "--output", "x.mp4",
+                "--outpaint-chunks", str(folder / "missing.csv"),
+            ]))
+
+        row = 180 * 640
+        self.assertEqual(len(plain), 12)
+        # Chunk 1 keeps the source centred (80..560); from frame 6 chunk 2's +40 px shift applies.
+        self.assertGreater(plain[2][row + 100], 215)
+        self.assertLess(plain[2][row + 580], 40)
+        self.assertLess(plain[9][row + 100], 40)
+        self.assertGreater(plain[9][row + 580], 215)
+        # The custom mask stays where it was drawn on the canvas while the source moves under it.
+        self.assertLess(masked[9][row + 320], 40)
+        self.assertGreater(masked[9][row + 200], 215)
+        self.assertGreater(masked[9][row + 580], 215)
+        self.assertNotIn("source_offsets", unshifted)
+        self.assertNotIn("outpaint_chunks", unshifted)
+
+    def test_recomposition_command_passes_the_outpaint_chunk_offsets(self) -> None:
+        app.APP.settings["global"].update({"source": "input/My Source.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["recomp"].update({"outpainted_video": "intermediate/outpainted/My_outpaint.mp4", "source": "input/My Source.mp4"})
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            manifest = Path(tmp_text) / "chunks.csv"
+            manifest.write_text("chunk_index,end_seconds,offset_x,offset_y\n0,1.0,0,0\n", encoding="utf-8")
+            with mock.patch.object(server, "outpaint_chunk_manifest_for", return_value=server.rel(manifest)):
+                command = app.APP._recomp_command({}, dict(app.APP.settings["recomp"]))
+
+        self.assertEqual(command[command.index("--outpaint-chunks") + 1], server.rel(manifest))
+
     def test_recomposition_command_punches_source_black_when_outpainting_all_black_regions(self) -> None:
         app.APP.settings["global"].update({"source": "input/My Source.mp4", "section_start": "0", "section_end": ""})
         app.APP.settings["outpaint"].update(
